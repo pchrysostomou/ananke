@@ -21184,6 +21184,31 @@ waits for the crashed node instead.
    and 227 of the first figure were still placeholders when their run ended, every one a
    range its node held.
 
+   **Corrected before #173 merged (#173's review, B1).** As first committed this held on
+   the split's path alone. A split's apply puts R's descriptor in place right after
+   tracing R's creation, with nothing awaited between. A placeholder's install traced
+   `RangeCreated { cause: snapshot }` at its switch and then awaited the store's open
+   before putting the descriptor in place. In that window, about 86 ms on seed 45, the host
+   still found the placeholder and answered for the replica as a refused server. Its
+   leader restarted the stream from offset 0 to a node that held the range. Under
+   `UninitialisedReplicaVotes` a grant there would come after `RangeCreated`, where check
+   20 as §8 words it cannot see it. The install now puts the descriptor in place at the
+   creation's trace, before the open, as the split does. Measured on the correct node,
+   seeds 0 to 999, release, with `placeholders_of`'s count of refused answers (hint 1,
+   echo 0, incarnation 0) a node sent for a range it had created and was not refused or
+   removed from since:
+   - before: **11** on 9 seeds (45, 221, 375, 401, 466, 579, 595, 604, 915);
+   - after: **0**, and every other placeholder figure of §5 unchanged.
+
+   The correct node's sweep asserts the absence at every tier. Seed 45's pin asserts it
+   at the gate, where it counted 2 before the fix: node 2's answers for 14.
+
+   If the open fails after the switch, the replica is on disk and its descriptor stays in
+   place. The host drops its messages and makes no placeholder of it again, and a chunk
+   of it goes unanswered, so no second install traces a second `RangeCreated`. The stream
+   is finished in the task's plan and the failure is traced `RaftServerFailed`. A restart
+   opens the replica from its keys. No test injects a failed open (#173's review, N5).
+
 **PROPOSED, settled here** (SHARD.md does not say): the placeholder lives in the host as a
 set, not as a core in a placeholder mode of `ananke-raft` (Q40: that crate names no range,
 and "no Raft state" is a core's whole content); it is made by any message of its range, not
@@ -21215,9 +21240,11 @@ task makes the install itself:
    descriptor's span, generation and voters, the snapshot's last index and term as the
    floor and the fresh incarnation, before anything else is awaited: traced later, with the
    core, a crash between the two would leave the node restating a replica the trace never
-   saw made, which check 20 would read as a placeholder's the day it granted a vote;
+   saw made, which check 20 would read as a placeholder's the day it granted a vote; and
+   **the descriptor is put in place with the trace**, so the placeholder answers nothing
+   from there (§1.6, corrected);
 5. the store is opened on what the switch wrote and entered in the node's tables with its
-   applied state and its descriptor, the range is hosted at its whole span, the replica is
+   applied state, the range is hosted at its whole span, the replica is
    read back and the install traced (`RaftSnapshotState`, `RaftSnapshot`), the sender is
    answered installed with the new incarnation, and the `raft` task gets `Switched`, which
    the host turns into the replica's core (`created_by_install`) — restored from the floor,
@@ -21313,7 +21340,7 @@ release, the variant is caught on:
 | by index (this) | 0 | 2 | 19 |
 
 Every one of the 19 is check 16's fall, as the test asserts of each catch. The correct
-node's sweep was not re-run at a thousand under the new fold; the gate's is green. At 1.9 % the premerge's share of a hundred sees none about
+node's sweep is green on 1 000 of 1 000 under the new fold (release, with §1.6's correction). At 1.9 % the premerge's share of a hundred sees none about
 one time in seven (0.981^100), which D-061 forbids. So
 `a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split` runs a
 thousand seeds from the premerge up rather than the share, and asserts its catch there, where

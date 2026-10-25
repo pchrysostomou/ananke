@@ -1421,11 +1421,27 @@ impl<E: Environment> Task<E> {
                 incarnation,
             },
         );
+        // The descriptor the switch put in place, at the creation's trace and before
+        // the open is awaited, as a split's apply puts its right half's: from here the
+        // range is initialised on the node, so the host drops its messages rather than
+        // answer them as its placeholder's, and a chunk of it is no placeholder's either
+        // (SHARD.md §5: the placeholder becomes a replica at the install). It is what the
+        // state read back below takes the span from, and what the host's receipt check
+        // reads from here on.
+        // PROPOSED(D-109)
+        lock(&self.descriptors).insert(range, descriptor.clone());
         // The store the switch wrote, opened beside the node's others: everything it
         // reads the repair wrote, so the open writes nothing.
         let store = match beside.open_sibling(prefix).await {
             Ok((store, _)) => Arc::new(store),
             Err(error) => {
+                // The replica is on disk and its descriptor in place, so the node
+                // answers for it as for a replica whose store is not open, and makes no
+                // placeholder of it again: a restart opens it from its keys. The stream
+                // is done with.
+                self.plan.finish(range, from);
+                self.receiving.remove(&(range, from));
+                self.as_placeholder.remove(&range);
                 self.env.trace(TraceEvent::RaftServerFailed {
                     server: self.id.0,
                     reason: format!("opening {range}'s store after its install: {error}"),
@@ -1444,9 +1460,6 @@ impl<E: Environment> Task<E> {
                 },
             );
         }
-        // The descriptor the switch put in place: what the state read back below takes
-        // the span from, and what the host's receipt check reads from here on.
-        lock(&self.descriptors).insert(range, descriptor.clone());
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));

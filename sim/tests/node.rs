@@ -566,6 +566,7 @@ impl Coverage {
             .installed_voters_waited
             .extend(placeholders.installed_voters_waited);
         self.placeholders.installed_voters_never += placeholders.installed_voters_never;
+        self.placeholders.answered_for_a_replica += placeholders.answered_for_a_replica;
         self.uniform_seeds += u64::from(report.uniform());
         self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
         self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1191,6 +1192,17 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         coverage.overlap_refusal_seeds,
         placeholders.installed_voters_waited.len(),
         placeholders.installed_voters_never,
+    );
+    // No placeholder answers for a replica its node holds: the install puts the range's
+    // descriptor in place at the creation's trace, before its store is opened, as a
+    // split's apply does, so the host drops the range's messages in between (D-109
+    // §1.6). Asserted at every tier as an absence; before that fix it was 11 answers on
+    // 9 of the first thousand seeds (45, 221, 375, 401, 466, 579, 595, 604, 915), and
+    // seed 45's pin asserts it at the gate.
+    assert_eq!(
+        placeholders.answered_for_a_replica, 0,
+        "a placeholder answered for a replica its node had created, on one of {seeds} seeds \
+         (SHARD.md §5: the placeholder becomes a replica at its install)"
     );
     assert!(
         coverage.placeholder_seeds > 0,
@@ -2424,6 +2436,16 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         !report.records[..created].iter().any(|record| on(record)
             && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
         "seed {seed}: node {node} created the right half {right} before its placeholder did"
+    );
+    // The install's window (D-109 §1.6): before the descriptor was put in place at the
+    // creation's trace, node 2's placeholder answered two AppendEntries of 14 as a
+    // refused server, 0.2 ms and 18.8 ms after 14's creation, and 14's leader restarted
+    // the stream from offset 0 to a node that held the replica.
+    let answered = raft::placeholders_of(&report.records).answered_for_a_replica;
+    assert_eq!(
+        answered, 0,
+        "seed {seed}: {answered} placeholder answers were sent for a replica its node had \
+         created"
     );
     let crashed = find(
         "a crash after the right half's creation",
