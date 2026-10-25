@@ -4158,10 +4158,11 @@ impl Report {
     // received.
     pub fn isolation_keeps_the_term_by_cause(&self) -> Result<(), String> {
         let records = self.pre_vote_records();
+        let streams = self.install_stream_terms();
         self.isolations
             .iter()
             .try_for_each(|&(server, from, until)| {
-                Self::keeps_its_term_by_cause(&records, server, from, until)
+                Self::keeps_its_term_by_cause(&records, &streams, server, from, until)
             })
     }
 
@@ -4179,7 +4180,13 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        Self::keeps_its_term_by_cause(&self.pre_vote_records(), server, from, until)
+        Self::keeps_its_term_by_cause(
+            &self.pre_vote_records(),
+            &self.install_stream_terms(),
+            server,
+            from,
+            until,
+        )
     }
 
     /// [`Report::isolation_keeps_its_term_by_cause`] over `records`, the
@@ -4188,6 +4195,7 @@ impl Report {
     // trace.
     fn keeps_its_term_by_cause(
         records: &[&TraceRecord],
+        streams: &StreamTerms,
         server: u64,
         from: Instant,
         until: Instant,
@@ -4195,7 +4203,7 @@ impl Report {
         Self::ranges_of(records, server)
             .into_iter()
             .try_for_each(|range| {
-                Self::replica_keeps_its_term_by_cause(records, range, server, from, until)
+                Self::replica_keeps_its_term_by_cause(records, streams, range, server, from, until)
             })
     }
 
@@ -4205,6 +4213,7 @@ impl Report {
     // PROPOSED(D-071): pre-vote's property is per (range, server).
     fn replica_keeps_its_term_by_cause(
         records: &[&TraceRecord],
+        streams: &StreamTerms,
         range: u64,
         server: u64,
         from: Instant,
@@ -4212,6 +4221,7 @@ impl Report {
     ) -> Result<(), String> {
         let verdict = Self::replica_keeps_its_term_by(
             records,
+            streams,
             RecordTime::Decided,
             range,
             server,
@@ -4290,6 +4300,9 @@ impl Report {
                         | TraceEvent::RaftReseeded { .. }
                         | TraceEvent::RaftSnapshot { taken: false, .. }
                         | TraceEvent::RangeCreated { .. }
+                        // PROPOSED(D-112): an install's restatement is read as the
+                        // term its creation wrote ([`Report::installed_term`]).
+                        | TraceEvent::RaftRecovered { .. }
                 )
             })
             .collect()
@@ -4349,10 +4362,11 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
         let records = self.pre_vote_records();
+        let streams = self.install_stream_terms();
         self.isolations
             .iter()
             .try_for_each(|&(server, from, until)| {
-                Self::keeps_its_term_by(&records, time, server, from, until)
+                Self::keeps_its_term_by(&records, &streams, time, server, from, until)
             })
     }
 
@@ -4369,7 +4383,14 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        Self::keeps_its_term_by(&self.pre_vote_records(), time, server, from, until)
+        Self::keeps_its_term_by(
+            &self.pre_vote_records(),
+            &self.install_stream_terms(),
+            time,
+            server,
+            from,
+            until,
+        )
     }
 
     /// [`Report::isolation_keeps_its_term_by`] over `records`, the
@@ -4378,6 +4399,7 @@ impl Report {
     // trace.
     fn keeps_its_term_by(
         records: &[&TraceRecord],
+        streams: &StreamTerms,
         time: RecordTime,
         server: u64,
         from: Instant,
@@ -4386,7 +4408,7 @@ impl Report {
         Self::ranges_of(records, server)
             .into_iter()
             .try_for_each(|range| {
-                Self::replica_keeps_its_term_by(records, time, range, server, from, until)
+                Self::replica_keeps_its_term_by(records, streams, time, range, server, from, until)
             })
     }
 
@@ -4399,6 +4421,16 @@ impl Report {
     /// replica did not exist at the start, and the term its creation names is no
     /// election of its own.
     ///
+    /// A replica an install created *before* the isolation, whose core first states
+    /// its term inside it, takes that restatement's term as the term the isolation
+    /// began with, where it equals the term of the stream the install completed
+    /// ([`Report::installed_term`], PROPOSED D-112). The switch wrote that term before
+    /// the window, and no core of the replica exists to change it until the
+    /// restatement. What the check still trusts is that pairing: the stream is read
+    /// as the last done chunk of the creation's snapshot delivered to the node before
+    /// the creation, and a restatement of exactly that term, after a `RaftRecovered`
+    /// of it, is read as the creation's.
+    ///
     /// The violation names the server, the terms and the window and not the range,
     /// which forty-four pinned assertions take word for word and a run of this stage
     /// has one of; the stage that gives a node many ranges moves those pins and
@@ -4406,6 +4438,7 @@ impl Report {
     // PROPOSED(D-071): pre-vote's property is per (range, server).
     fn replica_keeps_its_term_by(
         records: &[&TraceRecord],
+        streams: &StreamTerms,
         time: RecordTime,
         range: u64,
         server: u64,
@@ -4415,11 +4448,11 @@ impl Report {
         if Self::reseeding_during(records, range, server, from, until) {
             return Ok(());
         }
-        let before = match Self::term_by(records, range, server, time, from) {
+        let before = match Self::term_by(records, streams, range, server, time, from) {
             0 => Self::created_term_in(records, range, server, from, until).unwrap_or(0),
             term => term,
         };
-        let after = Self::term_by(records, range, server, time, until);
+        let after = Self::term_by(records, streams, range, server, time, until);
         if after != before {
             return Err(format!(
                 "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
@@ -4521,21 +4554,27 @@ impl Report {
     /// [`Report::pre_vote_records`].
     fn term_by(
         records: &[&TraceRecord],
+        streams: &StreamTerms,
         range: u64,
         server: u64,
         time: RecordTime,
         at: Instant,
     ) -> u64 {
-        records
+        let on = |r: &TraceRecord| r.node.map(|node| u64::from(node.get())) == Some(server);
+        // Each source of the replica's term by `at`, with where it stands: `None` for an
+        // install's creation, whose term the trace states only at the replica's
+        // restatement ([`Report::installed_term`]).
+        let sources: Vec<(usize, Option<u64>)> = records
             .iter()
-            .filter(|r| time.of(r) <= at)
-            .filter_map(|r| match &r.event {
+            .enumerate()
+            .filter(|(_, r)| time.of(r) <= at)
+            .filter_map(|(index, r)| match &r.event {
                 TraceEvent::RaftTerm {
                     server: s,
                     range: g,
                     term,
                     ..
-                } if (*g, *s) == (range, server) => Some(*term),
+                } if (*g, *s) == (range, server) => Some((index, Some(*term))),
                 // A right half starts at its floor's term (SHARD.md §5, Q20) and
                 // traces no `RaftTerm` for it: the creation is the term's source
                 // until an election moves it, else a replica created before an
@@ -4546,13 +4585,150 @@ impl Report {
                     cause: ananke_env::RangeCause::Split,
                     floor_term,
                     ..
-                } if *g == range && r.node.map(|node| u64::from(node.get())) == Some(server) => {
-                    Some(*floor_term)
-                }
+                } if *g == range && on(r) => Some((index, Some(*floor_term))),
+                // PROPOSED(D-112): an install's creation, a placeholder's or a
+                // re-seed's.
+                TraceEvent::RangeCreated {
+                    range: g,
+                    cause: ananke_env::RangeCause::Snapshot,
+                    ..
+                } if *g == range && on(r) => Some((index, None)),
                 _ => None,
             })
-            .next_back()
-            .unwrap_or(0)
+            .collect();
+        // The latest source; an install's creation that the trace cannot tie to the
+        // term its stream carried reads as it did before D-112, the source before it.
+        for &(index, term) in sources.iter().rev() {
+            match term {
+                Some(term) => return term,
+                None => {
+                    if let Some(term) = Self::installed_term(records, streams, index, range, server)
+                    {
+                        return term;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    /// The term an install's creation wrote, as the trace states it (PROPOSED D-112):
+    /// the term of the replica's restatement after the creation at `created` in
+    /// `records`, when that restatement is the term the install's stream carried.
+    ///
+    /// The switch writes the replica's whole state, its term the stream's, durably and
+    /// before anything is awaited, and traces `RangeCreated { cause: snapshot }` there.
+    /// The term itself is first traced at the replica's restatement, when its core
+    /// starts: `RaftRecovered` and then `RaftTerm` with role `follower` and no receipt
+    /// (D-109 §2, `created_by_install`; a re-seeded replica's `installed`). Between the
+    /// two no core of the replica exists and nothing can change its term, so the
+    /// restatement's term is the creation's. It is taken only where it equals the term of
+    /// the stream the install completed ([`Report::install_stream_terms`]): a restatement
+    /// of any other term, or a first term record of any other shape, is not the
+    /// creation's term and gives `None`.
+    // PROPOSED(D-112): the pre-vote fold reads an install's creation as a term source.
+    fn installed_term(
+        records: &[&TraceRecord],
+        streams: &StreamTerms,
+        created: usize,
+        range: u64,
+        server: u64,
+    ) -> Option<u64> {
+        let creation = records.get(created)?;
+        let stream = *streams.get(&(server, range, creation.at))?;
+        let mut recovered = None;
+        for record in &records[created + 1..] {
+            match &record.event {
+                TraceEvent::RaftRecovered {
+                    server: s,
+                    range: g,
+                    term,
+                    ..
+                } if (*g, *s) == (range, server) => recovered = Some(*term),
+                TraceEvent::RaftTerm {
+                    server: s,
+                    range: g,
+                    term,
+                    role,
+                    received,
+                } if (*g, *s) == (range, server) => {
+                    let restated =
+                        recovered == Some(*term) && *role == "follower" && received.is_none();
+                    return (restated && *term == stream).then_some(*term);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The term of the stream each install's creation completed (PROPOSED D-112): for
+    /// every `RangeCreated { cause: snapshot }` on a node, the term of the last
+    /// `InstallSnapshot` chunk of that range marked done, for the snapshot the creation
+    /// names (its floor index and term), delivered to the node before the creation.
+    /// That chunk's term is the stream's identity's, which the switch writes as the
+    /// replica's term (`Identity`, the repair's `term`). Keyed by (server, range, when
+    /// the creation was traced). A creation no delivered chunk matches is absent, and
+    /// the pre-vote fold then takes nothing from it (`Report::installed_term`).
+    ///
+    /// It reads the node's deliveries backwards from each creation and decodes only the
+    /// payloads of messages delivered to that node, and an install's creation is rare,
+    /// so the one pass over the trace it adds to the pre-vote check is all it costs a
+    /// seed with none.
+    #[must_use]
+    pub fn install_stream_terms(&self) -> StreamTerms {
+        let mut terms = StreamTerms::new();
+        for (at, record) in self.records.iter().enumerate() {
+            let TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Snapshot,
+                floor_index,
+                floor_term,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            let Some(server) = record.node.map(|node| u64::from(node.get())) else {
+                continue;
+            };
+            let mut delivered: BTreeSet<ananke_env::MessageId> = BTreeSet::new();
+            for earlier in self.records[..at].iter().rev() {
+                match &earlier.event {
+                    TraceEvent::MessageDelivered { id, .. }
+                        if earlier.node.map(|node| u64::from(node.get())) == Some(server) =>
+                    {
+                        delivered.insert(*id);
+                    }
+                    TraceEvent::MessageSent { id, payload, .. } if delivered.contains(id) => {
+                        let stream =
+                            messages_of(payload)
+                                .into_iter()
+                                .find_map(|(group, message)| match message {
+                                    Message::InstallSnapshot {
+                                        term,
+                                        last_index,
+                                        last_term,
+                                        done: true,
+                                        ..
+                                    } if group == *range
+                                        && last_index == *floor_index
+                                        && last_term == *floor_term =>
+                                    {
+                                        Some(term)
+                                    }
+                                    _ => None,
+                                });
+                        if let Some(term) = stream {
+                            terms.insert((server, *range, record.at), term);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        terms
     }
 
     /// Election timers fire (moirae rule 5): a running replica that is not the
@@ -5080,6 +5256,11 @@ impl Report {
         probed
     }
 }
+
+/// The term of the stream each install's creation completed, keyed by (server, range,
+/// when the creation was traced): [`Report::install_stream_terms`].
+// PROPOSED(D-112)
+pub type StreamTerms = BTreeMap<(u64, u64, Instant), u64>;
 
 /// Which of a record's two times a check reads (D-047). A node traces a
 /// step's events once what they report is durable (D-026), so a record's
@@ -9485,6 +9666,139 @@ mod tests {
         assert!(report.timers_fire_by(RecordTime::Decided).is_err());
         let gap = report.timer_gaps_by(TimerResets::ALL, RecordTime::Durable)[0];
         assert!(report.timer_removal(&gap).is_err());
+    }
+
+    /// An install's creation traced before an isolation and its restatement inside it
+    /// (PROPOSED D-112): seeds 1817 and 248 of the node's nightly. The switch wrote the
+    /// replica's term before the window and its core first states it inside, so the
+    /// term the window began with is the restatement's, taken only where it equals the
+    /// term of the stream the install completed. Four cases on one server:
+    ///
+    /// - restated at the stream's term and kept: no violation, where the fold before
+    ///   D-112 read "from 0 to 5";
+    /// - the same, then a candidacy at 6 inside the window: the raise is still caught;
+    /// - a first term record after the creation that is no restatement (a candidacy, no
+    ///   `RaftRecovered`): nothing is taken from it, and the window reads "from 0";
+    /// - a restatement of a term above the stream's: not the creation's term, "from 0".
+    // PROPOSED(D-112): an install's creation is a term source, tied to its stream.
+    #[test]
+    fn an_installs_creation_before_an_isolation_is_read_at_the_term_its_stream_carried() {
+        let isolation = (1, ms(100), ms(500));
+        let range = SINGLE_GROUP;
+        let addr = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let chunk = |stream: u64| {
+            Frame {
+                from: ServerId(2),
+                message: Message::InstallSnapshot {
+                    term: stream,
+                    last_index: 72,
+                    last_term: 2,
+                    file: bytes::Bytes::from_static(b"snapshot"),
+                    offset: 0,
+                    total: 1,
+                    done: true,
+                    data: bytes::Bytes::from_static(b"x"),
+                },
+            }
+            .encode()
+        };
+        let sent = record(
+            ms(80),
+            ms(80),
+            Some(2),
+            TraceEvent::MessageSent {
+                id: ananke_env::MessageId::new(7),
+                from: addr(2),
+                to: addr(1),
+                payload: chunk(5),
+            },
+        );
+        let delivered = record(
+            ms(85),
+            ms(85),
+            Some(1),
+            TraceEvent::MessageDelivered {
+                id: ananke_env::MessageId::new(7),
+                from: addr(2),
+                to: addr(1),
+                len: 1,
+                dup: false,
+            },
+        );
+        let created = record(
+            ms(95),
+            ms(90),
+            Some(1),
+            TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Snapshot,
+                parent: None,
+                start: bytes::Bytes::from_static(b"a"),
+                end: bytes::Bytes::from_static(b"z"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                floor_index: 72,
+                floor_term: 2,
+                incarnation: 9,
+            },
+        );
+        let recovered = |at: u64| {
+            record(
+                ms(110),
+                ms(110),
+                Some(1),
+                TraceEvent::RaftRecovered {
+                    server: 1,
+                    range,
+                    term: at,
+                    applied: 72,
+                    last_index: 72,
+                    incarnation: 9,
+                    state: ananke_env::RecoveredAs::Neither,
+                },
+            )
+        };
+        let restated = |at: u64| record(ms(110), ms(110), Some(1), term(1, at, "follower", None));
+        let pre = record(ms(200), ms(200), Some(1), term(1, 5, "pre-candidate", None));
+        let base = vec![sent, delivered, created];
+        let run = |tail: Vec<TraceRecord>| {
+            let mut records = base.clone();
+            records.extend(tail);
+            report(records, vec![isolation])
+        };
+        let words = |before: u64, after: u64| {
+            Err(format!(
+                "pre-vote: server 1 raised its term from {before} to {after} while isolated from \
+                 Instant(100ms) to Instant(500ms)"
+            ))
+        };
+        let kept = run(vec![recovered(5), restated(5), pre.clone()]);
+        assert_eq!(
+            kept.install_stream_terms().len(),
+            1,
+            "the stream's term is found"
+        );
+        assert_eq!(kept.isolation_keeps_the_term_by_cause(), Ok(()));
+        assert_eq!(
+            kept.isolation_keeps_the_term_by(RecordTime::Decided),
+            Ok(())
+        );
+        let raised = run(vec![
+            recovered(5),
+            restated(5),
+            pre.clone(),
+            record(ms(300), ms(300), Some(1), term(1, 6, "candidate", None)),
+        ]);
+        assert_eq!(raised.isolation_keeps_the_term_by_cause(), words(5, 6));
+        let campaigned = run(vec![record(
+            ms(110),
+            ms(110),
+            Some(1),
+            term(1, 5, "candidate", None),
+        )]);
+        assert_eq!(campaigned.isolation_keeps_the_term_by_cause(), words(0, 5));
+        let above = run(vec![recovered(6), restated(6)]);
+        assert_eq!(above.isolation_keeps_the_term_by_cause(), words(0, 6));
     }
 
     /// D-050's excuse needs every change of the window's term to be taken from a

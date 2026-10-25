@@ -5587,6 +5587,191 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_n
     );
 }
 
+/// What the pre-vote check reads of a placeholder's install that straddles an
+/// isolation's start (PROPOSED D-112), asserted on `report`'s trace: the replica of
+/// `range` on `server` was created by an install traced before the isolation from `from`
+/// to `until` (with the install's own `RaftSnapshot`, the skip's event, before it too),
+/// its core first stated its term inside the window (`RaftRecovered`, then `RaftTerm`
+/// as a follower with no receipt), that term is `stream`, the term of the stream the
+/// install completed, every term record of the replica inside the window keeps it, and
+/// the check holds the isolation green.
+fn assert_an_installs_restatement_straddles(
+    report: &raft::Report,
+    server: u64,
+    range: u64,
+    from: ananke_env::Instant,
+    until: ananke_env::Instant,
+    stream: u64,
+) {
+    let seed = report.seed;
+    assert!(
+        report.isolations.contains(&(server, from, until)),
+        "seed {seed}: server {server} is no longer isolated from {from:?} to {until:?}: the \
+         schedule moved, so re-audit the pin"
+    );
+    let on = |record: &TraceRecord| record.node.is_some_and(|n| u64::from(n.get()) == server);
+    let created = report
+        .records
+        .iter()
+        .find(|record| {
+            on(record)
+                && matches!(&record.event, TraceEvent::RangeCreated { range: r, cause: ananke_env::RangeCause::Snapshot, .. } if *r == range)
+        })
+        .unwrap_or_else(|| panic!("seed {seed}: server {server} was not created range {range} by an install"));
+    let installed = report.records.iter().any(|record| {
+        record.at < from
+            && matches!(record.event, TraceEvent::RaftSnapshot { server: s, range: r, taken: false, .. } if (s, r) == (server, range))
+    });
+    assert!(
+        created.at < from && installed,
+        "seed {seed}: server {server}'s install of range {range} was not traced before the \
+         isolation began at {from:?} (created at {:?})",
+        created.at
+    );
+    let terms: Vec<(&TraceRecord, u64)> = report
+        .records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::RaftTerm {
+                server: s,
+                range: r,
+                term,
+                ..
+            } if (*s, *r) == (server, range) => Some((record, *term)),
+            _ => None,
+        })
+        .collect();
+    let (first, restated) = terms
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("seed {seed}: server {server} traced no term of range {range}"));
+    assert!(
+        from < first.at
+            && first.at < until
+            && matches!(
+                &first.event,
+                TraceEvent::RaftTerm {
+                    role: "follower",
+                    received: None,
+                    ..
+                }
+            ),
+        "seed {seed}: server {server}'s first term record of range {range} is not a restatement \
+         inside the isolation: {first:?}"
+    );
+    assert!(
+        report.records.iter().any(|record| record.at <= first.at
+            && matches!(record.event, TraceEvent::RaftRecovered { server: s, range: r, term, .. } if (s, r, term) == (server, range, restated))),
+        "seed {seed}: server {server}'s restatement of range {range} has no `RaftRecovered` \
+         of its term {restated}"
+    );
+    assert_eq!(
+        report
+            .install_stream_terms()
+            .get(&(server, range, created.at)),
+        Some(&stream),
+        "seed {seed}: the term of the stream server {server}'s install of range {range} completed"
+    );
+    assert_eq!(
+        restated, stream,
+        "seed {seed}: the restatement's term is not the stream's"
+    );
+    for (record, term) in &terms {
+        if from <= record.at && record.at <= until {
+            assert_eq!(
+                *term, stream,
+                "seed {seed}: server {server} moved range {range}'s term inside the isolation: \
+                 {record:?}"
+            );
+        }
+    }
+    assert_eq!(
+        report.isolation_keeps_its_term_by_cause(server, from, until),
+        Ok(()),
+        "seed {seed}: the pre-vote check flags server {server}'s isolation from {from:?} to \
+         {until:?}"
+    );
+}
+
+/// **Seed 1817 of the correct node: a placeholder's install straddles an isolation's
+/// start, and pre-vote's property holds** (PROPOSED D-112). The nightly on 0e07274 (run
+/// 40220930109) failed the correct node's sweep and `RefusedReadLeft`'s test on it with
+/// "pre-vote: server 3 raised its term from 0 to 2 while isolated from Instant(15.76s) to
+/// Instant(16.628s)". Range 2 splits into 70 while node 3 is down; node 3 restarts and
+/// makes a placeholder of 70 (15.277 s), node 1 streams it 70's snapshot, and the install
+/// is created and switched at 15.730 s (`RangeCreated { cause: snapshot }`, the
+/// replica's term 2 durable) and traces its `RaftSnapshot` at 15.745 s. Node 3 is cut off
+/// at 15.760 s; its replica's core first states term 2 at 15.768 s, pre-votes at term 2
+/// and is a follower at term 2 after the heal at 16.628 s. The fold read the term the
+/// window began with as 0: an install's creation was no term source and the
+/// restatement came after the window's start. It now reads the restatement's term,
+/// which is the term 2 of the stream the install completed.
+// PROPOSED(D-112)
+#[test]
+fn seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term() {
+    let report = correct(1817);
+    checked(&report).expect("the correct node passes seed 1817");
+    assert_an_installs_restatement_straddles(
+        &report,
+        3,
+        70,
+        ananke_env::Instant::from_nanos(15_760_000_000),
+        ananke_env::Instant::from_nanos(16_628_000_000),
+        2,
+    );
+}
+
+/// **Seed 248 under `ApplyIgnoresSpan`: the same straddle, at a stream term above the
+/// snapshot's** (PROPOSED D-112). The nightly failed `ApplyIgnoresSpan`'s test on it with
+/// "pre-vote: server 3 raised its term from 0 to 5 while isolated from Instant(15.674s)
+/// to Instant(16.602s)", counted as a catch by something other than check 9. Node 3's
+/// install of range 38 is created at 15.608 s and its `RaftSnapshot` traced at 15.652 s,
+/// it is cut off at 15.674 s, and its core first states term 5 at 15.687 s: the term of
+/// the stream, where the snapshot's own last term, the creation's `floor_term`, is 2. So
+/// the creation's floor term cannot stand for the replica's term; the stream's does.
+/// The variant has nothing to do with it, and no check but check 9 may catch it here.
+// PROPOSED(D-112)
+#[test]
+fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
+    let report = raft::run_on_the_node(
+        248,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::ApplyIgnoresSpan]),
+    );
+    if let Err(violation) = report.check() {
+        assert!(
+            !violation.contains("pre-vote"),
+            "seed 248: the pre-vote check flags the run under ApplyIgnoresSpan: {violation}"
+        );
+    }
+    let floor = report
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::RangeCreated {
+                range: 38,
+                cause: ananke_env::RangeCause::Snapshot,
+                floor_term,
+                ..
+            } if record.node.is_some_and(|n| n.get() == 3) => Some(*floor_term),
+            _ => None,
+        });
+    assert_eq!(
+        floor,
+        Some(2),
+        "seed 248: the install's snapshot's last term"
+    );
+    assert_an_installs_restatement_straddles(
+        &report,
+        3,
+        38,
+        ananke_env::Instant::from_nanos(15_674_000_000),
+        ananke_env::Instant::from_nanos(16_602_000_000),
+        5,
+    );
+}
+
 /// **Seed 57: the pair is the stream half's wedge, on a schedule its skipped reset moved**
 /// (PROPOSED D-111; #179's review, B1). Not D-045's wedge: the ignoring leader's stale
 /// progress is not what stalls. Step by step, as asserted:
