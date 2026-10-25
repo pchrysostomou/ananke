@@ -22667,4 +22667,208 @@ in Stage E (SHARD.md §12).
 
 ---
 
-_Next entry: D-110. Add one before implementing anything not covered above._
+## PROPOSED D-110 — The overlap rule: a refusal answered `Overlaps`, which ends the stream and counts against no bound, the leader's wait of a minimum election timeout and its fresh take where the checkpoint's span is not the range's, the same rule on an install onto an initialised replica, `SnapshotOverlapsReplica`, check 8 against it and `sim/split.rs` (i)
+
+**The number.** Off `main` at 2d59c96 (#173 and #174 merged, D-109), whose footer reads
+D-110. Tracking issue #162 reserves **D-110** for S9, the overlap rule, and another slice
+may take D-111; the footer here moves to D-111, and at the merge the entries are a union in
+numerical order with one footer, the highest plus one. Every code site carries
+`// PROPOSED(D-110)`. Closes #177.
+
+**Context.** SHARD.md §5 (SHARD.md:789-810), Q27: "A snapshot is installed on a node only
+if its span overlaps no other initialised replica there; otherwise it is refused and asked
+for again later. [...] An install is refused with a new answer, `Overlaps`, on which the
+leader ends the stream and, after a minimum election timeout, streams again: from a fresh
+take if its checkpoint lies below the last split or merge its range applied, since only a
+newer snapshot can stop overlapping, and otherwise from the same checkpoint, since the
+overlap is the receiver's to clear." §10's `SnapshotOverlapsReplica` (SHARD.md:1733, 2548)
+installs every snapshot and is caught by check 8 at the install's `RangeCreated { cause:
+snapshot }` on `sim/split.rs` (i), every seed. §12's Stage C exit asks (i) built, its
+frame-length limit measured before it is asserted, and check 8 under the equivalence test
+against the variant. D-109 §2 built the receiver's half for a placeholder's install and
+answered it `SnapshotStatus::Restart`, the one start-over the wire had, which spent D-090's
+restart bound on a sound checkpoint (#177): seed 595 of the correct node retook range 38's
+checkpoint three times, each about 50 ms after a refusal for overlap.
+
+### 1. `Overlaps` on the wire
+
+`SnapshotStatus::Overlaps`, tag 4 (`ananke_raft::message`), and its constructor
+`snapshot::overlaps`. It is a status of its own for D-090's reason for `Waiting`: the two
+existing answers that end or restart a stream say the checkpoint or the ground covered is
+bad, and this one says neither. **`ananke-raft` gains a status its own receiver never
+sends** (it holds one group); its sender, heard one, ends the stream with no retake and
+counts nothing, and the sim's re-seed progress model (`sim/raft.rs`) ends the stream there.
+A released phase's crate carries a wire addition, as D-090 made one. **PROPOSED.**
+
+### 2. The receiver: one rule, two install paths
+
+- **A placeholder's install** (D-109 §2) keeps its check and its trace,
+  `RaftSnapshotStartOver { reason: overlaps }`, and now answers `Overlaps`.
+- **An install onto an initialised replica** (`finish`) is held to the same rule: the
+  snapshot's descriptor, read out of the staged bytes, must overlap no other replica's
+  descriptor on the node; otherwise the staged bytes are cleared, the answer is `Overlaps`
+  with the same trace, and the range's hold is released. A snapshot carrying no
+  descriptor names no span to refuse and installs as before.
+- **The descriptor is read in the snapshot record's own walk**
+  (`snapshot::staged_record_and_next`), off the entry that ends the record's key in each
+  table: the descriptor's key (`PURPOSE_DESCRIPTOR`, 4) is the one that follows the
+  record's (`PURPOSE_SNAPSHOT`, 3) in a range's state. The first build read it with a
+  second `staged_value` walk, and that moved the schedule of every run with an install,
+  since the simulated disk draws a delay for every read: eight tests of the node binary
+  failed the gate, the pins of seeds 2809, 45, 633, 12 and 76 and the D-045 pair (its seed
+  8) among them. Read in the
+  record's walk the reads are the same and none moved.
+- **On Stage C's tree the second path is unreachable on the correct system**, and is built
+  because Q27 states one rule. An install needs a snapshot past the replica's applied
+  index; a range's span only shrinks between two of its indices until merges exist; so a
+  newer snapshot's span lies inside the replica's own, which overlaps nothing on the node.
+  P's pre-split snapshot on a node where R is initialised needs that node's R installed
+  while its P covered R's span, which the first path refuses. Merges (Stage D) and
+  re-adds make it reachable. **PROPOSED.**
+
+### 3. The leader: the stream ends, a wait, and the fresh take
+
+On `Overlaps` the sender's step is `Step::Overlapped`: the stream ends, **nothing is
+counted against either bound** (`booked` leaves both counters), the plan's slot is given
+back and the leader traces `RaftSnapshotOverlapped { server, range, to, last_index }`. The
+core is **not** told yet: its ask stays outstanding (`installing`), so it asks nothing more
+of that follower, and a `Stream` job for the same (range, follower) during the wait — a core
+that changed role asks again at once — is dropped. After a minimum election timeout
+(`tick × election_ticks.0`, 100 ms in every scenario) the task traces `RaftSnapshotRestream
+{ server, range, to, retake }` and hands the core `SnapshotFailed { retake }`, which clears
+the ask; the core then streams from its checkpoint or, with `retake`, takes a fresh one. The
+refused stream's version directory is pinned against the range's sweeps through the wait,
+as a stream's own is (D-043).
+
+**"Below the last split or merge" is read off the checkpoint**: `retake` when the
+descriptor in the refused stream's version directory names a span other than the one the
+range's descriptor names now. Spans change at a split or a merge and nothing else, and a
+snapshot whose span is the range's present one is exactly what a fresh take would stream,
+so retaking it could not stop an overlap. A version that cannot be read is retaken, since
+nothing then says it postdates either. The words of Q27 are an index comparison; this is
+the same test for every case Stage C reaches and costs no index bookkeeping that a restart
+would lose (an index of the last split is not durable on the node; a descriptor is).
+**PROPOSED.**
+
+The wait lives in the node's `snapshot` task and not in the core, because the core names
+no range and has no notion of an overlap (Q40); `SnapshotFailed` is the input it already
+has for "this stream is over, ask again".
+
+**#177 is closed by it.** `an_overlap_refusal_ends_the_stream_and_leaves_the_restart_count_unchanged`
+drives `step_for` and `booked` with `Overlaps` at every restart count and three times in
+a row, seed 595's count, and the restart counter stays at 0 with no `Unusable`. On the
+correct node's sweep, release, seeds 0 to 999: **13 refusals for overlap on 10 seeds**
+(D-109 counted 15 on 10, two of them the second and third of the start-overs that no
+longer happen), 12 waits ended (the 13th's answer reached a leader no longer sending), every
+one with `retake: false`, and **no fresh take after a refusal**: seed 595's range 38 now has
+the one take of 11.789 s and three refusals, each followed 100 ms later by a restream of the
+same checkpoint. The stragglers D-109 noted — chunks still in flight when the staged bytes
+were cleared, refused `Unusable` — are still refused (six on seed 595), and now answer a
+stream the leader has ended, so nothing counts them.
+
+### 4. `SnapshotOverlapsReplica`
+
+`RangeVariant::SnapshotOverlapsReplica`, bit 8, one of §10's (seven of the twenty-four are
+built). The node installs every snapshot whatever it overlaps, on both paths. It keeps the
+refusal of a placeholder's install of a range created on the node meanwhile, which is no
+overlap with another replica but the same replica made twice. **On the node sweep**,
+release, seeds 0 to 999, check 8's overlap clause catches it on **8** (333, 466, 579, 595,
+604, 878, 915, 975), and the run's verdict fails on one more, **seed 219**, by Raft's state
+machine safety: node 3's apply of range 5's split created range 62 at 18.211 s while a
+placeholder's stream of 62 was completing, and its install, which the variant let through
+past P's covering span before the split shrank it, created 62 again at 18.288 s at index 347
+and re-applied 347. No two spans overlapped when the install was traced, so check 8 does not
+see it; on the correct node the install is refused by P's span and the window does not
+open. **#181** records that check 8 does not see a replica created twice. At 0.8 % the node
+sweep is no place to assert the variant (D-061); `sim/split.rs` (i) is its shape.
+
+### 5. `sim/split.rs` (i), *overlap*
+
+SHARD.md:1615-1622. The nodes, `x`'s draw (stream `split-overlap`), the cut, the split and
+the wait for P's leader and R to compact past `s` are (ii)'s, shared now (`prefix`). (i)'s
+own:
+
+- **The load**: P's left half is sixteen keys `k0-00` to `k0-15` of 2 KiB values, R's one
+  key `k1` of short ones, under a snapshot chunk of 16 KiB (`OVERLAP_CHUNK`), so P's left
+  half is about two chunks and R's under one. (ii)'s load and chunk are unchanged.
+- **The heal**: every link toward `x` limited to `FRAME_LIMIT`, 8 KiB, at the partition's
+  heal; the driver runs until `x` has refused R's install for overlap or (under the variant)
+  installed it, within six seconds, then holds the limit for `OVERLAP_HOLD`, one second,
+  lifts it and runs five seconds more.
+- **The limit, measured before it was asserted** (release, seeds 0 to 999): R's largest
+  chunk frame toward `x` is **731 to 732 bytes**, P's **16 469** on every seed. 8 KiB sits
+  between with an order of magnitude to spare on R's side, and the test asserts per seed
+  that the limit lies strictly between the two.
+- **Per seed, both systems** (`Report::overlap_shape`): built, (ii)'s premise — `x` applied
+  no split of P by its log, `x`'s P was installed at or past `s`, and `x` made R only by a
+  snapshot — and across the limit a chunk of R's stream reached `x` (24 to 29 delivered) while
+  a chunk of P's was dropped as oversized (17 to 20).
+- **The correct system**, every seed: its checks pass; `x` refused R for overlap before its
+  P was installed past `s` (6 to 8 refusals a seed); every wait was at least a minimum
+  election timeout, no stream of R to `x` opened inside one, none was left open, and every
+  one restreamed with `retake: false` (R split nothing after its take); and `x` made R by a
+  snapshot after its P's install, **179 to 406 ms after the lift**. 1 000 of 1 000 green.
+- **The variant**, every seed: built, and the record at which check 8's overlap clause, fed
+  one record at a time, first reads a violation is `x`'s `RangeCreated { cause: snapshot }`
+  of R; the fold's verdict over the run is in its own words. **1 000 of 1 000.**
+
+Both are asserted at every tier (D-061: every seed). The variant's harm SHARD.md names, a
+lagging P replaying entries below `s` over R's newer keys, is not reached: (i) keeps `x`
+away until P has compacted past `s`, as SHARD.md:1536-1538 says, so check 8 is the catch and
+linearizability is not asked to see it.
+
+### 6. Check 8 under the equivalence test against its variant
+
+`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`
+(`sim/tests/node.rs`) runs D-106's fold-by-fold comparison over (i)'s records under the
+variant, the tier's compared seeds (twenty at the gate, a hundred above), and asserts check
+8's overlap clause in violation on every one in its own words. Measured at 100: 100 of 100,
+every other fold green. It runs on (i) and not on the node sweep, where the variant reaches
+the shape on under one seed in a hundred. This closes the deferral D-107 made from S6.
+
+### 7. What is not built
+
+- **The apply's "R already initialised here" assertion** (SHARD.md:808-810), which D-109
+  §2 deferred to this slice. Built as a node failure at a voter's split that finds R's
+  store, it fired first under `IdBlockResumed` and hid check 18's catch (D-109). Seed 219
+  above shows it is the variant's harm on the node sweep too. Keyed on an install — the
+  failure only where R's store was made by a snapshot — would need the node to know, across
+  a restart, which replicas an install made, which nothing durable records. **Not built;
+  PROPOSED**, with #181: recommended, a fold rather than a node failure — a `RangeCreated
+  { cause: split }` of R on a node that already holds R initialised is a violation of check
+  8 — which needs no node state and does not stop the node before check 18 sees a reused id.
+- **Stage D's halves of Q27**: collection, and an install of a merged L's snapshot at or
+  above `m` replacing the R it merged.
+
+### 8. Traces and schedules
+
+Two events, `RaftSnapshotOverlapped` and `RaftSnapshotRestream` (moirae
+`ananke.raft.snapshot-overlapped` / `.snapshot-restream`). The change moves a schedule only
+where a refusal for overlap happens (10 of the correct node's first 1 000 seeds); every
+pinned seed of the gate passes unchanged and no pinned trace hash moved.
+
+### 9. The nightly's rows (D-064)
+
+Three rows, weighed on this tree from the built release binaries at ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100 with other slices' runs beside them (load 282 to 294): (i) correct
+226.1 cpu s into shard 5, (i) under the variant 205.7 into shard 4, check 8's comparison
+22.2 into shard 6. The premerge runs (i)'s two sweeps at a thousand seeds each, about
+75 s real apiece on this machine under that load.
+
+### 10. What is PROPOSED here, for the owner
+
+1. `Overlaps` as a wire status of `ananke-raft`'s, tag 4 (§1).
+2. The leader's wait in the node's `snapshot` task, the core's ask held through it, and a
+   new ask for the same follower dropped meanwhile (§3).
+3. "Below the last split or merge" read as "the checkpoint's span is not the range's
+   now", an unreadable checkpoint retaken (§3).
+4. The rule on an install onto an initialised replica, built though unreachable on Stage
+   C's correct system, its descriptor read in the record's walk (§2).
+5. (i)'s constants: the 16 KiB chunk, the 8 KiB limit, the 1 s hold, the load (§5).
+6. Check 8's comparison against the variant on (i) rather than the node sweep (§6).
+7. The apply's "R already initialised here" not built, and recommended as a fold (§7,
+   #181).
+
+---
+
+_Next entry: D-111. Add one before implementing anything not covered above._
