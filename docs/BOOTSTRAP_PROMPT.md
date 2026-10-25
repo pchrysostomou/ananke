@@ -102,7 +102,7 @@ ananke/
 _Update this section at the end of every session._
 
 - Branch `phase-3-stage-c-overlap-rule` (2026-10-25), off `main` at 2d59c96, PR #180,
-  PROPOSED D-110 (footer D-111), **#162's S9, the overlap rule (Q27)**. An install refused
+  PROPOSED D-110 (footer D-112 since the merge of `main` at 292cafc, #179 taking D-111), **#162's S9, the overlap rule (Q27)**. An install refused
   because its span overlaps another initialised replica on the node is answered
   `SnapshotStatus::Overlaps` (tag 4), on a placeholder's install and on an install onto an
   initialised replica (the latter unreachable on Stage C's correct system, its descriptor
