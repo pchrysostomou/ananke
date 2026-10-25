@@ -1211,8 +1211,15 @@ impl SplitLineage {
 #[derive(Clone, Debug, Default)]
 pub struct MetaNeverGoesBack {
     /// What meta names, as the sub-intervals its applies won: keyed by end, with the
-    /// start and the generation.
-    named: BTreeMap<Bytes, (Bytes, u64)>,
+    /// start, the generation and the meta index of the apply that named it.
+    ///
+    /// The index is what makes "from one meta index to the next" exact whatever order
+    /// the replicas trace their applies in: a replica that applies an index below one
+    /// already folded — a lagging follower, or a re-seeded replica of the meta range,
+    /// whose state starts again at the bootstrap's index 0 (D-098) — is compared with
+    /// the later index as an earlier one, and does not replace what it named
+    /// (PROPOSED D-109).
+    named: BTreeMap<Bytes, (Bytes, u64, u64)>,
     violation: Option<String>,
 }
 
@@ -1270,12 +1277,15 @@ impl MetaNeverGoesBack {
                 let overlapping: Vec<Bytes> = self
                     .named
                     .range::<[u8], _>((Excluded(&start[..]), Unbounded))
-                    .take_while(|(_, (from, _))| from < end)
+                    .take_while(|(_, (from, ..))| from < end)
                     .map(|(key, _)| key.clone())
                     .collect();
+                // What a later (or the same) index named inside the won span, which this
+                // apply does not replace: clipped to the span, in key order.
+                let mut kept: Vec<(Bytes, Bytes, u64, u64)> = Vec::new();
                 for key in overlapping {
-                    let (from, generation) = self.named.remove(&key).expect("listed");
-                    if generation > meta.generation {
+                    let (from, generation, at) = self.named.remove(&key).expect("listed");
+                    if at < *index && generation > meta.generation {
                         self.violation = Some(format!(
                             "meta never goes back: node {node:?}'s meta apply of {index} names \
                              [{start:?}, {end:?}) for range {} at generation {}, where meta \
@@ -1285,15 +1295,45 @@ impl MetaNeverGoesBack {
                         ));
                         return;
                     }
+                    if at >= *index && generation < meta.generation {
+                        self.violation = Some(format!(
+                            "meta never goes back: node {node:?}'s meta apply of {index} names \
+                             [{start:?}, {end:?}) for range {} at generation {}, where meta's \
+                             apply of {at} named [{from:?}, {key:?}) at generation \
+                             {generation}: the generation meta names never falls from one \
+                             meta index to the next (SHARD.md §1, §8)",
+                            meta.range, meta.generation
+                        ));
+                        return;
+                    }
                     if from < *start {
-                        self.named.insert(start.clone(), (from.clone(), generation));
+                        self.named
+                            .insert(start.clone(), (from.clone(), generation, at));
                     }
                     if key > *end {
-                        self.named.insert(key, (end.clone(), generation));
+                        self.named
+                            .insert(key.clone(), (end.clone(), generation, at));
+                    }
+                    if at >= *index {
+                        let from = if from < *start { start.clone() } else { from };
+                        let to = if key > *end { end.clone() } else { key };
+                        kept.push((from, to, generation, at));
                     }
                 }
-                self.named
-                    .insert(end.clone(), (start.clone(), meta.generation));
+                // The won span, less what a later index named, is this apply's.
+                let mut cursor = start.clone();
+                for (from, to, generation, at) in kept {
+                    if cursor < from {
+                        self.named
+                            .insert(from.clone(), (cursor.clone(), meta.generation, *index));
+                    }
+                    self.named.insert(to.clone(), (from, generation, at));
+                    cursor = to;
+                }
+                if cursor < *end {
+                    self.named
+                        .insert(end.clone(), (cursor, meta.generation, *index));
+                }
             }
         }
     }
@@ -2525,6 +2565,88 @@ mod tests {
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
         assert!(checker.verdict().unwrap_err().contains("never falls"));
+    }
+
+    #[test]
+    fn a_meta_apply_of_an_index_below_one_folded_is_compared_as_the_earlier_index() {
+        // PROPOSED(D-109): a re-seeded replica of the meta range restates the bootstrap's
+        // index 0 after the split's update at index 5 was applied elsewhere; index 0
+        // naming the parent's first generation is no fall from 5, and leaves 5's halves
+        // standing.
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.push(&meta_applied(
+            1,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        let mut left = created(1, 2, b"a", b"k", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated { floor_index, .. } = &mut left.event {
+            *floor_index = 5;
+        }
+        let mut right = created(1, 3, b"k", b"z", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated {
+            cause, floor_index, ..
+        } = &mut right.event
+        {
+            *cause = RangeCause::Split;
+            *floor_index = 5;
+        }
+        checker.push(&left);
+        checker.push(&right);
+        checker.push(&meta_applied(
+            1,
+            5,
+            vec![
+                (2, b"a", b"k", 2, vec![(b"a", b"k")]),
+                (3, b"k", b"z", 2, vec![(b"k", b"z")]),
+            ],
+        ));
+        checker.push(&meta_applied(
+            3,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        checker.verdict().unwrap();
+        // The re-seeded replica's own apply of 5 follows, as it catches up.
+        checker.push(&meta_applied(
+            3,
+            5,
+            vec![
+                (2, b"a", b"k", 2, vec![(b"a", b"k")]),
+                (3, b"k", b"z", 2, vec![(b"k", b"z")]),
+            ],
+        ));
+        checker.verdict().unwrap();
+        // 5's halves stand: a later index naming the parent's first generation over the
+        // right half is still a fall.
+        checker.push(&meta_applied(
+            1,
+            8,
+            vec![(2, b"a", b"z", 1, vec![(b"k", b"z")])],
+        ));
+        assert!(checker.verdict().unwrap_err().contains("never falls"));
+        // And an earlier index naming a higher generation than a later one folded is a
+        // fall read the other way.
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.push(&right);
+        checker.push(&meta_applied(
+            1,
+            6,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        checker.push(&meta_applied(
+            2,
+            5,
+            vec![(3, b"k", b"z", 2, vec![(b"k", b"z")])],
+        ));
+        assert!(
+            checker
+                .verdict()
+                .unwrap_err()
+                .contains("from one meta index to the next")
+        );
     }
 
     #[test]

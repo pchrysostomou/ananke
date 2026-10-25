@@ -402,6 +402,12 @@
 # shard 5 for both: 1626.0 -> 1648.1 -> 1648.5. The correct node's sweep folds the range layer's
 # checker once more per seed for its coverage (restatements, statements, check 8's right half);
 # its row is not re-weighed here, which the premerge's node time shows.
+# PROPOSED D-109 §2 (a re-seeded node's placeholder's install is quarantined) added one `reseed`
+# row, the re-seed after a split, which runs the binary's TIER_CAP of 200 seeds at the nightly:
+# weighed on its tree from the built release binary (`reseed-<hash> <test> --exact`) at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, on an Apple M2 of 8 cores
+# with other worktrees' gates beside it (load averages up to 160): 27.8 cpu s (26.87 + 1.48,
+# 26.56 + 1.15, 26.53 + 1.21). Into the lightest shard, shard 5 at 1648.5 -> 1676.3.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -501,7 +507,7 @@
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
 4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 4	node	50.0	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
-# shard 5: 1648.5 cpu s
+# shard 5: 1676.3 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -524,6 +530,7 @@
 5	node	0.2	seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse
 5	node	22.1	check_8_agrees_with_its_whole_trace_fold_on_the_node
 5	node	0.4	seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
+5	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
 # shard 6: 1657.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

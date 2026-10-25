@@ -481,6 +481,10 @@ pub struct Task<E: Environment> {
     /// placeholder's span is the snapshot's, and unknown until its stream completes.
     // PROPOSED(D-109)
     as_placeholder: BTreeSet<RangeId>,
+    /// Whether the node runs on an engine a re-seed built: a placeholder's install then
+    /// writes the quarantine (the host's `on_a_reseed`; D-035).
+    // PROPOSED(D-109)
+    on_a_reseed: bool,
 }
 
 impl<E: Environment> Task<E> {
@@ -506,6 +510,7 @@ impl<E: Environment> Task<E> {
         local: Queue<crate::server::Local>,
         snaps: Queue<SnapJob>,
         placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
+        on_a_reseed: bool,
     ) -> Self {
         Self {
             env,
@@ -525,6 +530,7 @@ impl<E: Environment> Task<E> {
             receiving: BTreeMap::new(),
             placeholders,
             as_placeholder: BTreeSet::new(),
+            on_a_reseed,
         }
     }
 
@@ -1297,12 +1303,19 @@ impl<E: Environment> Task<E> {
     /// leader's wait before it streams again are the overlap rule's slice's.
     ///
     /// Otherwise the repair is a placeholder's: the stream's term, no vote, no kept
-    /// tail, no quarantine — R's votes are in no store a re-seed could have lost (Q26)
-    /// — and an incarnation drawn fresh from the node's generator (Q26, D-042). The
-    /// switch writes the replica's whole state under its prefix and replaces its span's
-    /// keys, in one manifest switch (D-066), and the store is opened on what it wrote.
-    // PROPOSED(D-109): a placeholder's install creates the replica, and is refused
-    // where it would overlap.
+    /// tail and an incarnation drawn fresh from the node's generator (Q26, D-042). It
+    /// writes **the quarantine on a node that runs on an engine a re-seed built**, and
+    /// none elsewhere. Q26's reason for none — R is a new group, none of whose votes a
+    /// re-seed of P *before the split* can have lost — holds on a node that has lost no
+    /// engine, where every replica of the range it ever held is in the engine it runs
+    /// on. A re-seeded node may have held the range before its loss, a right half its
+    /// own split made, and voted in it; configuration never names a right half and the
+    /// fresh engine holds no key of one, so it cannot tell such a range from one it
+    /// never held, and quarantines both (D-035). The switch writes the replica's whole
+    /// state under its prefix and replaces its span's keys, in one manifest switch
+    /// (D-066), and the store is opened on what it wrote.
+    // PROPOSED(D-109): a placeholder's install creates the replica, quarantined on a
+    // re-seeded node, and is refused where it would overlap.
     async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
         let installing = self.env.decision();
         let prefix = KeyPrefix::group(range.get());
@@ -1361,7 +1374,7 @@ impl<E: Environment> Task<E> {
             term: at.term,
             vote: None,
             tail: Vec::new(),
-            quarantined: false,
+            quarantined: self.on_a_reseed,
             incarnation,
         };
         let batch = snapshot::repair_writes(

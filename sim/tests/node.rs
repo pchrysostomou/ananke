@@ -1723,7 +1723,11 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 /// the first resend, on every seed, since every other client starts stale.
 // PROPOSED(D-097)
 fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
-    let seeds = high_rate_share();
+    routing_variant_on(name, variants, high_rate_share())
+}
+
+/// [`routing_variant`] over `seeds` seeds rather than the share.
+fn routing_variant_on(name: &str, variants: &[RangeVariant], seeds: u64) -> Vec<Routed> {
     let taken = RangeVariants::of(variants);
     let outcomes: Vec<Routed> = sweep(seeds, |seed| {
         let report =
@@ -1967,17 +1971,26 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
 /// was still carrying — is left alone by the correct meta range (§1's maximum by
 /// generation) and stored by the variant, where check 16 sees the generation fall.
 /// Before the split every update named the first generation and the variant had no
-/// path (PROPOSED D-098). A rate, the schedule's to give — 3 of 20 at the gate, 18 of
-/// 100 at the thousand's share, asserted from the thousand's share, where a sample of
-/// a hundred at that rate sees none about once in 10^8 (D-061); the split landing on
-/// the share is asserted at every tier, and the variant is seen injected
-/// by its updates each winning their whole span where the correct meta range's win
-/// nothing but the split's.
+/// path (PROPOSED D-098). A rate, the schedule's to give, and a low one since check 16
+/// reads "from one meta index to the next" by index (PROPOSED D-109): 0 of 20 at the
+/// gate, 2 of 100 and 19 of 1 000. The trace-order reading before it counted 3, 18 and
+/// 149, most of them a lagging follower's apply of an index below the split's, which
+/// is no fall. So the catch is asserted over a thousand seeds, at the premerge and the
+/// nightly, where at 1.9 % a thousand see none about 5 times in 10^9 (D-061); below the
+/// premerge the test runs the share. The split landing is asserted at every tier, and
+/// the variant is seen injected by its updates each winning their whole span where the
+/// correct meta range's win nothing but the split's.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split() {
-    let outcomes = routing_variant(
+    let run = if seeds() >= 1000 {
+        high_rate_share().max(1000)
+    } else {
+        high_rate_share()
+    };
+    let outcomes = routing_variant_on(
         "MetaOverwritesByArrival",
         &[RangeVariant::MetaOverwritesByArrival],
+        run,
     );
     assert!(
         outcomes.iter().any(|o| o.splits > 0),
@@ -2003,7 +2016,7 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
     if seeds() >= 1000 {
         assert!(
             caught > 0,
-            "MetaOverwritesByArrival was caught on no seed of the share: no update of a \
+            "MetaOverwritesByArrival was caught on no seed of the thousand: no update of a \
              split's parent at its old generation arrived after the split's, or check 16 \
              is silent"
         );

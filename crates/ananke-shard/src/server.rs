@@ -728,6 +728,15 @@ pub struct ServerHost<E: Environment> {
     /// the `snapshot` task, which assembles a placeholder's stream.
     // PROPOSED(D-109): the placeholder is the host's, and is this set.
     placeholders: Arc<Mutex<BTreeSet<RangeId>>>,
+    /// Whether the node runs on an engine a re-seed built, this start's or an earlier
+    /// one's (D-066 opens it as the newest directory not marked lost). Such a node lost
+    /// an engine that may have held a replica configuration never names — a right half
+    /// its own split made — and its fresh engine holds no key to tell it so, so it cannot
+    /// tell a range it held before its loss from one it never held: every replica a
+    /// placeholder's install creates on it is quarantined, as the re-seed's own are
+    /// (D-035, Q26).
+    // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
+    on_a_reseed: bool,
 }
 
 pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1079,7 +1088,9 @@ impl<E: Environment> ServerHost<E> {
     /// The placeholder ends here. The replica states its recovery and its term as a
     /// start does (`restate`), so the checks that follow a replica from its start —
     /// the timer check, pre-vote's property — follow this one from here, where its
-    /// core began.
+    /// core began. On a node a re-seed rebuilt the install wrote the quarantine, and the
+    /// replica is restored and stated quarantined, as a re-seeded replica's install
+    /// states it (`installed`).
     ///
     /// `None` when the switch left nothing to restore, which the task never hands on:
     /// it opens the store and reads its descriptor back before it says it switched.
@@ -1117,8 +1128,17 @@ impl<E: Environment> ServerHost<E> {
             at.last_term,
             Some(config.clone()),
             Vec::new(),
-            false,
+            self.on_a_reseed,
         );
+        // The quarantine the install wrote on a node a re-seed rebuilt (D-035): this
+        // replica may be one whose votes were in the engine the node lost.
+        // PROPOSED(D-109)
+        if core.quarantined() {
+            self.env.trace(TraceEvent::RaftReseeded {
+                server: self.id.0,
+                range: range.get(),
+            });
+        }
         self.env.trace(TraceEvent::RaftRecovered {
             server: self.id.0,
             range: range.get(),
@@ -1126,7 +1146,11 @@ impl<E: Environment> ServerHost<E> {
             applied: at.last_index,
             last_index: core.last_index(),
             incarnation: store.incarnation(),
-            state: RecoveredAs::Neither,
+            state: if core.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
         });
         self.env.trace(TraceEvent::RaftTerm {
             server: self.id.0,
@@ -3374,6 +3398,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         bootstrap_meta = Some(descriptors);
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
+    // The same two facts read the other way: the node runs on an engine a re-seed
+    // built, this start's or an earlier one's, so a replica it held before its loss is
+    // one it cannot name, and every replica a placeholder's install creates here is
+    // quarantined (D-035; SHARD.md §5's Q26 reason holds only on a node that lost no
+    // engine).
+    // PROPOSED(D-109)
+    let on_a_reseed = reseeded_now || engine.dir != base_dir;
     // A node not named at bootstrap writes its interim replicas' descriptors at its
     // first start, in the configured directory alone, so that every replica of the
     // node checks a key against a descriptor (SHARD.md §2, §3; `interim_state`).
@@ -3559,6 +3590,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         refill_at,
         applied: applied_at.clone(),
         placeholders: placeholders.clone(),
+        on_a_reseed,
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
@@ -3692,6 +3724,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             local.clone(),
             snaps.clone(),
             placeholders,
+            on_a_reseed,
         );
         async move {
             task.run().await;

@@ -21206,11 +21206,11 @@ task makes the install itself:
 2. **the install is refused where the descriptor's span overlaps an initialised replica on
    the node**, or the range was created here meanwhile: the staged bytes are cleared and
    the sender is asked to start over, traced `RaftSnapshotStartOver { reason: overlaps }`;
-3. otherwise the repair is a placeholder's — the stream's term, no vote, no kept tail, no
-   quarantine, since R's votes are in no store a re-seed could have lost (Q26), and an
-   incarnation drawn fresh from the node's generator (Q26, D-042) — and the one manifest
-   switch writes the replica's state under its prefix and replaces its span's keys
-   (D-066), the spans being the Raft interval and the descriptor's span;
+3. otherwise the repair is a placeholder's — the stream's term, no vote, no kept tail, an
+   incarnation drawn fresh from the node's generator (Q26, D-042), and **the quarantine on
+   a node that runs on an engine a re-seed built, none elsewhere** (below) — and the one
+   manifest switch writes the replica's state under its prefix and replaces its span's
+   keys (D-066), the spans being the Raft interval and the descriptor's span;
 4. **the creation is traced at the switch**, `RangeCreated { cause: snapshot }` with the
    descriptor's span, generation and voters, the snapshot's last index and term as the
    floor and the fresh incarnation, before anything else is awaited: traced later, with the
@@ -21224,6 +21224,116 @@ task makes the install itself:
    seeded from its range's stream (Q13), its recovery and its term stated as a start states
    them, so the timer check and pre-vote's property follow it from there — and the core
    takes its place on the node with no parent and no hurried election.
+
+**The quarantine, and exactly where Q26 holds** (corrected before #173 merged; it first
+said "no quarantine, since R's votes are in no store a re-seed could have lost (Q26)").
+Q26's reason is that "R is a new group, none of whose votes a re-seed of P before the
+split can have lost" (SHARD.md:3136-3137, §5). For an install into a placeholder that
+holds exactly when every replica of the range the node ever held is in the engine it now
+runs on. On Stage C's tree a replica leaves a node's engine only with that engine (no
+collection or merge until Stage D, where removal and re-add is Q26's own re-add window), so
+it holds **on a node that has lost no engine**, and on a re-seeded node only if the node
+lost its engine before the range existed. A node a re-seed rebuilt cannot tell which. Its
+right half R, made by its own apply of a split before the loss, may have voted. The re-seed
+neither refuses nor marks R, because it rebuilds configuration's ranges and configuration
+never names a right half. The fresh engine holds no key of R. So R's leader reaches the
+node's placeholder, and its install creates R again at the stream's term with no vote: a
+replica that could grant a vote in a term its lost predecessor voted in, which is D-035's
+case. So a node that runs on an engine a re-seed built quarantines every replica a
+placeholder's install creates:
+- `on_a_reseed` is set when this start re-seeded, or when D-066 opened a directory other
+  than the configured one. These are the two facts the bootstrap reads, read the other way.
+- The install writes the quarantine key in its switch's batch.
+- `created_by_install` restores the core quarantined and states it, `RaftReseeded` and then
+  `RaftRecovered { state: quarantined }`, as an install onto a re-seeded replica states it.
+
+The cost is that such a node also quarantines a range it never held: a right half created
+after its loss, or in Stage D one moved to it. That is the "replicas added later" cost §5
+gives per-node quarantine (SHARD.md:725-726), taken here only for what a placeholder's
+install creates. Stage D's rebalancer moves quarantined replicas off first (Q33).
+**PROPOSED.**
+
+**Tested** by `reseed::run_after_split`, a directed run on the re-seed shape's three servers
+(`a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`):
+- P, the first user range, is split by an operator, and a follower `x` of P applies the
+  split.
+- `x` is crashed, kept down until P's leader compacts past the split, and restarted on a
+  store marked lost.
+- On every seed, `x` held R before its refusal and its P is installed past the split at
+  generation 2 over the left half. A placeholder of R is made, R is created by that
+  placeholder's install at generation 2, and the replica is stated quarantined and grants
+  R nothing.
+- Without the fix the run fails the quarantine on every seed. Measured in release with
+  `on_a_reseed` forced false in `run`, which takes the quarantine out of both the install's
+  batch and `created_by_install`: 20 of 20 gate seeds fail and 200 of 200 at the binary's
+  cap, seed 0 with "node 3 was created the right half 6 by its placeholder's install after
+  its re-seed and did not state it quarantined". With the fix 20 of 20 and 200 of 200 pass,
+  every one reaching the case.
+- What the test asserts is the quarantine, not a double vote. Unquarantined, seed 0's
+  replica of R granted nothing in the rest of its run: a second vote in a term the lost
+  replica voted in needs R's candidate still campaigning in that term after `x`'s whole
+  outage, which this shape does not aim at. The fix closes the window by D-035's rule, as
+  the re-seed's own replicas are closed, rather than by a measured double vote.
+- With its old fold check 16 fails this run on 18 of the first 20 seeds with the fix in
+  place (below).
+- `x` is not restarted after its re-seed, so the run is in #176's window, in which the node
+  may stage its streams in the directory it refused (#176 predates this PR and is not fixed
+  here). Nothing the run asserts reads that directory.
+
+**Check 16 reads "from one meta index to the next" by index** (found by this run). The run
+is the first to re-seed a replica of the meta range after a split (#172). That replica
+restates the bootstrap's `MetaApplied { index: 0 }` (D-098), which names range 2 at
+generation 1. The fold kept one interval map of the generation per key in trace order, so
+it read the restatement as meta going back from the split's generation 2. It failed 18 of
+the run's first 20 correct seeds. The fold now keeps, with each interval, the meta index
+that named it:
+- an apply of an index above the stored one must not name a lower generation. This is
+  the fall `MetaOverwritesByArrival` makes, with the message it had;
+- an apply of an index at or below the stored one must not name a higher generation, and
+  does not replace the stored one. A lagging or re-seeded replica's earlier index is read
+  as the earlier index it is.
+
+Nothing consecutive goes unread. Every replica applies in index order, so the first apply of
+an index anywhere in the trace comes before any apply of a later one, and it is compared
+with what the index before it named.
+
+SHARD.md §8's text for check 16 is unchanged: this is that text, read exactly. The unit test
+`a_meta_apply_of_an_index_below_one_folded_is_compared_as_the_earlier_index` holds both
+directions.
+
+**What it moved: `MetaOverwritesByArrival`'s rate.** The variant lets every resend win its
+whole span, a resend of P's old generation at an index below the split's among them. The
+trace-order fold also read a lagging follower's apply of such an index, traced after the
+split's update elsewhere, as a fall. By index it is none. On the node sweep, seeds `0..n`,
+release, the variant is caught on:
+
+| Fold | 20 | 100 | 1 000 |
+|---|---|---|---|
+| by trace order (D-098, D-108's table) | 3 | 18 | 149 |
+| by index (this) | 0 | 2 | 19 |
+
+Every one of the 19 is check 16's fall, as the test asserts of each catch. The correct
+node's sweep was not re-run at a thousand under the new fold; the gate's is green. At 1.9 % the premerge's share of a hundred sees none about
+one time in seven (0.981^100), which D-061 forbids. So
+`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split` runs a
+thousand seeds from the premerge up rather than the share, and asserts its catch there, where
+a thousand see none about 5 times in 10^9. The tier it asserts at does not move. The
+nightly's run is unchanged, since its share is already a thousand. The premerge runs 900
+more seeds of it. Below the premerge it runs the share and asserts the split's landing, as
+it did. The rates D-098 and D-108 record for this variant are the trace-order fold's.
+**PROPOSED**, for the owner: the variant is now a low-rate one, and the alternative is a
+shape that aims a resend past the split, which no scenario has.
+
+**For the owner (PROPOSED, #175): a re-seeded node that replays a split.** The other way R
+comes back to a re-seeded node is unsafe in the same way. Suppose P's re-seed is installed
+from a checkpoint below the split's index `s`. The node's P replays `s`, and its apply
+creates R again at term 1 with no vote and, by Q26's "a split does not copy P's quarantine
+to R", no quarantine, though the R it lost may have voted. Q26 argues only for a re-seed
+*before* the split. **Recommended**: a right half created by a split's apply on a
+quarantined replica of P takes P's quarantine. A replica is quarantined only by a re-seed
+(D-035), so this amends Q26 for re-seeded replicas alone. The cost is a right half
+quarantined that need not be: one whose split the node first applied after its re-seed.
+Nothing is built for it here.
 
 **Why the refusal is here and not only in the overlap rule's slice.** §5 has a placeholder
 take "only a snapshot the overlap rule below allows", and the placeholders make the
