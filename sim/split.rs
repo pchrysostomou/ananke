@@ -4,8 +4,8 @@
 //! and (iii), *crash*, Stage D's.
 //!
 //! **Shape (ii)** (SHARD.md:1624-1630): P, range 2 over `[k0, k2)`, on nodes 1 to 3.
-//! A follower `x` of P is cut off from before a split of P at `k1` until both halves
-//! have compacted past the split's index `s`, so `x`'s P can reach past `s` only by P's
+//! A follower `x` of P is cut off from before a split of P at `k1` until P's leader and
+//! R have compacted past the split's index `s`, so `x`'s P can reach past `s` only by P's
 //! post-split snapshot, which creates no R, and `x` holds no R of its own. At the heal
 //! the node leading R is crashed and `x`'s links to the third node healed, its links to
 //! the crashed node staying cut, and the crashed node restarts after ten maximum
@@ -15,10 +15,12 @@
 //! `UninitialisedReplicaVotes` it grants, R elects with it, and check 20 sees the grant.
 //!
 //! **What is asserted per seed**: the shape was built — the cut began before the split
-//! and ended after both halves compacted past `s`, R had a leader at the heal and it was
-//! crashed — and a pre-vote or vote request of R reached `x` before `x`'s
-//! `RangeCreated` of R (SHARD.md §12, Stage C's exit). The verdict is checks 1 to 4 and
-//! the range layer's folds, checks 7 to 20, and that no node stopped.
+//! and ended after P's leader and some replica of R compacted past `s`, R had a leader
+//! at the heal and it was crashed — and its premise held: `x` applied no split of P,
+//! `x`'s P was installed at or past `s`, and where `x` created R it was by a snapshot.
+//! And a pre-vote or vote request of R reached `x` before `x`'s `RangeCreated` of R
+//! (SHARD.md §12, Stage C's exit). The verdict is checks 1 to 4 and the range layer's
+//! folds, checks 7 to 20, and that no node stopped.
 // PROPOSED(D-109): `sim/split.rs` (ii).
 
 use std::collections::BTreeMap;
@@ -214,6 +216,57 @@ impl Report {
         None
     }
 
+    /// Shape (ii)'s premise, per seed: `x` applied no split of P, `x`'s P was installed at
+    /// or past the split's index, and `x` created R, where it did, by a snapshot alone.
+    ///
+    /// # Errors
+    ///
+    /// Which of the three did not hold, with the seed.
+    pub fn premise(&self) -> Result<(), String> {
+        let (seed, x) = (self.seed, self.x);
+        let Some((index, right)) = self.split else {
+            return Err(format!(
+                "seed {seed}: P never split, so there is no premise"
+            ));
+        };
+        let on_x = |record: &&TraceRecord| Self::node_of(record) == Some(x);
+        if self.records.iter().filter(on_x).any(|record| {
+            matches!(&record.event, TraceEvent::RangeSplit { range, .. } if *range == PARENT)
+        }) {
+            return Err(format!(
+                "seed {seed}: node {x} applied P's split at {index} by its log, where shape                  (ii) has its P reach past the split only by P's post-split snapshot"
+            ));
+        }
+        let installed = self.records.iter().any(|record| {
+            matches!(&record.event, TraceEvent::RaftSnapshot {
+                server, range, last_index, taken: false, ..
+            } if *server == x && *range == PARENT && *last_index >= index)
+        });
+        if !installed {
+            return Err(format!(
+                "seed {seed}: node {x}'s P was never installed at or past the split's index                  {index}, so nothing says how it got past the split, if it did"
+            ));
+        }
+        let causes: Vec<ananke_env::RangeCause> = self
+            .records
+            .iter()
+            .filter(on_x)
+            .filter_map(|record| match &record.event {
+                TraceEvent::RangeCreated { range, cause, .. } if *range == right => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        if causes
+            .iter()
+            .any(|cause| *cause != ananke_env::RangeCause::Snapshot)
+        {
+            return Err(format!(
+                "seed {seed}: node {x} created the right half {right} by {causes:?}, where                  shape (ii) has it hold no R but one a snapshot gave it"
+            ));
+        }
+        Ok(())
+    }
+
     /// Every `RaftServerFailed` of the run.
     #[must_use]
     pub fn failures(&self) -> Vec<String> {
@@ -228,8 +281,18 @@ impl Report {
             .collect()
     }
 
-    /// The shape, per seed (SHARD.md §12, Stage C's exit): built, and a pre-vote or vote
-    /// request of R reached `x` before `x`'s `RangeCreated` of R.
+    /// The shape, per seed (SHARD.md §12, Stage C's exit): built, its premise held, and
+    /// a pre-vote or vote request of R reached `x` before `x`'s `RangeCreated` of R.
+    ///
+    /// The premise is that `x`'s P reaches past `s` only by P's post-split snapshot,
+    /// which creates no R, so that `x` holds no R of its own. The driver's wait for P's
+    /// leader to compact past `s` aims at it, and these three say it was reached: no
+    /// `RangeSplit` of P traced on `x`, which a log that carried `s` to `x` would have
+    /// traced with R's `RangeCreated { cause: split }`; an install of P on `x` at or
+    /// past `s`; and every creation of R on `x` a snapshot's. A schedule that let `x`
+    /// take `s` by its log after all — P's leadership moving at the heal to a replica
+    /// that had not compacted — fails here rather than passing whenever the vote request
+    /// happened to arrive first (#174's review, N2).
     ///
     /// # Errors
     ///
@@ -239,6 +302,7 @@ impl Report {
         if let Some(why) = &self.unbuilt {
             return Err(format!("seed {seed}: shape (ii) was not built: {why}"));
         }
+        self.premise()?;
         let asked = self.vote_asked_of_x_at().ok_or_else(|| {
             format!(
                 "seed {seed}: no pre-vote or vote request of the right half reached node {}",
@@ -453,11 +517,12 @@ fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
     })
 }
 
-/// Whether some replica of `range` compacted its log past `index`.
-fn compacted_past(records: &[TraceRecord], range: u64, index: u64) -> bool {
+/// Whether some replica of `range` compacted its log past `index`, or, with `by`, that
+/// replica on server `by`.
+fn compacted_past(records: &[TraceRecord], range: u64, index: u64, by: Option<u64>) -> bool {
     records.iter().any(|record| {
-        matches!(&record.event, TraceEvent::RaftCompacted { range: of, through, .. }
-            if *of == range && *through > index)
+        matches!(&record.event, TraceEvent::RaftCompacted { server, range: of, through }
+            if *of == range && *through > index && by.is_none_or(|by| by == *server))
     })
 }
 
@@ -520,12 +585,18 @@ pub fn run(seed: u64, range_variants: RangeVariants) -> Report {
     let deadline = sim.now() + COMPACT_BUDGET;
     loop {
         let records = sim.trace();
-        if compacted_past(&records, PARENT, index) && compacted_past(&records, right, index) {
+        // P's compaction is its leader's, which is the replica that feeds `x` at the
+        // heal: a follower's would leave the leader able to send `x` the split's entry
+        // by its log (#174's review, N2). R's is any replica's, since `x` holds no R.
+        let leader = leader_of(&records, PARENT);
+        if leader.is_some_and(|leader| compacted_past(&records, PARENT, index, Some(leader)))
+            && compacted_past(&records, right, index, None)
+        {
             break;
         }
         if sim.now() >= deadline {
             report.unbuilt = Some(format!(
-                "the halves did not both compact past {index} within {COMPACT_BUDGET:?}"
+                "P's leader and R did not both compact past {index} within {COMPACT_BUDGET:?}"
             ));
             report.records = records;
             return report;

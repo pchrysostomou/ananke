@@ -446,7 +446,13 @@ impl Report {
             };
             // The replica's applied index is the snapshot's last index: an install
             // that left it anywhere else has a state machine out of step with the
-            // metadata describing it.
+            // metadata describing it. An install into a placeholder, which every one
+            // owed here is since PROPOSED D-109, reads its state back before its store
+            // is opened and traces it after, with the applied index the opened store
+            // reports. Until #174's review (N1) it traced the snapshot's own index, and
+            // this clause could not fail. A repair planted one index short is now
+            // traced one short on all 64 owed installs of seeds 0 to 7; it also stops
+            // the node at its next apply, which the check above reports first.
             let (last_index, last_term) = (key.last_index, key.last_term);
             if held.applied != last_index {
                 return Err(format!(
@@ -484,7 +490,11 @@ impl Report {
             }
             // A live install streams no log key, so what the receiver holds is its
             // kept tail and nothing else. A take that carried the leader's log would
-            // leave those keys here, untombstoned (D-083's first departure).
+            // leave those keys here, untombstoned (D-083's first departure). An
+            // install into a placeholder is read back before its store is opened, and
+            // the open deletes every log key at or below the snapshot's index: what is
+            // counted here is what the switch left, which no opened store serves, and
+            // the one point at which a carried log can still be seen.
             if held.log_keys > 0 {
                 let tail_bound = self.highest_index(*range).saturating_sub(last_index);
                 if held.log_keys > tail_bound {

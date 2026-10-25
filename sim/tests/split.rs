@@ -5,8 +5,10 @@
 //!
 //! What it asserts, at every tier (SHARD.md §12, Stage C's exit): the correct system
 //! passes every seed — checks 1 to 4, the range layer's folds and no node stopped — and
-//! on every seed the shape is built and a pre-vote or vote request of the right half
-//! reached the cut-off follower `x` before `x`'s creation of it. Under
+//! on every seed the shape is built, its premise holds — `x`'s P got past the split by
+//! P's snapshot alone, and `x` made no right half but by a snapshot — and a pre-vote or
+//! vote request of the right half reached the cut-off follower `x` before `x`'s creation
+//! of it. Under
 //! `UninitialisedReplicaVotes` the shape is built too, and `x`'s placeholder grants the
 //! right half's remaining replica its vote on every seed, which is what check 20 sees.
 // PROPOSED(D-109): `sim/split.rs` (ii).
@@ -133,12 +135,20 @@ fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() 
 }
 
 /// Exactly three bootstrap nodes (SHARD.md §2; Q7, Q32): a node configured with any
-/// other number stops before it binds anything, and says why. Five, as `sim/install.rs`
-/// configured before the placeholders, and two, and three with one named twice.
+/// other number stops at the top of its start, before it opens its store or binds its
+/// socket, and says why. Five, as `sim/install.rs` configured before the placeholders,
+/// and two, and three with one named twice. A bind leaves no trace of its own, so what
+/// is asserted is what one would lead to: the node sends nothing, opens no WAL and
+/// spawns no task of its own, and creates or restates no replica. The same harness with
+/// `[1, 2, 3]` is the control: that node starts, creates its replicas and sends, so the
+/// harness tells a node that stopped from one that did not.
 // PROPOSED(D-109): exactly three bootstrap nodes, enforced.
 #[test]
 fn a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why() {
-    for bootstrap in [vec![1, 2, 3, 4, 5], vec![1, 2], vec![1, 2, 2]] {
+    // What the harness saw of a node configured with `bootstrap`: its failures, and
+    // whether it sent a message, opened a WAL, spawned a task beside the harness's own
+    // and created or restated a replica.
+    let started = |bootstrap: &[u64]| {
         let mut sim = Sim::new(SimConfig::new(1));
         let node = sim.add_node();
         let mut config = split::server_config(1, RangeVariants::correct());
@@ -148,15 +158,30 @@ fn a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why() 
         env.spawn("node", async move {
             let _ = ananke_shard::server::run(inner, config).await;
         });
-        sim.run_for(std::time::Duration::from_millis(50));
-        let failed: Vec<String> = sim
-            .trace()
+        sim.run_for(std::time::Duration::from_millis(500));
+        let trace = sim.trace();
+        let failed: Vec<String> = trace
             .iter()
             .filter_map(|record| match &record.event {
                 TraceEvent::RaftServerFailed { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
             .collect();
+        let any = |what: &dyn Fn(&TraceEvent) -> bool| trace.iter().any(|r| what(&r.event));
+        let sent = any(&|event| matches!(event, TraceEvent::MessageSent { .. }));
+        let opened = any(&|event| matches!(event, TraceEvent::WalSegmentOpened { .. }));
+        let spawned =
+            any(&|event| matches!(event, TraceEvent::TaskSpawned { name, .. } if *name != "node"));
+        let replicas = any(&|event| {
+            matches!(
+                event,
+                TraceEvent::RangeCreated { .. } | TraceEvent::RangesRestated { .. }
+            )
+        });
+        (failed, sent, opened, spawned, replicas)
+    };
+    for bootstrap in [vec![1, 2, 3, 4, 5], vec![1, 2], vec![1, 2, 2]] {
+        let (failed, sent, opened, spawned, replicas) = started(&bootstrap);
         assert_eq!(
             failed.len(),
             1,
@@ -169,12 +194,18 @@ fn a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why() 
             failed[0]
         );
         assert!(
-            !sim.trace().iter().any(|record| matches!(
-                record.event,
-                TraceEvent::RangeCreated { .. } | TraceEvent::RangesRestated { .. }
-            )),
-            "a node configured with the bootstrap nodes {bootstrap:?} created or restated a \
-             replica before it stopped"
+            !sent && !opened && !spawned && !replicas,
+            "a node configured with the bootstrap nodes {bootstrap:?} got past the top of its \
+             start before it stopped: sent {sent}, opened a WAL {opened}, spawned a task \
+             {spawned}, created or restated a replica {replicas}"
         );
     }
+    // The control: three bootstrap nodes, and the same harness sees the node start.
+    let (failed, sent, opened, spawned, replicas) = started(&[1, 2, 3]);
+    assert!(
+        failed.is_empty() && sent && opened && spawned && replicas,
+        "a node configured with the bootstrap nodes [1, 2, 3] did not start as the harness \
+         expects: failures {failed:?}, sent {sent}, opened a WAL {opened}, spawned a task \
+         {spawned}, created or restated a replica {replicas}"
+    );
 }

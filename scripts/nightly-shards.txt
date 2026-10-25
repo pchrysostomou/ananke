@@ -409,8 +409,9 @@
 # s (121.46 + 3.59, 16.66 s real), the correct system at 124.0 (120.44 + 3.55, 16.64 s real), the
 # bootstrap count's directed test at 0.0, written 0.1 like the cheap rows beside it. Longest-first
 # into the lightest shard: shard 5 at 1648.5 -> 1773.6, shard 6 at 1657.1 -> 1781.1, shard 4 at
-# 1659.7 -> 1659.8. It renamed two `node` rows in place (seed 45's pin, the split wedge's pin moved
-# from seed 8 to 76), keeping their shards and weights.
+# 1659.7 -> 1659.8. It renamed no row. The two `node` rows renamed in place in shard 5 (seed
+# 45's pin, the split wedge's pin moved from seed 8 to 76), keeping their shards and weights,
+# were renamed by the placeholders' PR before it, #173 (0064770), which wrote no header line.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
