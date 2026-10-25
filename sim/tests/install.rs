@@ -13,7 +13,7 @@
 use ananke_raft::core::Variants;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::install::{self, Report};
-use ananke_sim::{sweep, verdict};
+use ananke_sim::{seeds, sweep, verdict};
 
 /// The correct node.
 fn correct(seed: u64) -> Report {
@@ -187,5 +187,97 @@ fn every_wiring_variant_is_caught() {
             "install: {variant} caught on {failed}/{total} seeds; first: {}",
             first.unwrap_or_default()
         );
+    }
+}
+
+/// The most seeds the joiner's re-seed runs at any tier (PROPOSED D-109 §7).
+const JOINER_TIER_CAP: u64 = 200;
+
+/// A node that joined and then lost its store (#174's review, B1; PROPOSED D-109 §2;
+/// #178): every user range it was a voter of comes back to it through its placeholder's
+/// install, quarantined, and it grants no vote or pre-vote afterwards, though the
+/// bootstrap node leading the most user ranges is crashed so that those ranges elect and
+/// ask it. Before the fix every seed fails (20 of 20 at the gate: seed 0's range 2 not
+/// stated quarantined); with it every seed passes. A joiner hosts nothing, so its re-seed refuses and marks nothing (#178): the
+/// quarantine its placeholders' installs write on an engine a re-seed built is what keeps
+/// a vote its lost replicas cast from being cast again (D-035). Every seed of the tier.
+///
+/// The tier is capped at [`JOINER_TIER_CAP`], as the re-seed shape's is (D-081): five
+/// nodes and 26 simulated seconds a seed weigh about 0.26 cpu s each in release (1 000
+/// seeds: 241.9 user + 14.8 sys), so the nightly's ten thousand would be some 2 600 cpu s,
+/// more than a whole nightly shard carries. The gate's twenty and CI's hundred run in full;
+/// the premerge and the nightly run two hundred. The cap is **PROPOSED** (D-109 §7).
+#[test]
+fn a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing() {
+    let seeds = seeds().min(JOINER_TIER_CAP);
+    println!(
+        "install: the joiner's re-seed: ANANKE_SEEDS={} ran {seeds} seeds \
+         (JOINER_TIER_CAP={JOINER_TIER_CAP}, PROPOSED D-109)",
+        ananke_sim::seeds()
+    );
+    let outcomes = sweep(seeds, |seed| {
+        let report = install::run_joiner_reseed(seed);
+        (judge(seed, &report), report.answered_after_refusal())
+    });
+    let asked: Vec<usize> = outcomes.iter().map(|(_, asked)| *asked).collect();
+    println!(
+        "install: a re-seeded joiner over {seeds} seeds answered vote or pre-vote requests \
+         after its re-seed, per seed: {asked:?}"
+    );
+    // The votes were asked: measured on 20 of the first 20 seeds, 4 to 19 requests each.
+    // Asserted over the tier, so a run whose joiner is never asked does not pass on
+    // nothing.
+    assert!(
+        asked.iter().any(|asked| *asked > 0),
+        "the re-seeded joiner was asked for no vote or pre-vote on any of {seeds} seeds"
+    );
+    let verdicts: Vec<Result<(), String>> =
+        outcomes.into_iter().map(|(outcome, _)| outcome).collect();
+    verdict(&verdicts).expect("a re-seeded joiner's replicas come back quarantined on every seed");
+}
+
+/// The joiner's re-seed's verdict on one seed.
+fn judge(seed: u64, report: &install::JoinerReseed) -> Result<(), String> {
+    {
+        report.check()?;
+        if report.refused_at().is_none() {
+            return Err(format!(
+                "seed {seed}: node {} was never refused",
+                install::JOINER
+            ));
+        }
+        if report.voter_of.is_empty() {
+            return Err(format!(
+                "seed {seed}: node {} was a voter of no user range when its store was lost",
+                install::JOINER
+            ));
+        }
+        let created = report.created_after_refusal();
+        let quarantined = report.quarantined_after_refusal();
+        for range in &report.voter_of {
+            if !created.contains(range) {
+                return Err(format!(
+                    "seed {seed}: node {} was a voter of range {range} and was not created it \
+                     again by an install after its re-seed (created: {created:?})",
+                    install::JOINER
+                ));
+            }
+        }
+        for range in &created {
+            if !quarantined.contains(range) {
+                return Err(format!(
+                    "seed {seed}: node {}'s range {range}, created by its placeholder's install \
+                     after its re-seed, was not stated quarantined (D-035)",
+                    install::JOINER
+                ));
+            }
+        }
+        match report.granted_after_refusal().as_slice() {
+            [] => Ok(()),
+            granted => Err(format!(
+                "seed {seed}: node {} granted {granted:?} (range, term, pre) after its re-seed",
+                install::JOINER
+            )),
+        }
     }
 }

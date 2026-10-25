@@ -10,12 +10,14 @@
 //! vote request of the right half reached the cut-off follower `x` before `x`'s creation
 //! of it. Under
 //! `UninitialisedReplicaVotes` the shape is built too, and `x`'s placeholder grants the
-//! right half's remaining replica its vote on every seed, which is what check 20 sees.
+//! right half's remaining replica its vote on every seed, and check 20 catches it on every
+//! seed.
 // PROPOSED(D-109): `sim/split.rs` (ii).
 
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{Environment, TraceEvent};
 use ananke_raft::ServerId;
+use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_sim::{seeds, split, sweep, verdict, write_trace};
 
@@ -100,7 +102,9 @@ fn every_seed_of_the_vote_shape_passes_on_the_correct_node() {
 /// vote before `x` holds the right half — the injection, on every seed, which a sweep that
 /// passed could otherwise not show it had made. With the placeholder's vote the right
 /// half elects without the crashed node, so `x` gets its right half well inside the ten
-/// maximum election timeouts the correct system waits.
+/// maximum election timeouts the correct system waits. Check 20 trips on every seed, a
+/// placeholder's grant (PROPOSED D-109 §3), and the correct system's test beside it holds
+/// check 20 green on every seed through the run's verdict.
 #[test]
 fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() {
     let seeds = seeds();
@@ -120,6 +124,22 @@ fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() 
                      injected on this seed",
                     report.x
                 ))
+            }
+        });
+        // And check 20 catches it, on every seed: the fold's own verdict, a placeholder's
+        // grant (PROPOSED D-109 §3).
+        let outcome = outcome.and_then(|()| {
+            match invariants::folded(&report.records).verdict_of(Fold::PlaceholderGrants) {
+                Err(words) if words.contains("from its placeholder") => Ok(()),
+                Err(words) => Err(format!(
+                    "seed {seed}: check 20 tripped on a grant that was not a placeholder's: \
+                     {words}"
+                )),
+                Ok(()) => Err(format!(
+                    "seed {seed}: under UninitialisedReplicaVotes node {}'s placeholder granted \
+                     {granted} votes or pre-votes and check 20 did not trip",
+                    report.x
+                )),
             }
         });
         (outcome, granted)

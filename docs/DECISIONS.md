@@ -22588,6 +22588,33 @@ passes. The other node scenarios — `sim/ranges.rs`, the sharded
 quorum scenario under both, the re-seed shape — run three bootstrap nodes and nothing else,
 and none of their first hundred moved.
 
+**A joiner re-seeded (#174's review, B1; #178).** A node that joins hosts nothing, so its
+re-seed refuses and marks nothing: no `RaftReplicaRefused` and no refused mark for any
+replica it held. Q15's wording asks for both, and #178 holds that open for the owner. The
+double vote is closed by §2's quarantine. The fresh engine holds no key of the joiner's
+replicas, so each comes back only through its placeholder's install, and that install is
+quarantined on a node that runs on an engine a re-seed built.
+
+`sim/install.rs`'s `run_joiner_reseed` is the review's repro, built as a directed run:
+- nodes 4 and 5 join, and the operator makes them voters of every user range;
+- node 4 is crashed and restarted on a store marked lost;
+- once it is back, the bootstrap node leading the most user ranges is crashed.
+
+`a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing` asserts on every
+seed:
+- node 4 was a voter of some user range when its store was lost;
+- each such range is created on it again by an install after the refusal;
+- each such install is stated quarantined (`RaftReseeded`, `RaftRecovered { quarantined }`);
+- node 4 grants no vote or pre-vote after the refusal.
+
+Over the tier it also asserts that node 4 was asked: 4 to 13 requests a seed over the first
+twenty.
+
+**Measured.** With §2's quarantine forced off, 20 of 20 gate seeds fail, seed 0 on range 2
+not stated quarantined. With it on, 20 of 20 pass, and 1 000 of 1 000 at ANANKE_SEEDS=1000
+uncapped. Its tier is capped at 200 (**PROPOSED**, as D-081 caps the re-seed shape's): a
+seed weighs about 0.26 cpu s in release.
+
 ### 8. `sim/split.rs` (ii), *vote*
 
 **What is built** (`sim/split.rs`, `sim/tests/split.rs`): SHARD.md §10's shape on four

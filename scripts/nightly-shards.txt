@@ -456,6 +456,11 @@
 # At #173's merge into #174 (#173 at 0059470, with #166's c0d9b07), the three `split` rows are
 # placed again, longest-first into the merged tree's lightest shard, their weights kept: shard 4
 # at 1684.9 -> 1810.0, shard 6 at 1686.1 -> 1810.1, shard 5 at 1696.3 -> 1696.4.
+# PROPOSED D-109 §7 (a joiner re-seeded) added one `install` row, the joiner's re-seed, capped at
+# 200 seeds at the premerge and the nightly: weighed on its tree from the built release binary
+# (`install-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
+# two runs, on an Apple M2 of 8 cores (load averages up to 77): 56.9 cpu s, the mean of 52.2
+# (49.32 + 2.87) and 61.7 (58.49 + 3.17). Into the lightest shard, shard 5 at 1696.4 -> 1753.3.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -558,7 +563,7 @@
 4	node	27.8	the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
-# shard 5: 1696.4 cpu s
+# shard 5: 1753.3 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -585,6 +590,7 @@
 5	node	0.4	seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
 5	node	18.0	a_placeholder_that_grants_votes_is_caught_by_check_20
 5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
+5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
 # shard 6: 1810.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
