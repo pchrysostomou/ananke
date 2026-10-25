@@ -1369,7 +1369,20 @@ impl<E: Environment> Task<E> {
                 .placeholder_refused(range, from, &install, StartOver::Unusable)
                 .await;
         };
-        let incarnation = self.env.rng().next_u64().max(FIRST_INCARNATION + 1);
+        // A creation draws its incarnation as every creation does (Q26): from the node's
+        // generator, or, under `IncarnationPerRangeStream`, from the range's own stream,
+        // which gives a replica created again for the same (range, node) the number its
+        // predecessor drew, as the split's creation and the re-seed's do.
+        // PROPOSED(D-109)
+        let incarnation = if self
+            .variants
+            .contains(NodeVariant::IncarnationPerRangeStream)
+        {
+            self.env.range_rng(range.get()).next_u64()
+        } else {
+            self.env.rng().next_u64()
+        }
+        .max(FIRST_INCARNATION + 1);
         let repair = Repair {
             term: at.term,
             vote: None,

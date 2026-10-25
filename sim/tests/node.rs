@@ -1171,7 +1171,11 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // snapshot through its placeholder — is rarer: 15 of the thousand, every voter so
     // installed (#170; 0 of the first 20, 1 of the first 100), and a placeholder's
     // install refused as overlapping its node's parent on 10 (Q27; 0 of the first 100).
-    // Both are asserted from the thousand (D-061).
+    // Both are asserted from the thousand (D-061), and their miss rates there are not
+    // CLAUDE.md's 10^-13 for 3 %: at 15 in 1 000 a thousand see no install about 3 times
+    // in 10^7 (0.985^1000), and at 10 in 1 000 no refusal about once in 23 000
+    // (0.99^1000, 4.3e-5). The second is within D-061's letter and is the weakest
+    // assertion here (#173's review, N3).
     // PROPOSED(D-109)
     let placeholders = &coverage.placeholders;
     let longest_wait = placeholders.installed_voters_waited.iter().max();
@@ -4469,21 +4473,36 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
     // answered with store incarnation 0, since it has no store, and the replica its node
     // then made — at its apply of the split, or at its placeholder's install — answers
     // with the fresh incarnation its creation drew (Q26), a change the leader forgets the
-    // follower's progress at, as D-042 says it must (PROPOSED D-109).
+    // follower's progress at, as D-042 says it must (PROPOSED D-109). That change is one
+    // per placeholder and per leader, so the placeholder explains **the first** reset of
+    // the follower by each leader of the range after it, and nothing more: a second
+    // reset by the same leader after the same placeholder is unexplained (#173's review,
+    // N1; measured at 0 of the correct node's first thousand seeds when it was bounded).
     let resets_unexplained = |report: &raft::Report| {
-        let mut placeholders: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // (range, node) → how many placeholders the node has made of the range.
+        let mut placeholders: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+        // (leader, range, follower, placeholder) already explained.
+        let mut used: BTreeSet<(u64, u64, u64, usize)> = BTreeSet::new();
         let (mut unexplained, mut explained) = (0usize, 0usize);
         for record in &report.records {
             match &record.event {
                 TraceEvent::RangeReplicaCreated { range } => {
                     if let Some(node) = record.node {
-                        placeholders.insert((*range, u64::from(node.get())));
+                        *placeholders
+                            .entry((*range, u64::from(node.get())))
+                            .or_default() += 1;
                     }
                 }
                 TraceEvent::RaftProgressReset {
-                    range, follower, ..
+                    server,
+                    range,
+                    follower,
+                    ..
                 } => {
-                    if placeholders.contains(&(*range, *follower)) {
+                    let first = placeholders
+                        .get(&(*range, *follower))
+                        .is_some_and(|made| used.insert((*server, *range, *follower, *made)));
+                    if first {
                         explained += 1;
                     } else {
                         unexplained += 1;

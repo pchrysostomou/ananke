@@ -21232,7 +21232,9 @@ task makes the install itself:
    the node**, or the range was created here meanwhile: the staged bytes are cleared and
    the sender is asked to start over, traced `RaftSnapshotStartOver { reason: overlaps }`;
 3. otherwise the repair is a placeholder's — the stream's term, no vote, no kept tail, an
-   incarnation drawn fresh from the node's generator (Q26, D-042), and **the quarantine on
+   incarnation drawn fresh as every creation's is (Q26, D-042: from the node's generator,
+   or under `IncarnationPerRangeStream` from the range's own stream, as the split's and the
+   re-seed's draws are; #173's review, N4), and **the quarantine on
    a node that runs on an engine a re-seed built, none elsewhere** (below) — and the one
    manifest switch writes the replica's state under its prefix and replaces its span's
    keys (D-066), the spans being the Raft interval and the descriptor's span;
@@ -21376,6 +21378,19 @@ node's first thousand seeds, and on none of them a second owner. The rule's own 
 fresh take where its checkpoint predates the last split, the same rule for an install onto
 an initialised replica, and `SnapshotOverlapsReplica` are S9's (D-110), which replaces this
 start-over. **PROPOSED**: the receiver's half here, answered as a start-over.
+
+**What the start-over costs until S9** (#173's review, N2; #177). The refusal is
+answered `SnapshotStatus::Restart`, the one status the wire has for "start over". The
+leader's `step_for` counts every `Restart` against D-090's restart bound (RAFT.md:210-212).
+A refusal for overlap is no fault of the checkpoint, but it still spends the bound. The
+chunks still in flight when the staged bytes are cleared draw `Unusable` start-overs, and
+those count too. Once the bound is spent the leader counts a sound checkpoint unusable and
+takes a fresh one. Seed 595 of the correct node (node 1, range 38, leader 3) shows it: three
+fresh takes at 12.383 s, 12.715 s and 12.944 s, each within about 50 ms of a refusal for
+overlap. This is a cost, not a fault: the leader streams again, the parent on the node moves
+off R's span meanwhile, and no placeholder of the thousand was open at its run's end. Not
+counting the refusal needs a status of its own on the wire. That is the overlap rule's
+`Overlaps` answer and the leader's wait, which S9 builds, so nothing is changed here.
 
 **The apply's "R already initialised here" is not asserted here**, though §5 says "The apply
 asserts it", and the gate is why. With the refusal above R can be installed on a node only
