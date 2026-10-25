@@ -939,6 +939,39 @@ pub enum TraceEvent {
         /// Streams in flight from this leader, the new one included.
         streams: u64,
     },
+    /// A leader's stream to a follower was answered `Overlaps` (SHARD.md §5's overlap
+    /// rule, Q27): the follower's node holds another initialised replica the snapshot's
+    /// span overlaps, so nothing was installed. The leader ends the stream here and
+    /// streams again after a minimum election timeout
+    /// ([`TraceEvent::RaftSnapshotRestream`]); nothing is counted against RAFT.md's
+    /// restart bound.
+    // PROPOSED(D-110): the leader's half of the overlap rule.
+    RaftSnapshotOverlapped {
+        /// The leader.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The follower that refused.
+        to: u64,
+        /// The refused snapshot's last index.
+        last_index: u64,
+    },
+    /// The minimum election timeout after a [`TraceEvent::RaftSnapshotOverlapped`] has
+    /// passed and the leader lets its range's core stream again: from a fresh take
+    /// when `retake`, because the checkpoint predates the range's last split or merge
+    /// and only a newer snapshot can stop overlapping, and otherwise from the same
+    /// checkpoint, the overlap being the receiver's to clear (SHARD.md §5, Q27).
+    // PROPOSED(D-110): the leader's half of the overlap rule.
+    RaftSnapshotRestream {
+        /// The leader.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The follower.
+        to: u64,
+        /// Whether the next stream is from a fresh take.
+        retake: bool,
+    },
     /// A leader's `matched` for a follower rose for the first time under the store
     /// incarnation the follower's answer carried: the first rise after the leader
     /// recorded that incarnation, whether as its first record or by a change
@@ -1489,13 +1522,16 @@ pub enum StartOver {
     /// anything was admitted: it took no slot under the cap and disturbed no assembly.
     /// The sender starts over and finds the range where it now lives (D-075).
     NotHosted,
-    /// The stream completed into a placeholder, and the snapshot's span overlaps an
-    /// initialised replica on this node: SHARD.md §5's overlap rule (Q27), which keeps
-    /// one owner per key on a node (check 8). Nothing was installed; the staged bytes
-    /// are cleared and the sender starts over, by when the replica it overlapped may
-    /// have moved on. The rule's own answer, `Overlaps`, and the leader's wait before it
-    /// streams again are the overlap rule's slice's (PROPOSED D-109).
+    /// The stream completed, and the snapshot's span overlaps another initialised
+    /// replica on this node: SHARD.md §5's overlap rule (Q27), which keeps one owner per
+    /// key on a node (check 8). Nothing was installed and the staged bytes are cleared.
+    /// The answer is `SnapshotStatus::Overlaps`, not a start-over: the sender ends the
+    /// stream, counts nothing against its restart bound, and streams again after a
+    /// minimum election timeout, by when the replica it overlapped may have moved on
+    /// (PROPOSED D-110). Until D-110 it was answered `Restart` (#177).
     // PROPOSED(D-109): a placeholder's install is refused where it would overlap.
+    // PROPOSED(D-110): and so is an install onto an initialised replica, with an
+    // answer of its own.
     Overlaps,
 }
 
