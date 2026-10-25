@@ -74,6 +74,7 @@ use bytes::Bytes;
 
 use crate::descriptor::RangeDescriptor;
 use crate::range::RangeId;
+use crate::range_variant::{RangeVariant, RangeVariants};
 use crate::server::lock;
 use crate::snapshot::{Identity, Install, Landing, Route, Snapshots, Started};
 use crate::variant::{NodeVariant, NodeVariants};
@@ -485,6 +486,13 @@ pub struct Task<E: Environment> {
     /// anchor on a node that hosts none — which a placeholder's install opens the new
     /// replica's store beside (PROPOSED D-109).
     anchor: Arc<RaftStore<E>>,
+    /// Whether the node runs on an engine a re-seed built: a placeholder's install then
+    /// writes the quarantine (the host's `on_a_reseed`; D-035).
+    // PROPOSED(D-109)
+    on_a_reseed: bool,
+    /// The range layer's variants: a placeholder's install is a creation, and draws its
+    /// incarnation as `IncarnationPerRangeStream` says (PROPOSED D-108, D-109).
+    range_variants: RangeVariants,
 }
 
 impl<E: Environment> Task<E> {
@@ -511,6 +519,8 @@ impl<E: Environment> Task<E> {
         snaps: Queue<SnapJob>,
         placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
         anchor: Arc<RaftStore<E>>,
+        on_a_reseed: bool,
+        range_variants: RangeVariants,
     ) -> Self {
         Self {
             env,
@@ -531,6 +541,8 @@ impl<E: Environment> Task<E> {
             placeholders,
             as_placeholder: BTreeSet::new(),
             anchor,
+            on_a_reseed,
+            range_variants,
         }
     }
 
@@ -1303,12 +1315,19 @@ impl<E: Environment> Task<E> {
     /// leader's wait before it streams again are the overlap rule's slice's.
     ///
     /// Otherwise the repair is a placeholder's: the stream's term, no vote, no kept
-    /// tail, no quarantine — R's votes are in no store a re-seed could have lost (Q26)
-    /// — and an incarnation drawn fresh from the node's generator (Q26, D-042). The
-    /// switch writes the replica's whole state under its prefix and replaces its span's
-    /// keys, in one manifest switch (D-066), and the store is opened on what it wrote.
-    // PROPOSED(D-109): a placeholder's install creates the replica, and is refused
-    // where it would overlap.
+    /// tail and an incarnation drawn fresh from the node's generator (Q26, D-042). It
+    /// writes **the quarantine on a node that runs on an engine a re-seed built**, and
+    /// none elsewhere. Q26's reason for none — R is a new group, none of whose votes a
+    /// re-seed of P *before the split* can have lost — holds on a node that has lost no
+    /// engine, where every replica of the range it ever held is in the engine it runs
+    /// on. A re-seeded node may have held the range before its loss, a right half its
+    /// own split made, and voted in it; configuration never names a right half and the
+    /// fresh engine holds no key of one, so it cannot tell such a range from one it
+    /// never held, and quarantines both (D-035). The switch writes the replica's whole
+    /// state under its prefix and replaces its span's keys, in one manifest switch
+    /// (D-066), and the store is opened on what it wrote.
+    // PROPOSED(D-109): a placeholder's install creates the replica, quarantined on a
+    // re-seeded node, and is refused where it would overlap.
     async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
         let installing = self.env.decision();
         let prefix = KeyPrefix::group(range.get());
@@ -1359,12 +1378,25 @@ impl<E: Environment> Task<E> {
                 .placeholder_refused(range, from, &install, StartOver::Unusable)
                 .await;
         };
-        let incarnation = self.env.rng().next_u64().max(FIRST_INCARNATION + 1);
+        // A creation draws its incarnation as every creation does (Q26): from the node's
+        // generator, or, under `RangeVariant::IncarnationPerRangeStream`, from the range's own stream,
+        // which gives a replica created again for the same (range, node) the number its
+        // predecessor drew, as the split's creation and the re-seed's do.
+        // PROPOSED(D-109)
+        let incarnation = if self
+            .range_variants
+            .contains(RangeVariant::IncarnationPerRangeStream)
+        {
+            self.env.range_rng(range.get()).next_u64()
+        } else {
+            self.env.rng().next_u64()
+        }
+        .max(FIRST_INCARNATION + 1);
         let repair = Repair {
             term: at.term,
             vote: None,
             tail: Vec::new(),
-            quarantined: false,
+            quarantined: self.on_a_reseed,
             incarnation,
         };
         let batch = snapshot::repair_writes(
@@ -1411,8 +1443,14 @@ impl<E: Environment> Task<E> {
                 incarnation,
             },
         );
-        // The descriptor the switch put in place: what the read-back below takes the span
-        // from, and what the host's receipt check reads from here on.
+        // The descriptor the switch put in place, at the creation's trace and before
+        // the open is awaited, as a split's apply puts its right half's: from here the
+        // range is initialised on the node, so the host drops its messages rather than
+        // answer them as its placeholder's, and a chunk of it is no placeholder's either
+        // (SHARD.md §5: the placeholder becomes a replica at the install). It is what the
+        // state read back below takes the span from, and what the host's receipt check
+        // reads from here on.
+        // PROPOSED(D-109)
         lock(&self.descriptors).insert(range, descriptor.clone());
         // What landed, read back out of the engine before the store is opened on it
         // (`read_back`): counting events says a stream flowed, and nothing about what is
@@ -1434,17 +1472,13 @@ impl<E: Environment> Task<E> {
         let store = match beside.open_sibling(prefix.clone()).await {
             Ok((store, _)) => Arc::new(store),
             Err(error) => {
-                // What this path leaves is not consistent (#174's review, N3). Since
-                // #174 the descriptor's insert, the read-back's scans and `RaftSnapshot
-                // { taken: false }` all come before this open, where #173 had them after
-                // it. A failed open therefore leaves the descriptor in `descriptors`
-                // with no store in `stores`, and an install in the trace that never
-                // opened (its read-back is traced only past the open, so it has none). It also leaves `as_placeholder`, `receiving` and `plan` as
-                // they were, as #173 did. Which of these to undo, and what to mark, is
-                // the cleanup #173's review asks for: its N5, beside its B1's descriptor
-                // or "being created" mark put in place before this await. It is
-                // settled where that fix and this order meet, at #173's merge into
-                // this branch, and not here.
+                // The replica is on disk and its descriptor in place, so the node
+                // answers for it as for a replica whose store is not open, and makes no
+                // placeholder of it again: a restart opens it from its keys. The stream
+                // is done with.
+                self.plan.finish(range, from);
+                self.receiving.remove(&(range, from));
+                self.as_placeholder.remove(&range);
                 self.env.trace(TraceEvent::RaftServerFailed {
                     server: self.id.0,
                     reason: format!("opening {range}'s store after its install: {error}"),

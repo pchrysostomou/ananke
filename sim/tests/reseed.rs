@@ -14,7 +14,9 @@
 //! - each clause with a plant is seen to fail on it: `ServeBeforeRefusedMark` on (c)'s
 //!   ordering, `ReseedMarkNotSynced` on (d), `RecordNeverQueued` on (a) and (b);
 //! - (c)'s second half — a replica answering *after its own install* — is shown not to be
-//!   a constant, which is what it was when it was keyed on the mark alone.
+//!   a constant, which is what it was when it was keyed on the mark alone;
+//! - a re-seeded node's right half, which configuration never names, comes back through
+//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2).
 
 use ananke_raft::core::Variants;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -299,4 +301,47 @@ fn caught(variant: NodeVariant, run: u64) {
         !caught.is_empty(),
         "{variant} was caught on no seed of {run}"
     );
+}
+
+/// A re-seeded node's right half comes back through its placeholder, quarantined
+/// (PROPOSED D-109 §2): `reseed::run_after_split`, on every seed of the tier.
+///
+/// The node held the right half before its loss: its own apply of the split created it,
+/// and it may have voted in it. The re-seed rebuilds configuration's replicas, and
+/// configuration never names a right half, so the right half is not among them; the
+/// fresh engine holds no key of it. So it comes back only by its placeholder's install,
+/// and the replica that install creates is quarantined — stated so, `RaftReseeded` and
+/// `RaftRecovered { state: quarantined }` — and grants the right half nothing. Before the
+/// fix it was installed unquarantined, and this failed on every seed.
+#[test]
+fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
+    let run = shape_seeds();
+    tier("the re-seed after a split", run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_after_split(seed);
+        report.check()?;
+        report.reached()?;
+        let (_, right) = report.split.expect("`reached` names the split");
+        let (at, ..) = report
+            .installed_after_refusal(right)
+            .expect("`reached` names the install");
+        if !report.quarantined_after(right, at) {
+            return Err(format!(
+                "seed {seed}: node {} was created the right half {right} by its \
+                 placeholder's install after its re-seed and did not state it \
+                 quarantined: the replica may be one whose votes were in the engine the \
+                 node lost (D-035)",
+                report.x
+            ));
+        }
+        match report.granted_after(right, at) {
+            0 => Ok(()),
+            granted => Err(format!(
+                "seed {seed}: node {}'s quarantined right half {right} granted {granted} \
+                 votes or pre-votes",
+                report.x
+            )),
+        }
+    });
+    verdict(&verdicts).expect("a re-seeded node's right half comes back quarantined on every seed");
 }

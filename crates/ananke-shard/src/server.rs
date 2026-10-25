@@ -203,8 +203,11 @@ pub struct ServerConfig {
     /// The range layer's known-buggy variants (SHARD.md §10, Q37), carried beside
     /// `node`'s and the cores' `raft.variants` and read only where the range layer's
     /// rules are kept: the receipt and serving checks, the apply check, the meta
-    /// range's apply and the lease record read at the start.
+    /// range's apply and the lease record read at the start; and, for its two
+    /// instruments, the start's choice of bootstrap and the draw of a replica's
+    /// incarnation at a re-seed and at a split.
     // PROPOSED(D-105): the range layer's own variant set.
+    // PROPOSED(D-108): and its two instruments, read at the start and at a creation.
     pub range_variants: RangeVariants,
 }
 
@@ -685,7 +688,8 @@ pub struct ServerHost<E: Environment> {
     variants: ananke_raft::core::Variants,
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
-    /// The range layer's, for the receipt and serving checks (PROPOSED D-105).
+    /// The range layer's, for the receipt and serving checks.
+    // PROPOSED(D-105)
     range_variants: RangeVariants,
     gaps: Mutex<Gaps>,
     /// Every hosted replica's descriptor as the store holds it (SHARD.md §1, §3):
@@ -737,6 +741,15 @@ pub struct ServerHost<E: Environment> {
     /// the `snapshot` task, which assembles a placeholder's stream.
     // PROPOSED(D-109): the placeholder is the host's, and is this set.
     placeholders: Arc<Mutex<BTreeSet<RangeId>>>,
+    /// Whether the node runs on an engine a re-seed built, this start's or an earlier
+    /// one's (D-066 opens it as the newest directory not marked lost). Such a node lost
+    /// an engine that may have held a replica configuration never names — a right half
+    /// its own split made — and its fresh engine holds no key to tell it so, so it cannot
+    /// tell a range it held before its loss from one it never held: every replica a
+    /// placeholder's install creates on it is quarantined, as the re-seed's own are
+    /// (D-035, Q26).
+    // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
+    on_a_reseed: bool,
 }
 
 pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1088,7 +1101,9 @@ impl<E: Environment> ServerHost<E> {
     /// The placeholder ends here. The replica states its recovery and its term as a
     /// start does (`restate`), so the checks that follow a replica from its start —
     /// the timer check, pre-vote's property — follow this one from here, where its
-    /// core began.
+    /// core began. On a node a re-seed rebuilt the install wrote the quarantine, and the
+    /// replica is restored and stated quarantined, as a re-seeded replica's install
+    /// states it (`installed`).
     ///
     /// `None` when the switch left nothing to restore, which the task never hands on:
     /// it opens the store and reads its descriptor back before it says it switched.
@@ -1126,8 +1141,17 @@ impl<E: Environment> ServerHost<E> {
             at.last_term,
             Some(config.clone()),
             Vec::new(),
-            false,
+            self.on_a_reseed,
         );
+        // The quarantine the install wrote on a node a re-seed rebuilt (D-035): this
+        // replica may be one whose votes were in the engine the node lost.
+        // PROPOSED(D-109)
+        if core.quarantined() {
+            self.env.trace(TraceEvent::RaftReseeded {
+                server: self.id.0,
+                range: range.get(),
+            });
+        }
         self.env.trace(TraceEvent::RaftRecovered {
             server: self.id.0,
             range: range.get(),
@@ -1135,7 +1159,11 @@ impl<E: Environment> ServerHost<E> {
             applied: at.last_index,
             last_index: core.last_index(),
             incarnation: store.incarnation(),
-            state: RecoveredAs::Neither,
+            state: if core.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
         });
         self.env.trace(TraceEvent::RaftTerm {
             server: self.id.0,
@@ -1360,6 +1388,7 @@ impl<E: Environment> Host for ServerHost<E> {
         // is never mismatched. `TrustStaleDescriptor` takes the range the request
         // names as proof and checks nothing here (§10, Q38).
         // PROPOSED(D-097): the receipt check, where D-076 failed the run.
+        // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
         let key = request.command.key().map(|key| user_key(key));
         let Some(replica) = self.replica(range) else {
             lock(&self.gaps).requests_for_ranges_not_held += 1;
@@ -1841,6 +1870,7 @@ impl<E: Environment> Host for ServerHost<E> {
             // subsume applied between receipt and serving answers `RangeMismatch`.
             // `TrustStaleDescriptor` checks nothing here (§10).
             // PROPOSED(D-097): the read check.
+            // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
             let descriptor = if self
                 .range_variants
                 .contains(RangeVariant::TrustStaleDescriptor)
@@ -1990,8 +2020,10 @@ struct ServerApplier<E: Environment> {
     snaps: Queue<SnapJob>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
-    /// The range layer's, for the apply check and the meta range's apply (PROPOSED
-    /// D-105).
+    /// The range layer's, for the apply check and the meta range's apply, and for the
+    /// incarnation a split's right half draws.
+    // PROPOSED(D-105)
+    // PROPOSED(D-108): `IncarnationPerRangeStream` at a split.
     range_variants: RangeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
     /// names the version directory a take writes (Q37, PROPOSED D-086).
@@ -2098,9 +2130,12 @@ impl<E: Environment> ServerApplier<E> {
             state: RangeState::Live,
         };
         let voter = config.voters.contains(&self.id);
+        // R's incarnation, from the node's generator and never from R's stream
+        // (Q26); `IncarnationPerRangeStream` draws it from the stream.
+        // PROPOSED(D-108): the instrument read from the range layer's set.
         let incarnation = if self
-            .node_variants
-            .contains(NodeVariant::IncarnationPerRangeStream)
+            .range_variants
+            .contains(RangeVariant::IncarnationPerRangeStream)
         {
             self.env.range_rng(right).next_u64()
         } else {
@@ -2551,6 +2586,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // (`initial_state`, a split's batch, an install); one without is
                 // checked against nothing, and check 9 then sees what it applied.
                 // PROPOSED(D-097): the apply check.
+                // PROPOSED(D-105): `ApplyIgnoresSpan` read from the range layer's set.
                 let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
                 {
                     Some(key) if !self.range_variants.contains(RangeVariant::ApplyIgnoresSpan) => {
@@ -2673,6 +2709,8 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     }
                 } else if let Some(descriptors) = &meta_update {
                     let result = if range == META_RANGE {
+                        // PROPOSED(D-105): `MetaOverwritesByArrival` read from the
+                        // range layer's set.
                         let as_arrived = self
                             .range_variants
                             .contains(RangeVariant::MetaOverwritesByArrival);
@@ -3147,7 +3185,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     let named = bootstrap.contains(&id);
     // `AnyFreshNodeBootstraps`: a node not named takes a fresh store for a bootstrap
     // anyway, with the address book for the voters it was not given (PROPOSED D-096).
-    let pretends = !named && node_variants.contains(NodeVariant::AnyFreshNodeBootstraps);
+    // PROPOSED(D-108): the instrument read from the range layer's set.
+    let pretends = !named && range_variants.contains(RangeVariant::AnyFreshNodeBootstraps);
     let is_bootstrap = named || pretends;
     let bootstrap: Vec<ServerId> = if pretends {
         servers.iter().map(|(server, _)| *server).collect()
@@ -3340,6 +3379,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 &servers,
                 variants,
                 node_variants,
+                range_variants,
                 &error,
             )
             .await?;
@@ -3405,6 +3445,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         bootstrap_meta = Some(descriptors);
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
+    // The same two facts read the other way: the node runs on an engine a re-seed
+    // built, this start's or an earlier one's, so a replica it held before its loss is
+    // one it cannot name, and every replica a placeholder's install creates here is
+    // quarantined (D-035; SHARD.md §5's Q26 reason holds only on a node that lost no
+    // engine).
+    // PROPOSED(D-109)
+    let on_a_reseed = reseeded_now || engine.dir != base_dir;
 
     // The node's stores and replicas, shared by the host, the `apply` task and the
     // `snapshot` task and mutable behind a lock: a split adds a range at its apply
@@ -3576,6 +3623,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         refill_at,
         applied: applied_at.clone(),
         placeholders: placeholders.clone(),
+        on_a_reseed,
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
@@ -3588,6 +3636,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
         && let Ok(record) = LeaseRecord::decode(bytes)
     {
+        // PROPOSED(D-105): `IdBlockResumed` read from the range layer's set.
         let any_run = range_variants.contains(RangeVariant::IdBlockResumed);
         lock(&ids).adopt(&record, any_run);
     }
@@ -3710,6 +3759,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             snaps.clone(),
             placeholders,
             anchor,
+            on_a_reseed,
+            range_variants,
         );
         async move {
             task.run().await;
@@ -3805,12 +3856,16 @@ async fn generations<E: Environment>(env: &E, base: &Path) -> io::Result<Vec<Can
 ///    the two keys in one synced batch (`RaftStore::mark_reseeded`), and `RaftReseeded`
 ///    is traced when it is durable, per replica and carrying its range (§8).
 ///
-/// The incarnation is drawn per replica from the **node's** generator and is never the
-/// first incarnation. It is not drawn from the range's protocol stream: `SimEnv` derives
-/// a named stream from the seed and the name alone, so a replica created again for the
-/// same (range, node) would draw its predecessor's number and a leader comparing
-/// incarnations for inequality only (D-042) would never reset (Q26,
-/// SHARD.md:1372-1379). [`NodeVariant::IncarnationPerRangeStream`] is that mistake.
+/// The incarnation is drawn per replica from the **node's** generator, as SHARD.md §8
+/// draws a fresh incarnation (Q26), and is never the first incarnation. It is never
+/// drawn from a named stream derived anew at each creation of a replica of the same
+/// (range, node): such a stream would hand a replica created again its predecessor's
+/// number, and a leader comparing incarnations for inequality only (D-042) would never
+/// reset (SHARD.md:1376-1383). [`RangeVariant::IncarnationPerRangeStream`], a
+/// range-layer instrument since PROPOSED D-108, draws it from the range's protocol
+/// stream instead. That stream is not derived anew: `range_rng` is one stream per node
+/// and range, continuing across draws and restarts. So the variant changes the draw
+/// without reaching the repeat (PROPOSED D-108).
 ///
 /// What the replicas are when this returns is empty and quarantined: each waits for its
 /// leader's stream, and the install that fills it is the node's snapshot *wiring*, which
@@ -3832,6 +3887,8 @@ async fn reseed<E: Environment>(
     servers: &[(ServerId, SocketAddr)],
     variants: Variants,
     node_variants: NodeVariants,
+    // PROPOSED(D-108): the range layer's set, for `IncarnationPerRangeStream`.
+    range_variants: RangeVariants,
     error: &io::Error,
 ) -> io::Result<Reseeded<E>> {
     // What `MetaApplied { index: 0 }` names for a re-seeded replica of the meta range.
@@ -3946,7 +4003,8 @@ async fn reseed<E: Environment>(
                 }
                 store.engine().write(initial, true).await?;
             }
-            let incarnation = if node_variants.contains(NodeVariant::IncarnationPerRangeStream) {
+            // PROPOSED(D-108): the instrument read from the range layer's set.
+            let incarnation = if range_variants.contains(RangeVariant::IncarnationPerRangeStream) {
                 env.range_rng(range.id.get()).next_u64()
             } else {
                 env.rng().next_u64()

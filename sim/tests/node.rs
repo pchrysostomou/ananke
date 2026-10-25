@@ -65,6 +65,7 @@ use ananke_env::RecoveredAs;
 use ananke_env::TraceEvent;
 use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
+use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::folds::{self, ApplyLagFold, CrossRangeHoldFold, NodeCoverage, NodeCoverageFold};
@@ -542,13 +543,12 @@ impl Coverage {
         self.seeds += 1;
         // PROPOSED(D-107): the restatements, and the descriptors check 7 holds to its
         // map as statements.
-        let mut checker = ananke_shard::invariants::Checker::new(true);
-        checker.extend(&report.records);
+        let checker = invariants::folded(&report.records);
         self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
         self.descriptors_stated += checker.descriptors().statements();
         // PROPOSED(D-107): check 8's right-half clause, folded over the correct node
         // and printed, not asserted.
-        if let Err(violation) = checker.owners().right_half_verdict() {
+        if let Err(violation) = checker.verdict_of(Fold::RightHalf) {
             self.right_half_not_restated.push((report.seed, violation));
             self.right_half_not_restated.sort();
         }
@@ -567,6 +567,7 @@ impl Coverage {
             .installed_voters_waited
             .extend(placeholders.installed_voters_waited);
         self.placeholders.installed_voters_never += placeholders.installed_voters_never;
+        self.placeholders.answered_for_a_replica += placeholders.answered_for_a_replica;
         self.uniform_seeds += u64::from(report.uniform());
         self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
         self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1171,7 +1172,11 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // snapshot through its placeholder — is rarer: 15 of the thousand, every voter so
     // installed (#170; 0 of the first 20, 1 of the first 100), and a placeholder's
     // install refused as overlapping its node's parent on 10 (Q27; 0 of the first 100).
-    // Both are asserted from the thousand (D-061).
+    // Both are asserted from the thousand (D-061), and their miss rates there are not
+    // CLAUDE.md's 10^-13 for 3 %: at 15 in 1 000 a thousand see no install about 3 times
+    // in 10^7 (0.985^1000), and at 10 in 1 000 no refusal about once in 23 000
+    // (0.99^1000, 4.3e-5). The second is within D-061's letter and is the weakest
+    // assertion here (#173's review, N3).
     // PROPOSED(D-109)
     let placeholders = &coverage.placeholders;
     let longest_wait = placeholders.installed_voters_waited.iter().max();
@@ -1192,6 +1197,17 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         coverage.overlap_refusal_seeds,
         placeholders.installed_voters_waited.len(),
         placeholders.installed_voters_never,
+    );
+    // No placeholder answers for a replica its node holds: the install puts the range's
+    // descriptor in place at the creation's trace, before its store is opened, as a
+    // split's apply does, so the host drops the range's messages in between (D-109
+    // §1.6). Asserted at every tier as an absence; before that fix it was 11 answers on
+    // 9 of the first thousand seeds (45, 221, 375, 401, 466, 579, 595, 604, 915), and
+    // seed 45's pin asserts it at the gate.
+    assert_eq!(
+        placeholders.answered_for_a_replica, 0,
+        "a placeholder answered for a replica its node had created, on one of {seeds} seeds \
+         (SHARD.md §5: the placeholder becomes a replica at its install)"
     );
     assert!(
         coverage.placeholder_seeds > 0,
@@ -1643,11 +1659,16 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 /// to do: its run is byte-identical to the correct node's, which is the absence
 /// asserted with its reason (CLAUDE.md), rather than a sweep passed by injecting
 /// nothing.
+///
+/// The variant is a range-layer instrument outside §10's count since PROPOSED D-108,
+/// which moved it out of the node's set and measured the move: every verdict, catch
+/// and trace hash of this test's runs is the same on both sides of it.
 // PROPOSED(D-096): the bootstrap nodes named in configuration.
+// PROPOSED(D-108): the instrument in the range layer's set.
 #[test]
 fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
     let seeds = high_rate_share();
-    let taken = NodeVariants::of(&[NodeVariant::AnyFreshNodeBootstraps]);
+    let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
     // Check 7 as the range layer folds it, which holds an install's creation to its
     // map as well as a bootstrap's: since the placeholders the correct membership
     // node's joiners are created by installs into their placeholders (PROPOSED D-109),
@@ -1661,24 +1682,56 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         }
         descriptors.verdict()
     };
-    let outcomes: Vec<(Option<String>, Option<String>)> = sweep(seeds, |seed| {
-        let report = membership::run_on_node(Cluster::Node, seed, Variants::default(), taken);
-        (check_7(&report.records).err(), report.check().err())
+    let outcomes: Vec<(Option<String>, Option<String>, Option<String>)> = sweep(seeds, |seed| {
+        let report = membership::run_on_node(
+            Cluster::Node,
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            taken,
+        );
+        (
+            check_7(&report.records).err(),
+            report.check().err(),
+            invariants::folded(&report.records)
+                .verdict_of(Fold::RangeIds)
+                .err(),
+        )
     });
     let by_check_7 = outcomes.iter().filter(|o| o.0.is_some()).count();
     let by_others = outcomes.iter().filter(|o| o.1.is_some()).count();
+    let by_range_ids = outcomes.iter().filter(|o| o.2.is_some()).count();
     println!(
         "AnyFreshNodeBootstraps: check 7 caught it on {by_check_7} of {seeds} membership seeds, \
-         the run's other checks on {by_others}; first: {}",
+         the run's other checks on {by_others}; check 18's grants (`range ids:`), read fold \
+         by fold, on {by_range_ids}; first: {}; first by the grants: {}",
         outcomes
             .iter()
             .find_map(|o| o.0.as_deref())
+            .unwrap_or("none"),
+        outcomes
+            .iter()
+            .find_map(|o| o.2.as_deref())
             .unwrap_or("none")
     );
     assert_eq!(
         by_check_7, seeds as usize,
         "AnyFreshNodeBootstraps was not caught by check 7 on every membership seed"
     );
+    // Check 18's half that no §10 variant trips (PROPOSED D-106, a question for the
+    // owner): every replica of range 0 grants at an index what its first apply granted.
+    // Two clusters' replicas of range 0 grant two blocks at one index, read fold by fold
+    // since the run's verdict names check 7 first. Measured over seeds 0 to 999 in
+    // release: 0 of 20, 4 of 100, 34 of 1 000 — under D-061's 5 %, so asserted from the
+    // nightly's share of a thousand, which sees none about once in 10^15; printed at
+    // every tier.
+    if ananke_sim::seeds() >= 10_000 {
+        assert!(
+            by_range_ids > 0,
+            "check 18's grants tripped on no membership seed of AnyFreshNodeBootstraps's \
+             share: no two clusters' replicas of range 0 granted different blocks at one index"
+        );
+    }
     // And the correct node passes the same check on the same scenario, which D-096's
     // version of this test never asked, and which was false: a node not named at
     // bootstrap traced its interim replica's creation with its own empty Raft
@@ -1692,6 +1745,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         1,
         Variants::default(),
         NodeVariants::correct(),
+        RangeVariants::correct(),
     );
     check_7(&honest.records).expect("the correct membership node passes check 7");
 
@@ -1701,7 +1755,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         NodeVariants::correct(),
         RangeVariants::correct(),
     );
-    let pretending = raft::run_on_the_node(1, Variants::default(), taken, RangeVariants::correct());
+    let pretending = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct(), taken);
     assert_eq!(
         correct.jsonl(),
         pretending.jsonl(),
@@ -1737,7 +1791,11 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 /// the first resend, on every seed, since every other client starts stale.
 // PROPOSED(D-097)
 fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
-    let seeds = high_rate_share();
+    routing_variant_on(name, variants, high_rate_share())
+}
+
+/// [`routing_variant`] over `seeds` seeds rather than the share.
+fn routing_variant_on(name: &str, variants: &[RangeVariant], seeds: u64) -> Vec<Routed> {
     let taken = RangeVariants::of(variants);
     let outcomes: Vec<Routed> = sweep(seeds, |seed| {
         let report =
@@ -1780,6 +1838,11 @@ fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
             misapplied,
             splits: raft::splits_of(&report.records).applied,
             resumed: report.splits.from_restarted_done,
+            tripped: invariants::folded(&report.records)
+                .verdicts()
+                .into_iter()
+                .filter_map(|(fold, verdict)| verdict.is_err().then_some(fold))
+                .collect(),
         }
     });
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
@@ -1825,6 +1888,9 @@ struct Routed {
     splits: usize,
     /// Splits done by a proposer restarted after its last (`Fault::SplitFromRestarted`).
     resumed: u64,
+    /// The range layer's folds in violation over the whole run, each read on its own
+    /// (PROPOSED D-106): the run's verdict names only the first in check order.
+    tripped: BTreeSet<Fold>,
 }
 
 #[test]
@@ -1834,12 +1900,31 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
         &[RangeVariant::TrustStaleDescriptor],
     );
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
-    // A rate, not every seed: 20 of 20 at the gate and 99 of 100 at the premerge's
-    // share. Seed 48 is the one it is not caught on, and legitimately: its stale
-    // clients' first operations on their stale ranges are writes, which the apply
-    // check refuses and the resend corrects the cache by, so no read is ever served
-    // through a stale route there. The variant's harm needs a read before a write on
-    // the same stale route, which is the schedule's to give (D-061: far above 5 %).
+    // A rate, not every seed: 20 of 20 at the gate and in CI, 100 of 100 at the
+    // premerge's share and 998 of 1 000 at the nightly's, and the test prints the seeds
+    // it misses. The variant is caught when a range serves a read of a key outside its
+    // span. At the nightly's share that happens three ways. On 992 seeds it is through
+    // client 1's stale range-2 entry, before a write to the key's range has corrected
+    // it: the apply check refuses the write, and the client merges the descriptors its
+    // `RangeMismatch` carries. On five it is through a client's cached entry for a
+    // range that split: range 2's on seeds 503, 579, 660 and 759, range 3's on 999. On
+    // 282 it is a read sent to range 3 just before its split applied and served just
+    // after. On the two misses, seeds 184 and 819, no read is served through a stale
+    // entry at all. Every operation through one, client 1's range-2 entry or a client's
+    // entry for a range that split (ranges 3 and 5 on 184, range 4 on 819), is a write
+    // refused at apply, with two exceptions: on 184 client 1's cas of `k3` after range
+    // 3's split, abandoned unanswered, and on 819 client 1's first operation, a read of
+    // `k4` sent before range 2 had a leader, then only to followers, and abandoned
+    // unserved. Seed 48, which an earlier comment named as the miss, is caught. The
+    // seeds were re-derived from both clients' records in release. The variant's harm
+    // is the schedule's to give (D-061: far above 5 %).
+    // PROPOSED(D-108): the misses re-derived (#156), and printed.
+    let missed: Vec<u64> = outcomes
+        .iter()
+        .filter(|o| o.why.is_none())
+        .map(|o| o.seed)
+        .collect();
+    println!("node: TrustStaleDescriptor not caught on seeds {missed:?}");
     assert!(
         caught > 0,
         "TrustStaleDescriptor was caught on no seed: a stale client's read served from \
@@ -1859,9 +1944,10 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
     // Q10's path reached on the correct apply code. A rate and not every seed,
     // because the incremental checker stops the run at check 9's first violation —
     // a read served from the wrong range — and on some seeds that read comes before
-    // any trusted write reaches apply: measured at 17 of 20 at the gate, so it is
-    // asserted at every tier (D-061) and printed. No write was applied in the
-    // wrong range: the apply check, kept by this variant, refused every one.
+    // any trusted write reaches apply: measured at 15 of 20 at the gate and in CI, 72
+    // of 100 at the premerge's share and 720 of 1 000 at the nightly's, far above
+    // D-061's 5 %, so it is asserted at every tier and printed. No write was applied in
+    // the wrong range: the apply check, kept by this variant, refused every one.
     let reached = outcomes.iter().filter(|o| o.at_apply > 0).count();
     assert!(
         reached > 0,
@@ -1965,12 +2051,44 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
         );
     }
     let caught = alone.iter().filter(|o| o.why.is_some()).count();
+    // Check 10 behind check 9, read fold by fold (PROPOSED D-106): the misapplied write
+    // breaks check 9, and where the right half writes the key at the same generation, or
+    // had, check 10 on the same run, which the run's verdict never names. Measured over
+    // seeds 0 to 999 in release: 1 of 20, 3 of 100 and 26 of 1 000, every one on a seed
+    // check 9 tripped too — under D-061's 5 %, so asserted from the nightly's share of a
+    // thousand, which sees none about once in 3 × 10^11, beside the catch; printed at
+    // every tier.
+    let by_check_10 = alone
+        .iter()
+        .filter(|o| o.tripped.contains(&Fold::GenerationsRise))
+        .count();
+    println!(
+        "node: ApplyIgnoresSpan alone: check 10 in violation on {by_check_10}/{} seeds, read \
+         fold by fold",
+        alone.len()
+    );
+    for outcome in &alone {
+        if outcome.tripped.contains(&Fold::GenerationsRise) {
+            assert!(
+                outcome.tripped.contains(&Fold::ServingWithinSpan),
+                "seed {}: check 10 tripped under ApplyIgnoresSpan alone without check 9, \
+                 where a key two ranges wrote at one generation needs a write applied \
+                 outside its span first",
+                outcome.seed
+            );
+        }
+    }
     if seeds() >= 10_000 {
         assert!(
             caught > 0,
             "ApplyIgnoresSpan alone was caught on no seed of the share: no write proposed \
              before a split reached apply above the split's index, or the fold for it is \
              silent"
+        );
+        assert!(
+            by_check_10 > 0,
+            "check 10 tripped on no seed of ApplyIgnoresSpan alone's share: no key was \
+             written by a split's two halves at one generation"
         );
     }
 }
@@ -1981,17 +2099,26 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
 /// was still carrying — is left alone by the correct meta range (§1's maximum by
 /// generation) and stored by the variant, where check 16 sees the generation fall.
 /// Before the split every update named the first generation and the variant had no
-/// path (PROPOSED D-098). A rate, the schedule's to give — 3 of 20 at the gate, 18 of
-/// 100 at the thousand's share, asserted from the thousand's share, where a sample of
-/// a hundred at that rate sees none about once in 10^8 (D-061); the split landing on
-/// the share is asserted at every tier, and the variant is seen injected
-/// by its updates each winning their whole span where the correct meta range's win
-/// nothing but the split's.
+/// path (PROPOSED D-098). A rate, the schedule's to give, and a low one since check 16
+/// reads "from one meta index to the next" by index (PROPOSED D-109): 0 of 20 at the
+/// gate, 2 of 100 and 19 of 1 000. The trace-order reading before it counted 3, 18 and
+/// 149, most of them a lagging follower's apply of an index below the split's, which
+/// is no fall. So the catch is asserted over a thousand seeds, at the premerge and the
+/// nightly, where at 1.9 % a thousand see none about 5 times in 10^9 (D-061); below the
+/// premerge the test runs the share. The split landing is asserted at every tier, and
+/// the variant is seen injected by its updates each winning their whole span where the
+/// correct meta range's win nothing but the split's.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split() {
-    let outcomes = routing_variant(
+    let run = if seeds() >= 1000 {
+        high_rate_share().max(1000)
+    } else {
+        high_rate_share()
+    };
+    let outcomes = routing_variant_on(
         "MetaOverwritesByArrival",
         &[RangeVariant::MetaOverwritesByArrival],
+        run,
     );
     assert!(
         outcomes.iter().any(|o| o.splits > 0),
@@ -2017,7 +2144,7 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
     if seeds() >= 1000 {
         assert!(
             caught > 0,
-            "MetaOverwritesByArrival was caught on no seed of the share: no update of a \
+            "MetaOverwritesByArrival was caught on no seed of the thousand: no update of a \
              split's parent at its old generation arrived after the split's, or check 16 \
              is silent"
         );
@@ -2071,14 +2198,29 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
         "no restarted proposer's second split was done on the share, so IdBlockResumed had \
          no id to take twice: the schedule's shape for it (SHARD.md §10) was not reached"
     );
+    // The catch is check 18's range-id clause's — a right half a creation or a split
+    // named before, or two grants of one id — and not any `descriptor lineage:`
+    // violation, which a wrong generation or wrong voters also begin with (issue #141).
+    // Re-measured over seeds 0 to 999 in release, the shares of the gate, the premerge
+    // and the nightly: 12 of the first twenty, 58 of the first hundred and 499 of the
+    // thousand, the loose predicate's own figures, since every `descriptor lineage:`
+    // verdict of the variant's runs is the freshness failure; the narrowing moves no count
+    // and makes the attribution what it says. The run's verdict names another check
+    // first on 129 of the 628 seeds the variant is caught on — state machine safety on
+    // 90, check 9 on 16, log matching on 11, commit by current term on 8, check 7 on 3,
+    // check 16 on 1 — and check 18's clause trips beneath every one of them, read fold by
+    // fold (`the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed`).
+    // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
-        .filter(|o| {
-            o.why
-                .as_deref()
-                .is_some_and(|why| why.contains("descriptor lineage"))
-        })
+        .filter(|o| o.why.as_deref().is_some_and(by_the_range_id_clause))
         .count();
+    println!(
+        "node: IdBlockResumed: caught by check 18's range-id clause on {by_check_18}/{}, \
+         by any check on {}",
+        outcomes.len(),
+        outcomes.iter().filter(|o| o.why.is_some()).count()
+    );
     assert!(
         by_check_18 > 0,
         "IdBlockResumed was caught by check 18's range-id clause on no seed of the share: \
@@ -2141,175 +2283,740 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
     );
 }
 
-/// The range layer's checker at prefixes against its folds over the whole trace
-/// (D-046; SHARD.md §8, §11 raft 12): fed in eight prefixes, its verdict at each is
-/// what folding its seven folds (checks 7, 9, 10, 16, 17 and 18's two clauses) over that
-/// prefix from the first record reports, in the same words, on the correct node and on
-/// the two variants that trip checks 9 and 17.
-// PROPOSED(D-097)
-#[test]
-fn the_range_layers_checks_agree_with_their_whole_trace_folds() {
-    const PREFIXES: usize = 8;
-    let seeds = high_rate_share().min(20);
-    let variants: [&[RangeVariant]; 3] = [
-        &[],
-        &[RangeVariant::TrustStaleDescriptor],
-        &[RangeVariant::ClientIgnoresMismatch],
-    ];
-    let mut compared = 0usize;
-    let mut tripped = 0usize;
-    for taken in variants {
-        let results = sweep(seeds, |seed| {
-            let report = raft::run_on_the_node(
-                seed,
-                Variants::default(),
-                NodeVariants::correct(),
-                RangeVariants::of(taken),
-            );
-            let records = &report.records;
-            let mut incremental = ananke_shard::invariants::Checker::new(true);
-            let mut fed = 0usize;
-            let mut compared = 0usize;
-            let mut tripped = 0usize;
-            for prefix in 1..=PREFIXES {
-                let upto = records.len() * prefix / PREFIXES;
-                incremental.extend(&records[fed..upto]);
-                fed = upto;
-                let whole = ananke_shard::invariants::all(&records[..upto]);
-                assert_eq!(
-                    incremental.verdict(),
-                    whole,
-                    "seed {seed}, prefix {prefix}/{PREFIXES} under {taken:?}: the checker \
-                     fed in prefixes disagrees with the folds over the whole prefix"
-                );
-                compared += 1;
-                tripped += usize::from(whole.is_err());
+// --- The range layer's folds under the equivalence test, fold by fold (SHARD.md §11,
+// raft 12; §12 Stage C's exit; PROPOSED D-106) ---
+
+/// How many seeds a pair's comparison runs: the hundred the one-group checker is
+/// compared over (D-046), the gate's twenty at the gate.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+fn range_folds_compared() -> u64 {
+    seeds().min(100)
+}
+
+/// What one seed's comparison found: the folds in violation over the whole run, each
+/// with its own words, and whether a split took effect on the run — the shape the
+/// split's variants need before any of them has anything to break.
+#[derive(Debug, Default)]
+struct FoldsFound {
+    tripped: BTreeMap<Fold, String>,
+    split: bool,
+}
+
+/// One run's comparison, **fold by fold**: at eight prefixes, a checker fed the
+/// records thirty-seven at a time against the checker folded over the whole prefix from
+/// the first record (`invariants::folded`) — each fold's own verdict the same `Ok` or
+/// `Err` in the same words, and the checker's verdict, which stops a run, the same too.
+/// A fold's violation is in its own words ([`Fold::words`]) and latched: once a prefix
+/// shows it, every later prefix shows the same one.
+///
+/// Until PROPOSED D-106 the comparison was of the checker's one verdict, the first
+/// violation in check order, so a fold behind another — check 10 behind check 9 on the
+/// same misapplied write — was compared on nothing but the first fold's words.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+fn compare_range_folds(
+    seed: u64,
+    system: &str,
+    records: &[TraceRecord],
+) -> Result<FoldsFound, String> {
+    let mut incremental = invariants::Checker::new(true);
+    let mut fed = 0;
+    let mut found = FoldsFound {
+        split: raft::splits_of(records).applied > 0,
+        ..FoldsFound::default()
+    };
+    for step in 1..=FOLD_PREFIXES {
+        let stop = records.len() * step / FOLD_PREFIXES;
+        while fed < stop {
+            let next = (fed + FOLD_CHUNK).min(stop);
+            incremental.extend(&records[fed..next]);
+            fed = next;
+        }
+        let whole = invariants::folded(&records[..stop]);
+        let at = |what: String| {
+            format!(
+                "seed {seed}: under {system}, over the first {stop} of {} records, {what}",
+                records.len()
+            )
+        };
+        for fold in Fold::ALL {
+            let in_chunks = incremental.verdict_of(fold);
+            let over_the_prefix = whole.verdict_of(fold);
+            if in_chunks != over_the_prefix {
+                return Err(at(format!(
+                    "{fold} fed in chunks said {in_chunks:?} and folded over the whole prefix \
+                     said {over_the_prefix:?}"
+                )));
             }
-            (compared, tripped)
-        });
-        compared += results.iter().map(|(c, _)| c).sum::<usize>();
-        tripped += results.iter().map(|(_, t)| t).sum::<usize>();
+            match (over_the_prefix, found.tripped.get(&fold)) {
+                (Err(words), _) if !words.starts_with(fold.words()) => {
+                    return Err(at(format!(
+                        "{fold} reported a violation in words not its own: {words}"
+                    )));
+                }
+                (Err(words), Some(before)) if words != *before => {
+                    return Err(at(format!(
+                        "{fold}'s violation moved from {before:?} to {words:?}: a fold \
+                         returns at its first violation"
+                    )));
+                }
+                (Err(words), None) => {
+                    found.tripped.insert(fold, words);
+                }
+                (Ok(()), Some(before)) => {
+                    return Err(at(format!(
+                        "{fold} was in violation at an earlier prefix ({before:?}) and is not \
+                         at this one"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if incremental.verdict() != whole.verdict() {
+            return Err(at(format!(
+                "the checker fed in chunks said {:?} and folded over the whole prefix said {:?}",
+                incremental.verdict(),
+                whole.verdict()
+            )));
+        }
     }
+    Ok(found)
+}
+
+/// Runs `system` over `seeds` seeds, compares the range layer's folds fold by fold on
+/// every run, fails on any disagreement, and prints each fold's trip count over the
+/// seeds compared, with the first violation of each, so a comparison that saw only
+/// `Ok` of a fold is visible at every tier.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+fn range_folds_under(
+    system: &str,
+    seeds: u64,
+    run: impl Fn(u64) -> Vec<TraceRecord> + Sync + Send,
+) -> Vec<FoldsFound> {
+    let outcomes: Vec<Result<FoldsFound, String>> =
+        sweep(seeds, |seed| compare_range_folds(seed, system, &run(seed)));
+    let mismatches: Vec<Result<(), String>> = outcomes
+        .iter()
+        .map(|outcome| outcome.as_ref().map(|_| ()).map_err(Clone::clone))
+        .collect();
+    if let Err(mismatch) = verdict(&mismatches) {
+        panic!("{mismatch}");
+    }
+    let found: Vec<FoldsFound> = outcomes.into_iter().map(Result::unwrap).collect();
+    let tripped: Vec<String> = Fold::ALL
+        .iter()
+        .map(|fold| {
+            let on = found
+                .iter()
+                .filter(|seed| seed.tripped.contains_key(fold))
+                .count();
+            format!("{fold} {on}/{seeds}")
+        })
+        .collect();
+    let first: BTreeMap<Fold, &str> = Fold::ALL
+        .iter()
+        .filter_map(|fold| {
+            found.iter().find_map(|seed| {
+                seed.tripped
+                    .get(fold)
+                    .map(|words| (*fold, head(words, 160)))
+            })
+        })
+        .collect();
     println!(
-        "node: the range layer's checker agreed with its whole-trace folds at {compared} \
-         prefixes over {seeds} seeds and {} variants, {tripped} of them in violation",
-        variants.len()
+        "range folds: {system}: {seeds} seeds compared fold by fold at {FOLD_PREFIXES} prefixes; \
+         in violation over the run: {}; a split took effect on {}/{seeds}; first of each: \
+         {first:?}",
+        tripped.join(", "),
+        found.iter().filter(|seed| seed.split).count()
     );
+    found
+}
+
+/// The first `chars` characters of `words`, cut on a character boundary: a verdict
+/// names `§` and `—`, which a cut by bytes can split.
+fn head(words: &str, chars: usize) -> &str {
+    words
+        .char_indices()
+        .nth(chars)
+        .map_or(words, |(at, _)| &words[..at])
+}
+
+/// How many of `found` show `fold` in violation.
+fn tripped_on(found: &[FoldsFound], fold: Fold) -> usize {
+    found
+        .iter()
+        .filter(|seed| seed.tripped.contains_key(&fold))
+        .count()
+}
+
+/// The records of the raft sweep's arms on the node under the range layer's `taken`.
+fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
+    raft::run_on_the_node(
+        seed,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::of(taken),
+    )
+    .records
+}
+
+/// The range layer's folds fold by fold on the correct node (SHARD.md §12, Stage C's
+/// exit: "check 7 runs under the test over the correct system and this stage's
+/// variants"), each fed in chunks against its fold over the whole prefix; and no fold
+/// that stops a run trips ([`Fold::VERDICT`]), which the correct node's sweep asserts
+/// of the checker's one verdict on every seed. Check 7 runs here and under every pair
+/// below; no variant of Stage C's §10 set trips it, and it is asserted against
+/// `SplitNotAtomicWithDescriptor` in Stage D, which builds that variant (SHARD.md §12)
+/// — `AnyFreshNodeBootstraps`, D-096's instrument, trips it on the membership scenario
+/// below.
+///
+/// **Check 8** runs here and under every pair below too, its two clauses a fold each
+/// (PROPOSED D-107). Its right half's clause trips on the correct node itself — a voter
+/// installed past a split holds no right half until placeholders exist — so it is
+/// compared and printed and not asserted absent, and its seed 45
+/// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
+/// own comparison at the gate's twenty and inside it from CI's hundred, asserting the
+/// clause's words there: the comparison is held in violation, where a fold fed in
+/// chunks that lost its state between them reads `Ok` (#166's review, N7). Its overlap
+/// clause trips on no run of this tree, so its comparison in violation comes with its
+/// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12).
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-107): check 8's two clauses among them.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("the correct node", compared, |seed| node_records(seed, &[]));
+    for (seed, outcome) in found.iter().enumerate() {
+        let stopping = stopping_folds(outcome);
+        assert!(
+            stopping.is_empty(),
+            "seed {seed}: the correct node tripped {stopping:?}"
+        );
+    }
     assert!(
-        tripped > 0,
-        "no prefix was in violation, so the agreement was asserted on green alone"
+        found.iter().any(|seed| seed.split),
+        "no split took effect on the correct node's compared seeds, so check 18's split \
+         clause and every fold reading a split's descriptors compared nothing of one"
+    );
+    // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
+    // tier.
+    // With the placeholders the correct node's seed 45 holds the clause: its voter gets
+    // its right half through its placeholder before its restart
+    // (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`).
+    // So the shape is planted on seed 45's own trace, the voter's creation and
+    // restatements of the right half taken out, and compared there at every tier
+    // (PROPOSED D-109).
+    let (seed, node, _, _, right) = RIGHT_HALF_PINNED;
+    let planted = without_the_right_half(&node_records(seed, &[]), node, right);
+    let words = compare_range_folds(
+        seed,
+        "the correct node's seed 45 with its voter's right half taken out",
+        &planted,
+    )
+    .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+    .tripped
+    .get(&Fold::RightHalf)
+    .cloned();
+    assert_eq!(
+        words.as_deref(),
+        Some(right_half_pinned_words().as_str()),
+        "seed {seed} with node {node}'s right half {right} taken out: check 8's right half's \
+         clause was not compared in violation in its pin's shape, so the planting no longer \
+         makes the shape it was written for"
+    );
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::RightHalf))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: the correct node: check 8's right half's clause, compared and not \
+         asserted absent (PROPOSED D-107), in violation on seeds {on:?} of the {compared} \
+         compared, and compared in violation on the pinned seed {seed} planted at every tier"
     );
 }
 
-/// Check 8 under the equivalence test (SHARD.md §11, raft 12; §12): the range layer's
-/// checker fed in eight prefixes holds, at each, the verdicts of both of check 8's
-/// clauses that the fold over that whole prefix holds, on the correct node and under
-/// each of the stage's six range variants built so far.
+/// The folds of `outcome` in violation that stop a run ([`Fold::VERDICT`]): every one
+/// but check 8's right half's clause, which a correct system trips until placeholders
+/// exist (PROPOSED D-107).
+// PROPOSED(D-107)
+fn stopping_folds(outcome: &FoldsFound) -> BTreeMap<Fold, &str> {
+    outcome
+        .tripped
+        .iter()
+        .filter(|(fold, _)| Fold::VERDICT.contains(fold))
+        .map(|(fold, words)| (*fold, words.as_str()))
+        .collect()
+}
+
+/// Whether check 9's violation is at an apply — a write applied outside the span of
+/// its range's descriptor in force before its index — and not at a read's serving.
+fn at_apply(violation: &str) -> bool {
+    violation.contains("(SHARD.md §3, at apply)")
+}
+
+/// Checks 9 and 10 against `ApplyIgnoresSpan` (SHARD.md §12, Stage C's exit), which
+/// turns the apply check off, compared on two systems:
 ///
-/// No variant of this tree trips check 8: its tripping variant,
-/// `SnapshotOverlapsReplica`, comes with the overlap rule (SHARD.md §12, Stage C's
-/// exit; the overlap rule's slice), which asserts the fold against it. The right half's
-/// clause tripped on the correct node itself until the placeholders (PROPOSED D-107):
-/// seed 45 was its shape, a voter installed past a split restating without the right
-/// half. With the placeholders that voter gets its right half before its restart
-/// (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`),
-/// so the shape is planted on seed 45's own trace — the voter's creation of the right
-/// half and its restatement of it taken out (`without_the_right_half`) — and the
-/// agreement is asserted in violation on that as well as on green prefixes (PROPOSED
-/// D-109). Beside the agreement this asserts that the fold had something to hold: nodes
-/// restated on the share, and splits whose right halves the clause owes.
-// PROPOSED(D-107): check 8 under the equivalence test from its own stage.
+/// - **With `TrustStaleDescriptor`**, D-097's instrument: the server proposes a stale
+///   client's write in the range the client named, and with the apply check off it
+///   applies there, outside that range's span — check 9 at the apply, where the read
+///   check `TrustStaleDescriptor` also turns off has not tripped it first, and check 10
+///   once the key's owner and the wrong range have both written it at the first
+///   generation. `TrustStaleDescriptor` alone applies no such write (its own test
+///   asserts it) and trips check 10 on no seed (asserted beside it), so every check-10
+///   trip here, and every check-9 trip at an apply, is the apply check's absence.
+/// - **Alone**, §10's path through the split: a write proposed under P's span and
+///   appended above the split's index applies in P — check 9 — and where R has written
+///   the key at the same generation, or writes it next, check 10. Before PROPOSED D-106
+///   every such catch read as check 9's, the first in check order, and check 10 had
+///   never been seen to trip on any run.
+///
+/// Measured before asserted, over seeds 0 to 999 of this tree in release (the first
+/// twenty, the first hundred, all thousand). With trust: check 9 at an apply on 2, 9 and
+/// 112, check 10 on 4, 25 and 210 — so both are asserted from CI's hundred compared
+/// seeds, which miss them about once in 10^5 and 10^10 redraws, and not at the gate's
+/// twenty, which would miss check 9's about once in ten (D-061). Alone: check 9 on 1, 5
+/// and 82, check 10 on 1, 3 and 26, every one of the 26 on a seed check 9 tripped too;
+/// check 10's 2.6 % is under D-061's 5 % and the comparison never sees a thousand seeds
+/// of it, so alone's trips are printed at every tier and not asserted, and the variant's
+/// own catch stays asserted from the nightly's share (D-100); the split it needs, which
+/// took effect on 999 of the 1 000, is asserted at every tier.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
 #[test]
-fn check_8_agrees_with_its_whole_trace_fold_on_the_node() {
-    const PREFIXES: usize = 8;
-    let seeds = high_rate_share().min(20);
-    let systems: [&[RangeVariant]; 7] = [
-        &[],
-        &[RangeVariant::TrustStaleDescriptor],
-        &[RangeVariant::ApplyIgnoresSpan],
-        &[RangeVariant::ClientIgnoresMismatch],
-        &[RangeVariant::MetaOverwritesByArrival],
-        &[RangeVariant::IdBlockResumed],
-        &[RangeVariant::UninitialisedReplicaVotes],
-    ];
-    // One run's records fed to the checker in eight prefixes, each prefix's two verdicts
-    // held to the fold's over that whole prefix: (prefixes compared, those in violation).
-    let compare_records = |seed: u64, what: &str, records: &[TraceRecord]| {
-        let mut incremental = ananke_shard::invariants::Checker::new(true);
-        let mut fed = 0usize;
-        let mut compared = 0usize;
-        let mut tripped = 0usize;
-        for prefix in 1..=PREFIXES {
-            let upto = records.len() * prefix / PREFIXES;
-            incremental.extend(&records[fed..upto]);
-            fed = upto;
-            let mut whole = ananke_shard::invariants::OneOwnerPerKey::default();
-            for record in &records[..upto] {
-                whole.push(record);
-            }
-            assert_eq!(
-                (
-                    incremental.owners().overlap_verdict(),
-                    incremental.owners().right_half_verdict()
-                ),
-                (whole.overlap_verdict(), whole.right_half_verdict()),
-                "seed {seed}, prefix {prefix}/{PREFIXES} under {what}: check 8 fed in \
-                 prefixes disagrees with its fold over the whole prefix"
+fn the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span() {
+    let compared = range_folds_compared();
+    let with_trust = range_folds_under(
+        "{TrustStaleDescriptor, ApplyIgnoresSpan}",
+        compared,
+        |seed| {
+            node_records(
+                seed,
+                &[
+                    RangeVariant::TrustStaleDescriptor,
+                    RangeVariant::ApplyIgnoresSpan,
+                ],
+            )
+        },
+    );
+    let at_an_apply = with_trust
+        .iter()
+        .filter(|seed| {
+            seed.tripped
+                .get(&Fold::ServingWithinSpan)
+                .is_some_and(|words| at_apply(words))
+        })
+        .count();
+    println!(
+        "range folds: {{TrustStaleDescriptor, ApplyIgnoresSpan}}: check 9 at an apply on \
+         {at_an_apply}/{compared}"
+    );
+    if seeds() >= 100 {
+        assert!(
+            at_an_apply > 0,
+            "check 9 tripped at an apply on no compared seed of {{TrustStaleDescriptor, \
+             ApplyIgnoresSpan}}'s {compared}: the misapplied writes went unseen by the fold \
+             written for them"
+        );
+        assert!(
+            tripped_on(&with_trust, Fold::GenerationsRise) > 0,
+            "check 10 tripped on no compared seed of {{TrustStaleDescriptor, \
+             ApplyIgnoresSpan}}'s {compared}: a key written by two ranges at one generation \
+             went unseen"
+        );
+    }
+    let alone = range_folds_under("ApplyIgnoresSpan", compared, |seed| {
+        node_records(seed, &[RangeVariant::ApplyIgnoresSpan])
+    });
+    assert!(
+        alone.iter().any(|seed| seed.split),
+        "no split took effect on the compared seeds, so ApplyIgnoresSpan alone had no write \
+         to misapply"
+    );
+    for (seed, found) in alone.iter().enumerate() {
+        if let Some(words) = found.tripped.get(&Fold::ServingWithinSpan) {
+            assert!(
+                at_apply(words),
+                "seed {seed}: ApplyIgnoresSpan alone tripped check 9 at a read, which it does \
+                 not touch: {words}"
             );
-            compared += 1;
-            tripped += usize::from(whole.verdict().is_err());
         }
-        (compared, tripped)
-    };
-    // (prefixes compared, those in violation, restatements, splits applied).
-    let compare = |seed: u64, taken: &[RangeVariant]| {
-        let report = raft::run_on_the_node(
+    }
+}
+
+/// Check 9 against `TrustStaleDescriptor` (SHARD.md §12, Stage C's exit): a stale
+/// client's read served from the wrong range. Measured: 998 of seeds 0 to 999, 100 of
+/// the first hundred, 20 of the first twenty — asserted at every tier; and check 10 on
+/// none of the thousand, asserted on every seed.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor() {
+    let seeds = range_folds_compared();
+    let found = range_folds_under("TrustStaleDescriptor", seeds, |seed| {
+        node_records(seed, &[RangeVariant::TrustStaleDescriptor])
+    });
+    assert!(
+        tripped_on(&found, Fold::ServingWithinSpan) > 0,
+        "check 9 tripped on no compared seed of TrustStaleDescriptor's {seeds}"
+    );
+    // The apply check this variant keeps refuses every write it trusts, so no key is
+    // written by a range that does not own it: check 10 trips on no seed (0 of 1 000
+    // measured), which is what makes check 10's trips under the pair with
+    // `ApplyIgnoresSpan` the pair's second half's.
+    assert_eq!(
+        tripped_on(&found, Fold::GenerationsRise),
+        0,
+        "check 10 tripped under TrustStaleDescriptor alone, whose apply check refuses every \
+         trusted write"
+    );
+}
+
+/// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
+/// hundred, since check 16 reads one meta index against the next by index (PROPOSED
+/// D-109): 48 and 66, each a resend of a split parent's first generation applied at an
+/// index above the split's update.
+const META_REORDER_PINNED: [u64; 2] = [48, 66];
+
+/// Check 16 against `MetaOverwritesByArrival` (SHARD.md §12, Stage C's exit): a resend
+/// of a split parent's old descriptor that the variant's meta range stores after the
+/// split's update. Measured, by trace order (D-106): 149 of seeds 0 to 999, 18 of the
+/// first hundred, 3 of the first twenty, asserted from CI's hundred compared seeds. By
+/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0. The comparison never sees more
+/// than a hundred seeds, and two in a hundred is under D-061's 5 %, so the tier's catch
+/// is printed and not asserted; the comparison is held in violation on the two seeds
+/// pinned ([`META_REORDER_PINNED`]) at every tier, as check 18's grants clause is on its
+/// pins, and the variant's own catch is asserted over a thousand seeds from the premerge
+/// (`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split`).
+/// The split it needs, on 999 of the 1 000, at every tier.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-109): check 16 by index; its comparison in violation on two pins.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("MetaOverwritesByArrival", compared, |seed| {
+        node_records(seed, &[RangeVariant::MetaOverwritesByArrival])
+    });
+    assert!(
+        found.iter().any(|seed| seed.split),
+        "no split took effect on the compared seeds, so MetaOverwritesByArrival had no \
+         update to reorder"
+    );
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::MetaNeverGoesBack))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: MetaOverwritesByArrival: check 16 tripped on seeds {on:?} of the \
+         {compared} compared"
+    );
+    let pinned: Vec<(u64, Option<String>)> = sweep(META_REORDER_PINNED.len() as u64, |at| {
+        let seed = META_REORDER_PINNED[usize::try_from(at).expect("two pins")];
+        let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+            Some(compared) => compared.tripped.get(&Fold::MetaNeverGoesBack).cloned(),
+            None => compare_range_folds(
+                seed,
+                "MetaOverwritesByArrival, pinned",
+                &node_records(seed, &[RangeVariant::MetaOverwritesByArrival]),
+            )
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::MetaNeverGoesBack)
+            .cloned(),
+        };
+        (seed, words)
+    });
+    for (seed, words) in &pinned {
+        let words = words.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: check 16 did not trip under MetaOverwritesByArrival, where it was \
+                 pinned for a resend applied at an index above the split's update: a schedule \
+                 move took it off that shape, so re-audit the pin to the shape's absence with \
+                 its reason (CLAUDE.md)"
+            )
+        });
+        assert!(
+            words.contains("before it: the generation meta names never falls"),
+            "seed {seed}: check 16 tripped in a shape other than its pin's, a later meta index \
+             naming a lower generation: {words}"
+        );
+    }
+}
+
+/// Check 20 against `UninitialisedReplicaVotes` (SHARD.md §12, Stage C's exit): a
+/// placeholder that grants every vote and pre-vote it receives. Measured on this tree,
+/// release: 15 of the first 20 compared seeds and 89 of the first 100, every one a
+/// placeholder's grant — asserted at every tier, where twenty seeds at 75 % miss it about
+/// once in 10^12 (D-061). The correct node's comparison above asserts check 20 green on
+/// every compared seed.
+// PROPOSED(D-109)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("UninitialisedReplicaVotes", compared, |seed| {
+        node_records(seed, &[RangeVariant::UninitialisedReplicaVotes])
+    });
+    let tripped = tripped_on(&found, Fold::PlaceholderGrants);
+    println!(
+        "range folds: UninitialisedReplicaVotes: check 20 tripped on {tripped}/{compared} \
+         compared seeds"
+    );
+    assert!(
+        tripped > 0,
+        "check 20 tripped on no compared seed of UninitialisedReplicaVotes's {compared}"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        if let Some(words) = outcome.tripped.get(&Fold::PlaceholderGrants) {
+            assert!(
+                words.contains("from its placeholder"),
+                "seed {seed}: check 20 tripped on a grant that was not a placeholder's: {words}"
+            );
+        }
+    }
+}
+
+/// §10's `UninitialisedReplicaVotes` on the node, caught by check 20 at the first grant
+/// (SHARD.md §8, §10; PROPOSED D-109), and its pair: the correct node's sweep, which runs
+/// the same checks, asserts every seed green. A placeholder is made on most seeds — a
+/// split's right half pre-votes at once to replicas of its parent that have not applied
+/// the split (Q21, Q22) — and the variant grants that pre-vote. Measured on this tree,
+/// release: 15 of the gate's share of 20, 89 of the premerge's 100 and 896 of the
+/// nightly's 1 000, as before the install's window was closed (#173's review, B1: that
+/// window followed the creation, and every catch here precedes it), each check 20's at a
+/// right half's first pre-vote reaching a node that had not applied its split. Asserted
+/// as a catch at every tier (D-061: far above 5 %), and every catch is check 20's.
+// PROPOSED(D-109)
+#[test]
+fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
+    let outcomes = routing_variant(
+        "UninitialisedReplicaVotes",
+        &[RangeVariant::UninitialisedReplicaVotes],
+    );
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    for outcome in &outcomes {
+        if let Some(why) = outcome.why.as_deref() {
+            assert!(
+                why.contains("placeholder grants nothing"),
+                "seed {}: UninitialisedReplicaVotes was caught by something other than check \
+                 20: {why}",
+                outcome.seed
+            );
+        }
+    }
+    assert!(
+        caught > 0,
+        "UninitialisedReplicaVotes was caught on no seed of the share: no placeholder \
+         received a vote request, or check 20 is silent"
+    );
+}
+
+/// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
+/// the range and generation a mismatch has already corrected. Measured: 1 000 of seeds
+/// 0 to 999 — asserted on every compared seed.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch() {
+    let seeds = range_folds_compared();
+    let found = range_folds_under("ClientIgnoresMismatch", seeds, |seed| {
+        node_records(seed, &[RangeVariant::ClientIgnoresMismatch])
+    });
+    assert_eq!(
+        tripped_on(&found, Fold::ClientRefreshes),
+        found.len(),
+        "check 17 did not trip on every compared seed of ClientIgnoresMismatch"
+    );
+}
+
+/// The membership seeds on which `AnyFreshNodeBootstraps` trips check 18's grants clause
+/// among the first hundred (PROPOSED D-106, #163's review): 41, 74, 81 and 82, measured
+/// over seeds 0 to 999 in release, where it trips on 34, every one the clause's agreement
+/// branch at index 2 of range 0. Two groups of range 0 run side by side — the bootstrap
+/// nodes' and the one the variant's fresh nodes bootstrap beside it, whose leaders of term
+/// 1 the run's own verdict names first (election safety) — each leases the first block of
+/// its own counter, 6..=13, to some node's refill at index 2, and a replica of the one
+/// applies at index 2 what a replica of the other applied first. The clause's other two
+/// branches, two blocks sharing an id and an empty block, are reached by no variant and no
+/// instrument.
+const GRANTS_PINNED: [u64; 4] = [41, 74, 81, 82];
+
+/// The two nodes a violation of the grants clause's agreement branch at index 2 of range 0
+/// names — the first apply's grantee and the other replica's — when both were granted the
+/// block 6..=13: "range ids: index 2 of range 0 granted node A's run … the block 6..=13
+/// at its first apply and node B's run … the block 6..=13 on …".
+fn grants_at_index_2_of(violation: &str) -> Option<(u64, u64)> {
+    let after = violation.strip_prefix("range ids: index 2 of range 0 granted node ")?;
+    let (first, after) = after.split_once("'s run ")?;
+    let (_, after) = after.split_once(" the block 6..=13 at its first apply and node ")?;
+    let (second, after) = after.split_once("'s run ")?;
+    if !after.contains(" the block 6..=13 on ") {
+        return None;
+    }
+    Some((first.parse().ok()?, second.parse().ok()?))
+}
+
+/// Whether `violation` is check 18's **range-id clause**: a right half whose id a
+/// creation or a split had named before (the freshness failure, in
+/// [`Fold::SplitLineage`]'s words), or two grants of one id ([`Fold::RangeIds`]) — and
+/// not a split's values, a wrong generation or wrong voters, which a node that resumes
+/// another run's block does not break and `descriptor lineage:` alone also names (issue
+/// #141). Read off a fold's own verdict or a run's, which names its seed first.
+// PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
+fn by_the_range_id_clause(violation: &str) -> bool {
+    violation.contains(Fold::RangeIds.words())
+        || (violation.contains(Fold::SplitLineage.words())
+            && violation.contains("which a creation or a split had named before it"))
+}
+
+/// Check 18 against `IdBlockResumed` (SHARD.md §12, Stage C's exit): the restarted
+/// proposer's second split takes the id its record's block gave the first, and check
+/// 18's range-id clause sees the right half named before. Measured, fold by fold: check
+/// 18's split clause in violation on 628 of seeds 0 to 999, 71 of the first hundred and
+/// 14 of the first twenty, every one the freshness failure — which is every seed the
+/// variant is caught on: the run's own verdict names another check first on 129 of the
+/// 628 (state machine safety, check 9, log matching and others, D-105's table), and the
+/// fold shows check 18 tripped beneath each. Asserted at every tier.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed() {
+    let seeds = range_folds_compared();
+    let found = range_folds_under("IdBlockResumed", seeds, |seed| {
+        node_records(seed, &[RangeVariant::IdBlockResumed])
+    });
+    let by_clause = found
+        .iter()
+        .filter(|seed| {
+            [Fold::RangeIds, Fold::SplitLineage].iter().any(|fold| {
+                seed.tripped
+                    .get(fold)
+                    .is_some_and(|words| by_the_range_id_clause(words))
+            })
+        })
+        .count();
+    println!("range folds: IdBlockResumed: check 18's range-id clause on {by_clause}/{seeds}");
+    assert!(
+        by_clause > 0,
+        "check 18's range-id clause tripped on no compared seed of IdBlockResumed's {seeds}"
+    );
+}
+
+/// Check 7 against `AnyFreshNodeBootstraps` on the membership scenario's five nodes,
+/// whose nodes 4 and 5 are not bootstrap nodes and create every range with themselves
+/// among its voters (D-096): a second value at index 0 of every range. Measured: every
+/// seed (D-096: 1 000 of 1 000), so asserted on every compared seed. This is check 7
+/// seen to trip under the test, by D-096's instrument; §12 asserts check 7 against
+/// `SplitNotAtomicWithDescriptor`, Stage D's (above). The pair's correct half is the
+/// correct membership node on the same seeds, compared fold by fold too, on which no
+/// fold trips.
+///
+/// **Check 18's grants clause** (`IdsUnique`), which no variant of §10 trips, is compared
+/// here on a violation at every tier: the variant trips it on 4 of the first hundred
+/// seeds and none of the first twenty, so those four are pinned ([`GRANTS_PINNED`]) and
+/// compared fold by fold whatever the tier, each asserting its mechanism.
+// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps() {
+    let compared = range_folds_compared();
+    // An instrument of the range layer's own set since PROPOSED D-108 (#151).
+    let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
+    let membership_run = |seed: u64| {
+        membership::run_on_node(
+            Cluster::Node,
             seed,
             Variants::default(),
             NodeVariants::correct(),
-            RangeVariants::of(taken),
-        );
-        let (compared, tripped) = compare_records(seed, &format!("{taken:?}"), &report.records);
-        let restatements = report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
-        let splits = report.count(|e| matches!(e, TraceEvent::RangeSplit { .. }));
-        (compared, tripped, restatements, splits)
+            taken,
+        )
+        .records
     };
-    let mut compared = 0usize;
-    let mut tripped = 0usize;
-    let mut restatements = 0usize;
-    let mut splits = 0usize;
-    for taken in systems {
-        for (c, t, r, s) in sweep(seeds, |seed| compare(seed, taken)) {
-            compared += c;
-            tripped += t;
-            restatements += r;
-            splits += s;
-        }
+    let found = range_folds_under(
+        "AnyFreshNodeBootstraps on the membership scenario",
+        compared,
+        membership_run,
+    );
+    assert_eq!(
+        tripped_on(&found, Fold::DescriptorAgreement),
+        found.len(),
+        "check 7 did not trip on every compared membership seed of AnyFreshNodeBootstraps"
+    );
+    // The pins: each seed's comparison is the one above where the tier compared it, and
+    // is run here where it did not, so the grants clause is compared fold by fold on a
+    // violation at the gate's twenty too (#163's review).
+    let pinned: Vec<(u64, Option<String>)> = sweep(GRANTS_PINNED.len() as u64, |at| {
+        let seed = GRANTS_PINNED[usize::try_from(at).expect("four pins")];
+        let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+            Some(compared) => compared.tripped.get(&Fold::RangeIds).cloned(),
+            None => compare_range_folds(
+                seed,
+                "AnyFreshNodeBootstraps on the membership scenario, pinned",
+                &membership_run(seed),
+            )
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::RangeIds)
+            .cloned(),
+        };
+        (seed, words)
+    });
+    for (seed, words) in &pinned {
+        let words = words.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: check 18's grants clause did not trip under \
+                 AnyFreshNodeBootstraps on the membership scenario, where it was pinned for \
+                 two clusters' replicas of range 0 granting the block 6..=13 at index 2 to \
+                 two runs: a schedule move took it off that shape, so re-audit the pin to the \
+                 shape's absence with its reason (CLAUDE.md)"
+            )
+        });
+        let granted = grants_at_index_2_of(words);
+        assert!(
+            granted.is_some_and(|(first, second)| first != second),
+            "seed {seed}: check 18's grants clause tripped in a shape other than its pin's, \
+             two clusters' replicas of range 0 granting the block 6..=13 at index 2 to the \
+             runs of two nodes: {words}"
+        );
     }
-    // The correct node's seed 45 with its voter's right half taken out: the shape the
-    // right half's clause was written for, and the agreement held in violation.
-    // PROPOSED(D-109)
-    let planted = without_the_right_half(&correct(45).records, 2, 14);
-    let (c, in_violation) = compare_records(45, "the right half taken out", &planted);
-    compared += c;
-    tripped += in_violation;
     println!(
-        "node: check 8 agreed with its whole-trace fold at {compared} prefixes over {seeds} \
-         seeds and {} systems and the correct node's seed 45 planted, {tripped} of them in \
-         violation ({in_violation} of the planted seed's); {restatements} restatements and \
-         {splits} splits applied folded",
-        systems.len()
+        "range folds: AnyFreshNodeBootstraps: check 18's grants clause compared in violation \
+         on the pinned seeds {GRANTS_PINNED:?}, each the agreement branch at index 2 of range 0"
     );
-    assert!(
-        restatements > 0 && splits > 0,
-        "check 8 folded {restatements} restatements and {splits} splits: the agreement was \
-         asserted over nothing it holds"
-    );
-    assert!(
-        in_violation > 0,
-        "seed 45's run with its voter's right half taken out is in violation of check 8 at no \
-         prefix, so the agreement was held on green prefixes alone"
-    );
+    let correct = range_folds_under("the correct membership node", compared, |seed| {
+        membership::run_on_node(
+            Cluster::Node,
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::correct(),
+        )
+        .records
+    });
+    for (seed, outcome) in correct.iter().enumerate() {
+        // PROPOSED(D-107): check 8's right half's clause is compared and printed above,
+        // and not asserted absent on a correct system.
+        let stopping = stopping_folds(outcome);
+        assert!(
+            stopping.is_empty(),
+            "seed {seed}: the correct membership node tripped {stopping:?}"
+        );
+    }
+}
+
+/// The correct node's seed on which check 8's right half's clause tripped before the
+/// placeholders, and on whose trace its shape is now planted (`without_the_right_half`;
+/// PROPOSED D-109): (seed, node, parent, the split's index, the right half).
+// PROPOSED(D-107)
+const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (45, 2, 4, 165, 14);
+
+/// Check 8's right half's clause's violation on [`RIGHT_HALF_PINNED`], word for word.
+// PROPOSED(D-107)
+fn right_half_pinned_words() -> String {
+    let (_, node, parent, index, right) = RIGHT_HALF_PINNED;
+    format!(
+        "one owner per key: node {node} is a voter of range {parent}'s configuration at its \
+         split at index {index}, its replica of range {parent} has applied it, and at its \
+         restatement it holds no replica of the right half {right} (SHARD.md §8, check 8)"
+    )
 }
 
 /// `records` with `node`'s replica of `right` taken out from its creation on: the
@@ -2362,17 +3069,16 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
     report
         .check()
         .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
-    let mut checker = ananke_shard::invariants::Checker::new(true);
-    checker.extend(&report.records);
+    let checker = invariants::folded(&report.records);
     assert_eq!(
-        checker.owners().overlap_verdict(),
+        checker.verdict_of(Fold::Overlap),
         Ok(()),
         "seed {seed}: check 8's overlap clause"
     );
     // The shape D-107 pinned is gone, and this is why: the voter holds the right half
     // at its restatement.
     assert_eq!(
-        checker.owners().right_half_verdict(),
+        checker.verdict_of(Fold::RightHalf),
         Ok(()),
         "seed {seed}: check 8's right-half clause"
     );
@@ -2425,6 +3131,16 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         !report.records[..created].iter().any(|record| on(record)
             && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
         "seed {seed}: node {node} created the right half {right} before its placeholder did"
+    );
+    // The install's window (D-109 §1.6): before the descriptor was put in place at the
+    // creation's trace, node 2's placeholder answered two AppendEntries of 14 as a
+    // refused server, 0.2 ms and 18.8 ms after 14's creation, and 14's leader restarted
+    // the stream from offset 0 to a node that held the replica.
+    let answered = raft::placeholders_of(&report.records).answered_for_a_replica;
+    assert_eq!(
+        answered, 0,
+        "seed {seed}: {answered} placeholder answers were sent for a replica its node had \
+         created"
     );
     let crashed = find(
         "a crash after the right half's creation",
@@ -2589,6 +3305,8 @@ fn mechanism(violation: &str) -> &'static str {
         ("serving within span", "serving within span"),
         ("owners' generations", "owners' generations"),
         ("client refreshes", "client refreshes"),
+        // PROPOSED(D-109): check 20.
+        ("placeholder grants nothing", "placeholder grants nothing"),
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),
@@ -3166,6 +3884,13 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 ///
 /// The fan-out clause is asserted seen, every catch is one of the three, and each
 /// one's share is printed at every tier.
+///
+/// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
+/// and before the history and the fan-out clause (PROPOSED D-106, issue #140). None of
+/// their seven folds is in violation under the variant on any of seeds 0 to 999, and at
+/// ten thousand the split is D-101's to the seed (3 338 / 6 661 / 1), so they name no
+/// catch the attribution does not admit; one that ever did would fail this test as
+/// "caught by something other than", and be read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 #[test]
@@ -4448,21 +5173,36 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
     // answered with store incarnation 0, since it has no store, and the replica its node
     // then made — at its apply of the split, or at its placeholder's install — answers
     // with the fresh incarnation its creation drew (Q26), a change the leader forgets the
-    // follower's progress at, as D-042 says it must (PROPOSED D-109).
+    // follower's progress at, as D-042 says it must (PROPOSED D-109). That change is one
+    // per placeholder and per leader, so the placeholder explains **the first** reset of
+    // the follower by each leader of the range after it, and nothing more: a second
+    // reset by the same leader after the same placeholder is unexplained (#173's review,
+    // N1; measured at 0 of the correct node's first thousand seeds when it was bounded).
     let resets_unexplained = |report: &raft::Report| {
-        let mut placeholders: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // (range, node) → how many placeholders the node has made of the range.
+        let mut placeholders: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+        // (leader, range, follower, placeholder) already explained.
+        let mut used: BTreeSet<(u64, u64, u64, usize)> = BTreeSet::new();
         let (mut unexplained, mut explained) = (0usize, 0usize);
         for record in &report.records {
             match &record.event {
                 TraceEvent::RangeReplicaCreated { range } => {
                     if let Some(node) = record.node {
-                        placeholders.insert((*range, u64::from(node.get())));
+                        *placeholders
+                            .entry((*range, u64::from(node.get())))
+                            .or_default() += 1;
                     }
                 }
                 TraceEvent::RaftProgressReset {
-                    range, follower, ..
+                    server,
+                    range,
+                    follower,
+                    ..
                 } => {
-                    if placeholders.contains(&(*range, *follower)) {
+                    let first = placeholders
+                        .get(&(*range, *follower))
+                        .is_some_and(|made| used.insert((*server, *range, *follower, *made)));
+                    if first {
                         explained += 1;
                     } else {
                         unexplained += 1;

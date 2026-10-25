@@ -645,8 +645,50 @@ pub fn placeholders_of(records: &[TraceRecord]) -> PlaceholderCoverage {
     // (parent, index) → (right, the voters of the parent's configuration at it).
     let mut splits: BTreeMap<(u64, u64), (u64, Vec<u64>)> = BTreeMap::new();
     let mut waiting: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+    // The replicas a node answers for as replicas: from its creation of the range to its
+    // refusal or the range's removal there (PROPOSED D-109 §1.6).
+    let mut created: BTreeSet<(u64, u64)> = BTreeSet::new();
     for (at, record) in records.iter().enumerate() {
         let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RangeCreated { range, .. } => {
+                if let Some(node) = node {
+                    created.insert((node, *range));
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. }
+            | TraceEvent::RaftReplicaRefused { range, .. } => {
+                if let Some(node) = node {
+                    created.remove(&(node, *range));
+                }
+            }
+            TraceEvent::RaftRefused { .. } => {
+                if let Some(node) = node {
+                    created.retain(|(of, _)| *of != node);
+                }
+            }
+            TraceEvent::MessageSent { payload, .. } => {
+                if let Some(node) = node {
+                    coverage.answered_for_a_replica += messages_of(payload)
+                        .iter()
+                        .filter(|(range, message)| {
+                            created.contains(&(node, *range))
+                                && matches!(
+                                    message,
+                                    Message::AppendEntriesResponse {
+                                        hint: 1,
+                                        echo: 0,
+                                        incarnation: 0,
+                                        refused: true,
+                                        ..
+                                    }
+                                )
+                        })
+                        .count();
+                }
+            }
+            _ => {}
+        }
         match &record.event {
             TraceEvent::RangeReplicaCreated { range } => {
                 coverage.made += 1;
@@ -760,6 +802,11 @@ pub struct PlaceholderCoverage {
     pub installed_voters_waited: Vec<Duration>,
     /// Such voters still without their right half when the run ended.
     pub installed_voters_never: usize,
+    /// Placeholder answers sent for a replica that exists: an `AppendEntriesResponse`
+    /// refused with a hint of 1, an echo of zero and store incarnation 0, sent by a node
+    /// for a range it has traced the creation of and has not been refused or removed
+    /// from since (SHARD.md §5: the placeholder becomes a replica at its install).
+    pub answered_for_a_replica: usize,
 }
 
 /// What [`splits_of`] counts.
@@ -7754,6 +7801,7 @@ pub(crate) async fn client_on<E: Environment>(
                     seq += 1;
                     // `ClientIgnoresMismatch`: the resend goes to the range and
                     // generation the client had, merging nothing (§10, Q38).
+                    // PROPOSED(D-105): read from the range layer's set.
                     if range_variants.contains(RangeVariant::ClientIgnoresMismatch) {
                         target = target % servers + 1;
                         continue;

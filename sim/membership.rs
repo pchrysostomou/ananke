@@ -605,6 +605,7 @@ pub fn node_server_config(
     id: u64,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    range: RangeVariants,
 ) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
@@ -637,12 +638,21 @@ pub fn node_server_config(
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
-        // No range-layer variant runs on this scenario (PROPOSED D-105).
-        range_variants: RangeVariants::correct(),
+        // PROPOSED(D-105): the range layer's set beside the node's.
+        // PROPOSED(D-108): `AnyFreshNodeBootstraps` is the one range-layer variant this
+        // scenario runs.
+        range_variants: range,
     }
 }
 
-fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants, node: NodeVariants) {
+fn spawn_server(
+    cluster: Cluster,
+    sim: &Sim,
+    id: u64,
+    variants: Variants,
+    node: NodeVariants,
+    range: RangeVariants,
+) {
     let env = sim.env(NodeId::new(u32::try_from(id).expect("small")));
     let inner = env.clone();
     match cluster {
@@ -654,7 +664,8 @@ fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants, node: 
         Cluster::Node => {
             env.spawn("node", async move {
                 let _ =
-                    ananke_shard::server::run(inner, node_server_config(id, variants, node)).await;
+                    ananke_shard::server::run(inner, node_server_config(id, variants, node, range))
+                        .await;
             });
         }
     }
@@ -1979,23 +1990,31 @@ pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[must_use]
 pub fn run_on(cluster: Cluster, seed: u64, variants: impl Into<Variants>) -> Report {
-    run_on_node(cluster, seed, variants, NodeVariants::correct())
+    run_on_node(
+        cluster,
+        seed,
+        variants,
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    )
 }
 
-/// The same, with the node's own variants (PROPOSED D-096): the one-group server
-/// ignores them.
+/// The same, with the node's own variants and the range layer's (PROPOSED D-096,
+/// D-108): the one-group server ignores both.
+// PROPOSED(D-108): the range layer's set carried beside the node's.
 #[must_use]
 pub fn run_on_node(
     cluster: Cluster,
     seed: u64,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    range: RangeVariants,
 ) -> Report {
     let schedule = match cluster {
         Cluster::OneGroup => Schedule::draw(seed),
         Cluster::Node => Schedule::draw_on_the_node(seed),
     };
-    run_on_with_node(cluster, seed, schedule, variants, node)
+    run_on_with_node(cluster, seed, schedule, variants, node, range)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
@@ -2014,11 +2033,19 @@ pub fn run_on_with(
     schedule: Schedule,
     variants: impl Into<Variants>,
 ) -> Report {
-    run_on_with_node(cluster, seed, schedule, variants, NodeVariants::correct())
+    run_on_with_node(
+        cluster,
+        seed,
+        schedule,
+        variants,
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    )
 }
 
-/// Runs the scenario on `cluster` for `seed` with an explicit schedule and the
-/// node's own variants (PROPOSED D-096).
+/// Runs the scenario on `cluster` for `seed` with an explicit schedule, the node's own
+/// variants and the range layer's (PROPOSED D-096, D-108).
+// PROPOSED(D-108): the range layer's set carried beside the node's.
 #[must_use]
 pub fn run_on_with_node(
     cluster: Cluster,
@@ -2026,6 +2053,7 @@ pub fn run_on_with_node(
     schedule: Schedule,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    range: RangeVariants,
 ) -> Report {
     let variants = variants.into();
     let mut sim = Sim::new(config_on(cluster, seed, &schedule));
@@ -2036,7 +2064,7 @@ pub fn run_on_with_node(
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(cluster, &sim, id, variants, node);
+        spawn_server(cluster, &sim, id, variants, node, range);
     }
     for (i, &client) in clients.iter().enumerate() {
         let env = sim.env(client);
@@ -2044,14 +2072,7 @@ pub fn run_on_with_node(
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(
-                cluster,
-                inner,
-                i as u64 + 1,
-                SERVERS,
-                stats,
-                RangeVariants::correct(),
-            ),
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, range),
         );
     }
     let last_heal = sim.now();
