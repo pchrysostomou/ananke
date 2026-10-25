@@ -36,7 +36,7 @@
 //! scenarios that run this node, with the reason, rather than left to be discovered
 //! (CLAUDE.md's rule for a pinned situation's absence).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range as KeyRange;
@@ -61,7 +61,7 @@ use ananke_raft::store::{
     split_state_into,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
-use ananke_raft::{Input, Message, Persist, Raft};
+use ananke_raft::{Input, Message, Output, Persist, Raft};
 use ananke_storage::{EngineConfig, WriteBatch};
 use bytes::Bytes;
 
@@ -722,6 +722,25 @@ pub struct ServerHost<E: Environment> {
     // PROPOSED(D-086): a live install moves the `apply` task's applied state with the
     // replica, as it moves the core's.
     applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
+    /// The ranges this node keeps a placeholder for (SHARD.md §5, Q22): a range whose
+    /// messages reached the node before it held a replica of it. A placeholder has no
+    /// descriptor, no span and no Raft state — this set is all of it, in memory, and a
+    /// restart forgets it — grants no vote or pre-vote, acknowledges nothing, answers
+    /// an `AppendEntries` as a refused server does, and takes only a snapshot that
+    /// overlaps no initialised replica here. It ends where the range is created: at
+    /// the node's apply of the split that makes it, or at its own install. Shared with
+    /// the `snapshot` task, which assembles a placeholder's stream.
+    // PROPOSED(D-109): the placeholder is the host's, and is this set.
+    placeholders: Arc<Mutex<BTreeSet<RangeId>>>,
+    /// Whether the node runs on an engine a re-seed built, this start's or an earlier
+    /// one's (D-066 opens it as the newest directory not marked lost). Such a node lost
+    /// an engine that may have held a replica configuration never names — a right half
+    /// its own split made — and its fresh engine holds no key to tell it so, so it cannot
+    /// tell a range it held before its loss from one it never held: every replica a
+    /// placeholder's install creates on it is quarantined, as the re-seed's own are
+    /// (D-035, Q26).
+    // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
+    on_a_reseed: bool,
 }
 
 pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1065,6 +1084,87 @@ impl<E: Environment> ServerHost<E> {
         }
         Some(restored)
     }
+
+    /// The replica a placeholder's install created (SHARD.md §5, §8; Q22): the store
+    /// the switch wrote, which the `snapshot` task opened and entered in the node's
+    /// tables, and whose creation it traced at the switch, restored as a core.
+    ///
+    /// The placeholder ends here. The replica states its recovery and its term as a
+    /// start does (`restate`), so the checks that follow a replica from its start —
+    /// the timer check, pre-vote's property — follow this one from here, where its
+    /// core began. On a node a re-seed rebuilt the install wrote the quarantine, and the
+    /// replica is restored and stated quarantined, as a re-seeded replica's install
+    /// states it (`installed`).
+    ///
+    /// `None` when the switch left nothing to restore, which the task never hands on:
+    /// it opens the store and reads its descriptor back before it says it switched.
+    // PROPOSED(D-109): a placeholder's install creates the replica.
+    fn created_by_install(
+        &self,
+        range: RangeId,
+        at: &Identity,
+        config: &Configuration,
+        descriptor: Option<&RangeDescriptor>,
+    ) -> Option<Raft> {
+        let store = lock(&self.stores).get(&range).cloned()?;
+        let descriptor = descriptor?;
+        lock(&self.placeholders).remove(&range);
+        lock(&self.descriptors).insert(range, descriptor.clone());
+        lock(&self.replicas).insert(range, Arc::new(Mutex::new(Replica::new())));
+        // Q13, D-057: the replica draws its election timeout from its own range's
+        // stream, as every core of the node does.
+        let seed = if self.node.contains(NodeVariant::OneSeedForEveryCore) {
+            self.env.rng().next_u64()
+        } else {
+            self.env.range_rng(range.get()).next_u64()
+        };
+        let core = Raft::restore_compacted(
+            self.id,
+            Configuration::of(&self.initial),
+            RaftConfig {
+                range: range.get(),
+                ..self.raft.clone()
+            },
+            seed,
+            store.term(),
+            store.vote(),
+            at.last_index,
+            at.last_term,
+            Some(config.clone()),
+            Vec::new(),
+            self.on_a_reseed,
+        );
+        // The quarantine the install wrote on a node a re-seed rebuilt (D-035): this
+        // replica may be one whose votes were in the engine the node lost.
+        // PROPOSED(D-109)
+        if core.quarantined() {
+            self.env.trace(TraceEvent::RaftReseeded {
+                server: self.id.0,
+                range: range.get(),
+            });
+        }
+        self.env.trace(TraceEvent::RaftRecovered {
+            server: self.id.0,
+            range: range.get(),
+            term: core.term(),
+            applied: at.last_index,
+            last_index: core.last_index(),
+            incarnation: store.incarnation(),
+            state: if core.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
+        });
+        self.env.trace(TraceEvent::RaftTerm {
+            server: self.id.0,
+            range: range.get(),
+            term: core.term(),
+            role: "follower",
+            received: None,
+        });
+        Some(core)
+    }
 }
 
 impl<E: Environment> Host for ServerHost<E> {
@@ -1079,11 +1179,130 @@ impl<E: Environment> Host for ServerHost<E> {
         }
     }
 
-    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, RangeId)> {
+    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, Option<RangeId>)> {
         match local {
-            Local::RangeAdded { core, parent, .. } => Some((core.clone(), *parent)),
+            // The node's apply of the split made the right half, and its placeholder,
+            // if it kept one, ends here (SHARD.md §5, Q22).
+            Local::RangeAdded {
+                range,
+                core,
+                parent,
+            } => {
+                lock(&self.placeholders).remove(range);
+                Some((core.clone(), Some(*parent)))
+            }
+            // A placeholder's install switched: the replica it created (§5, Q22).
+            // PROPOSED(D-109)
+            Local::Snapshot(SnapAnswer::Switched {
+                range,
+                at,
+                config,
+                descriptor,
+            }) if lock(&self.placeholders).contains(range) => self
+                .created_by_install(*range, at, config, descriptor.as_deref())
+                .map(|core| (Box::new(core), None)),
             _ => None,
         }
+    }
+
+    /// A message for a range this node holds no replica of: its placeholder's
+    /// (SHARD.md §5, Q22). The first message of a range the node does not hold makes
+    /// the placeholder, traced `RangeReplicaCreated`, which is all a placeholder is
+    /// (`placeholders`).
+    ///
+    /// It answers an `AppendEntries` as a refused server does (RAFT.md §3, D-049,
+    /// PROPOSED D-087): a rejection carrying the request's term and previous index, a
+    /// hint of 1, an echo of zero, so no lease promise and no read confirmation is ever
+    /// measured from it, store incarnation 0, since it has no store, and the refused
+    /// mark, so check quorum counts it only while a stream to it progresses. The hint
+    /// is what asks for the snapshot: it moves the leader's next index for the node to
+    /// 1, which feeds it the snapshot once the log is compacted, and otherwise draws the
+    /// rejection at previous index 0 that designates it snapshot-fed (D-037). Silence
+    /// would ask nothing (§5).
+    ///
+    /// It grants nothing: a vote or pre-vote request, a `TimeoutNow` and every response
+    /// go unanswered, as a refused server drops them. It cannot vote twice, because it
+    /// never votes, and that is the departure from D-033's usual rules SHARD.md makes
+    /// for placeholders (Q22). `UninitialisedReplicaVotes` is the hole: it grants every
+    /// vote and pre-vote request, keeping nothing, and traces each grant.
+    // PROPOSED(D-109): the placeholder answers as a refused server does.
+    fn unheld(&self, range: RangeId, from: ServerId, message: Message) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        // A range the node holds a descriptor or a store of is initialised here already
+        // and its core is on its way to the `raft` task: a split's apply made it — its
+        // descriptor is in place from the creation's trace, its store a disk read later
+        // — or a placeholder's install did, and the core takes its place once that task
+        // reaches the input that carries it. Its messages meanwhile are dropped, as a
+        // core's are while it is down; they are no placeholder's to answer, and a
+        // placeholder made there would answer for a replica that holds the range
+        // (SHARD.md §5).
+        // PROPOSED(D-109)
+        let initialised = lock(&self.descriptors).contains_key(&range);
+        if initialised || lock(&self.stores).contains_key(&range) {
+            return outputs;
+        }
+        if lock(&self.placeholders).insert(range) {
+            outputs.push(Output::Trace(TraceEvent::RangeReplicaCreated {
+                range: range.get(),
+            }));
+        }
+        let grants = self
+            .range_variants
+            .contains(RangeVariant::UninitialisedReplicaVotes);
+        match message {
+            Message::AppendEntries {
+                term, prev_index, ..
+            } => outputs.push(Output::Send {
+                to: from,
+                message: Message::AppendEntriesResponse {
+                    term,
+                    success: false,
+                    prev_index,
+                    match_index: 0,
+                    hint: 1,
+                    echo: 0,
+                    local: 0,
+                    incarnation: 0,
+                    refused: true,
+                },
+            }),
+            Message::PreVote { term, .. } if grants => {
+                outputs.push(Output::Trace(TraceEvent::RaftVote {
+                    server: self.id.0,
+                    range: range.get(),
+                    term,
+                    candidate: from.0,
+                    granted: true,
+                    pre: true,
+                }));
+                outputs.push(Output::Send {
+                    to: from,
+                    message: Message::PreVoteResponse {
+                        term,
+                        granted: true,
+                    },
+                });
+            }
+            Message::RequestVote { term, .. } if grants => {
+                outputs.push(Output::Trace(TraceEvent::RaftVote {
+                    server: self.id.0,
+                    range: range.get(),
+                    term,
+                    candidate: from.0,
+                    granted: true,
+                    pre: false,
+                }));
+                outputs.push(Output::Send {
+                    to: from,
+                    message: Message::RequestVoteResponse {
+                        term,
+                        granted: true,
+                    },
+                });
+            }
+            _ => {}
+        }
+        outputs
     }
 
     /// The right half is on the node: the `snapshot` task hosts its spans, and where
@@ -3195,6 +3414,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         bootstrap_meta = Some(descriptors);
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
+    // The same two facts read the other way: the node runs on an engine a re-seed
+    // built, this start's or an earlier one's, so a replica it held before its loss is
+    // one it cannot name, and every replica a placeholder's install creates here is
+    // quarantined (D-035; SHARD.md §5's Q26 reason holds only on a node that lost no
+    // engine).
+    // PROPOSED(D-109)
+    let on_a_reseed = reseeded_now || engine.dir != base_dir;
     // A node not named at bootstrap writes its interim replicas' descriptors at its
     // first start, in the configured directory alone, so that every replica of the
     // node checks a key against a descriptor (SHARD.md §2, §3; `interim_state`).
@@ -3347,6 +3573,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         });
     }
 
+    // The node's placeholders, shared by the host, which makes them, and the
+    // `snapshot` task, which assembles their streams (SHARD.md §5, Q22). None survives
+    // a restart: a placeholder holds nothing durable.
+    // PROPOSED(D-109)
+    let placeholders: Arc<Mutex<BTreeSet<RangeId>>> = Arc::default();
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -3374,6 +3605,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         ids: ids.clone(),
         refill_at,
         applied: applied_at.clone(),
+        placeholders: placeholders.clone(),
+        on_a_reseed,
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
@@ -3507,6 +3740,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             plan,
             local.clone(),
             snaps.clone(),
+            placeholders,
+            on_a_reseed,
+            range_variants,
         );
         async move {
             task.run().await;

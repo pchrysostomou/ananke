@@ -1233,3 +1233,459 @@ fn spawn(
         let _ = ananke_shard::server::run(inner, server_config(id, variants, node)).await;
     });
 }
+
+// The re-seed after a split: a right half back through a placeholder.
+
+/// The range the re-seed after a split splits: the first user range, `[k0, k2)`.
+pub const SPLIT_PARENT: u64 = FIRST_RANGE;
+/// The key it splits at: the right half is `[k1, k2)`.
+pub const SPLIT_KEY: &str = "k1";
+/// The key the run's writer writes, P's left half's, so that P's log goes on growing past
+/// the split and its leader takes and compacts past it.
+const LEFT_KEY: &str = "k0";
+/// How long the three run before the split is asked: every range elects.
+const SPLIT_SETTLE: Duration = Duration::from_secs(2);
+/// The longest the run waits for the split to be traced, and then for `x` to apply it.
+const SPLIT_BUDGET: Duration = Duration::from_secs(4);
+/// The longest the run waits, `x` down, for P's leader to compact past the split, after
+/// [`GONE`] has passed.
+const SPLIT_COMPACT_BUDGET: Duration = Duration::from_secs(8);
+/// The slice the run advances in while it waits for something.
+const SPLIT_SLICE: Duration = Duration::from_millis(50);
+/// How long the run goes on after `x` starts again on its lost store: its re-seed
+/// streams, and its right half's stream to its placeholder.
+const SPLIT_AFTER: Duration = Duration::from_secs(8);
+
+/// What one run of the re-seed after a split built and traced
+/// ([`run_after_split`]).
+#[derive(Clone, Debug)]
+pub struct AfterSplit {
+    /// The seed.
+    pub seed: u64,
+    /// The run's trace.
+    pub records: Vec<TraceRecord>,
+    /// The follower of P that applied the split, and was then refused and re-seeded.
+    pub x: u64,
+    /// The split: its index and the right half's id.
+    pub split: Option<(u64, u64)>,
+    /// What the run could not build, if anything.
+    pub unbuilt: Option<String>,
+}
+
+impl AfterSplit {
+    /// Whether `record` is `x`'s: a scenario's node ids are its server ids.
+    fn on_x(&self, record: &TraceRecord) -> bool {
+        record.node.map(|node| u64::from(node.get())) == Some(self.x)
+    }
+
+    /// Where `x`'s refusal stands in the trace.
+    #[must_use]
+    pub fn refused_at(&self) -> Option<usize> {
+        self.records.iter().position(|record| {
+            matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == self.x)
+        })
+    }
+
+    /// Whether `x` created `range` before its refusal: the right half `x`'s own apply of
+    /// the split made, which its refused engine held.
+    #[must_use]
+    pub fn held_before_refusal(&self, range: u64) -> bool {
+        let refused = self.refused_at().unwrap_or(self.records.len());
+        self.records[..refused].iter().any(|record| {
+            self.on_x(record)
+                && matches!(&record.event, TraceEvent::RangeCreated { range: r, .. } if *r == range)
+        })
+    }
+
+    /// Whether `x` made a placeholder of `range` after its refusal.
+    #[must_use]
+    pub fn placeholder_after_refusal(&self, range: u64) -> bool {
+        let Some(refused) = self.refused_at() else {
+            return false;
+        };
+        self.records[refused..].iter().any(|record| {
+            self.on_x(record)
+                && matches!(record.event, TraceEvent::RangeReplicaCreated { range: r } if r == range)
+        })
+    }
+
+    /// `x`'s creation of `range` by an install after its refusal: where it stands, and the
+    /// generation and span it names.
+    #[must_use]
+    pub fn installed_after_refusal(&self, range: u64) -> Option<(usize, u64, Bytes, Bytes)> {
+        let refused = self.refused_at()?;
+        self.records
+            .iter()
+            .enumerate()
+            .skip(refused)
+            .find_map(|(at, record)| match &record.event {
+                TraceEvent::RangeCreated {
+                    range: r,
+                    cause: RangeCause::Snapshot,
+                    generation,
+                    start,
+                    end,
+                    ..
+                } if *r == range && self.on_x(record) => {
+                    Some((at, *generation, start.clone(), end.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether `x` stated `range` quarantined after record `at`: its `RaftReseeded` of the
+    /// range, and a `RaftRecovered` of it saying `Quarantined` (D-035, D-081).
+    #[must_use]
+    pub fn quarantined_after(&self, range: u64, at: usize) -> bool {
+        let after = &self.records[at..];
+        let marked = after.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftReseeded { server, range: r }
+                if server == self.x && r == range)
+        });
+        let stated = after.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftRecovered { server, range: r, state, .. }
+                if server == self.x && r == range && state == RecoveredAs::Quarantined)
+        });
+        marked && stated
+    }
+
+    /// The votes and pre-votes `x` granted `range` after record `at`.
+    #[must_use]
+    pub fn granted_after(&self, range: u64, at: usize) -> usize {
+        self.records[at..]
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftVote { server, range: r, granted: true, .. }
+                    if server == self.x && r == range)
+            })
+            .count()
+    }
+
+    /// The run's verdict: checks 1 to 4, the commit majority, the range layer's folds
+    /// (checks 7 to 18) and no node stopped.
+    ///
+    /// # Errors
+    ///
+    /// The first violation, with the seed.
+    pub fn check(&self) -> Result<(), String> {
+        let seed = self.seed;
+        if let Some((server, reason)) = self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RaftServerFailed { server, reason } => Some((*server, reason.clone())),
+            _ => None,
+        }) {
+            return Err(format!("seed {seed}: server {server} stopped: {reason}"));
+        }
+        if let Err(violation) = ananke_raft::invariants::all(crate::traced(&self.records)) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        if let Err(violation) = ananke_raft::invariants::commit_majority(
+            crate::traced(&self.records),
+            usize::try_from(SERVERS).expect("small"),
+        ) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        if let Err(violation) = ananke_shard::invariants::all(&self.records) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        Ok(())
+    }
+
+    /// The case the run is for, per seed: `x` held the right half, was refused, and was
+    /// created it again by its placeholder's install, after its P was installed past the
+    /// split — P's install creation at the split's generation over the left half, which
+    /// is what leaves `x` nothing to create the right half from but its placeholder.
+    ///
+    /// # Errors
+    ///
+    /// What was not built or not reached, with the seed.
+    pub fn reached(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        if let Some(why) = &self.unbuilt {
+            return Err(format!(
+                "seed {seed}: the re-seed after a split was not built: {why}"
+            ));
+        }
+        let Some((_, right)) = self.split else {
+            return Err(format!("seed {seed}: no split was traced"));
+        };
+        if self.refused_at().is_none() {
+            return Err(format!("seed {seed}: node {x} was never refused"));
+        }
+        if !self.held_before_refusal(right) {
+            return Err(format!(
+                "seed {seed}: node {x} never created the right half {right} before its \
+                 refusal, so it lost nothing of it"
+            ));
+        }
+        let left_end = ananke_raft::apply::user_key(SPLIT_KEY.as_bytes());
+        match self.installed_after_refusal(SPLIT_PARENT) {
+            Some((_, generation, _, end))
+                if generation == FIRST_GENERATION + 1 && end == left_end => {}
+            other => {
+                return Err(format!(
+                    "seed {seed}: node {x}'s re-seed of range {SPLIT_PARENT} was not an install \
+                     of its left half at the split's generation: {other:?}"
+                ));
+            }
+        }
+        if !self.placeholder_after_refusal(right) {
+            return Err(format!(
+                "seed {seed}: node {x} made no placeholder of the right half {right} after \
+                 its refusal"
+            ));
+        }
+        match self.installed_after_refusal(right) {
+            Some((_, generation, start, _))
+                if generation == FIRST_GENERATION + 1 && start == left_end => {}
+            other => {
+                return Err(format!(
+                    "seed {seed}: node {x} was not created the right half {right} by its \
+                     placeholder's install at the split's generation: {other:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The run's writer: puts to P's left half's key, routed by the scenario's fixed map,
+/// which the split leaves true for that key, and following `NotLeader`.
+async fn left_writer<E: Environment>(env: E) {
+    let Ok(sock) = env.net().bind(client_addr(1)).await else {
+        return;
+    };
+    let mut leader: Option<u64> = None;
+    let mut seq = 0u64;
+    loop {
+        seq += 1;
+        let target = leader.unwrap_or_else(|| 1 + env.rng().below(SERVERS));
+        let request = RangedRequest {
+            generation: FIRST_GENERATION,
+            range: RangeId(SPLIT_PARENT),
+            request: Request {
+                client: 1,
+                seq,
+                command: Command::Put {
+                    key: Bytes::from(LEFT_KEY),
+                    value: Bytes::from(format!("v{seq}")),
+                },
+            },
+        };
+        let _ = sock.send(server_addr(target), request.encode()).await;
+        let deadline = env.clock().now() + Duration::from_millis(80);
+        loop {
+            let recv = pin!(sock.recv());
+            let timer = pin!(env.clock().sleep_until(deadline));
+            let bytes = match race(&env, recv, timer).await {
+                Either::Left(Ok((_, bytes))) => bytes,
+                Either::Left(Err(_)) | Either::Right(()) => {
+                    leader = None;
+                    break;
+                }
+            };
+            let Ok(response) = RangedResponse::decode(bytes) else {
+                continue;
+            };
+            if response.response.seq != seq {
+                continue;
+            }
+            leader = match response.response.reply {
+                Reply::NotLeader { leader: Some(who) } => Some(who.0),
+                Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. } => None,
+                Reply::Outcome(_) => Some(target),
+            };
+            break;
+        }
+        env.clock().sleep(Duration::from_millis(4)).await;
+    }
+}
+
+/// The operator's split of P at [`SPLIT_KEY`], asked of `target` and following
+/// `NotLeader`; it records nothing, since the trace says whether the split took effect.
+async fn split_operator<E: Environment>(env: E, mut target: u64) {
+    let Ok(sock) = env.net().bind(crate::raft::admin_addr(1)).await else {
+        return;
+    };
+    for _ in 0..SERVERS * 4 {
+        let request = RangedRequest {
+            generation: FIRST_GENERATION,
+            range: RangeId(SPLIT_PARENT),
+            request: Request {
+                client: u64::MAX >> 2,
+                seq: 1,
+                command: Command::Split {
+                    key: Bytes::from(SPLIT_KEY),
+                    right: 0,
+                },
+            },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let recv = pin!(sock.recv());
+        let timer = pin!(env.clock().sleep(Duration::from_millis(300)));
+        let Either::Left(Ok((_, bytes))) = race(&env, recv, timer).await else {
+            target = target % SERVERS + 1;
+            continue;
+        };
+        let Ok(answer) = RangedResponse::decode(bytes) else {
+            continue;
+        };
+        match answer.response.reply {
+            Reply::NotLeader { leader: Some(who) } => target = who.0,
+            Reply::NotLeader { leader: None } => {
+                env.clock().sleep(Duration::from_millis(50)).await;
+                target = target % SERVERS + 1;
+            }
+            Reply::Outcome(_) | Reply::RangeMismatch { .. } => return,
+        }
+    }
+}
+
+/// The latest leader `records` name for `range`, by term.
+fn leader_of(records: &[TraceRecord], range: u64) -> Option<u64> {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::RaftLeader {
+                server,
+                range: led,
+                term,
+                ..
+            } if *led == range => Some((*term, *server)),
+            _ => None,
+        })
+        .max()
+        .map(|(_, server)| server)
+}
+
+/// The split of P the trace names, by its first `RangeSplit`: its index and right half.
+fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
+    records.iter().find_map(|record| match &record.event {
+        TraceEvent::RangeSplit {
+            range,
+            right,
+            index,
+            ..
+        } if *range == SPLIT_PARENT => Some((*index, *right)),
+        _ => None,
+    })
+}
+
+/// Runs the re-seed after a split for `seed` on the correct system.
+///
+/// The three servers of the re-seed shape and a writer on P's left half's key. P, the
+/// first user range, is split at [`SPLIT_KEY`] by an operator once every range has
+/// elected. A follower `x` of P, drawn on the run's own stream, applies the split — it
+/// creates the right half R and holds it — and is crashed; it stays down for `GONE`
+/// and until P's leader has compacted past the split, and starts again on a store
+/// marked lost, so it is refused and re-seeded (Q15). The re-seed rebuilds the replicas
+/// configuration names. R is not one of them and the fresh engine holds no key of it,
+/// so R comes back to `x` only through its placeholder: R's leader reaches it, and is
+/// told to stream (SHARD.md §5, Q22). `x` may have voted in R before its loss, and the
+/// replica its placeholder's install creates is quarantined (PROPOSED D-109 §2).
+#[must_use]
+pub fn run_after_split(seed: u64) -> AfterSplit {
+    let mut sim = Sim::new(config(seed));
+    let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
+    let client = sim.add_node();
+    let variants = Variants::default();
+    let node_variants = NodeVariants::correct();
+    for id in 1..=SERVERS {
+        spawn(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            variants,
+            node_variants,
+            false,
+        );
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("writer", left_writer(inner));
+    }
+    sim.run_for(SPLIT_SETTLE);
+    let leader = leader_of(&sim.trace(), SPLIT_PARENT).unwrap_or(1);
+    let mut draw = moirae_sched::stream(seed, "reseed-after-split");
+    let followers: Vec<u64> = (1..=SERVERS).filter(|id| *id != leader).collect();
+    let x = followers[usize::try_from(draw.below(followers.len() as u64)).expect("small")];
+    let mut report = AfterSplit {
+        seed,
+        records: Vec::new(),
+        x,
+        split: None,
+        unbuilt: None,
+    };
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("split", split_operator(inner, leader));
+    }
+    let deadline = sim.now() + SPLIT_BUDGET;
+    let applied_by_x = |records: &[TraceRecord]| {
+        records.iter().any(|record| {
+            record.node.map(|node| u64::from(node.get())) == Some(x)
+                && matches!(record.event, TraceEvent::RangeSplit { range, .. } if range == SPLIT_PARENT)
+        })
+    };
+    loop {
+        let records = sim.trace();
+        report.split = split_of(&records);
+        if report.split.is_some() && applied_by_x(&records) {
+            break;
+        }
+        if sim.now() >= deadline {
+            report.unbuilt = Some(format!(
+                "node {x} did not apply a split of range {SPLIT_PARENT} within {SPLIT_BUDGET:?}"
+            ));
+            report.records = records;
+            return report;
+        }
+        sim.run_for(SPLIT_SLICE);
+    }
+    let Some((index, _)) = report.split else {
+        unreachable!("the loop above leaves only with a split");
+    };
+    // The loss: `x` crashed, kept down until P's leader has taken and compacted past the
+    // split, and started again on a store marked lost, as the re-seed shape loses one.
+    let at = nodes[x as usize - 1];
+    sim.crash(at);
+    sim.run_for(GONE);
+    // P's leader, and not any replica: a follower compacts to its own applied index with
+    // no checkpoint behind it (D-078), and `x` may have done so before its crash. A leader
+    // whose snapshot is past the split streams `x` a version past it, which is what
+    // leaves `x` its right half to get through its placeholder rather than by a replay of
+    // the split.
+    let compacted_by_leader = |records: &[TraceRecord]| {
+        leader_of(records, SPLIT_PARENT).is_some_and(|leader| {
+            records.iter().any(|record| {
+                matches!(record.event, TraceEvent::RaftCompacted { server, range, through, .. }
+                    if server == leader && range == SPLIT_PARENT && through > index)
+            })
+        })
+    };
+    let deadline = sim.now() + SPLIT_COMPACT_BUDGET;
+    while !compacted_by_leader(&sim.trace()) {
+        if sim.now() >= deadline {
+            report.unbuilt = Some(format!(
+                "range {SPLIT_PARENT}'s leader did not compact past the split at {index} \
+                 within {SPLIT_COMPACT_BUDGET:?} of node {x}'s crash and {GONE:?}"
+            ));
+            report.records = sim.trace();
+            return report;
+        }
+        sim.run_for(SPLIT_SLICE);
+    }
+    sim.restart(at);
+    spawn(&sim, at, x, variants, node_variants, true);
+    sim.run_for(SPLIT_AFTER);
+    report.records = sim.trace();
+    report
+}

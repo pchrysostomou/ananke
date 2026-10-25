@@ -101,6 +101,33 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-placeholders` (2026-10-18), off `phase-3-stage-c-restatement-check8`
+  at b21d76e (PR #166), draft PR stacked on #166, PROPOSED D-109 (footer D-110), **Stage C's
+  placeholders (Q22)**, #162's S8, the first of three stacked PRs: (a) the placeholder,
+  `UninitialisedReplicaVotes` and check 20; (b) `sim/split.rs` (ii), joining nodes that
+  hold nothing and exactly three bootstrap nodes; (c) a re-seeded node's right halves
+  (#172). Built in (a) so far: a message for a range a node holds no replica of is handed
+  to the host (`Round::unheld`, `Host::unheld`), which keeps a placeholder for it — a set
+  in memory, traced `RangeReplicaCreated` — that answers an `AppendEntries` as a refused
+  server does (hint 1, echo 0, incarnation 0, the refused mark) and grants nothing; a
+  range being created (descriptor or store in place, core not yet in the round) is no
+  placeholder's; the `snapshot` task assembles a placeholder's stream and installs it
+  itself, refusing an install whose span overlaps an initialised replica on the node
+  (`StartOver::Overlaps`, the receiver's half of Q27 until S9), creating the replica at
+  the switch (`RangeCreated { cause: snapshot }`) and handing its core to the round (the
+  split's apply's "R already initialised here" assertion, as first built, fired under
+  `IdBlockResumed` before check 18 could see the reused id, and goes to S9); the timer
+  check skips a placeholder; `UninitialisedReplicaVotes` built (bit 7), its check 20 to
+  follow once
+  #166 carries #163's `Fold`. **Measured at 1 000 seeds of the correct node**: every
+  verdict green, 92 schedules moved, placeholders on 896 seeds, 15 installs into one (every
+  voter installed past its split, #170 resolved: 99 ms to 2.367 s for its right half), 15
+  overlap refusals on 10 seeds; check 8's right half's clause holds on 1 000 of 1 000 under
+  both its readings (D-107 unruled, so still folded and printed); the hand-folded check 20
+  catches the variant on 896 of 1 000 and the correct node on none. No other node
+  scenario's schedule moved (100 seeds each, `sim/install.rs` 32). Pins re-audited: 45
+  upgraded to the placeholder that closes it, 8's split wedge moved to seed 76, 613's stall
+  moved from `k4` to `k1`.
 - Branch `phase-3-stage-c-restatement-check8` (2026-10-18), off `main` at 6633266, PR
   #166, PROPOSED D-107 (footer D-109 since the merge of `main` at 5e3d575), **Stage C's
   restatement, check 7's restatement clause, check 8, the install traces and the

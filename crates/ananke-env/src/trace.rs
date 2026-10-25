@@ -1489,6 +1489,14 @@ pub enum StartOver {
     /// anything was admitted: it took no slot under the cap and disturbed no assembly.
     /// The sender starts over and finds the range where it now lives (D-075).
     NotHosted,
+    /// The stream completed into a placeholder, and the snapshot's span overlaps an
+    /// initialised replica on this node: SHARD.md §5's overlap rule (Q27), which keeps
+    /// one owner per key on a node (check 8). Nothing was installed; the staged bytes
+    /// are cleared and the sender starts over, by when the replica it overlapped may
+    /// have moved on. The rule's own answer, `Overlaps`, and the leader's wait before it
+    /// streams again are the overlap rule's slice's (PROPOSED D-109).
+    // PROPOSED(D-109): a placeholder's install is refused where it would overlap.
+    Overlaps,
 }
 
 impl StartOver {
@@ -1500,6 +1508,7 @@ impl StartOver {
             StartOver::Cap => "cap",
             StartOver::Unusable => "unusable",
             StartOver::NotHosted => "not-hosted",
+            StartOver::Overlaps => "overlaps",
         }
     }
 }

@@ -1364,8 +1364,15 @@ impl SplitLineage {
 #[derive(Clone, Debug, Default)]
 pub struct MetaNeverGoesBack {
     /// What meta names, as the sub-intervals its applies won: keyed by end, with the
-    /// start and the generation.
-    named: BTreeMap<Bytes, (Bytes, u64)>,
+    /// start, the generation and the meta index of the apply that named it.
+    ///
+    /// The index is what makes "from one meta index to the next" exact whatever order
+    /// the replicas trace their applies in: a replica that applies an index below one
+    /// already folded — a lagging follower, or a re-seeded replica of the meta range,
+    /// whose state starts again at the bootstrap's index 0 (D-098) — is compared with
+    /// the later index as an earlier one, and does not replace what it named
+    /// (PROPOSED D-109).
+    named: BTreeMap<Bytes, (Bytes, u64, u64)>,
     violation: Option<String>,
 }
 
@@ -1423,12 +1430,15 @@ impl MetaNeverGoesBack {
                 let overlapping: Vec<Bytes> = self
                     .named
                     .range::<[u8], _>((Excluded(&start[..]), Unbounded))
-                    .take_while(|(_, (from, _))| from < end)
+                    .take_while(|(_, (from, ..))| from < end)
                     .map(|(key, _)| key.clone())
                     .collect();
+                // What a later (or the same) index named inside the won span, which this
+                // apply does not replace: clipped to the span, in key order.
+                let mut kept: Vec<(Bytes, Bytes, u64, u64)> = Vec::new();
                 for key in overlapping {
-                    let (from, generation) = self.named.remove(&key).expect("listed");
-                    if generation > meta.generation {
+                    let (from, generation, at) = self.named.remove(&key).expect("listed");
+                    if at < *index && generation > meta.generation {
                         self.violation = Some(format!(
                             "meta never goes back: node {node:?}'s meta apply of {index} names \
                              [{start:?}, {end:?}) for range {} at generation {}, where meta \
@@ -1438,15 +1448,45 @@ impl MetaNeverGoesBack {
                         ));
                         return;
                     }
+                    if at >= *index && generation < meta.generation {
+                        self.violation = Some(format!(
+                            "meta never goes back: node {node:?}'s meta apply of {index} names \
+                             [{start:?}, {end:?}) for range {} at generation {}, where meta's \
+                             apply of {at} named [{from:?}, {key:?}) at generation \
+                             {generation}: the generation meta names never falls from one \
+                             meta index to the next (SHARD.md §1, §8)",
+                            meta.range, meta.generation
+                        ));
+                        return;
+                    }
                     if from < *start {
-                        self.named.insert(start.clone(), (from.clone(), generation));
+                        self.named
+                            .insert(start.clone(), (from.clone(), generation, at));
                     }
                     if key > *end {
-                        self.named.insert(key, (end.clone(), generation));
+                        self.named
+                            .insert(key.clone(), (end.clone(), generation, at));
+                    }
+                    if at >= *index {
+                        let from = if from < *start { start.clone() } else { from };
+                        let to = if key > *end { end.clone() } else { key };
+                        kept.push((from, to, generation, at));
                     }
                 }
-                self.named
-                    .insert(end.clone(), (start.clone(), meta.generation));
+                // The won span, less what a later index named, is this apply's.
+                let mut cursor = start.clone();
+                for (from, to, generation, at) in kept {
+                    if cursor < from {
+                        self.named
+                            .insert(from.clone(), (cursor.clone(), meta.generation, *index));
+                    }
+                    self.named.insert(to.clone(), (from, generation, at));
+                    cursor = to;
+                }
+                if cursor < *end {
+                    self.named
+                        .insert(end.clone(), (cursor, meta.generation, *index));
+                }
             }
         }
     }
@@ -1545,7 +1585,81 @@ impl ClientRefreshes {
     }
 }
 
-/// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16 and 17,
+/// Check 20, a placeholder grants nothing (SHARD.md §8, Q22): a `RaftVote` granted,
+/// vote or pre-vote, of range R on node `n` when `n` has traced no `RangeCreated` of R
+/// since its last `RangeRemoved` of R is a violation. A replica outlives its node's
+/// crash, so a crash ends nothing here; a placeholder is what a node keeps for a range
+/// it holds no replica of, and the only thing on a node that could grant for such a
+/// range. `RangeReplicaCreated` is folded for the words: a grant that follows one is
+/// named a placeholder's.
+// PROPOSED(D-109)
+#[derive(Clone, Debug, Default)]
+pub struct PlaceholderGrantsNothing {
+    /// The replicas each node holds: (node, range), from its `RangeCreated` of the range
+    /// to its `RangeRemoved` of it.
+    held: BTreeSet<(u64, u64)>,
+    /// The placeholders each node has made: (node, range), from its
+    /// `RangeReplicaCreated` to the range's creation there.
+    placeholders: BTreeSet<(u64, u64)>,
+    violation: Option<String>,
+}
+
+impl PlaceholderGrantsNothing {
+    /// Folds one record.
+    pub fn push(&mut self, record: &TraceRecord) {
+        if self.violation.is_some() {
+            return;
+        }
+        let Some(node) = record.node.map(|node| u64::from(node.get())) else {
+            return;
+        };
+        match &record.event {
+            TraceEvent::RangeCreated { range, .. } => {
+                self.held.insert((node, *range));
+                self.placeholders.remove(&(node, *range));
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                self.held.remove(&(node, *range));
+            }
+            TraceEvent::RangeReplicaCreated { range } => {
+                self.placeholders.insert((node, *range));
+            }
+            TraceEvent::RaftVote {
+                range,
+                term,
+                candidate,
+                granted: true,
+                pre,
+                ..
+            } if !self.held.contains(&(node, *range)) => {
+                let what = if *pre { "pre-vote" } else { "vote" };
+                let whose = if self.placeholders.contains(&(node, *range)) {
+                    "its placeholder"
+                } else {
+                    "a node that holds no replica of it"
+                };
+                self.violation = Some(format!(
+                    "placeholder grants nothing: node {node} granted range {range}'s {what} \
+                     in term {term} to node {candidate} from {whose}, having traced no \
+                     `RangeCreated` of range {range} since its last `RangeRemoved` of it \
+                     (SHARD.md §5, §8, check 20; Q22)"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    /// The first violation, if one was folded.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    pub fn verdict(&self) -> Result<(), String> {
+        self.violation.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16, 17 and 20,
 /// check 18's two clauses, and check 8's two, each of which keeps a verdict of its own
 /// in [`Checker`].
 // PROPOSED(D-106): a verdict per fold.
@@ -1574,13 +1688,16 @@ pub enum Fold {
     /// trips it until placeholders exist.
     // PROPOSED(D-107)
     RightHalf,
+    /// Check 20, a placeholder grants nothing ([`PlaceholderGrantsNothing`]).
+    // PROPOSED(D-109)
+    PlaceholderGrants,
 }
 
 impl Fold {
-    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18
+    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20
     /// and check 8's overlap clause — and then check 8's right half's clause, which it
     /// does not ask ([`Fold::VERDICT`]).
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1588,6 +1705,7 @@ impl Fold {
         Self::ClientRefreshes,
         Self::RangeIds,
         Self::SplitLineage,
+        Self::PlaceholderGrants,
         Self::Overlap,
         Self::RightHalf,
     ];
@@ -1596,7 +1714,7 @@ impl Fold {
     /// last, so that no violation a fold before it reports moves to it, and check 8's
     /// right half's clause not at all (PROPOSED D-107).
     // PROPOSED(D-107)
-    pub const VERDICT: [Self; 8] = [
+    pub const VERDICT: [Self; 9] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1604,6 +1722,7 @@ impl Fold {
         Self::ClientRefreshes,
         Self::RangeIds,
         Self::SplitLineage,
+        Self::PlaceholderGrants,
         Self::Overlap,
     ];
 
@@ -1618,6 +1737,7 @@ impl Fold {
             Self::MetaNeverGoesBack => 16,
             Self::ClientRefreshes => 17,
             Self::RangeIds | Self::SplitLineage => 18,
+            Self::PlaceholderGrants => 20,
         }
     }
 
@@ -1634,6 +1754,7 @@ impl Fold {
             Self::RangeIds => "range ids:",
             Self::SplitLineage => "descriptor lineage:",
             Self::Overlap | Self::RightHalf => "one owner per key:",
+            Self::PlaceholderGrants => "placeholder grants nothing:",
         }
     }
 }
@@ -1655,8 +1776,8 @@ impl std::fmt::Display for Fold {
     }
 }
 
-/// The range layer's folds — checks 7, 8, 9, 10, 16 and 17, and check 18's two clauses
-/// — as one incremental checker: fed the records since its last look, with a verdict at
+/// The range layer's folds — checks 7, 8, 9, 10, 16, 17 and 20, and check 18's two
+/// clauses — as one incremental checker: fed the records since its last look, with a verdict at
 /// any prefix that is what the folds over the whole prefix report, in the same words
 /// (D-046), for each fold on its own ([`Checker::verdict_of`], check 8 a verdict per
 /// clause) and for those that stop a run together ([`Checker::verdict`]).
@@ -1674,6 +1795,8 @@ pub struct Checker {
     refreshes: ClientRefreshes,
     ids: IdsUnique,
     lineage: SplitLineage,
+    // PROPOSED(D-109)
+    placeholders: PlaceholderGrantsNothing,
 }
 
 impl Checker {
@@ -1699,6 +1822,7 @@ impl Checker {
         self.refreshes.push(record);
         self.ids.push(record);
         self.lineage.push(record, &self.descriptors, &self.ids);
+        self.placeholders.push(record);
     }
 
     /// Folds records in order.
@@ -1736,12 +1860,13 @@ impl Checker {
             Fold::SplitLineage => self.lineage.verdict(),
             Fold::Overlap => self.owners.overlap_verdict(),
             Fold::RightHalf => self.owners.right_half_verdict(),
+            Fold::PlaceholderGrants => self.placeholders.verdict(),
         }
     }
 
     /// Every fold's own verdict, in [`Fold::ALL`]'s order.
     // PROPOSED(D-106): a verdict per fold.
-    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 9] {
+    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 10] {
         Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
     }
 
@@ -3179,12 +3304,12 @@ mod tests {
         }
         assert_eq!(
             Fold::VERDICT.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8],
             "the order the checker's verdict asks the folds in"
         );
         assert_eq!(
             Fold::ALL.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 8, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8],
             "every fold, the verdict's first and check 8's right half's clause last"
         );
         assert_eq!(
@@ -3343,6 +3468,88 @@ mod tests {
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
         assert!(checker.verdict().unwrap_err().contains("never falls"));
+    }
+
+    #[test]
+    fn a_meta_apply_of_an_index_below_one_folded_is_compared_as_the_earlier_index() {
+        // PROPOSED(D-109): a re-seeded replica of the meta range restates the bootstrap's
+        // index 0 after the split's update at index 5 was applied elsewhere; index 0
+        // naming the parent's first generation is no fall from 5, and leaves 5's halves
+        // standing.
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.push(&meta_applied(
+            1,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        let mut left = created(1, 2, b"a", b"k", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated { floor_index, .. } = &mut left.event {
+            *floor_index = 5;
+        }
+        let mut right = created(1, 3, b"k", b"z", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated {
+            cause, floor_index, ..
+        } = &mut right.event
+        {
+            *cause = RangeCause::Split;
+            *floor_index = 5;
+        }
+        checker.push(&left);
+        checker.push(&right);
+        checker.push(&meta_applied(
+            1,
+            5,
+            vec![
+                (2, b"a", b"k", 2, vec![(b"a", b"k")]),
+                (3, b"k", b"z", 2, vec![(b"k", b"z")]),
+            ],
+        ));
+        checker.push(&meta_applied(
+            3,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        checker.verdict().unwrap();
+        // The re-seeded replica's own apply of 5 follows, as it catches up.
+        checker.push(&meta_applied(
+            3,
+            5,
+            vec![
+                (2, b"a", b"k", 2, vec![(b"a", b"k")]),
+                (3, b"k", b"z", 2, vec![(b"k", b"z")]),
+            ],
+        ));
+        checker.verdict().unwrap();
+        // 5's halves stand: a later index naming the parent's first generation over the
+        // right half is still a fall.
+        checker.push(&meta_applied(
+            1,
+            8,
+            vec![(2, b"a", b"z", 1, vec![(b"k", b"z")])],
+        ));
+        assert!(checker.verdict().unwrap_err().contains("never falls"));
+        // And an earlier index naming a higher generation than a later one folded is a
+        // fall read the other way.
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.push(&right);
+        checker.push(&meta_applied(
+            1,
+            6,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        checker.push(&meta_applied(
+            2,
+            5,
+            vec![(3, b"k", b"z", 2, vec![(b"k", b"z")])],
+        ));
+        assert!(
+            checker
+                .verdict()
+                .unwrap_err()
+                .contains("from one meta index to the next")
+        );
     }
 
     #[test]

@@ -411,6 +411,13 @@ struct Coverage {
     /// (PROPOSED D-107): the seeds on which a voter of a parent at its split restated
     /// the parent at or past the split without the right half, with the violation.
     right_half_not_restated: Vec<(u64, String)>,
+    /// What the placeholders did over the tier (SHARD.md §5, Q22), summed, and on how
+    /// many seeds a placeholder was made, was installed into, and had an install refused
+    /// for overlapping a replica (PROPOSED D-109).
+    placeholders: raft::PlaceholderCoverage,
+    placeholder_seeds: usize,
+    placeholder_install_seeds: usize,
+    overlap_refusal_seeds: usize,
 }
 
 /// Everything but the two sample vectors, which are summarised.
@@ -505,6 +512,26 @@ impl std::fmt::Debug for Coverage {
             .field("restatements", &self.restatements)
             .field("descriptors_stated", &self.descriptors_stated)
             .field("right_half_not_restated", &self.right_half_not_restated)
+            .field("placeholders_made", &self.placeholders.made)
+            .field("placeholders_by_split", &self.placeholders.by_split)
+            .field("placeholders_installed", &self.placeholders.installed)
+            .field("placeholders_forgotten", &self.placeholders.forgotten)
+            .field("placeholders_open_at_end", &self.placeholders.open_at_end)
+            .field(
+                "placeholder_refused_for_overlap",
+                &self.placeholders.refused_for_overlap,
+            )
+            .field(
+                "installed_voters_waited",
+                &self.placeholders.installed_voters_waited.len(),
+            )
+            .field(
+                "installed_voters_never",
+                &self.placeholders.installed_voters_never,
+            )
+            .field("placeholder_seeds", &self.placeholder_seeds)
+            .field("placeholder_install_seeds", &self.placeholder_install_seeds)
+            .field("overlap_refusal_seeds", &self.overlap_refusal_seeds)
             .finish()
     }
 }
@@ -524,6 +551,22 @@ impl Coverage {
             self.right_half_not_restated.push((report.seed, violation));
             self.right_half_not_restated.sort();
         }
+        // PROPOSED(D-109): the placeholders.
+        let placeholders = raft::placeholders_of(&report.records);
+        self.placeholder_seeds += usize::from(placeholders.made > 0);
+        self.placeholder_install_seeds += usize::from(placeholders.installed > 0);
+        self.overlap_refusal_seeds += usize::from(placeholders.refused_for_overlap > 0);
+        self.placeholders.made += placeholders.made;
+        self.placeholders.by_split += placeholders.by_split;
+        self.placeholders.installed += placeholders.installed;
+        self.placeholders.forgotten += placeholders.forgotten;
+        self.placeholders.open_at_end += placeholders.open_at_end;
+        self.placeholders.refused_for_overlap += placeholders.refused_for_overlap;
+        self.placeholders
+            .installed_voters_waited
+            .extend(placeholders.installed_voters_waited);
+        self.placeholders.installed_voters_never += placeholders.installed_voters_never;
+        self.placeholders.answered_for_a_replica += placeholders.answered_for_a_replica;
         self.uniform_seeds += u64::from(report.uniform());
         self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
         self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1105,11 +1148,13 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         coverage.descriptors_stated,
         coverage.restatements
     );
-    // Check 8's right-half clause, folded over every seed and **not asserted**: on this
-    // tree a voter of P installed past P's split holds no R and gets none back, since a
-    // placeholder (Q22) is what would take R's snapshot, and the restatement after its
-    // next restart reads as an apply of the split without R (PROPOSED D-107, for the
-    // owner). Printed at every tier, with every seed's violation.
+    // Check 8's right-half clause, folded over every seed and **not asserted** until the
+    // owner rules on how it reads a voter installed past the split (PROPOSED D-107).
+    // Before the placeholders such a voter held no R and got none back, and the
+    // restatement after its next restart read as an apply of the split without R; now
+    // its placeholder takes R's snapshot (below), and the clause as §8 words it held on
+    // every one of the correct node's first thousand seeds (PROPOSED D-109). Printed at
+    // every tier, with every seed's violation.
     println!(
         "node: check 8's right-half clause, folded and not asserted (PROPOSED D-107), finds \
          a voter of a parent at its split restating the parent at or past it without the \
@@ -1117,6 +1162,69 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         coverage.right_half_not_restated.len(),
         coverage.right_half_not_restated
     );
+    // The placeholders (SHARD.md §5, Q22). A split's right half pre-votes at once from
+    // the node whose parent led (Q21) and reaches the other replicas of the parent
+    // before they apply the split, so most splits make a placeholder on a node for the
+    // moment between: measured on 896 of the first thousand seeds (15 of the first 20,
+    // 89 of the first 100), and asserted at every tier. An install into one — a voter of
+    // the parent installed past the split, which never applies it, fed the right half's
+    // snapshot through its placeholder — is rarer: 15 of the thousand, every voter so
+    // installed (#170; 0 of the first 20, 1 of the first 100), and a placeholder's
+    // install refused as overlapping its node's parent on 10 (Q27; 0 of the first 100).
+    // Both are asserted from the thousand (D-061), and their miss rates there are not
+    // CLAUDE.md's 10^-13 for 3 %: at 15 in 1 000 a thousand see no install about 3 times
+    // in 10^7 (0.985^1000), and at 10 in 1 000 no refusal about once in 23 000
+    // (0.99^1000, 4.3e-5). The second is within D-061's letter and is the weakest
+    // assertion here (#173's review, N3).
+    // PROPOSED(D-109)
+    let placeholders = &coverage.placeholders;
+    let longest_wait = placeholders.installed_voters_waited.iter().max();
+    println!(
+        "node: placeholders made on {}/{seeds} seeds, {} in all: {} ended by their node's \
+         apply of the split, {} by an install into them on {}/{seeds} seeds, {} forgotten by \
+         a crash, {} open when the run ended; {} installs refused as overlapping a replica, \
+         on {}/{seeds} seeds; {} voters of a parent installed past its split without the \
+         right half waited at most {longest_wait:?} for it, and {} never got it (#170)",
+        coverage.placeholder_seeds,
+        placeholders.made,
+        placeholders.by_split,
+        placeholders.installed,
+        coverage.placeholder_install_seeds,
+        placeholders.forgotten,
+        placeholders.open_at_end,
+        placeholders.refused_for_overlap,
+        coverage.overlap_refusal_seeds,
+        placeholders.installed_voters_waited.len(),
+        placeholders.installed_voters_never,
+    );
+    // No placeholder answers for a replica its node holds: the install puts the range's
+    // descriptor in place at the creation's trace, before its store is opened, as a
+    // split's apply does, so the host drops the range's messages in between (D-109
+    // §1.6). Asserted at every tier as an absence; before that fix it was 11 answers on
+    // 9 of the first thousand seeds (45, 221, 375, 401, 466, 579, 595, 604, 915), and
+    // seed 45's pin asserts it at the gate.
+    assert_eq!(
+        placeholders.answered_for_a_replica, 0,
+        "a placeholder answered for a replica its node had created, on one of {seeds} seeds \
+         (SHARD.md §5: the placeholder becomes a replica at its install)"
+    );
+    assert!(
+        coverage.placeholder_seeds > 0,
+        "no node made a placeholder on any of {seeds} seeds, though nearly every split's right \
+         half pre-votes at once to replicas of its parent that have not applied it (Q21, Q22)"
+    );
+    if seeds >= 1000 {
+        assert!(
+            coverage.placeholder_install_seeds > 0,
+            "no placeholder was installed into on any of {seeds} seeds: a voter installed past \
+             its parent's split gets its right half from no one else (SHARD.md §5, #170)"
+        );
+        assert!(
+            coverage.overlap_refusal_seeds > 0,
+            "no placeholder's install was refused as overlapping a replica on any of {seeds} \
+             seeds, so the overlap rule's refusal was never exercised (SHARD.md §5, Q27)"
+        );
+    }
 
     // §4's threshold is on the median apply lag, and it is asked **per range**. The
     // pooled median hides a breach: with the scenario's key map answering one range,
@@ -1666,7 +1774,11 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 /// the first resend, on every seed, since every other client starts stale.
 // PROPOSED(D-097)
 fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
-    let seeds = high_rate_share();
+    routing_variant_on(name, variants, high_rate_share())
+}
+
+/// [`routing_variant`] over `seeds` seeds rather than the share.
+fn routing_variant_on(name: &str, variants: &[RangeVariant], seeds: u64) -> Vec<Routed> {
     let taken = RangeVariants::of(variants);
     let outcomes: Vec<Routed> = sweep(seeds, |seed| {
         let report =
@@ -1970,17 +2082,26 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
 /// was still carrying — is left alone by the correct meta range (§1's maximum by
 /// generation) and stored by the variant, where check 16 sees the generation fall.
 /// Before the split every update named the first generation and the variant had no
-/// path (PROPOSED D-098). A rate, the schedule's to give — 3 of 20 at the gate, 18 of
-/// 100 at the thousand's share, asserted from the thousand's share, where a sample of
-/// a hundred at that rate sees none about once in 10^8 (D-061); the split landing on
-/// the share is asserted at every tier, and the variant is seen injected
-/// by its updates each winning their whole span where the correct meta range's win
-/// nothing but the split's.
+/// path (PROPOSED D-098). A rate, the schedule's to give, and a low one since check 16
+/// reads "from one meta index to the next" by index (PROPOSED D-109): 0 of 20 at the
+/// gate, 2 of 100 and 19 of 1 000. The trace-order reading before it counted 3, 18 and
+/// 149, most of them a lagging follower's apply of an index below the split's, which
+/// is no fall. So the catch is asserted over a thousand seeds, at the premerge and the
+/// nightly, where at 1.9 % a thousand see none about 5 times in 10^9 (D-061); below the
+/// premerge the test runs the share. The split landing is asserted at every tier, and
+/// the variant is seen injected by its updates each winning their whole span where the
+/// correct meta range's win nothing but the split's.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split() {
-    let outcomes = routing_variant(
+    let run = if seeds() >= 1000 {
+        high_rate_share().max(1000)
+    } else {
+        high_rate_share()
+    };
+    let outcomes = routing_variant_on(
         "MetaOverwritesByArrival",
         &[RangeVariant::MetaOverwritesByArrival],
+        run,
     );
     assert!(
         outcomes.iter().any(|o| o.splits > 0),
@@ -2006,7 +2127,7 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
     if seeds() >= 1000 {
         assert!(
             caught > 0,
-            "MetaOverwritesByArrival was caught on no seed of the share: no update of a \
+            "MetaOverwritesByArrival was caught on no seed of the thousand: no update of a \
              split's parent at its old generation arrived after the split's, or check 16 \
              is silent"
         );
@@ -2362,22 +2483,29 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
     );
     // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
     // tier.
-    let (seed, ..) = RIGHT_HALF_PINNED;
-    let words = match found.get(usize::try_from(seed).expect("a small seed")) {
-        Some(compared) => compared.tripped.get(&Fold::RightHalf).cloned(),
-        None => compare_range_folds(seed, "the correct node, pinned", &node_records(seed, &[]))
-            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
-            .tripped
-            .get(&Fold::RightHalf)
-            .cloned(),
-    };
+    // With the placeholders the correct node's seed 45 holds the clause: its voter gets
+    // its right half through its placeholder before its restart
+    // (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`).
+    // So the shape is planted on seed 45's own trace, the voter's creation and
+    // restatements of the right half taken out, and compared there at every tier
+    // (PROPOSED D-109).
+    let (seed, node, _, _, right) = RIGHT_HALF_PINNED;
+    let planted = without_the_right_half(&node_records(seed, &[]), node, right);
+    let words = compare_range_folds(
+        seed,
+        "the correct node's seed 45 with its voter's right half taken out",
+        &planted,
+    )
+    .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+    .tripped
+    .get(&Fold::RightHalf)
+    .cloned();
     assert_eq!(
         words.as_deref(),
         Some(right_half_pinned_words().as_str()),
-        "seed {seed}: check 8's right half's clause was not compared in violation in its \
-         pin's shape: a schedule move took the seed off it, so re-pin it to the seed the \
-         correct node's sweep names next, or assert the shape's absence with its reason \
-         (CLAUDE.md)"
+        "seed {seed} with node {node}'s right half {right} taken out: check 8's right half's \
+         clause was not compared in violation in its pin's shape, so the planting no longer \
+         makes the shape it was written for"
     );
     let on: Vec<usize> = found
         .iter()
@@ -2388,7 +2516,7 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
     println!(
         "range folds: the correct node: check 8's right half's clause, compared and not \
          asserted absent (PROPOSED D-107), in violation on seeds {on:?} of the {compared} \
-         compared, and compared in violation on the pinned seed {seed} at every tier"
+         compared, and compared in violation on the pinned seed {seed} planted at every tier"
     );
 }
 
@@ -2527,14 +2655,25 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
     );
 }
 
+/// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
+/// hundred, since check 16 reads one meta index against the next by index (PROPOSED
+/// D-109): 48 and 66, each a resend of a split parent's first generation applied at an
+/// index above the split's update.
+const META_REORDER_PINNED: [u64; 2] = [48, 66];
+
 /// Check 16 against `MetaOverwritesByArrival` (SHARD.md §12, Stage C's exit): a resend
 /// of a split parent's old descriptor that the variant's meta range stores after the
-/// split's update. Measured: 149 of seeds 0 to 999, 18 of the first hundred, 3 of the
-/// first twenty, every one check 16's — asserted from CI's hundred compared seeds, which
-/// miss it about once in 10^7 redraws, and not at the gate's twenty, which would miss it
-/// about once in twenty-five (D-061); the split it needs, on 999 of the 1 000, at every
-/// tier.
+/// split's update. Measured, by trace order (D-106): 149 of seeds 0 to 999, 18 of the
+/// first hundred, 3 of the first twenty, asserted from CI's hundred compared seeds. By
+/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0. The comparison never sees more
+/// than a hundred seeds, and two in a hundred is under D-061's 5 %, so the tier's catch
+/// is printed and not asserted; the comparison is held in violation on the two seeds
+/// pinned ([`META_REORDER_PINNED`]) at every tier, as check 18's grants clause is on its
+/// pins, and the variant's own catch is asserted over a thousand seeds from the premerge
+/// (`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split`).
+/// The split it needs, on 999 of the 1 000, at every tier.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-109): check 16 by index; its comparison in violation on two pins.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival() {
     let compared = range_folds_compared();
@@ -2546,12 +2685,114 @@ fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwri
         "no split took effect on the compared seeds, so MetaOverwritesByArrival had no \
          update to reorder"
     );
-    if seeds() >= 100 {
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::MetaNeverGoesBack))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: MetaOverwritesByArrival: check 16 tripped on seeds {on:?} of the \
+         {compared} compared"
+    );
+    let pinned: Vec<(u64, Option<String>)> = sweep(META_REORDER_PINNED.len() as u64, |at| {
+        let seed = META_REORDER_PINNED[usize::try_from(at).expect("two pins")];
+        let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+            Some(compared) => compared.tripped.get(&Fold::MetaNeverGoesBack).cloned(),
+            None => compare_range_folds(
+                seed,
+                "MetaOverwritesByArrival, pinned",
+                &node_records(seed, &[RangeVariant::MetaOverwritesByArrival]),
+            )
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::MetaNeverGoesBack)
+            .cloned(),
+        };
+        (seed, words)
+    });
+    for (seed, words) in &pinned {
+        let words = words.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: check 16 did not trip under MetaOverwritesByArrival, where it was \
+                 pinned for a resend applied at an index above the split's update: a schedule \
+                 move took it off that shape, so re-audit the pin to the shape's absence with \
+                 its reason (CLAUDE.md)"
+            )
+        });
         assert!(
-            tripped_on(&found, Fold::MetaNeverGoesBack) > 0,
-            "check 16 tripped on no compared seed of MetaOverwritesByArrival's {compared}"
+            words.contains("before it: the generation meta names never falls"),
+            "seed {seed}: check 16 tripped in a shape other than its pin's, a later meta index \
+             naming a lower generation: {words}"
         );
     }
+}
+
+/// Check 20 against `UninitialisedReplicaVotes` (SHARD.md §12, Stage C's exit): a
+/// placeholder that grants every vote and pre-vote it receives. Measured on this tree,
+/// release: 15 of the first 20 compared seeds and 89 of the first 100, every one a
+/// placeholder's grant — asserted at every tier, where twenty seeds at 75 % miss it about
+/// once in 10^12 (D-061). The correct node's comparison above asserts check 20 green on
+/// every compared seed.
+// PROPOSED(D-109)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("UninitialisedReplicaVotes", compared, |seed| {
+        node_records(seed, &[RangeVariant::UninitialisedReplicaVotes])
+    });
+    let tripped = tripped_on(&found, Fold::PlaceholderGrants);
+    println!(
+        "range folds: UninitialisedReplicaVotes: check 20 tripped on {tripped}/{compared} \
+         compared seeds"
+    );
+    assert!(
+        tripped > 0,
+        "check 20 tripped on no compared seed of UninitialisedReplicaVotes's {compared}"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        if let Some(words) = outcome.tripped.get(&Fold::PlaceholderGrants) {
+            assert!(
+                words.contains("from its placeholder"),
+                "seed {seed}: check 20 tripped on a grant that was not a placeholder's: {words}"
+            );
+        }
+    }
+}
+
+/// §10's `UninitialisedReplicaVotes` on the node, caught by check 20 at the first grant
+/// (SHARD.md §8, §10; PROPOSED D-109), and its pair: the correct node's sweep, which runs
+/// the same checks, asserts every seed green. A placeholder is made on most seeds — a
+/// split's right half pre-votes at once to replicas of its parent that have not applied
+/// the split (Q21, Q22) — and the variant grants that pre-vote. Measured on this tree,
+/// release: 15 of the gate's share of 20, 89 of the premerge's 100 and 896 of the
+/// nightly's 1 000, as before the install's window was closed (#173's review, B1: that
+/// window followed the creation, and every catch here precedes it), each check 20's at a
+/// right half's first pre-vote reaching a node that had not applied its split. Asserted
+/// as a catch at every tier (D-061: far above 5 %), and every catch is check 20's.
+// PROPOSED(D-109)
+#[test]
+fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
+    let outcomes = routing_variant(
+        "UninitialisedReplicaVotes",
+        &[RangeVariant::UninitialisedReplicaVotes],
+    );
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    for outcome in &outcomes {
+        if let Some(why) = outcome.why.as_deref() {
+            assert!(
+                why.contains("placeholder grants nothing"),
+                "seed {}: UninitialisedReplicaVotes was caught by something other than check \
+                 20: {why}",
+                outcome.seed
+            );
+        }
+    }
+    assert!(
+        caught > 0,
+        "UninitialisedReplicaVotes was caught on no seed of the share: no placeholder \
+         received a vote request, or check 20 is silent"
+    );
 }
 
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
@@ -2744,9 +2985,9 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
     }
 }
 
-/// The correct node's seed on which check 8's right half's clause trips, in the shape
-/// `seed_45_restates_a_voter_installed_past_a_split_without_its_right_half` asserts:
-/// (seed, node, parent, the split's index, the right half).
+/// The correct node's seed on which check 8's right half's clause tripped before the
+/// placeholders, and on whose trace its shape is now planted (`without_the_right_half`;
+/// PROPOSED D-109): (seed, node, parent, the split's index, the right half).
 // PROPOSED(D-107)
 const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (45, 2, 4, 165, 14);
 
@@ -2761,25 +3002,52 @@ fn right_half_pinned_words() -> String {
     )
 }
 
-/// **Seed 45 is the shape check 8's right-half clause trips on the correct node**
-/// (PROPOSED D-107): node 2's replica of range 4 lagged the split at index 165 (key
-/// `k5`, right half 14) and was installed P's post-split snapshot at 165 — the install's
-/// `RangeDescriptor`, at generation 2 — without applying the split or creating 14; after
-/// its next restart it restated range 4 past 165 and its `RangesRestated` named no 14,
-/// which the clause reads as an apply of the split without its right half. On this tree
-/// nothing gives that voter its right half (a message for a range a node does not host
-/// is counted and dropped until the placeholders, Q22), so the clause is folded and not
-/// asserted: the correct node's thousand found it on seeds 45 and 878, both this shape.
-/// What is asserted is the mechanism: the run green under every check that is asserted,
-/// check 8's overlap clause green, the right half's clause's violation in its words, the
-/// install past the split, no split applied and no right half created on the node, a
-/// crash after the install, and the restatement after it without the right half. The
-/// day a schedule moves the seed off the shape this pin says so, and moves to the next
-/// seed the correct node's sweep names (`right_half_not_restated`).
+/// `records` with `node`'s replica of `right` taken out from its creation on: the
+/// creation, the restatements of its descriptor, and its name in every `RangesRestated`
+/// of `node` — the trace of a voter that never gets its right half, which is what check
+/// 8's right half's clause exists to see and what the placeholders keep the correct node
+/// from tracing (PROPOSED D-109).
+fn without_the_right_half(records: &[TraceRecord], node: u32, right: u64) -> Vec<TraceRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            !(record.node.is_some_and(|n| n.get() == node)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RangeCreated { range, .. }
+                        | TraceEvent::RangeDescriptor { range, .. } if *range == right
+                ))
+        })
+        .cloned()
+        .map(|mut record| {
+            if record.node.is_some_and(|n| n.get() == node)
+                && let TraceEvent::RangesRestated { ranges } = &mut record.event
+            {
+                ranges.retain(|range| *range != right);
+            }
+            record
+        })
+        .collect()
+}
+
+/// **Seed 45 is where check 8's right-half clause tripped on the correct node, and the
+/// placeholders are what close it** (PROPOSED D-107, D-109). Node 2's replica of range 4
+/// lagged the split at index 165 (key `k5`, right half 14) and was installed P's
+/// post-split snapshot at 165 — the install's `RangeDescriptor`, at generation 2 —
+/// without applying the split or creating 14. Before the placeholders nothing gave it 14,
+/// and after its next restart its `RangesRestated` named no 14. Now a message of 14
+/// reaches it first and it makes a placeholder of 14 (`RangeReplicaCreated`), whose
+/// refused server's answer has 14's leader stream it 14's snapshot, and the install
+/// creates node 2's replica of 14 (`RangeCreated { cause: snapshot }`) before node 2
+/// crashes; its restatement after the restart names 14, and the clause holds. What is
+/// asserted is that mechanism, step by step, and that the shape the pin had is absent,
+/// with the reason: the day a schedule moves the seed off it, this says so.
 // PROPOSED(D-107): the right half's clause's STOP, pinned where the thousand found it.
+// PROPOSED(D-109): and closed by a placeholder, on the same seed.
 #[test]
-fn seed_45_restates_a_voter_installed_past_a_split_without_its_right_half() {
-    let (seed, node, parent, index, right) = RIGHT_HALF_PINNED;
+fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder() {
+    let seed = 45u64;
+    let (node, parent, index, right) = (2u32, 4u64, 165u64, 14u64);
     let report = correct(seed);
     report
         .check()
@@ -2790,30 +3058,24 @@ fn seed_45_restates_a_voter_installed_past_a_split_without_its_right_half() {
         Ok(()),
         "seed {seed}: check 8's overlap clause"
     );
+    // The shape D-107 pinned is gone, and this is why: the voter holds the right half
+    // at its restatement.
     assert_eq!(
         checker.verdict_of(Fold::RightHalf),
-        Err(right_half_pinned_words()),
-        "seed {seed}'s schedule has moved off the shape this pin asserts: pin the seed the \
-         correct node's sweep names next, or assert the absence with its reason"
+        Ok(()),
+        "seed {seed}: check 8's right-half clause"
     );
     let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
-    let installed = report
-        .records
-        .iter()
-        .position(|record| {
-            on(record)
-                && matches!(
-                    &record.event,
-                    TraceEvent::RangeDescriptor { range, applied, generation: 2, .. }
-                        if (*range, *applied) == (parent, index)
-                )
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "seed {seed}: node {node}'s replica of range {parent} was installed no snapshot \
-                 at {index} carrying the split's generation"
-            )
-        });
+    let find = |what: &str, from: usize, matches: &dyn Fn(&TraceEvent) -> bool| {
+        from + report.records[from..]
+            .iter()
+            .position(|record| on(record) && matches(&record.event))
+            .unwrap_or_else(|| panic!("seed {seed}: node {node} never traced {what}"))
+    };
+    let installed = find("the install past the split", 0, &|event| {
+        matches!(event, TraceEvent::RangeDescriptor { range, applied, generation: 2, .. }
+            if (*range, *applied) == (parent, index))
+    });
     assert!(
         matches!(
             &report.records[installed - 1].event,
@@ -2826,18 +3088,48 @@ fn seed_45_restates_a_voter_installed_past_a_split_without_its_right_half() {
             && matches!(&record.event, TraceEvent::RangeSplit { range, .. } if *range == parent)),
         "seed {seed}: node {node} applied range {parent}'s split itself"
     );
-    assert!(
-        !report.records.iter().any(|record| on(record)
-            && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
-        "seed {seed}: node {node} created the right half {right}"
+    let placeholder = find(
+        "a placeholder of the right half",
+        0,
+        &|event| matches!(event, TraceEvent::RangeReplicaCreated { range } if *range == right),
     );
-    let crashed = installed
-        + report.records[installed..]
-            .iter()
-            .position(|record| {
-                matches!(&record.event, TraceEvent::NodeCrashed { node: n } if n.get() == node)
-            })
-            .unwrap_or_else(|| panic!("seed {seed}: node {node} never crashed after the install"));
+    let created = find(
+        "the right half's creation",
+        placeholder,
+        &|event| matches!(event, TraceEvent::RangeCreated { range, .. } if *range == right),
+    );
+    assert!(
+        matches!(
+            &report.records[created].event,
+            TraceEvent::RangeCreated {
+                cause: ananke_env::RangeCause::Snapshot,
+                ..
+            }
+        ),
+        "seed {seed}: node {node}'s right half was not created by its placeholder's install: \
+         {:?}",
+        report.records[created].event
+    );
+    assert!(
+        !report.records[..created].iter().any(|record| on(record)
+            && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
+        "seed {seed}: node {node} created the right half {right} before its placeholder did"
+    );
+    // The install's window (D-109 §1.6): before the descriptor was put in place at the
+    // creation's trace, node 2's placeholder answered two AppendEntries of 14 as a
+    // refused server, 0.2 ms and 18.8 ms after 14's creation, and 14's leader restarted
+    // the stream from offset 0 to a node that held the replica.
+    let answered = raft::placeholders_of(&report.records).answered_for_a_replica;
+    assert_eq!(
+        answered, 0,
+        "seed {seed}: {answered} placeholder answers were sent for a replica its node had \
+         created"
+    );
+    let crashed = find(
+        "a crash after the right half's creation",
+        created,
+        &|event| matches!(event, TraceEvent::NodeCrashed { node: n } if n.get() == node),
+    );
     let restated = report.records[crashed..]
         .iter()
         .find_map(|record| match &record.event {
@@ -2846,14 +3138,17 @@ fn seed_45_restates_a_voter_installed_past_a_split_without_its_right_half() {
         })
         .unwrap_or_else(|| panic!("seed {seed}: node {node} never restated after its crash"));
     assert!(
-        restated.contains(&parent) && !restated.contains(&right),
+        restated.contains(&parent) && restated.contains(&right),
         "seed {seed}: node {node}'s restatement after its crash named {restated:?}"
     );
     println!(
         "seed {seed}: node {node}'s replica of range {parent} installed past the split at \
-         {index} at {:?}, crashed at {:?}, and restated {restated:?} without the right half \
-         {right}",
-        report.records[installed].at, report.records[crashed].at
+         {index} at {:?}, made a placeholder of {right} at {:?}, installed it at {:?}, crashed \
+         at {:?}, and restated {restated:?}",
+        report.records[installed].at,
+        report.records[placeholder].at,
+        report.records[created].at,
+        report.records[crashed].at
     );
 }
 
@@ -2993,6 +3288,8 @@ fn mechanism(violation: &str) -> &'static str {
         ("serving within span", "serving within span"),
         ("owners' generations", "owners' generations"),
         ("client refreshes", "client refreshes"),
+        // PROPOSED(D-109): check 20.
+        ("placeholder grants nothing", "placeholder grants nothing"),
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),
@@ -4553,7 +4850,7 @@ fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
         .expect("the correct node passes seed 2809: the write was in flight");
 }
 
-/// Seeds 12 and 8 under `SharedSnapshotDir`: wedges that the run's true end **alone**
+/// Seeds 12 and 76 under `SharedSnapshotDir`: wedges that the run's true end **alone**
 /// would excuse, and that the exemption's evidence keeps (PROPOSED D-102).
 ///
 /// Read against where the run stopped, every post-heal write to the wedged key was
@@ -4570,21 +4867,32 @@ fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
 ///   all pending, the earliest called 1.028 s before the run stopped at 20.584 s. The
 ///   run is uniform and `check()` reports the read bound first (39 registered reads
 ///   against 38), so this is the wedge `read_bound_reports_a_wedge` attributes.
-/// - **Seed 8** is the same wedge on a split range, and is why the evidence is the
-///   range **serving** the key and not `Report::key_range`'s. Range 3 split at `k3`
-///   at 7.254 s; its left half, serving `k2`, last commits at 17.273 s, and both
-///   post-heal writes to `k2` are pending at the end; the right half, serving `k3`,
-///   completes every post-heal write. The run's starting map puts `k3` in range 3, so
-///   evidence read through it shows the wedged half live by its sibling's writes and
-///   excuses the wedge — as it does seed 54's. Here the liveness clause is the first
-///   `check()` reports.
+/// - **Seed 76** is the same wedge on a split range, and is why the evidence is the
+///   range **serving** the key and not `Report::key_range`'s. Range 4 split at `k5`;
+///   its left half, serving `k4`, last commits 12.418 s before the end, and the
+///   post-heal writes to `k4` are pending at the end; the right half,
+///   serving `k5`, completes post-heal writes. The run's starting map puts `k5` in
+///   range 4, so evidence read through it shows the wedged half live by its sibling's
+///   writes and excuses the wedge — as it does seed 54's. Here the liveness clause is
+///   the first `check()` reports.
+///
+/// **Seed 8 carried the second shape until the placeholders** (PROPOSED D-109): range 3
+/// split at `k3`, its left half wedged on `k2` and its right half completing every
+/// post-heal write to `k3`. The placeholders moved its schedule, and its right half now
+/// completes no post-heal write, so the starting map has nothing to excuse the wedge
+/// with there; seed 76 is the lowest of the first thousand to carry the shape on this
+/// tree (76, 80, 277, 320, …), and the pin moved to it.
 // PROPOSED(D-102): the exemption keeps the wedges the true end alone would excuse.
+// PROPOSED(D-109): the split range's shape moved from seed 8 to seed 76.
 #[test]
-fn seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
+fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
     let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
     let twelve = buggy(12, Variant::SharedSnapshotDir);
-    let eight = buggy(8, Variant::SharedSnapshotDir);
-    for (report, keys, range) in [(&twelve, &["k0", "k1"][..], 2u64), (&eight, &["k2"][..], 3)] {
+    let seventy_six = buggy(76, Variant::SharedSnapshotDir);
+    for (report, keys, range) in [
+        (&twelve, &["k0", "k1"][..], 2u64),
+        (&seventy_six, &["k4"][..], 4),
+    ] {
         let seed = report.seed;
         assert!(report.uniform(), "seed {seed} is a uniform schedule");
         // The masking shape: every post-heal write to the wedged keys is pending and
@@ -4623,28 +4931,41 @@ fn seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wou
         read_bound_reports_a_wedge(&twelve, &violation),
         "seed 12's read-bound trip is not attributed to the wedge: {violation}"
     );
-    // Seed 8: the split, and the sibling the starting map would have counted.
+    // Seed 76: the split, and the sibling the starting map would have counted.
     assert!(
-        eight.records.iter().any(|r| matches!(
+        seventy_six.records.iter().any(|r| matches!(
             &r.event,
-            TraceEvent::RangeSplit { range: 3, key, .. }
-                if ananke_raft::apply::user_key_of(key) == Some(&b"k3"[..])
+            TraceEvent::RangeSplit { range: 4, key, .. }
+                if ananke_raft::apply::user_key_of(key) == Some(&b"k5"[..])
         )),
-        "seed 8's range 3 no longer splits at k3"
+        "seed 76's range 4 no longer splits at k5"
     );
     assert!(
-        eight.history.ops.iter().any(|op| op.op.is_write()
-            && op.call >= eight.last_heal
+        seventy_six.history.ops.iter().any(|op| op.op.is_write()
+            && op.call >= seventy_six.last_heal
             && op.ret.is_some()
-            && op.op.key().as_ref() == b"k3"),
-        "seed 8's right half completed no post-heal write to k3, so the starting map had \
+            && op.op.key().as_ref() == b"k5"),
+        "seed 76's right half completed no post-heal write to k5, so the starting map had \
          nothing to excuse the wedge with"
     );
-    let violation = eight.check().expect_err("seed 8 fails under the variant");
+    let violation = seventy_six
+        .check()
+        .expect_err("seed 76 fails under the variant");
     assert_eq!(
         mechanism(&violation),
         "liveness",
-        "seed 8 fails first on something else: {violation}"
+        "seed 76 fails first on something else: {violation}"
+    );
+    // Seed 8, where the shape was pinned first: its right half completes no post-heal
+    // write to `k3` on this tree, so the shape is absent there, with the reason above.
+    // The day the schedule brings it back this says so.
+    let eight = buggy(8, Variant::SharedSnapshotDir);
+    assert!(
+        !eight.history.ops.iter().any(|op| op.op.is_write()
+            && op.call >= eight.last_heal
+            && op.ret.is_some()
+            && op.op.key().as_ref() == b"k3"),
+        "seed 8's right half completes a post-heal write to k3 again: its shape may be back"
     );
 }
 
@@ -4654,17 +4975,24 @@ fn seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wou
 ///
 /// The variant's apply task waits for a job of every range before it runs any, so a
 /// node's applies stall behind its quietest range while the logs go on committing. The
-/// last heal is at 13.816 s and the run stops at 16.546 s. Range 4 (`k4`, `k5`, never
-/// split on this run) last completed a client write, to `k5`, 2.432 s before the end;
-/// `k4`'s three post-heal writes were called after it, 0.785 to 1.359 s before the end,
-/// and all three are pending. The clause as first merged asked only that the range had
-/// completed some write after the heal, so it excused all three and passed the run.
-/// Run on for 4 s more, every draw unchanged and the trace the same up to the original
-/// end, none of them is answered: a stall, not the artefact. The clause now asks for a
-/// completion after the write's own call, and there is none, so the per-key reading
-/// reports `k4` and `check()` fails on it. The mechanism is built by hand too, in
-/// `sim/raft.rs` (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`).
+/// last heal is at 13.816 s and the run stops at 16.546 s. Range 2 (`k0`, `k1`, never
+/// split on this run) last completed a post-heal client write 1.993 s before the end;
+/// `k1`'s two post-heal writes were called after it, the first 1.748 s before the end,
+/// and both are pending. The clause as first merged asked only that the range had
+/// completed some write after the heal, so it excused both and passed the run. Run on
+/// for 4 s more, every draw unchanged and the trace the same up to the original end,
+/// neither is answered: a stall, not the artefact. The clause now asks for a completion
+/// after the write's own call, and there is none, so the per-key reading reports `k1`
+/// and `check()` fails on it. The mechanism is built by hand too, in `sim/raft.rs`
+/// (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`).
+///
+/// **The stall moved key with the placeholders** (PROPOSED D-109): as pinned it was range
+/// 4's, `k4`'s three writes pending from 1.359 s before the end; the placeholders moved
+/// this seed's schedule, and the same shape — every completion of the range before the
+/// pending writes' calls, none after in the 4 s more — is range 2's now, which is what
+/// this asserts.
 // PROPOSED(D-102): the exemption asks for the range shown live after the call.
+// PROPOSED(D-109): re-pinned on the key the stall moved to.
 #[test]
 fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse() {
     let variant = NodeVariants::correct().with(NodeVariant::ApplyWaitsForEveryRange);
@@ -4680,64 +5008,64 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
     };
     let report = run(raft::Schedule::draw_on_the_node(613));
     assert!(report.uniform(), "seed 613 is a uniform schedule");
-    let k4 = bytes::Bytes::from_static(b"k4");
-    assert_eq!((report.key_range)(&k4), 4, "k4 is range 4's");
+    let k1 = bytes::Bytes::from_static(b"k1");
+    assert_eq!((report.key_range)(&k1), 2, "k1 is range 2's");
     assert!(
         !report
             .records
             .iter()
-            .any(|r| matches!(&r.event, TraceEvent::RangeSplit { range: 4, .. })),
-        "seed 613 splits range 4 now, so the range serving k4 at the end is to be re-read"
+            .any(|r| matches!(&r.event, TraceEvent::RangeSplit { range: 2, .. })),
+        "seed 613 splits range 2 now, so the range serving k1 at the end is to be re-read"
     );
-    // k4's post-heal writes: all pending, every one called inside the bound of the end
+    // k1's post-heal writes: all pending, every one called inside the bound of the end
     // and before its client's wait, so the range's evidence alone decides them.
     assert!(
-        keys_with_only_a_tail(&report).contains(&"k4".to_owned()),
-        "seed 613's post-heal writes to k4 are not all pending inside the bound of the end"
+        keys_with_only_a_tail(&report).contains(&"k1".to_owned()),
+        "seed 613's post-heal writes to k1 are not all pending inside the bound of the end"
     );
     let writes: Vec<&ananke_sim::lin::Op> = report
         .history
         .ops
         .iter()
-        .filter(|op| op.op.is_write() && op.call >= report.last_heal && op.op.key() == &k4)
+        .filter(|op| op.op.is_write() && op.call >= report.last_heal && op.op.key() == &k1)
         .collect();
     assert!(
         writes
             .iter()
             .all(|op| report.ended.duration_since(op.call) > raft::WRITE_TIMEOUT),
-        "a write to k4 was still inside its client's wait at the end"
+        "a write to k1 was still inside its client's wait at the end"
     );
     let first_call = writes
         .iter()
         .map(|op| op.call)
         .min()
-        .expect("k4 is written after the heal");
+        .expect("k1 is written after the heal");
     // The range's completed post-heal writes: some, and every one before that call.
     let completed: Vec<ananke_env::Instant> = report
         .history
         .ops
         .iter()
         .filter(|op| op.op.is_write() && op.call >= report.last_heal)
-        .filter(|op| (report.key_range)(op.op.key()) == 4)
+        .filter(|op| (report.key_range)(op.op.key()) == 2)
         .filter_map(|op| op.ret)
         .collect();
     let last = completed.iter().max().copied();
     println!(
-        "seed 613: last heal {:?}, stopped at {:?}; range 4's last completed post-heal write \
-         at {last:?}; k4's {} writes called from {first_call:?}",
+        "seed 613: last heal {:?}, stopped at {:?}; range 2's last completed post-heal write \
+         at {last:?}; k1's {} writes called from {first_call:?}",
         report.last_heal,
         report.ended,
         writes.len()
     );
     assert!(
         last.is_some_and(|last| last < first_call),
-        "range 4 completed no post-heal write, or one after k4's first pending write was \
+        "range 2 completed no post-heal write, or one after k1's first pending write was \
          called: not the shape this pin is for"
     );
     assert_eq!(
         report.liveness(),
         Err(format!(
-            "liveness: no client write to k4 completed after the last heal at {:?}",
+            "liveness: no client write to k1 completed after the last heal at {:?}",
             report.last_heal
         )),
         "seed 613's stall is not reported"
@@ -4771,7 +5099,7 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
         .count();
     assert_eq!(
         answered, 0,
-        "a pending write to k4 was answered in the 4 s more: seed 613 is no longer a stall"
+        "a pending write to k1 was answered in the 4 s more: seed 613 is no longer a stall"
     );
 }
 
@@ -4823,42 +5151,92 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
     // that is absent by construction — a store incarnation that never changes — rather
     // than a rate that more seeds would sharpen.
     let seeds = high_rate_share();
-    let outcomes: Vec<(u64, usize, usize, usize, usize)> = sweep(seeds, |seed| {
+    // A reset the placeholders explain: a leader's `RaftProgressReset` of a follower that
+    // made a placeholder of the range before it (SHARD.md §5, Q22). The placeholder
+    // answered with store incarnation 0, since it has no store, and the replica its node
+    // then made — at its apply of the split, or at its placeholder's install — answers
+    // with the fresh incarnation its creation drew (Q26), a change the leader forgets the
+    // follower's progress at, as D-042 says it must (PROPOSED D-109). That change is one
+    // per placeholder and per leader, so the placeholder explains **the first** reset of
+    // the follower by each leader of the range after it, and nothing more: a second
+    // reset by the same leader after the same placeholder is unexplained (#173's review,
+    // N1; measured at 0 of the correct node's first thousand seeds when it was bounded).
+    let resets_unexplained = |report: &raft::Report| {
+        // (range, node) → how many placeholders the node has made of the range.
+        let mut placeholders: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+        // (leader, range, follower, placeholder) already explained.
+        let mut used: BTreeSet<(u64, u64, u64, usize)> = BTreeSet::new();
+        let (mut unexplained, mut explained) = (0usize, 0usize);
+        for record in &report.records {
+            match &record.event {
+                TraceEvent::RangeReplicaCreated { range } => {
+                    if let Some(node) = record.node {
+                        *placeholders
+                            .entry((*range, u64::from(node.get())))
+                            .or_default() += 1;
+                    }
+                }
+                TraceEvent::RaftProgressReset {
+                    server,
+                    range,
+                    follower,
+                    ..
+                } => {
+                    let first = placeholders
+                        .get(&(*range, *follower))
+                        .is_some_and(|made| used.insert((*server, *range, *follower, *made)));
+                    if first {
+                        explained += 1;
+                    } else {
+                        unexplained += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (unexplained, explained)
+    };
+    let outcomes: Vec<(u64, usize, usize, usize, usize, usize)> = sweep(seeds, |seed| {
         let correct = correct(seed);
         let buggy = buggy(seed, Variant::IgnoreIncarnation);
         let resets = |report: &raft::Report| {
             report.count(|e| matches!(e, ananke_env::TraceEvent::RaftProgressReset { .. }))
         };
+        let (unexplained, by_placeholders) = resets_unexplained(&correct);
         (
             seed,
-            resets(&correct),
+            unexplained,
             resets(&buggy),
             correct.refused.len(),
             correct.snapshot_actions(),
+            by_placeholders,
         )
     });
-    let correct_resets: usize = outcomes.iter().map(|(_, c, _, _, _)| c).sum();
-    let buggy_resets: usize = outcomes.iter().map(|(_, _, b, _, _)| b).sum();
-    let refusals: usize = outcomes.iter().map(|(_, _, _, r, _)| r).sum();
-    let actions: usize = outcomes.iter().map(|(_, _, _, _, a)| a).sum();
+    let correct_resets: usize = outcomes.iter().map(|(_, c, _, _, _, _)| c).sum();
+    let buggy_resets: usize = outcomes.iter().map(|(_, _, b, _, _, _)| b).sum();
+    let refusals: usize = outcomes.iter().map(|(_, _, _, r, _, _)| r).sum();
+    let actions: usize = outcomes.iter().map(|(_, _, _, _, a, _)| a).sum();
+    let by_placeholders: usize = outcomes.iter().map(|(_, _, _, _, _, p)| p).sum();
     let refused_seeds: Vec<(u64, usize)> = outcomes
         .iter()
-        .filter(|(_, _, _, r, _)| *r > 0)
-        .map(|(seed, c, _, _, _)| (*seed, *c))
+        .filter(|(_, _, _, r, _, _)| *r > 0)
+        .map(|(seed, c, _, _, _, _)| (*seed, *c))
         .collect();
     let reset_without_a_refusal: Vec<(u64, usize)> = outcomes
         .iter()
-        .filter(|(_, c, _, r, _)| *c > 0 && *r == 0)
-        .map(|(seed, c, _, _, _)| (*seed, *c))
+        .filter(|(_, c, _, r, _, _)| *c > 0 && *r == 0)
+        .map(|(seed, c, _, _, _, _)| (*seed, *c))
         .collect();
     println!(
         "node: IgnoreIncarnation over {seeds} seeds — the correct node reset a follower's \
-         progress {correct_resets} times and the variant {buggy_resets}, over {refusals} store \
-         refusals (seeds and the correct node's resets on them: {refused_seeds:?}) and \
-         {actions} snapshot actions. A leader resets on a *change* of store incarnation, \
-         and only a re-seed rebuilds a store with a fresh one (D-077); a live install \
-         keeps it (D-042). So the leader has something to forget only where a store was \
-         refused"
+         progress {correct_resets} times past the {by_placeholders} its placeholders explain, \
+         and the variant {buggy_resets}, over {refusals} store refusals (seeds and the correct \
+         node's resets on them: {refused_seeds:?}) and {actions} snapshot actions. A leader \
+         resets on a *change* of store incarnation: a re-seed rebuilds a store with a fresh \
+         one (D-077), a live install keeps it (D-042), and a replica made where its node \
+         kept a placeholder answers with a fresh one where the placeholder answered with \
+         none (PROPOSED D-109). So the leader has something to forget past a placeholder \
+         only where a store was refused"
     );
     // Non-vacuity: the install path is reached on these seeds, so this is an absence of
     // incarnation changes and not an absence of runs.
@@ -4866,15 +5244,17 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
         actions > 0,
         "no core asked for a snapshot action over {seeds} seeds, so this says nothing"
     );
-    // The absence, with its reason: an incarnation changes only where a store was
-    // refused and re-seeded, so a reset on a seed with no refusal is a change nothing
-    // explains. A reset on a seed that did refuse a store is D-077's re-seed doing what
-    // it says, and it is in the print above, not in this assertion.
+    // The absence, with its reason: past a placeholder, an incarnation changes only where
+    // a store was refused and re-seeded, so a reset on a seed with no refusal that no
+    // placeholder explains is a change nothing explains. A reset on a seed that did refuse
+    // a store is D-077's re-seed doing what it says, and it is in the print above, not in
+    // this assertion. (On the gate's twenty, seeds 5 and 10 each reset a follower whose
+    // placeholder had answered first, the first such resets the placeholders brought.)
     assert!(
         reset_without_a_refusal.is_empty(),
-        "the correct node reset a follower's progress on seeds where no store was refused \
-         (seed, resets: {reset_without_a_refusal:?}), so a store incarnation changed on this \
-         node without a re-seed: re-audit this test"
+        "the correct node reset a follower's progress on seeds where no store was refused, \
+         past what its placeholders explain (seed, resets: {reset_without_a_refusal:?}), so \
+         a store incarnation changed on this node without a re-seed: re-audit this test"
     );
     // The injection, on every seed: the variant's leader forgets nothing, refusal or no.
     assert_eq!(

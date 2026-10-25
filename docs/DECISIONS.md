@@ -22031,4 +22031,465 @@ never committed. Their rows are in PR #164.
 
 ---
 
-_Next entry: D-109. Add one before implementing anything not covered above._
+## PROPOSED D-109 — Placeholders: a node that holds no replica of a range keeps a placeholder for it, which grants nothing, answers as a refused server does and takes only a snapshot that overlaps no replica on the node; `UninitialisedReplicaVotes` and check 20
+
+**The number.** Off `phase-3-stage-c-restatement-check8` at b21d76e (PR #166, D-107), whose
+footer reads D-108. Tracking issue #162 gives the per-fold equivalence D-106 (#163), the
+restatement and check 8 D-107 (#166) and the variant set's follow-ups D-108 (#164, merged),
+and the placeholders' slice, S8, **D-109**; the footer here moves to D-110, and at the merge
+the entries are a union in numerical order with one footer, the highest plus one. Every
+code site carries `// PROPOSED(D-109)`. The slice is three changes, each its own PR stacked
+on the one before, each with its own gate, checklist and sections of this entry: (a) the
+placeholder, `UninitialisedReplicaVotes` and check 20 (this PR, sections 1 to 6); (b)
+`sim/split.rs` (ii), the joining nodes that hold nothing and exactly three bootstrap
+nodes; (c) a re-seeded node's right halves (#172).
+
+**Context.** SHARD.md §5 (SHARD.md:759-780), Q22: "A node can receive R's messages before
+it holds R: its replica of P lags behind `s`, or R is being moved to it (§7). The node
+creates a placeholder for R with no descriptor, no span and no Raft state, and traces
+`RangeReplicaCreated`. A placeholder grants no vote or pre-vote, acknowledges nothing, and
+takes only a snapshot the overlap rule below allows; it becomes a replica at its node's
+apply of `s` or at such an install." It answers every AppendEntries "as a refused server
+does (RAFT.md:507-511): a rejection with a hint of 1, an echo of zero and store
+incarnation 0", counted for nothing in a lease or read-index round and for check quorum
+only as D-049 counts a refused server's. §8's check 20 folds it, §10's
+`UninitialisedReplicaVotes` breaks it, `sim/split.rs` (ii) builds its shape on every seed,
+and §8 has the timer check skip a placeholder. What the tree had, on b21d76e: a message for
+a range the node does not hold counted and dropped (D-076), so a right half elected among
+the replicas that had applied its split (D-100), and a voter of P installed P's
+post-split snapshot held no R for the rest of the run — 16 of the correct node's 1 000
+seeds, two of them tripping check 8's right half's clause when that voter restarted
+(D-107, #170).
+
+**The departure from D-033 (Q22's own entry).** D-033 has a server that is not a voter of
+its configuration in force — "a server with no configuration yet" among them — grant votes
+and pre-votes "by the usual rules". A placeholder grants nothing, for placeholders only.
+The usual rules were written for a server with a store: Raft's `votedFor` is persistent
+state, "updated on stable storage before responding to RPCs" (Ongaro and Ousterhout,
+*In Search of an Understandable Consensus Algorithm*, Figure 2), and a placeholder has no
+stable storage to hold a vote in. It cannot vote twice, because it never votes. What a
+placeholder gives up is the vote of a replica of R that has not yet applied `s`, which is
+the vote §5's first pre-vote "usually" fails to get anyway (Q21), and which the shape of
+`sim/split.rs` (ii) is built to need: there R elects only with it, and the correct system
+waits for the crashed node instead.
+
+### 1. The placeholder
+
+**What is built** (crates/ananke-shard: `server.rs`, `node.rs`, `round.rs`).
+
+1. **A message for a range the node holds no core of** is handed on, not dropped: the
+   round records it whole (`Round::unheld`, with the stamps its step would have carried)
+   beside the count it always had (`Meters::messages_for_ranges_not_held`), and the node
+   asks the host what to do with it (`Host::unheld`) before the round's early outputs,
+   since a placeholder has nothing to persist. A host with no placeholders answers
+   nothing, which is every test host in the tree.
+2. **The placeholder is the host's**: a set of range ids in memory, shared with the
+   `snapshot` task (`ServerHost::placeholders`), and nothing else — no descriptor, no span,
+   no Raft state, no store, no core. The first message of a range that has no replica on
+   the node makes one and traces `RangeReplicaCreated { range }`; a restart forgets every
+   one, as it forgets everything in memory, and the next message makes it again.
+3. **It answers an `AppendEntries` as a refused server does**: a rejection carrying the
+   request's term and previous index, a hint of 1, an echo of zero, store incarnation 0
+   (the host's stamp finds no store) and the refused mark (D-087), so check quorum counts it
+   only in a window in which a stream to it progressed (D-049) and no lease promise or read
+   confirmation is measured from it. The hint is what asks for the snapshot: the leader's
+   next index for the node goes to 1, which feeds the snapshot once the log is compacted
+   past it — a split-born range's log is, from its floor at `s` — and otherwise draws the
+   rejection at previous index 0 that designates it snapshot-fed (D-037).
+4. **It grants nothing**: a vote or pre-vote request, a `TimeoutNow` and every response go
+   unanswered, as a refused server drops them (RAFT.md §3), and nothing is traced of them.
+5. **It ends where its range is created on the node**: at the node's apply of the split
+   that makes it (`Local::RangeAdded` takes it out of the set), or at the install a stream
+   to it completes into (section 2).
+6. **A range being created is no placeholder's.** A split's apply traces R's creation and
+   puts R's descriptor in place, then opens R's store — a disk read — and hands R's core to
+   the `raft` task; a placeholder's install does the same from the `snapshot` task. A
+   message for R in that window finds no core. The host takes a range with a descriptor or
+   a store as initialised and drops its messages, as a core's are dropped while it is down,
+   rather than answer for a replica that holds the range. **Found by the first
+   measurement**: as first built, seed 0 of the correct node made a placeholder of right
+   half 14 on node 3 1.2 ms after node 3 traced 14's creation, and the timer check, which
+   skips a placeholder until its range's creation, never measured node 3's replica of 14
+   again; over the thousand, 2 408 placeholders were made before the fix and 2 105 after,
+   and 227 of the first figure were still placeholders when their run ended, every one a
+   range its node held.
+
+   **Corrected before #173 merged (#173's review, B1).** As first committed this held on
+   the split's path alone. A split's apply puts R's descriptor in place right after
+   tracing R's creation, with nothing awaited between. A placeholder's install traced
+   `RangeCreated { cause: snapshot }` at its switch and then awaited the store's open
+   before putting the descriptor in place. In that window, about 86 ms on seed 45, the host
+   still found the placeholder and answered for the replica as a refused server. Its
+   leader restarted the stream from offset 0 to a node that held the range. Under
+   `UninitialisedReplicaVotes` a grant there would come after `RangeCreated`, where check
+   20 as §8 words it cannot see it. The install now puts the descriptor in place at the
+   creation's trace, before the open, as the split does. Measured on the correct node,
+   seeds 0 to 999, release, with `placeholders_of`'s count of refused answers (hint 1,
+   echo 0, incarnation 0) a node sent for a range it had created and was not refused or
+   removed from since:
+   - before: **11** on 9 seeds (45, 221, 375, 401, 466, 579, 595, 604, 915);
+   - after: **0**, and every other placeholder figure of §5 unchanged.
+
+   The correct node's sweep asserts the absence at every tier. Seed 45's pin asserts it
+   at the gate, where it counted 2 before the fix: node 2's answers for 14.
+
+   If the open fails after the switch, the replica is on disk and its descriptor stays in
+   place. The host drops its messages and makes no placeholder of it again, and a chunk
+   of it goes unanswered, so no second install traces a second `RangeCreated`. The stream
+   is finished in the task's plan and the failure is traced `RaftServerFailed`. A restart
+   opens the replica from its keys. No test injects a failed open (#173's review, N5).
+
+**PROPOSED, settled here** (SHARD.md does not say): the placeholder lives in the host as a
+set, not as a core in a placeholder mode of `ananke-raft` (Q40: that crate names no range,
+and "no Raft state" is a core's whole content); it is made by any message of its range, not
+only a leader's, as §8's re-add window already reads it ("a placeholder of X is also made
+on n by any stale leader's message"); its vote requests are dropped, not answered refused,
+as a refused server's are; and its answer carries the refused mark, which is what D-049's
+count reads since D-087.
+
+### 2. The install into a placeholder, and the overlap rule's half that protects it
+
+**What is built** (`install.rs`, the `snapshot` task; `ananke_raft::snapshot::staged_value`).
+A chunk of a placeholder's range is assembled as any stream's is, the range hosted in the
+task's plan at its Raft interval alone, since its span is the snapshot's and unknown until
+the stream completes, and answered with the stream's own term and store incarnation 0. At
+the stream's last chunk there is no core to hold and no replica's state to repair, so the
+task makes the install itself:
+
+1. the staged snapshot record and **the staged descriptor** are read out of the staged
+   tables (`staged_value`, the walk `staged_record` already made, for any key);
+2. **the install is refused where the descriptor's span overlaps an initialised replica on
+   the node**, or the range was created here meanwhile: the staged bytes are cleared and
+   the sender is asked to start over, traced `RaftSnapshotStartOver { reason: overlaps }`;
+3. otherwise the repair is a placeholder's — the stream's term, no vote, no kept tail, an
+   incarnation drawn fresh as every creation's is (Q26, D-042: from the node's generator,
+   or under `IncarnationPerRangeStream` from the range's own stream, as the split's and the
+   re-seed's draws are; #173's review, N4), and **the quarantine on
+   a node that runs on an engine a re-seed built, none elsewhere** (below) — and the one
+   manifest switch writes the replica's state under its prefix and replaces its span's
+   keys (D-066), the spans being the Raft interval and the descriptor's span;
+4. **the creation is traced at the switch**, `RangeCreated { cause: snapshot }` with the
+   descriptor's span, generation and voters, the snapshot's last index and term as the
+   floor and the fresh incarnation, before anything else is awaited: traced later, with the
+   core, a crash between the two would leave the node restating a replica the trace never
+   saw made, which check 20 would read as a placeholder's the day it granted a vote; and
+   **the descriptor is put in place with the trace**, so the placeholder answers nothing
+   from there (§1.6, corrected);
+5. the store is opened on what the switch wrote and entered in the node's tables with its
+   applied state, the range is hosted at its whole span, the replica is
+   read back and the install traced (`RaftSnapshotState`, `RaftSnapshot`), the sender is
+   answered installed with the new incarnation, and the `raft` task gets `Switched`, which
+   the host turns into the replica's core (`created_by_install`) — restored from the floor,
+   seeded from its range's stream (Q13), its recovery and its term stated as a start states
+   them, so the timer check and pre-vote's property follow it from there — and the core
+   takes its place on the node with no parent and no hurried election.
+
+**The quarantine, and exactly where Q26 holds** (corrected before #173 merged; it first
+said "no quarantine, since R's votes are in no store a re-seed could have lost (Q26)").
+Q26's reason is that "R is a new group, none of whose votes a re-seed of P before the
+split can have lost" (SHARD.md:3136-3137, §5). For an install into a placeholder that
+holds exactly when every replica of the range the node ever held is in the engine it now
+runs on. On Stage C's tree a replica leaves a node's engine only with that engine (no
+collection or merge until Stage D, where removal and re-add is Q26's own re-add window), so
+it holds **on a node that has lost no engine**, and on a re-seeded node only if the node
+lost its engine before the range existed. A node a re-seed rebuilt cannot tell which. Its
+right half R, made by its own apply of a split before the loss, may have voted. The re-seed
+neither refuses nor marks R, because it rebuilds configuration's ranges and configuration
+never names a right half. The fresh engine holds no key of R. So R's leader reaches the
+node's placeholder, and its install creates R again at the stream's term with no vote: a
+replica that could grant a vote in a term its lost predecessor voted in, which is D-035's
+case. So a node that runs on an engine a re-seed built quarantines every replica a
+placeholder's install creates:
+- `on_a_reseed` is set when this start re-seeded, or when D-066 opened a directory other
+  than the configured one. These are the two facts the bootstrap reads, read the other way.
+- The install writes the quarantine key in its switch's batch.
+- `created_by_install` restores the core quarantined and states it, `RaftReseeded` and then
+  `RaftRecovered { state: quarantined }`, as an install onto a re-seeded replica states it.
+
+The cost is that such a node also quarantines a range it never held: a right half created
+after its loss, or in Stage D one moved to it. That is the "replicas added later" cost §5
+gives per-node quarantine (SHARD.md:725-726), taken here only for what a placeholder's
+install creates. Stage D's rebalancer moves quarantined replicas off first (Q33).
+**PROPOSED.**
+
+**Tested** by `reseed::run_after_split`, a directed run on the re-seed shape's three servers
+(`a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`):
+- P, the first user range, is split by an operator, and a follower `x` of P applies the
+  split.
+- `x` is crashed, kept down until P's leader compacts past the split, and restarted on a
+  store marked lost.
+- On every seed, `x` held R before its refusal and its P is installed past the split at
+  generation 2 over the left half. A placeholder of R is made, R is created by that
+  placeholder's install at generation 2, and the replica is stated quarantined and grants
+  R nothing.
+- Without the fix the run fails the quarantine on every seed. Measured in release with
+  `on_a_reseed` forced false in `run`, which takes the quarantine out of both the install's
+  batch and `created_by_install`: 20 of 20 gate seeds fail and 200 of 200 at the binary's
+  cap, seed 0 with "node 3 was created the right half 6 by its placeholder's install after
+  its re-seed and did not state it quarantined". With the fix 20 of 20 and 200 of 200 pass,
+  every one reaching the case.
+- What the test asserts is the quarantine, not a double vote. Unquarantined, seed 0's
+  replica of R granted nothing in the rest of its run: a second vote in a term the lost
+  replica voted in needs R's candidate still campaigning in that term after `x`'s whole
+  outage, which this shape does not aim at. The fix closes the window by D-035's rule, as
+  the re-seed's own replicas are closed, rather than by a measured double vote.
+- With its old fold check 16 fails this run on 18 of the first 20 seeds with the fix in
+  place (below).
+- `x` is not restarted after its re-seed, so the run is in #176's window, in which the node
+  may stage its streams in the directory it refused (#176 predates this PR and is not fixed
+  here). Nothing the run asserts reads that directory.
+
+**Check 16 reads "from one meta index to the next" by index** (found by this run). The run
+is the first to re-seed a replica of the meta range after a split (#172). That replica
+restates the bootstrap's `MetaApplied { index: 0 }` (D-098), which names range 2 at
+generation 1. The fold kept one interval map of the generation per key in trace order, so
+it read the restatement as meta going back from the split's generation 2. It failed 18 of
+the run's first 20 correct seeds. The fold now keeps, with each interval, the meta index
+that named it:
+- an apply of an index above the stored one must not name a lower generation. This is
+  the fall `MetaOverwritesByArrival` makes, with the message it had;
+- an apply of an index at or below the stored one must not name a higher generation, and
+  does not replace the stored one. A lagging or re-seeded replica's earlier index is read
+  as the earlier index it is.
+
+Nothing consecutive goes unread. Every replica applies in index order, so the first apply of
+an index anywhere in the trace comes before any apply of a later one, and it is compared
+with what the index before it named.
+
+SHARD.md §8's text for check 16 is unchanged: this is that text, read exactly. The unit test
+`a_meta_apply_of_an_index_below_one_folded_is_compared_as_the_earlier_index` holds both
+directions.
+
+**What it moved: `MetaOverwritesByArrival`'s rate.** The variant lets every resend win its
+whole span, a resend of P's old generation at an index below the split's among them. The
+trace-order fold also read a lagging follower's apply of such an index, traced after the
+split's update elsewhere, as a fall. By index it is none. On the node sweep, seeds `0..n`,
+release, the variant is caught on:
+
+| Fold | 20 | 100 | 1 000 |
+|---|---|---|---|
+| by trace order (D-098, D-108's table) | 3 | 18 | 149 |
+| by index (this) | 0 | 2 | 19 |
+
+Every one of the 19 is check 16's fall, as the test asserts of each catch. The correct
+node's sweep is green on 1 000 of 1 000 under the new fold (release, with §1.6's correction). At 1.9 % the premerge's share of a hundred sees none about
+one time in seven (0.981^100), which D-061 forbids. So
+`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split` runs a
+thousand seeds from the premerge up rather than the share, and asserts its catch there, where
+a thousand see none about 5 times in 10^9. The tier it asserts at does not move. The
+nightly's run is unchanged, since its share is already a thousand. The premerge runs 900
+more seeds of it. Below the premerge it runs the share and asserts the split's landing, as
+it did. The rates D-098 and D-108 record for this variant are the trace-order fold's.
+**PROPOSED**, for the owner: the variant is now a low-rate one, and the alternative is a
+shape that aims a resend past the split, which no scenario has.
+
+**For the owner (PROPOSED, #175): a re-seeded node that replays a split.** The other way R
+comes back to a re-seeded node is unsafe in the same way. Suppose P's re-seed is installed
+from a checkpoint below the split's index `s`. The node's P replays `s`, and its apply
+creates R again at term 1 with no vote and, by Q26's "a split does not copy P's quarantine
+to R", no quarantine, though the R it lost may have voted. Q26 argues only for a re-seed
+*before* the split. **Recommended**: a right half created by a split's apply on a
+quarantined replica of P takes P's quarantine. A replica is quarantined only by a re-seed
+(D-035), so this amends Q26 for re-seeded replicas alone. The cost is a right half
+quarantined that need not be: one whose split the node first applied after its re-seed.
+Nothing is built for it here.
+
+**For the owner (PROPOSED, #178): the re-seed's refused mark for replicas configuration
+does not name.** #174's review (B1) found that a re-seed refuses and marks only `hosted`,
+configuration's ranges. A right half, a replica a placeholder's install created and every
+replica of a joiner (#174) get no refused mark and no `RaftReplicaRefused`. Q15's wording
+asks for both. **The double vote is closed here**: such a replica is in no key of the
+fresh engine, so it comes back only through its placeholder, and the quarantine above is
+written by that install on a re-seeded node. **The refused mark stays open.** #178 sets out
+the two ways to know what a lost engine held: read the lost engine, or keep a range list
+outside it. It recommends the list, which would also cover #175's replay. Nothing is
+built for it here.
+
+**Why the refusal is here and not only in the overlap rule's slice.** §5 has a placeholder
+take "only a snapshot the overlap rule below allows", and the placeholders make the
+overlap reachable on the correct node: a voter of P that has not yet applied `s` is fed
+R's snapshot whenever R's leader reaches its placeholder first, and installing it would
+put two owners on `[key, end)` until P moved on, which check 8's overlap clause, asserted
+since D-107, fails. So the receiver's half of Q27 is built here, for a placeholder's
+install, and answered as a start-over: the leader restarts the stream, and by then P on
+that node has applied `s`, which creates R and ends the placeholder, or been installed
+past it, which moves its span off R's. **Measured**: 15 refusals on 10 of the correct
+node's first thousand seeds, and on none of them a second owner. The rule's own answer,
+`Overlaps`, the leader's wait of a minimum election timeout before it streams again, the
+fresh take where its checkpoint predates the last split, the same rule for an install onto
+an initialised replica, and `SnapshotOverlapsReplica` are S9's (D-110), which replaces this
+start-over. **PROPOSED**: the receiver's half here, answered as a start-over.
+
+**What the start-over costs until S9** (#173's review, N2; #177). The refusal is
+answered `SnapshotStatus::Restart`, the one status the wire has for "start over". The
+leader's `step_for` counts every `Restart` against D-090's restart bound (RAFT.md:210-212).
+A refusal for overlap is no fault of the checkpoint, but it still spends the bound. The
+chunks still in flight when the staged bytes are cleared draw `Unusable` start-overs, and
+those count too. Once the bound is spent the leader counts a sound checkpoint unusable and
+takes a fresh one. Seed 595 of the correct node (node 1, range 38, leader 3) shows it: three
+fresh takes at 12.383 s, 12.715 s and 12.944 s, each within about 50 ms of a refusal for
+overlap. This is a cost, not a fault: the leader streams again, the parent on the node moves
+off R's span meanwhile, and no placeholder of the thousand was open at its run's end. Not
+counting the refusal needs a status of its own on the wire. That is the overlap rule's
+`Overlaps` answer and the leader's wait, which S9 builds, so nothing is changed here.
+
+**The apply's "R already initialised here" is not asserted here**, though §5 says "The apply
+asserts it", and the gate is why. With the refusal above R can be installed on a node only
+where no replica of P covers its span, and then no replica of P is there to apply `s`; but
+the assertion as first built, a voter's split that finds R's store on the node failing the
+node, fired under `IdBlockResumed` first: the variant's second split takes an id its node's
+first split already took, every voter's apply found that right half here, and every node
+stopped before tracing the split, so check 18's range-id clause — the variant's catch, and
+its pair in Stage C's exit — saw nothing, and the node sweep's test of it reached no second
+split. The assertion goes with the overlap rule's slice (S9), which owns the rest of the
+rule and has to place it after the split is traced or key it on an install.
+
+### 3. `UninitialisedReplicaVotes`
+
+`RangeVariant::UninitialisedReplicaVotes` (bit 7; bits 5 and 6 are D-108's two
+instruments): the placeholder grants every vote and pre-vote request it receives, answered
+granted at the request's term with nothing durable, and traces each grant as a
+`RaftVote { granted: true }`. One of §10's twenty-four.
+
+**Check 20 is built** (crates/ananke-shard: `invariants.rs`). It is
+`PlaceholderGrantsNothing`, a `Fold` of #163's framework, `Fold::PlaceholderGrants`, with
+a verdict of its own. It sits in `Fold::ALL` and in `Fold::VERDICT`, after check 18's two
+clauses and before check 8's overlap clause, so it stops a run. It folds §8's four events
+exactly as worded:
+- a node's `RangeCreated` of R holds R there until its `RangeRemoved` of R;
+- a crash ends nothing, since a replica outlives it;
+- a granted `RaftVote`, vote or pre-vote, of R on a node that does not hold R is the
+  violation;
+- `RangeReplicaCreated` is folded only for the words, which name a grant that follows
+  one as "from its placeholder".
+
+(This paragraph first said check 20 would follow and that the variant was asserted nowhere
+until then. Corrected in place when it landed; the entry is PROPOSED and on this branch.)
+
+**Measured, and asserted.** On the node sweep in release, after §1.6's correction:
+
+| `UninitialisedReplicaVotes` caught by check 20 | 20 seeds | 100 seeds | 1 000 seeds |
+|---|---|---|---|
+| this fold | 15 | 89 | 896 |
+
+These are the scratch fold's figures exactly. §1.6's window followed the creation, and every
+catch precedes it: a right half's first pre-vote reaching a node that has not applied its
+split.
+- `a_placeholder_that_grants_votes_is_caught_by_check_20` asserts the catch at every tier
+  over `high_rate_share` (15 of 20 at the gate; D-061, far above 5 %), and asserts that
+  every catch is check 20's.
+- Its pair is the correct node's sweep, which runs the same verdict: **1 000 of 1 000**
+  green with check 20 in it.
+- Under the equivalence test,
+  `the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes`
+  compares every fold chunk by chunk under the variant. It asserts check 20 in violation
+  on at least one compared seed at every tier (15 of 20, 89 of 100), each a placeholder's
+  grant. The correct node's comparison asserts it green.
+
+**Check 16's comparison under `MetaOverwritesByArrival`** asserted a trip from CI's
+hundred compared seeds on the trace-order fold's 18 in 100. By index that is 2 in 100,
+seeds 48 and 66, under D-061's 5 %, and the comparison never sees more than a hundred. So
+its tier catch is printed and not asserted. The comparison in violation is held on those
+two seeds at every tier (`META_REORDER_PINNED`), asserting a later index naming a lower
+generation, as check 18's grants clause is held on its four pins.
+
+**Check 8's right half's clause and `Checker::verdict`, measured for the owner.** On the
+correct node's sweep, seeds 0 to 999, release, the clause trips on **0 of 1 000**. On
+b21d76e, before the placeholders, it tripped on 2. It was left out of the verdict only for
+those trips. Nothing here adds it: D-107's two readings are still the owner's to choose
+between (§6), and other scenarios have not been measured at a thousand.
+
+### 4. The timer check skips a placeholder
+
+`sim/raft.rs`'s replay keeps the placeholders per (range, server), from each
+`RangeReplicaCreated` to the range's `RangeCreated` on that node, forgets a node's at its
+crash, and measures none of them (SHARD.md §8). A placeholder has no core and is never in
+the replay's running set, which its first `RaftTerm` would put it in, so on this tree the
+skip changes no verdict; it is asked of a placeholder directly by a unit test
+(`a_placeholder_is_not_measured_and_the_replica_its_install_creates_is`), and the replica
+an install creates is measured from its creation.
+
+### 5. What the placeholders moved, measured
+
+One probe, a scratch test file never committed, built in release on b21d76e and on this
+tree, run on one machine (an Apple M2 of 8 cores on AC power, under other slices' gates and
+probes, load averages up to 240; every figure is a hash or a count, which load does not
+touch, D-070). Per run it hashes, FNV-1a 64 over each record's `Debug` form, the trace
+with `RangeReplicaCreated` left out and every `TaskPolled` kept, so a schedule that moved
+shows, and records the verdict.
+
+- **The correct node under the raft sweep's arms, seeds 0 to 999**: every verdict green on
+  both trees, and the schedule moved on **92 of 1 000**, the seeds where a placeholder
+  answered an `AppendEntries` and so sent something. Placeholders were made on **896**
+  seeds (15 of the first 20, 89 of the first 100), 2 105 in all: 2 088 ended by their
+  node's apply of the split, **15** by an install into them, on 15 seeds (one of the first
+  hundred), 2 forgotten by a crash, none still a placeholder when its run ended; **15**
+  placeholders' installs were refused as overlapping their node's parent, on 10 seeds
+  (none of the first hundred).
+- **Every other node scenario**, seeds 0 to 99 — the membership scenario on the node,
+  `sim/ranges.rs`, the sharded quorum scenario under the correct node and under
+  `RefuseOneRangeOnly`, the re-seed shape — and `sim/install.rs`'s 0 to 31: **the same
+  schedule on every seed**, every verdict as it was. None of them splits a range, so no
+  message reaches a node for a range it holds no replica of, and where one did, a
+  placeholder that sends nothing leaves its round as empty as it was: such a round flushes
+  nothing, as it never did. (The first build flushed it, and moved 81 of the re-seed
+  shape's hundred and all 32 of `sim/install.rs`'s by shipping what an earlier frame had
+  left in the outbox; and it read a store's term once per chunk instead of at each answer,
+  as the task always had. Both were put back before anything was committed.)
+- **The range layer's variants and the node's on the node sweep**, seeds 0 to 99 each,
+  schedules moved and seeds failing before and after: `ApplyIgnoresSpan` 10, 5 and 5;
+  `IdBlockResumed` 7, 71 and 71; `MetaOverwritesByArrival` 8, 18 and 18;
+  `TrustStaleDescriptor` and `ClientIgnoresMismatch` none, 100 and 100 each, caught before
+  any split; `TakeSkipsTheUserKeys` 7, 86 and 86; `ApplyWaitsForEveryRange` 40, 87 and 86;
+  `InstallKeepsTheOldCore` 83, 3 and 4; `SharedSnapshotDir` 79, 41 and 34. The last three
+  move most because they leave replicas lagging or wedged, which is where a right half's
+  leader meets a placeholder; their tests assert the tiers they did, and pass at the gate.
+- **The pinned seeds.** The same schedule on 272, 516, 633, 8885 and 2809 of the correct
+  node, on 2994 of the sharded quorum scenario under both, on 1969 of the membership node
+  and on the re-seed shape's seed 1; seed 42's one-group trace is untouched. Moved: 368
+  and 493 of the correct node, whose pins still find the live install's hold they assert;
+  12 under `SharedSnapshotDir`, whose pin still finds its wedge; **45**, the right half's
+  clause's pin, upgraded to the mechanism that now closes it (section 6); **8** under
+  `SharedSnapshotDir`, whose split range's right half now completes no post-heal write, so
+  the starting map has nothing to excuse its wedge with — the pin asserts that absence and
+  moved the shape to **seed 76**, the lowest of the first thousand to carry it on this tree
+  (76, 80, 277, 320, …); and **613** under `ApplyWaitsForEveryRange`, whose stall moved from
+  range 4's `k4` to range 2's `k1` with the same shape — every completion of the range
+  before the pending writes' calls, none after them in 4 s more — which the pin now asserts
+  on `k1`.
+
+### 6. Check 8's right half's clause, and #170
+
+**#170 is resolved.** On the correct node's first thousand seeds **15** voters of a split's
+parent were installed the parent's snapshot at or past the split while they held no right
+half — every one the shape #170 names, on seeds 45, 221, 333, 375, 401, 466, 579, 595, 604,
+642, 728, 749, 878, 915 and 975 — and **every one** was created its right half by its
+placeholder's install, after 99 ms to **2 367 ms** (seed 595, behind four refusals for
+overlap; the median 319 ms). None was left without it at its run's end.
+
+**The right half's clause, under both readings, at 1 000.** Its reading as §8 words it —
+owed from a restatement of P at or past `s` whatever installed P there — holds on **1 000
+of 1 000** of the correct node's seeds, where on b21d76e it tripped on 2 (45 and 878): the
+installed voter now holds R by its next restart. D-107's recommended reading — owed from an
+apply of `s`, kept across restarts, and from a restatement past `s` only where the node's P
+was not installed at or past `s` since its last refusal — holds on **1 000 of 1 000** too;
+it is a scratch fold (the probe's copy of `OneOwnerPerKey` with that one change), not in
+this tree. The owner has not ruled on D-107, so the clause stays folded and printed at every
+tier and asserted nowhere. What the placeholders change in the question: the trip D-107
+found is gone under both readings, and the installed voter's own check D-107 recommends —
+its right half within a bound — would be asked of waits measured at 99 ms to 2.367 s over a
+thousand seeds, past ten maximum election timeouts (2 s) on one of them, so a bound for it is
+to be measured at ten thousand before it is chosen. **Seed 45 is re-pinned** on the
+mechanism that closes it
+(`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`): the
+install past the split at 165, no split applied on node 2, a placeholder of 14 made, 14
+created on node 2 by its install and before node 2's crash, the restatement after it naming
+14, and both of check 8's clauses green. The equivalence test's comparison in violation,
+which ran on seed 45's trip, runs on seed 45's trace with node 2's creation and restatements
+of 14 taken out — the voter that never gets its right half — and asserts the agreement there
+(`check_8_agrees_with_its_whole_trace_fold_on_the_node`, now with
+`UninitialisedReplicaVotes` among its systems).
+
+---
+
+_Next entry: D-110. Add one before implementing anything not covered above._

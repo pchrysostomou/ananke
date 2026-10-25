@@ -18,13 +18,14 @@
 //! classified as well as given a bit:
 //!
 //! - **One of §10's twenty-four**, the variants SHARD.md tables, each breaking one
-//!   rule with a reference, built by the stage §12 assigns it. Five are built:
+//!   rule with a reference, built by the stage §12 assigns it. Six are built:
 //!   [`RangeVariant::TrustStaleDescriptor`], [`RangeVariant::ApplyIgnoresSpan`] and
 //!   [`RangeVariant::ClientIgnoresMismatch`] (routing, PROPOSED D-097),
-//!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, PROPOSED D-098) and
-//!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099). The stale descriptor
-//!   is both a server's trust and a client's: Q38 ships `TrustStaleDescriptor` and
-//!   `ClientIgnoresMismatch` side by side.
+//!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, PROPOSED D-098),
+//!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099) and
+//!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, PROPOSED D-109). The
+//!   stale descriptor is both a server's trust and a client's: Q38 ships
+//!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
 //!   §8 has something that trips it where no protocol mistake of §10 does. Two are
 //!   built, both moved here from the node's set by PROPOSED D-108 because each
@@ -130,6 +131,16 @@ pub enum RangeVariant {
     /// §10's count.
     // PROPOSED(D-108): moved from the node's set, outside §10's count.
     IncarnationPerRangeStream,
+    /// A placeholder grants votes: a node that holds no replica of a range answers
+    /// that range's `PreVote` and `RequestVote` granted, every one it receives, with
+    /// nothing durable, where SHARD.md §5 has a placeholder grant nothing (Q22) and
+    /// D-033's usual rules were written for a server with a store to hold a vote in.
+    /// Check 20 sees the first grant: a `RaftVote` granted for a range its node has
+    /// traced no `RangeCreated` of (SHARD.md §8, §10). A placeholder that keeps no
+    /// vote can give one term's vote to two candidates, and a right half whose other
+    /// replicas are down elects with it.
+    // PROPOSED(D-109)
+    UninitialisedReplicaVotes,
 }
 
 impl RangeVariant {
@@ -142,6 +153,7 @@ impl RangeVariant {
         RangeVariant::IdBlockResumed,
         RangeVariant::AnyFreshNodeBootstraps,
         RangeVariant::IncarnationPerRangeStream,
+        RangeVariant::UninitialisedReplicaVotes,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -161,6 +173,8 @@ impl RangeVariant {
             // (D-096) and 25 (D-077).
             RangeVariant::AnyFreshNodeBootstraps => 1 << 5,
             RangeVariant::IncarnationPerRangeStream => 1 << 6,
+            // PROPOSED(D-109): a placeholder that grants votes.
+            RangeVariant::UninitialisedReplicaVotes => 1 << 7,
         }
     }
 
@@ -174,7 +188,8 @@ impl RangeVariant {
             | RangeVariant::ApplyIgnoresSpan
             | RangeVariant::ClientIgnoresMismatch
             | RangeVariant::MetaOverwritesByArrival
-            | RangeVariant::IdBlockResumed => true,
+            | RangeVariant::IdBlockResumed
+            | RangeVariant::UninitialisedReplicaVotes => true,
             RangeVariant::AnyFreshNodeBootstraps | RangeVariant::IncarnationPerRangeStream => false,
         }
     }
@@ -190,6 +205,7 @@ impl RangeVariant {
             RangeVariant::IdBlockResumed => "IdBlockResumed",
             RangeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
             RangeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
+            RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
         }
     }
 }
@@ -304,10 +320,11 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        // D-097's three for routing, D-098's one for the meta range and D-099's one for
-        // the range-id blocks, all of them §10's; and the two instruments PROPOSED
-        // D-108 moved here from the node's set, neither of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 7);
+        // D-097's three for routing, D-098's one for the meta range, D-099's one for
+        // the range-id blocks and D-109's one for placeholders, all of them §10's; and
+        // the two instruments PROPOSED D-108 moved here from the node's set, neither of
+        // them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 8);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -320,7 +337,7 @@ mod tests {
             .filter(|variant| variant.in_section_10())
             .count();
         assert!(counted <= SECTION_10.len());
-        assert_eq!(counted, 5, "§10's five built so far");
+        assert_eq!(counted, 6, "§10's six built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
         // a replica's incarnation at its creation).

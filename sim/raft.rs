@@ -628,6 +628,187 @@ pub fn splits_of(records: &[TraceRecord]) -> SplitCoverage {
     coverage
 }
 
+/// What a run's placeholders did (SHARD.md §5, Q22), over `records`: each made, traced
+/// `RangeReplicaCreated`, and ended by its node's own creation of the range — at the
+/// apply of the split that makes it, or at the install a stream to the placeholder
+/// completed into — or by its node's crash, which forgets it; how often a placeholder's
+/// install was refused because its span overlapped an initialised replica on the node
+/// (`StartOver::Overlaps`, Q27); and how long each voter of a split's parent that was
+/// installed the parent's snapshot at or past the split while it held no right half
+/// waited for the right half to be created on it (#170).
+// PROPOSED(D-109)
+#[must_use]
+pub fn placeholders_of(records: &[TraceRecord]) -> PlaceholderCoverage {
+    let mut coverage = PlaceholderCoverage::default();
+    let mut open: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+    let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // (parent, index) → (right, the voters of the parent's configuration at it).
+    let mut splits: BTreeMap<(u64, u64), (u64, Vec<u64>)> = BTreeMap::new();
+    let mut waiting: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+    // The replicas a node answers for as replicas: from its creation of the range to its
+    // refusal or the range's removal there (PROPOSED D-109 §1.6).
+    let mut created: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for (at, record) in records.iter().enumerate() {
+        let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RangeCreated { range, .. } => {
+                if let Some(node) = node {
+                    created.insert((node, *range));
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. }
+            | TraceEvent::RaftReplicaRefused { range, .. } => {
+                if let Some(node) = node {
+                    created.remove(&(node, *range));
+                }
+            }
+            TraceEvent::RaftRefused { .. } => {
+                if let Some(node) = node {
+                    created.retain(|(of, _)| *of != node);
+                }
+            }
+            TraceEvent::MessageSent { payload, .. } => {
+                if let Some(node) = node {
+                    coverage.answered_for_a_replica += messages_of(payload)
+                        .iter()
+                        .filter(|(range, message)| {
+                            created.contains(&(node, *range))
+                                && matches!(
+                                    message,
+                                    Message::AppendEntriesResponse {
+                                        hint: 1,
+                                        echo: 0,
+                                        incarnation: 0,
+                                        refused: true,
+                                        ..
+                                    }
+                                )
+                        })
+                        .count();
+                }
+            }
+            _ => {}
+        }
+        match &record.event {
+            TraceEvent::RangeReplicaCreated { range } => {
+                coverage.made += 1;
+                if let Some(node) = node {
+                    open.entry((node, *range)).or_insert(record.at);
+                }
+            }
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                parent,
+                floor_index,
+                voters,
+                ..
+            } => {
+                let Some(node) = node else { continue };
+                held.insert((node, *range));
+                if open.remove(&(node, *range)).is_some() {
+                    match cause {
+                        ananke_env::RangeCause::Snapshot => coverage.installed += 1,
+                        _ => coverage.by_split += 1,
+                    }
+                }
+                if *cause == ananke_env::RangeCause::Split
+                    && let Some(parent) = parent
+                {
+                    splits
+                        .entry((*parent, *floor_index))
+                        .or_insert_with(|| (*range, voters.clone()));
+                }
+                if let Some(since) = waiting.remove(&(node, *range)) {
+                    coverage
+                        .installed_voters_waited
+                        .push(record.at.duration_since(since));
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                if let Some(node) = node {
+                    held.remove(&(node, *range));
+                }
+            }
+            TraceEvent::NodeCrashed { node: crashed } => {
+                let crashed = u64::from(crashed.get());
+                let before = open.len();
+                open.retain(|(of, _), _| *of != crashed);
+                coverage.forgotten += before - open.len();
+            }
+            TraceEvent::RaftRefused { .. } => {
+                if let Some(node) = node {
+                    held.retain(|(of, _)| *of != node);
+                }
+            }
+            TraceEvent::RaftSnapshotStartOver {
+                reason: ananke_env::StartOver::Overlaps,
+                ..
+            } => coverage.refused_for_overlap += 1,
+            // A live install of a split's parent, at or past the split, onto a voter
+            // there that holds no right half: the replica `RaftSnapshotState` and
+            // `RaftSnapshot` trace at one instant at a live install's switch (D-091).
+            TraceEvent::RaftSnapshot {
+                server,
+                range,
+                last_index,
+                last_term,
+                taken: false,
+            } if at > 0
+                && matches!(
+                    &records[at - 1].event,
+                    TraceEvent::RaftSnapshotState { server: s, range: g, last_index: i, last_term: t, .. }
+                        if (s, g, i, t) == (server, range, last_index, last_term)
+                ) =>
+            {
+                let Some(node) = node else { continue };
+                for ((parent, index), (right, voters)) in &splits {
+                    if parent == range
+                        && last_index >= index
+                        && voters.contains(server)
+                        && !held.contains(&(node, *right))
+                    {
+                        waiting.entry((node, *right)).or_insert(record.at);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    coverage.open_at_end = open.len();
+    coverage.installed_voters_never = waiting.len();
+    coverage
+}
+
+/// What [`placeholders_of`] counts.
+// PROPOSED(D-109)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaceholderCoverage {
+    /// Placeholders made.
+    pub made: usize,
+    /// Of those, ended by the node's apply of the split that makes their range.
+    pub by_split: usize,
+    /// Of those, ended by an install into the placeholder, which created the replica.
+    pub installed: usize,
+    /// Of those, forgotten by their node's crash.
+    pub forgotten: usize,
+    /// Still placeholders when the run ended.
+    pub open_at_end: usize,
+    /// Placeholders' installs refused because the snapshot's span overlapped an
+    /// initialised replica on the node.
+    pub refused_for_overlap: usize,
+    /// How long each voter of a split's parent installed the parent's snapshot at or
+    /// past the split, holding no right half, waited for its right half (#170).
+    pub installed_voters_waited: Vec<Duration>,
+    /// Such voters still without their right half when the run ended.
+    pub installed_voters_never: usize,
+    /// Placeholder answers sent for a replica that exists: an `AppendEntriesResponse`
+    /// refused with a hint of 1, an echo of zero and store incarnation 0, sent by a node
+    /// for a range it has traced the creation of and has not been refused or removed
+    /// from since (SHARD.md §5: the placeholder becomes a replica at its install).
+    pub answered_for_a_replica: usize,
+}
+
 /// What [`splits_of`] counts.
 // PROPOSED(D-100)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4379,7 +4560,9 @@ impl Report {
     /// timeouts of the last AppendEntries it received from a leader of that range's
     /// term or later, the last vote it granted, its range's `RangeCreated`, or its
     /// start. A re-seeded server is exempt: it never campaigns on that store, by
-    /// design (RAFT.md §3, D-035). The first gap [`Report::replay_timers`] finds
+    /// design (RAFT.md §3, D-035). So is a placeholder, from its `RangeReplicaCreated`
+    /// to its range's `RangeCreated` on that node: it has no core and runs no timer
+    /// (SHARD.md §8, PROPOSED D-109). The first gap [`Report::replay_timers`] finds
     /// under every reset arm, in a range whose unimpaired replicas form a majority
     /// (SHARD.md §8), is the violation.
     ///
@@ -4539,6 +4722,12 @@ impl Report {
         // PROPOSED(D-091): the node's live install holds one range, and the replay
         // does not measure a replica whose core is held.
         let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // The placeholders, from each `RangeReplicaCreated` to its replica's
+        // `RangeCreated` (SHARD.md §8): a placeholder has no core and so no election
+        // timer, and the check skips it. A crash forgets every placeholder on the node,
+        // as the node does.
+        // PROPOSED(D-109): the timer check skips a placeholder.
+        let mut placeholders: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
@@ -4615,7 +4804,20 @@ impl Report {
                 // PROPOSED(D-071): the timer check is per (range, server).
                 TraceEvent::RangeCreated { range, .. } => {
                     if let Some(server) = record.node.map(|node| u64::from(node.get())) {
+                        // PROPOSED(D-109): a placeholder ends at its replica's creation.
+                        placeholders.remove(&(*range, server));
                         clocks.reset((*range, server), at);
+                    }
+                }
+                // A placeholder is no replica: it has no core and runs no timer, so
+                // nothing is measured of it until its range is created on the node
+                // (SHARD.md §8).
+                // PROPOSED(D-109): the timer check skips a placeholder.
+                TraceEvent::RangeReplicaCreated { range } => {
+                    if let Some(server) = record.node.map(|node| u64::from(node.get())) {
+                        placeholders.insert((*range, server));
+                        up.remove(&(*range, server));
+                        leaders.remove(&(*range, server));
                     }
                 }
                 // And its removal ends it: a replica whose state was deleted keeps
@@ -4815,12 +5017,17 @@ impl Report {
                     // replica is down for the ordinary reason now, and its restart's
                     // `RaftTerm` is what re-admits it.
                     held.retain(|&(_, s)| s != server);
+                    // PROPOSED(D-109): and so do its placeholders, which held nothing.
+                    placeholders.retain(|&(_, s)| s != server);
                 }
                 _ => {}
             }
             let mut flagged = BTreeSet::new();
             for &(range, server) in &up {
-                if leaders.contains(&(range, server)) || reseeded.contains(&(range, server)) {
+                if leaders.contains(&(range, server))
+                    || reseeded.contains(&(range, server))
+                    || placeholders.contains(&(range, server))
+                {
                     continue;
                 }
                 let since = clocks
@@ -9930,6 +10137,64 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(report.timer_gaps(TimerResets::ALL), Vec::new());
+    }
+
+    /// A placeholder is no replica, and the timer check skips it (SHARD.md §8): from
+    /// its `RangeReplicaCreated` to its range's `RangeCreated` on the node nothing is
+    /// measured of it, and the replica the creation makes is measured from there. Here
+    /// server 1's replica of `OTHER` is in the running set from its term at 0 and its
+    /// node makes a placeholder of the range at 100 ms — a shape no node of this stage
+    /// reaches, since a placeholder is made only where the node holds no replica, which
+    /// is why the skip is asked of it directly: at 500 ms, 500 ms past its last reset and
+    /// past the 400 ms bound, it is no gap. The install creates the replica at 600 ms and
+    /// states its term, as `created_by_install` does, and at 1 100 ms, 500 ms past that,
+    /// it is one. Without the skip the first stretch is a gap too.
+    // PROPOSED(D-109): the timer check skips a placeholder.
+    #[test]
+    fn a_placeholder_is_not_measured_and_the_replica_its_install_creates_is() {
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(
+                    ms(100),
+                    ms(100),
+                    Some(1),
+                    TraceEvent::RangeReplicaCreated { range: OTHER },
+                ),
+                record(ms(300), ms(300), Some(1), vote_in(1, SINGLE_GROUP)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+                record(ms(600), ms(600), Some(1), range_created(OTHER, 1)),
+                record(ms(600), ms(600), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(650), ms(650), Some(1), vote_in(1, SINGLE_GROUP)),
+                record(ms(1_000), ms(1_000), Some(1), vote_in(1, SINGLE_GROUP)),
+                record(
+                    ms(1_100),
+                    ms(1_100),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(1_100) },
+                ),
+            ],
+            Vec::new(),
+        );
+        let gaps = report.timer_gaps(TimerResets::ALL);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!((gaps[0].range, gaps[0].server), (OTHER, 1));
+        assert_eq!(
+            gaps[0].since,
+            ms(600),
+            "measured from the creation: {gaps:?}"
+        );
     }
 
     /// Pre-vote's property is per (range, server) (SHARD.md §8). Server 1 leads one
