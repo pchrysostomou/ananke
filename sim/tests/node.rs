@@ -2655,14 +2655,25 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
     );
 }
 
+/// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
+/// hundred, since check 16 reads one meta index against the next by index (PROPOSED
+/// D-109): 48 and 66, each a resend of a split parent's first generation applied at an
+/// index above the split's update.
+const META_REORDER_PINNED: [u64; 2] = [48, 66];
+
 /// Check 16 against `MetaOverwritesByArrival` (SHARD.md §12, Stage C's exit): a resend
 /// of a split parent's old descriptor that the variant's meta range stores after the
-/// split's update. Measured: 149 of seeds 0 to 999, 18 of the first hundred, 3 of the
-/// first twenty, every one check 16's — asserted from CI's hundred compared seeds, which
-/// miss it about once in 10^7 redraws, and not at the gate's twenty, which would miss it
-/// about once in twenty-five (D-061); the split it needs, on 999 of the 1 000, at every
-/// tier.
+/// split's update. Measured, by trace order (D-106): 149 of seeds 0 to 999, 18 of the
+/// first hundred, 3 of the first twenty, asserted from CI's hundred compared seeds. By
+/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0. The comparison never sees more
+/// than a hundred seeds, and two in a hundred is under D-061's 5 %, so the tier's catch
+/// is printed and not asserted; the comparison is held in violation on the two seeds
+/// pinned ([`META_REORDER_PINNED`]) at every tier, as check 18's grants clause is on its
+/// pins, and the variant's own catch is asserted over a thousand seeds from the premerge
+/// (`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split`).
+/// The split it needs, on 999 of the 1 000, at every tier.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-109): check 16 by index; its comparison in violation on two pins.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival() {
     let compared = range_folds_compared();
@@ -2674,12 +2685,114 @@ fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwri
         "no split took effect on the compared seeds, so MetaOverwritesByArrival had no \
          update to reorder"
     );
-    if seeds() >= 100 {
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::MetaNeverGoesBack))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: MetaOverwritesByArrival: check 16 tripped on seeds {on:?} of the \
+         {compared} compared"
+    );
+    let pinned: Vec<(u64, Option<String>)> = sweep(META_REORDER_PINNED.len() as u64, |at| {
+        let seed = META_REORDER_PINNED[usize::try_from(at).expect("two pins")];
+        let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+            Some(compared) => compared.tripped.get(&Fold::MetaNeverGoesBack).cloned(),
+            None => compare_range_folds(
+                seed,
+                "MetaOverwritesByArrival, pinned",
+                &node_records(seed, &[RangeVariant::MetaOverwritesByArrival]),
+            )
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::MetaNeverGoesBack)
+            .cloned(),
+        };
+        (seed, words)
+    });
+    for (seed, words) in &pinned {
+        let words = words.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: check 16 did not trip under MetaOverwritesByArrival, where it was \
+                 pinned for a resend applied at an index above the split's update: a schedule \
+                 move took it off that shape, so re-audit the pin to the shape's absence with \
+                 its reason (CLAUDE.md)"
+            )
+        });
         assert!(
-            tripped_on(&found, Fold::MetaNeverGoesBack) > 0,
-            "check 16 tripped on no compared seed of MetaOverwritesByArrival's {compared}"
+            words.contains("before it: the generation meta names never falls"),
+            "seed {seed}: check 16 tripped in a shape other than its pin's, a later meta index \
+             naming a lower generation: {words}"
         );
     }
+}
+
+/// Check 20 against `UninitialisedReplicaVotes` (SHARD.md §12, Stage C's exit): a
+/// placeholder that grants every vote and pre-vote it receives. Measured on this tree,
+/// release: 15 of the first 20 compared seeds and 89 of the first 100, every one a
+/// placeholder's grant — asserted at every tier, where twenty seeds at 75 % miss it about
+/// once in 10^12 (D-061). The correct node's comparison above asserts check 20 green on
+/// every compared seed.
+// PROPOSED(D-109)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("UninitialisedReplicaVotes", compared, |seed| {
+        node_records(seed, &[RangeVariant::UninitialisedReplicaVotes])
+    });
+    let tripped = tripped_on(&found, Fold::PlaceholderGrants);
+    println!(
+        "range folds: UninitialisedReplicaVotes: check 20 tripped on {tripped}/{compared} \
+         compared seeds"
+    );
+    assert!(
+        tripped > 0,
+        "check 20 tripped on no compared seed of UninitialisedReplicaVotes's {compared}"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        if let Some(words) = outcome.tripped.get(&Fold::PlaceholderGrants) {
+            assert!(
+                words.contains("from its placeholder"),
+                "seed {seed}: check 20 tripped on a grant that was not a placeholder's: {words}"
+            );
+        }
+    }
+}
+
+/// §10's `UninitialisedReplicaVotes` on the node, caught by check 20 at the first grant
+/// (SHARD.md §8, §10; PROPOSED D-109), and its pair: the correct node's sweep, which runs
+/// the same checks, asserts every seed green. A placeholder is made on most seeds — a
+/// split's right half pre-votes at once to replicas of its parent that have not applied
+/// the split (Q21, Q22) — and the variant grants that pre-vote. Measured on this tree,
+/// release: 15 of the gate's share of 20, 89 of the premerge's 100 and 896 of the
+/// nightly's 1 000, as before the install's window was closed (#173's review, B1: that
+/// window followed the creation, and every catch here precedes it), each check 20's at a
+/// right half's first pre-vote reaching a node that had not applied its split. Asserted
+/// as a catch at every tier (D-061: far above 5 %), and every catch is check 20's.
+// PROPOSED(D-109)
+#[test]
+fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
+    let outcomes = routing_variant(
+        "UninitialisedReplicaVotes",
+        &[RangeVariant::UninitialisedReplicaVotes],
+    );
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    for outcome in &outcomes {
+        if let Some(why) = outcome.why.as_deref() {
+            assert!(
+                why.contains("placeholder grants nothing"),
+                "seed {}: UninitialisedReplicaVotes was caught by something other than check \
+                 20: {why}",
+                outcome.seed
+            );
+        }
+    }
+    assert!(
+        caught > 0,
+        "UninitialisedReplicaVotes was caught on no seed of the share: no placeholder \
+         received a vote request, or check 20 is silent"
+    );
 }
 
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
@@ -3175,6 +3288,8 @@ fn mechanism(violation: &str) -> &'static str {
         ("serving within span", "serving within span"),
         ("owners' generations", "owners' generations"),
         ("client refreshes", "client refreshes"),
+        // PROPOSED(D-109): check 20.
+        ("placeholder grants nothing", "placeholder grants nothing"),
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),

@@ -22294,6 +22294,17 @@ quarantined replica of P takes P's quarantine. A replica is quarantined only by 
 quarantined that need not be: one whose split the node first applied after its re-seed.
 Nothing is built for it here.
 
+**For the owner (PROPOSED, #178): the re-seed's refused mark for replicas configuration
+does not name.** #174's review (B1) found that a re-seed refuses and marks only `hosted`,
+configuration's ranges. A right half, a replica a placeholder's install created and every
+replica of a joiner (#174) get no refused mark and no `RaftReplicaRefused`. Q15's wording
+asks for both. **The double vote is closed here**: such a replica is in no key of the
+fresh engine, so it comes back only through its placeholder, and the quarantine above is
+written by that install on a re-seeded node. **The refused mark stays open.** #178 sets out
+the two ways to know what a lost engine held: read the lost engine, or keep a range list
+outside it. It recommends the list, which would also cover #175's replay. Nothing is
+built for it here.
+
 **Why the refusal is here and not only in the overlap rule's slice.** §5 has a placeholder
 take "only a snapshot the overlap rule below allows", and the placeholders make the
 overlap reachable on the correct node: a voter of P that has not yet applied `s` is fed
@@ -22340,15 +22351,53 @@ instruments): the placeholder grants every vote and pre-vote request it receives
 granted at the request's term with nothing durable, and traces each grant as a
 `RaftVote { granted: true }`. One of §10's twenty-four.
 
-**Check 20 follows in this PR**, written as a `Fold` with a verdict of its own in #163's
-framework once #166 carries it (#162's merge order: #163, then #166, which merges `main`),
-with its pair in the equivalence test. Until then the variant is built and asserted
-nowhere. Measured before anything is asserted, with a scratch fold of check 20 as §8 words
-it over the node sweep's first thousand seeds: the variant is caught on **896** (15 of the
-first 20, 89 of the first 100) — every seed on which a placeholder was made, each at a
-right half's first pre-vote reaching a node that had not yet applied its split — and the
-run's own checks catch it on none, which is what check 20 is for; the correct node trips it
-on **0 of 1 000**.
+**Check 20 is built** (crates/ananke-shard: `invariants.rs`). It is
+`PlaceholderGrantsNothing`, a `Fold` of #163's framework, `Fold::PlaceholderGrants`, with
+a verdict of its own. It sits in `Fold::ALL` and in `Fold::VERDICT`, after check 18's two
+clauses and before check 8's overlap clause, so it stops a run. It folds §8's four events
+exactly as worded:
+- a node's `RangeCreated` of R holds R there until its `RangeRemoved` of R;
+- a crash ends nothing, since a replica outlives it;
+- a granted `RaftVote`, vote or pre-vote, of R on a node that does not hold R is the
+  violation;
+- `RangeReplicaCreated` is folded only for the words, which name a grant that follows
+  one as "from its placeholder".
+
+(This paragraph first said check 20 would follow and that the variant was asserted nowhere
+until then. Corrected in place when it landed; the entry is PROPOSED and on this branch.)
+
+**Measured, and asserted.** On the node sweep in release, after §1.6's correction:
+
+| `UninitialisedReplicaVotes` caught by check 20 | 20 seeds | 100 seeds | 1 000 seeds |
+|---|---|---|---|
+| this fold | 15 | 89 | 896 |
+
+These are the scratch fold's figures exactly. §1.6's window followed the creation, and every
+catch precedes it: a right half's first pre-vote reaching a node that has not applied its
+split.
+- `a_placeholder_that_grants_votes_is_caught_by_check_20` asserts the catch at every tier
+  over `high_rate_share` (15 of 20 at the gate; D-061, far above 5 %), and asserts that
+  every catch is check 20's.
+- Its pair is the correct node's sweep, which runs the same verdict: **1 000 of 1 000**
+  green with check 20 in it.
+- Under the equivalence test,
+  `the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes`
+  compares every fold chunk by chunk under the variant. It asserts check 20 in violation
+  on at least one compared seed at every tier (15 of 20, 89 of 100), each a placeholder's
+  grant. The correct node's comparison asserts it green.
+
+**Check 16's comparison under `MetaOverwritesByArrival`** asserted a trip from CI's
+hundred compared seeds on the trace-order fold's 18 in 100. By index that is 2 in 100,
+seeds 48 and 66, under D-061's 5 %, and the comparison never sees more than a hundred. So
+its tier catch is printed and not asserted. The comparison in violation is held on those
+two seeds at every tier (`META_REORDER_PINNED`), asserting a later index naming a lower
+generation, as check 18's grants clause is held on its four pins.
+
+**Check 8's right half's clause and `Checker::verdict`, measured for the owner.** On the
+correct node's sweep, seeds 0 to 999, release, the clause trips on **0 of 1 000**. On
+b21d76e, before the placeholders, it tripped on 2. It was left out of the verdict only for
+those trips. Nothing here adds it: D-107's two readings are still the owner's to choose
+between (§6), and other scenarios have not been measured at a thousand.
 
 ### 4. The timer check skips a placeholder
 
