@@ -23046,12 +23046,27 @@ wrong record.
   { term }` and then `RaftTerm` of that term, role `follower`, no receipt
   (`Report::installed_term`).
 - **Tied to the stream.** That term is taken only where it equals the term of the stream
-  the install completed (`Report::install_stream_terms`). The stream is the last
-  `InstallSnapshot` chunk marked done for the creation's snapshot, the same floor index and
-  term, delivered to the node before the creation. Its term is the stream's identity's,
-  which the switch writes as the replica's term.
-- **Otherwise unchanged.** A creation the trace cannot tie reads as it did before this
-  entry: the source before it, else 0.
+  the install completed (`Report::install_stream_terms`). The stream is the `InstallSnapshot`
+  chunk marked done for the creation's snapshot, the same floor index and term, delivered
+  last to the node **by the time the switch was decided**: the creation's `decided`, not
+  when it was traced, which is later. Its term is the stream's identity's, which the switch
+  writes as the replica's term. (Corrected before #184 merged, from its review's N1: as
+  first built the pairing scanned back from the creation's trace time, so it could pair a
+  done chunk delivered after the switch was decided, one the switch cannot have installed.
+  On seed 1817 it paired id 15680, delivered 52 ms after the decision; on the tree merged
+  with S9, 12 of the 15 install creations over 1 000 correct seeds had such a late chunk,
+  all at the installed term, so no verdict moved. Bounded to the decision, both pins pair
+  the same terms (the review's figures: seed 1817's chunk 15559, delivered at 15.5945 s
+  against the decision at 15.6407 s, term 2; seed 248's chunk 14119, at 15.5207 s against
+  15.5243 s, term 5), and the pins assert those terms.)
+- **Otherwise unchanged.** A creation the trace cannot tie gives way to the source before
+  it. That is the reading before this entry whenever that source is a term record, a
+  split's creation or nothing. An earlier install creation of the same replica gives
+  nothing either: its restatement is looked for only up to the creation after it, and
+  where it came before that creation it is itself the latest source. So an unpaired
+  creation always reads as before this entry. (Made exact before #184 merged, from its
+  review's N4: as first built, the earlier creation's restatement search ran past the
+  later creation and read that creation's restatement as its own.)
 - **What it can still catch.** A restatement of a term above the stream's is not taken. A
   first term record that is no restatement is not taken. A raise after the restatement is
   still a raise.
@@ -23060,10 +23075,10 @@ wrong record.
   which is rare.
 
 **What the check still trusts**, written down rather than built around. It pairs the
-creation with a stream by the snapshot's floor index and term, taking the last such done
-chunk delivered before the creation. If two streams of one snapshot at different terms
-both reach the node before its switch, the later one is read. That is the stream a switch
-on the latest chunk installs, and a mismatch reads as a violation, not as an excuse. It
+creation with a stream by the snapshot's floor index and term, taking the done chunk of it
+delivered last by the switch's decision. If two streams of one snapshot at different terms
+both reach the node by then, the one delivered later is read; a chunk delivered after the
+decision is never read. A mismatch reads as a violation, not as an excuse. It
 also trusts that a restatement of exactly that term, after a `RaftRecovered` of it, is the
 creation's own. The trace format is not changed for this.
 
@@ -23076,6 +23091,21 @@ creation's own. The trace format is not changed for this.
   - then a candidacy at 6 inside the window: "from 5 to 6";
   - a first term record that is no restatement: "from 0 to 5";
   - a restatement above the stream's term: "from 0 to 6".
+- **The second unit test**,
+  `an_installs_pairing_and_restatement_refuse_what_is_not_the_switchs_stream`, holds each
+  condition the pairing and the restatement rest on, one case each (#184's review, N1, N2,
+  N4). Each case fails under the plant that drops its condition, and passes without it:
+
+| Case | Expected | Plant | Under the plant |
+|---|---|---|---|
+| a done chunk of the checkpoint at term 6 delivered after the switch was decided | pairs 5, green | no bound to the decision | pairs 6 |
+| a follower `RaftTerm` with no `RaftRecovered` before it | "from 0 to 5" | no `RaftRecovered` required | green |
+| a restatement carrying a receipt taken inside the window | "from 0 to 5" | no receipt check | green |
+| beside the stream, a later chunk at term 6 that is not done | pairs 5, green | `done` not required | pairs 6 |
+| beside the stream, another range's chunk at term 6 | pairs 5, green | range not matched | pairs 6 |
+| beside the stream, another checkpoint's chunk at term 6 | pairs 5, green | floor index not matched | pairs 6 |
+| a second, unpaired creation after the paired one | "from 0 to 5", as before this entry | restatement search not stopped at the later creation | green |
+
 - **The pins.** `seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term`
   (correct node) and `seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation`
   (`ApplyIgnoresSpan`) assert on the trace that:

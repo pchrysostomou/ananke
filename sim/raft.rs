@@ -4427,9 +4427,9 @@ impl Report {
     /// ([`Report::installed_term`], PROPOSED D-112). The switch wrote that term before
     /// the window, and no core of the replica exists to change it until the
     /// restatement. What the check still trusts is that pairing: the stream is read
-    /// as the last done chunk of the creation's snapshot delivered to the node before
-    /// the creation, and a restatement of exactly that term, after a `RaftRecovered`
-    /// of it, is read as the creation's.
+    /// as the done chunk of the creation's snapshot delivered last to the node by the
+    /// time its switch was decided, and a restatement of exactly that term, after a
+    /// `RaftRecovered` of it, is read as the creation's.
     ///
     /// The violation names the server, the terms and the window and not the range,
     /// which forty-four pinned assertions take word for word and a run of this stage
@@ -4596,8 +4596,12 @@ impl Report {
                 _ => None,
             })
             .collect();
-        // The latest source; an install's creation that the trace cannot tie to the
-        // term its stream carried reads as it did before D-112, the source before it.
+        // The latest source. An install's creation the trace cannot tie to the term its
+        // stream carried gives way to the source before it. That is the reading before
+        // D-112 whenever the source before it is a term record, a split's creation or
+        // nothing; an install's creation before it gives nothing either, unless its own
+        // restatement came before the creation after it, which the latest source would
+        // then be ([`Report::installed_term`]; #184's review, N4).
         for &(index, term) in sources.iter().rev() {
             match term {
                 Some(term) => return term,
@@ -4626,6 +4630,12 @@ impl Report {
     /// the stream the install completed ([`Report::install_stream_terms`]): a restatement
     /// of any other term, or a first term record of any other shape, is not the
     /// creation's term and gives `None`.
+    ///
+    /// The restatement is looked for up to the replica's next creation and no further: a
+    /// term record after a later creation is that creation's (#184's review, N4). So an
+    /// install's creation the fold falls back past, because the creation after it could
+    /// not be paired, gives `None` unless its own restatement came before that later
+    /// creation, and the fold reads on as it did before D-112.
     // PROPOSED(D-112): the pre-vote fold reads an install's creation as a term source.
     fn installed_term(
         records: &[&TraceRecord],
@@ -4639,6 +4649,12 @@ impl Report {
         let mut recovered = None;
         for record in &records[created + 1..] {
             match &record.event {
+                TraceEvent::RangeCreated { range: g, .. }
+                    if *g == range
+                        && record.node.map(|node| u64::from(node.get())) == Some(server) =>
+                {
+                    return None;
+                }
                 TraceEvent::RaftRecovered {
                     server: s,
                     range: g,
@@ -4665,7 +4681,10 @@ impl Report {
     /// The term of the stream each install's creation completed (PROPOSED D-112): for
     /// every `RangeCreated { cause: snapshot }` on a node, the term of the last
     /// `InstallSnapshot` chunk of that range marked done, for the snapshot the creation
-    /// names (its floor index and term), delivered to the node before the creation.
+    /// names (its floor index and term), delivered to the node by the time the switch
+    /// was decided (`decided`, the install's decision, and not when its creation was
+    /// traced, which is later: a chunk delivered between the two cannot be the one the
+    /// switch installed; #184's review, N1). Last means delivered last.
     /// That chunk's term is the stream's identity's, which the switch writes as the
     /// replica's term (`Identity`, the repair's `term`). Keyed by (server, range, when
     /// the creation was traced). A creation no delivered chunk matches is absent, and
@@ -4692,15 +4711,30 @@ impl Report {
             let Some(server) = record.node.map(|node| u64::from(node.get())) else {
                 continue;
             };
-            let mut delivered: BTreeSet<ananke_env::MessageId> = BTreeSet::new();
-            for earlier in self.records[..at].iter().rev() {
+            // The deliveries to the node by the switch's decision, by where each
+            // stands, and the matching chunk delivered last among them.
+            let mut pending: BTreeMap<ananke_env::MessageId, usize> = BTreeMap::new();
+            let mut latest: Option<(usize, u64)> = None;
+            for (position, earlier) in self.records[..at].iter().enumerate().rev() {
+                // Every delivery not yet seen stands before `position`: once the latest
+                // match is later than every delivery still waiting for its send, no
+                // earlier record can change the answer.
+                if let Some((delivered_at, _)) = latest
+                    && pending.values().all(|waiting| *waiting < delivered_at)
+                {
+                    break;
+                }
                 match &earlier.event {
                     TraceEvent::MessageDelivered { id, .. }
-                        if earlier.node.map(|node| u64::from(node.get())) == Some(server) =>
+                        if earlier.at <= record.decided
+                            && earlier.node.map(|node| u64::from(node.get())) == Some(server) =>
                     {
-                        delivered.insert(*id);
+                        pending.insert(*id, position);
                     }
-                    TraceEvent::MessageSent { id, payload, .. } if delivered.contains(id) => {
+                    TraceEvent::MessageSent { id, payload, .. } => {
+                        let Some(delivered_at) = pending.remove(id) else {
+                            continue;
+                        };
                         let stream =
                             messages_of(payload)
                                 .into_iter()
@@ -4719,13 +4753,17 @@ impl Report {
                                     }
                                     _ => None,
                                 });
-                        if let Some(term) = stream {
-                            terms.insert((server, *range, record.at), term);
-                            break;
+                        if let Some(term) = stream
+                            && latest.is_none_or(|(best, _)| delivered_at > best)
+                        {
+                            latest = Some((delivered_at, term));
                         }
                     }
                     _ => {}
                 }
+            }
+            if let Some((_, term)) = latest {
+                terms.insert((server, *range, record.at), term);
             }
         }
         terms
@@ -9805,6 +9843,207 @@ mod tests {
         assert_eq!(campaigned.isolation_keeps_the_term_by_cause(), words(0, 5));
         let above = run(vec![recovered(6), restated(6)]);
         assert_eq!(above.isolation_keeps_the_term_by_cause(), words(0, 6));
+    }
+
+    /// What the pairing and the restatement's shape each refuse (#184's review, N1, N2,
+    /// N4; PROPOSED D-112), one case per condition, each on one server whose replica an
+    /// install created at 95 ms, its switch decided at 90 ms, before an isolation from
+    /// 100 ms; the install's stream is a done chunk of the checkpoint (72, 2) at term 5,
+    /// delivered at 85 ms, and the restatement is at 110 ms. Each case fails under the
+    /// plant that drops its condition:
+    ///
+    /// - **a done chunk of the same checkpoint at term 6 delivered at 92 ms**, after the
+    ///   switch was decided and before its creation was traced: not the stream the
+    ///   switch installed, so the term stays 5 (dropping the bound to the decision pairs
+    ///   6, and the restatement at 5 is flagged);
+    /// - **a follower `RaftTerm` with no `RaftRecovered` before it**: no restatement,
+    ///   "from 0 to 5";
+    /// - **a restatement that carries a receipt** taken after the window began: no
+    ///   restatement either, "from 0 to 5";
+    /// - **beside the stream, a later chunk at term 6 that is not done**, **one of
+    ///   another range** and **one of another checkpoint**: none is the stream, and the
+    ///   term stays 5;
+    /// - **a second creation of the replica, after the first and unpaired**: the fold
+    ///   falls back past it to the first, whose restatement is looked for only up to the
+    ///   second, so nothing is taken and the window reads "from 0 to 5", as before
+    ///   D-112.
+    // PROPOSED(D-112): the pairing's and the restatement's conditions, one case each.
+    #[test]
+    fn an_installs_pairing_and_restatement_refuse_what_is_not_the_switchs_stream() {
+        let isolation = (1, ms(100), ms(500));
+        let range = SINGLE_GROUP;
+        let addr = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let snapshot = |stream: u64, last_index: u64, done: bool| Message::InstallSnapshot {
+            term: stream,
+            last_index,
+            last_term: 2,
+            file: bytes::Bytes::from_static(b"snapshot"),
+            offset: 0,
+            total: 1,
+            done,
+            data: bytes::Bytes::from_static(b"x"),
+        };
+        let one_group = |message: Message| {
+            Frame {
+                from: ServerId(2),
+                message,
+            }
+            .encode()
+        };
+        // A node's batch frame of one message about `group`.
+        let batched = |group: u64, message: Message| {
+            let encoded = Frame {
+                from: ServerId(2),
+                message,
+            }
+            .encode();
+            let mut builder = ananke_shard::frame::Builder::new(1 << 16);
+            builder.push(RangeId(group), &encoded);
+            builder.finish()
+        };
+        // A message sent at `sent` and delivered to server 1 at `delivered`.
+        let chunk = |id: u64, sent: u64, delivered: u64, payload: bytes::Bytes| {
+            vec![
+                record(
+                    ms(sent),
+                    ms(sent),
+                    Some(2),
+                    TraceEvent::MessageSent {
+                        id: ananke_env::MessageId::new(id),
+                        from: addr(2),
+                        to: addr(1),
+                        payload,
+                    },
+                ),
+                record(
+                    ms(delivered),
+                    ms(delivered),
+                    Some(1),
+                    TraceEvent::MessageDelivered {
+                        id: ananke_env::MessageId::new(id),
+                        from: addr(2),
+                        to: addr(1),
+                        len: 1,
+                        dup: false,
+                    },
+                ),
+            ]
+        };
+        let created = |at: u64, decided: u64, floor_index: u64| {
+            record(
+                ms(at),
+                ms(decided),
+                Some(1),
+                TraceEvent::RangeCreated {
+                    range,
+                    cause: ananke_env::RangeCause::Snapshot,
+                    parent: None,
+                    start: bytes::Bytes::from_static(b"a"),
+                    end: bytes::Bytes::from_static(b"z"),
+                    generation: 2,
+                    voters: vec![1, 2, 3],
+                    floor_index,
+                    floor_term: 2,
+                    incarnation: 9,
+                },
+            )
+        };
+        let recovered = |at: u64| {
+            record(
+                ms(110),
+                ms(110),
+                Some(1),
+                TraceEvent::RaftRecovered {
+                    server: 1,
+                    range,
+                    term: at,
+                    applied: 72,
+                    last_index: 72,
+                    incarnation: 9,
+                    state: ananke_env::RecoveredAs::Neither,
+                },
+            )
+        };
+        let restated = |at: u64| record(ms(110), ms(110), Some(1), term(1, at, "follower", None));
+        let stream = chunk(7, 80, 85, one_group(snapshot(5, 72, true)));
+        let run = |records: Vec<Vec<TraceRecord>>| {
+            let mut records: Vec<TraceRecord> = records.into_iter().flatten().collect();
+            records.sort_by_key(|record| record.at);
+            report(records, vec![isolation])
+        };
+        let words = |before: u64, after: u64| {
+            Err(format!(
+                "pre-vote: server 1 raised its term from {before} to {after} while isolated from \
+                 Instant(100ms) to Instant(500ms)"
+            ))
+        };
+        let paired = |report: &Report| {
+            report
+                .install_stream_terms()
+                .values()
+                .copied()
+                .collect::<Vec<u64>>()
+        };
+        let restatement = || vec![recovered(5), restated(5)];
+        // N1: a done chunk of the checkpoint delivered after the switch was decided.
+        let late = run(vec![
+            stream.clone(),
+            chunk(8, 86, 92, one_group(snapshot(6, 72, true))),
+            vec![created(95, 90, 72)],
+            restatement(),
+        ]);
+        assert_eq!(
+            paired(&late),
+            vec![5],
+            "a chunk delivered after the decision is paired"
+        );
+        assert_eq!(late.isolation_keeps_the_term_by_cause(), Ok(()));
+        // N2: the restatement's shape.
+        let unrecovered = run(vec![stream.clone(), vec![created(95, 90, 72), restated(5)]]);
+        assert_eq!(unrecovered.isolation_keeps_the_term_by_cause(), words(0, 5));
+        let receipted = run(vec![
+            stream.clone(),
+            vec![
+                created(95, 90, 72),
+                recovered(5),
+                record(
+                    ms(110),
+                    ms(110),
+                    Some(1),
+                    term(1, 5, "follower", Some(stamp(ms(105)))),
+                ),
+            ],
+        ]);
+        assert_eq!(receipted.isolation_keeps_the_term_by_cause(), words(0, 5));
+        // N2: the pairing's filters, each against a later chunk at term 6.
+        for (what, decoy) in [
+            (
+                "a chunk that is not done",
+                one_group(snapshot(6, 72, false)),
+            ),
+            ("another range's chunk", batched(99, snapshot(6, 72, true))),
+            (
+                "another checkpoint's chunk",
+                one_group(snapshot(6, 71, true)),
+            ),
+        ] {
+            let beside = run(vec![
+                stream.clone(),
+                chunk(8, 86, 88, decoy),
+                vec![created(95, 90, 72)],
+                restatement(),
+            ]);
+            assert_eq!(paired(&beside), vec![5], "{what} is paired");
+            assert_eq!(beside.isolation_keeps_the_term_by_cause(), Ok(()), "{what}");
+        }
+        // N4: an unpaired creation after a paired one falls back to the reading before
+        // D-112.
+        let again = run(vec![
+            stream,
+            vec![created(95, 90, 72), created(98, 97, 999)],
+            restatement(),
+        ]);
+        assert_eq!(again.isolation_keeps_the_term_by_cause(), words(0, 5));
     }
 
     /// D-050's excuse needs every change of the window's term to be taken from a
