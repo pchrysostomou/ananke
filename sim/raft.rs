@@ -2165,7 +2165,10 @@ fn replica_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftProgressReset { server, .. }
         | TraceEvent::RaftSnapshotDeleted { server, .. }
         | TraceEvent::RaftSnapshotReused { server, .. }
-        | TraceEvent::RaftSnapshotStreams { server, .. } => Some(*server),
+        | TraceEvent::RaftSnapshotStreams { server, .. }
+        // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
+        | TraceEvent::RaftSnapshotOverlapped { server, .. }
+        | TraceEvent::RaftSnapshotRestream { server, .. } => Some(*server),
         _ => None,
     }
 }
@@ -2918,6 +2921,9 @@ pub fn range_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftSnapshotDeleted { range, .. }
         | TraceEvent::RaftSnapshotReused { range, .. }
         | TraceEvent::RaftSnapshotStreams { range, .. }
+        // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
+        | TraceEvent::RaftSnapshotOverlapped { range, .. }
+        | TraceEvent::RaftSnapshotRestream { range, .. }
         | TraceEvent::RaftMatchStarted { range, .. }
         | TraceEvent::RaftLearnerRound { range, .. }
         | TraceEvent::RaftChangeAccepted { range, .. } => Some(*range),
@@ -7243,8 +7249,9 @@ impl StreamProgress {
             // is not a restart either, so it is neither counted nor credited.
             // PROPOSED(D-090): a cap-wait is not progress and is not a start-over.
             message::SnapshotStatus::Waiting => false,
-            // The overlap rule's refusal (PROPOSED D-110): the stream ends there, and
-            // nothing it covered is progress.
+            // The overlap rule's refusal: the stream ends there, and nothing it covered
+            // is progress.
+            // PROPOSED(D-110): the overlap rule's refusal ends the stream.
             message::SnapshotStatus::Overlaps => {
                 self.streams.remove(&(to, from));
                 false
