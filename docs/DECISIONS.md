@@ -23121,4 +23121,279 @@ creation's own. The trace format is not changed for this.
 
 ---
 
-_Next entry: D-113. Add one before implementing anything not covered above._
+## PROPOSED D-116 — Check 8's created-twice clause: a `RangeCreated` of a range on a node that holds it initialised is a violation whatever made either creation, which is §5's "the apply asserts it" asked of the trace; `IdBlockResumed` trips it under the equivalence test, and seed 219 of the node sweep under `SnapshotOverlapsReplica` is pinned
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. Tracking issue #162 has
+D-113 for S10, and #183 and #172 have D-114 and D-115. This entry takes D-116, and the
+footer moves to D-117. At each merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-116)`. Closes #181.
+
+**Context.** SHARD.md §5 said the overlap rule makes the apply's "R already initialised
+here" unreachable (SHARD.md:808-810 before this entry), and then: "The apply asserts it."
+Nothing asserted it:
+- D-109 §2 built it as a node failure, at a voter's split that finds R's store on the
+  node. It fired first under `IdBlockResumed`. That variant's second split takes an id the
+  first split already took, so every voter's apply found that right half, and every node
+  stopped before check 18 could see the reused id. The assertion went to S9.
+- D-110 §7 did not build it. Keyed on an install, it would need durable knowledge of
+  which replicas an install made. The entry recommended a fold.
+- D-110 §4 found the run it would have caught: seed 219 of the node sweep under
+  `SnapshotOverlapsReplica`. Node 3 creates range 62 twice, by its split's apply and by an
+  install, and only Raft's state machine safety sees the run fail. #181 records it and
+  recommends the fold built here.
+
+### 1. The clause
+
+A `RangeCreated` of R on a node whose spans hold R is a violation:
+- the spans are check 8's, folded from its events in §8's fixed orders;
+- R is in them from its creation there, or from its restatement since the node's last
+  crash;
+- it leaves them at a `RangeRemoved` of R, a crash of the node, or its `RaftRefused`;
+- the cause of either creation does not matter: a split's apply, an install or a
+  bootstrap.
+
+**The words** name the node, the creation's cause and floor index, and what made the range
+held (a creation, by its cause and floor index, or a restatement at its applied index):
+
+> one owner per key: node 3 traced a `RangeCreated { cause: snapshot }` of range 62 at
+> floor index 347 while it holds range 62 initialised, created by a split at floor index
+> 346, with no `RangeRemoved` of it, crash or refusal of the node between: a replica
+> created twice on one node (SHARD.md §5, the apply's "R already initialised here"; §8,
+> check 8)
+
+**Latched, like the other two clauses.** `OneOwnerPerKey::created_twice_verdict` and
+`Fold::CreatedTwice` (check 8, the words `one owner per key:`, shown as "check 8 (one owner
+per key, the created-twice clause)").
+
+**"Holds" is check 8's own reading: what the node's trace has said since its last start.**
+A crash forgets the node's spans and the restatement states them again. A node that
+restates no R holds none; for a voter of R's split, that is the right half's clause's to
+see. Refusals are covered by the same reading. A refusal also ends the holding, as it ends
+check 8's spans. On this tree a refusal is traced only by a start's re-seed, so a crash has
+already ended the holding (§7, M4).
+
+**The stronger reading.** A holding could instead last across a crash, ended only by a
+removal or a refusal. That reading sees one more fault: a node that does not restate a
+replica it holds and later creates it again. That fault is not "R already initialised
+here", since the node does not hold R. It is a creation that did not survive a restart, the
+mirror of check 21's removal. On the correct system the two readings agree: every creation
+is traced once its batch is durable (a split's apply is a synced batch, an install's
+creation is traced at its switch), so a restart restates it. Measured at the gate's twenty
+on every node binary (§7, M5). **PROPOSED**: check 8's reading, as #181 recommends ("since
+its last crash and restatement"); the stronger one is the owner's.
+
+**SHARD.md is amended to say so.**
+- §5: "The apply asserts it" becomes "Check 8 asserts it, of the trace and whatever made
+  either creation", with the reason the node does not fail.
+- §8: check 8 gains the clause.
+- §12: the clause is added to Stage C's folds, and its tripping variant to Stage C's exit
+  list.
+- §10's rows need no change. `SnapshotOverlapsReplica`'s row already names check 8 at the
+  install's `RangeCreated { cause: snapshot }`, which is where seed 219 trips the clause.
+  `IdBlockResumed`'s catch stays check 18's (§3).
+
+### 2. A clause of check 8, not a fold of its own
+
+- **The state it reads is check 8's.** That state is the spans of each node's initialised
+  replicas, folded from check 8's six events: `RangeCreated`, `RangeDescriptor`,
+  `RangeRemoved`, `RangesRestated`, `NodeCrashed` and the node's `RaftRefused`. A fold of
+  its own would keep a second copy of that map, from the same events, under the same
+  rules for a crash and a refusal. Those rules would then have to be kept the same in two
+  places. The clause adds one map beside the spans, `held_since`: per (node, range), what
+  put the range there, a creation or a statement, which its words name. It is kept and
+  cleared exactly as the spans are.
+- **§5 derives the assertion from the rule check 8 holds.** "The same rule makes the
+  apply's 'R already initialised here' unreachable", and §5 says that rule "keeps one
+  owner per key per node (check 8 of §8)". The assertion also needs a fresh right half's
+  id (Q17), which check 18 holds. A second creation writes R's state over the first's on
+  one node: the split's `split_state_into`, or the install's switch. That is one range
+  owning its keys twice over, with one history replacing another. It is check 8's
+  question asked of one range rather than of two.
+- **Not check 7's.** Check 7 is a map per (range, index) across the cluster and knows no
+  node. The second creation on seed 219 states the value the map holds there: the same
+  span, generation and voters at a floor above the split's. So check 7 rightly passes it.
+- **Not check 20's.** Check 20's set of held replicas lasts across a crash and ignores a
+  refusal, because a grant is judged against everything the node could ever have voted
+  with. It is a rule fold about votes.
+
+### 3. In the checker's verdict, last
+
+`Fold::VERDICT` gains the clause after the overlap clause, and `Fold::ALL` puts it between
+the overlap clause and the right half's. Asked last, it moves no violation that another fold
+reports.
+- **`IdBlockResumed`.** Check 18's freshness clause trips at the second split's first
+  `RangeSplit`. That precedes, in §8's fixed order, every voter's `RangeCreated` of the
+  reused id, so the run's verdict keeps check 18's words. Measured over the node sweep's
+  seeds 0 to 999 in release: the clause trips on 630 seeds. The run's own verdict there
+  names:
+
+  | Check | Seeds |
+  |---|---|
+  | check 18 (`descriptor lineage:`) | 482 |
+  | state machine safety | 92 |
+  | check 7 | 22 |
+  | check 9 | 15 |
+  | log matching | 9 |
+  | commit by current term | 9 |
+  | check 16 | 1 |
+
+  None of them names the new clause.
+- **Seed 219.** The raft checker is asked before the range layer's at every look
+  (`sim/raft.rs`, `advance`). The run's verdict is still state machine safety, as D-110
+  §4 reported.
+
+The clause stops runs because the correct system never trips it (§4). The unit test
+`check_8s_created_twice_clause_is_asked_last_and_a_reused_id_stays_check_18s` holds the
+order: on a split that names a held right half's id again, the verdict is check 18's. On a
+second creation alone, the verdict is the clause's.
+
+### 4. The correct system
+
+Release, seeds 0 to 999. The clause is read fold by fold over every run's records, and
+the run's verdict, which now asks it, is read beside it:
+
+| Run | Clause in violation | Run's verdict |
+|---|---|---|
+| the node sweep (`raft::run_on_the_node`) | 0 | green on 1 000 |
+| `sim/split.rs` (i) | 0 | green on 1 000 |
+| `sim/split.rs` (ii) | 0 | green on 1 000 |
+| the membership scenario on the node | 0 | green on 1 000 |
+| the re-seed shape (`reseed::run`) | 0 | green on 1 000 |
+| a re-seeded node's right half (`reseed::run_after_split`) | 0 | green on 1 000 |
+| `sim/install.rs`, and its joiner's re-seed | 0 | green on 1 000 each |
+
+Every other test of the node binaries passes at the gate's twenty with the clause in the
+verdict. `SnapshotOverlapsReplica` on (i) trips the overlap clause on 1 000 of 1 000 and
+the created-twice clause on none: `x`'s P is installed past the split and never applies
+it.
+
+**A latent case, unreached on every run above: a re-seeded system replica.**
+- The re-seed writes a system range's descriptor and its index-0 state into the fresh
+  engine (D-098). The start therefore restates that replica as initialised.
+- If its leader has compacted, the replica is caught up by an install. The node's
+  `installed` classifies that install as a creation: applied 0, no log, no snapshot. It
+  traces `RangeCreated { cause: snapshot }` of a range the node has just restated, and the
+  clause would trip.
+- §8 defines `RangeCreated` as "an install on a node that held no initialised replica of
+  the range". So the clause is right to flag it. The trace is what is wrong.
+- Measured: none of the scenarios above creates range 0 or range 1 on a node after its
+  refusal on any of its thousand seeds. The node sweep refuses no store on any of the
+  10 000 seeds of the nightly on 7d15a83 (run 41330474538: "0 store refusals over 10000
+  seeds").
+- It becomes reachable the day a scenario both refuses a store and compacts a system range
+  past it. S10's `sim/shard.rs`, with Phase 2's disk faults, may be that scenario.
+- **Not fixed here.** The fix is in the node's trace, not in the check: a replica that held
+  a descriptor before its install is not created by it. Recommended as its own issue, with
+  a directed run that reaches it.
+
+### 5. Its tripping variant: `IdBlockResumed` on the node sweep
+
+The clause is compared fold by fold under D-106's equivalence test against
+`IdBlockResumed`, in the test that already compares check 18 against it. That test is
+renamed in place `the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`.
+
+Measured fold by fold, release, seeds `0..n`:
+
+| Tier | Created-twice clause | Of those, over a restatement | Check 18's range-id clause |
+|---|---|---|---|
+| 20 | 14 | 13 | 14 |
+| 100 | 71 | 67 | 71 |
+| 1 000 | 630 | 605 | 630 |
+
+- **Same seeds.** At every tier the clause trips on exactly the seeds check 18's range-id
+  clause trips on.
+- **Each trip is a split's creation of a range its node holds.** In most, the node had
+  restated it after the restart the variant needs; in the rest, the first split had
+  created it.
+- **Asserted at every tier** (D-061: 70 %), together with a trip over a restatement (65 %).
+  Twenty seeds at those rates miss about once in 10^10 and once in 10^9.
+- **Each trip's mechanism is asserted too.** It is a `cause: split` creation, on a seed
+  where check 18's range-id clause also trips. So what the clause sees here is the reused
+  id and not some other second creation.
+- **It is a high-rate comparison, so it is in violation at every tier.** A fold fed in
+  chunks that lost its holdings between them reads `Ok` there, and the comparison fails on
+  it (§7, M3; #166's review, N7).
+
+**Why not `SnapshotOverlapsReplica`, whose harm §5 names.** No scenario reaches its second
+creation at a rate any tier can assert:
+- On the node sweep it creates a range twice on 1 of 1 000 seeds, seed 219. A thousand
+  seeds would miss that about once in three.
+- On `sim/split.rs` (i) it does so on 0 of 1 000 (§4).
+
+A shape where `x`'s P catches up by its log after R's install would reach it on every
+seed. That needs a new directed shape, so it is not built here (§9).
+
+### 6. Seed 219, pinned
+
+`seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`
+(`sim/tests/node.rs`).
+
+**Under the variant:**
+1. Node 3 makes a placeholder of 62 at 17.653 s.
+2. Its apply of range 5's split at index 346 creates 62 at 18.211 s
+   (`RangeCreated { cause: split }`, floor 346).
+3. The install, which the variant had let past the overlap check while node 3's 5 still
+   covered 62's span, creates 62 again at 18.289 s (`cause: snapshot`, floor 347).
+4. Node 3 applies 347 again at 18.305 s.
+
+Asserted:
+- those records, in that order, with nothing between the two creations that lets node 3
+  drop 62;
+- the clause, fed one record at a time, first in violation at the second creation, in the
+  words of §1;
+- the overlap clause green, because the split shrank 5 before the install was traced;
+- the raft checker, fed the same way, first in violation 16 ms later, at the re-apply;
+- the run's verdict is state machine safety.
+
+**On the correct node:**
+- the run is green;
+- node 3 refuses 62's install for overlap at 18.192 s, while its 5 still covers 62;
+- its apply of the split creates 62 once.
+
+The day a schedule moves the seed off either shape, the test names which, and the pin is
+re-audited (CLAUDE.md).
+
+### 7. Plants: what fails without each part
+
+Each change below was made to the clause alone. Each was run against `ananke-shard`'s unit
+tests, then the node binary's correct-node comparison, the `IdBlockResumed` comparison, the
+seed 219 pin and the correct node's sweep, then the `reseed`, `split`, `ranges` and
+`install` binaries, all at the gate's twenty:
+
+| Plant | What fails |
+|---|---|
+| M1: the clause never latches | both of its unit tests; the `IdBlockResumed` comparison ("tripped on no compared seed"); the seed 219 pin ("did not first trip at node 3's second creation of 62") |
+| M2: the checker's verdict does not ask it | the verdict-order unit test. The sweeps assert a correct system green and read the clause's own verdict, so they cannot see it |
+| M3: the holdings cleared at each `Checker::extend`, a fold that loses its state between the looks an incremental checker takes | the verdict-order unit test, and the `IdBlockResumed` comparison: on 14 seeds, "fed in chunks said Ok(()) and folded over the whole prefix said Err(...)" |
+| M4: a refusal does not end the holding | the unit test's refusal case, since it now holds a refusal alone. First run against a case with the crash before the refusal, nothing failed: every refusal on this tree follows its node's crash |
+| M5: a crash does not end the holding (§1's stronger reading) | the unit test's case of a crash after which nothing is restated. Every sweep is green |
+| M6: a restatement does not hold the range | the unit test's restatement case, and the `IdBlockResumed` comparison's trip over a restatement. First run without that assertion, the comparison passed on the trips over a first split's creation |
+
+### 8. Traces, schedules and the nightly
+
+- No trace event is added and no schedule moves. A fold reads the trace. A check moves a
+  run only where it stops the run at a look where nothing else had, and §3 and §4 measure
+  none. No pinned hash moved.
+- D-064 nightly rows:
+  - the comparison is renamed in place, keeping its shard 5 and its 23.1 cpu s; its
+    created-twice assertions read the folds it already compared;
+  - seed 219's pin is weighed from the built release binary at 0.7 cpu s and goes into the
+    lightest shard, shard 6: 1832.3 -> 1833.0.
+- The premerge runs nothing new at its thousand.
+
+### 9. For the owner (PROPOSED)
+
+1. The assertion as a clause of check 8, not a fold of its own (§2).
+2. Asked by the checker's verdict, last (§3).
+3. "Holds" read as check 8's spans, which a crash forgets and the restatement states
+   again, rather than as a holding that lasts across a crash (§1).
+4. `IdBlockResumed` on the node sweep as its tripping variant, and seed 219 pinned for
+   `SnapshotOverlapsReplica`. A directed shape for that variant's second creation — (i)
+   with `x`'s P left to catch up by its log — is not built (§5).
+5. The re-seeded system replica's install traced as a creation of a replica its node had
+   just restated: latent, recommended as its own issue (§4).
+6. SHARD.md §5, §8 and §12 amended (§1).
+
+---
+
+_Next entry: D-117. Add one before implementing anything not covered above._

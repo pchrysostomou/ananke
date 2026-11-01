@@ -101,6 +101,21 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-created-twice-fold` (2026-11-01), off `main` at b1da6ec,
+  PROPOSED D-116 (footer D-117; D-113 to D-115 are other slices'), **#181: check 8's
+  created-twice clause**. A `RangeCreated` of a range on a node whose check-8 spans already
+  hold it is a violation, whatever made either creation: §5's "the apply asserts" that R is
+  not "already initialised here", asked of the trace instead of failing the node, so it no
+  longer hides check 18's reused id. `Fold::CreatedTwice`, in the checker's verdict after
+  the overlap clause. The correct system trips it on none of 1 000 seeds of the node
+  sweep, `sim/split.rs` (i) and (ii), the membership scenario on the node, the re-seed
+  shapes and `sim/install.rs`. Its tripping variant under the equivalence test is
+  `IdBlockResumed` on the node sweep: 14 of 20, 71 of 100 and 630 of 1 000, the same seeds
+  as check 18's range-id clause, asserted at every tier. Seed 219 under
+  `SnapshotOverlapsReplica` is pinned: the clause trips at node 3's install's creation of
+  62 after its split's, 16 ms before Raft's state machine safety. A latent case is left as
+  an issue: a re-seeded system replica's install is traced as a creation of a replica just
+  restated, which no run reaches.
 - Branch `phase-3-stage-c-overlap-rule` (2026-10-25), off `main` at 2d59c96, PR #180,
   PROPOSED D-110 (footer D-112 since the merge of `main` at 292cafc, #179 taking D-111), **#162's S9, the overlap rule (Q27)**. An install refused
   because its span overlaps another initialised replica on the node is answered

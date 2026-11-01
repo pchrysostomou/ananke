@@ -2209,7 +2209,7 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     // first on 129 of the 628 seeds the variant is caught on — state machine safety on
     // 90, check 9 on 16, log matching on 11, commit by current term on 8, check 7 on 3,
     // check 16 on 1 — and check 18's clause trips beneath every one of them, read fold by
-    // fold (`the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed`).
+    // fold (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
     // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
@@ -2470,8 +2470,12 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// — `AnyFreshNodeBootstraps`, D-096's instrument, trips it on the membership scenario
 /// below.
 ///
-/// **Check 8** runs here and under every pair below too, its two clauses a fold each
-/// (PROPOSED D-107). Its right half's clause trips on the correct node itself — a voter
+/// **Check 8** runs here and under every pair below too, each of its clauses a fold
+/// (PROPOSED D-107, D-116); its created-twice clause stops a run and is asserted absent
+/// here with the others ([`Fold::VERDICT`]), and its comparison in violation comes with
+/// `IdBlockResumed`
+/// (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
+/// Its right half's clause trips on the correct node itself — a voter
 /// installed past a split holds no right half until placeholders exist — so it is
 /// compared and printed and not asserted absent, and its seed 45
 /// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
@@ -2915,28 +2919,93 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// variant is caught on: the run's own verdict names another check first on 129 of the
 /// 628 (state machine safety, check 9, log matching and others, D-105's table), and the
 /// fold shows check 18 tripped beneath each. Asserted at every tier.
+///
+/// **Check 8's created-twice clause** against the same variant (PROPOSED D-116): a voter
+/// of the second split that holds the right half the first made, created there or
+/// restated there after the restart the variant needs, creates it again at its apply,
+/// which is SHARD.md §5's "R already initialised here". Measured fold by fold over seeds 0
+/// to 999 of this tree in release: in violation on 630 of the thousand, 71 of the first
+/// hundred and 14 of the first twenty, on exactly the seeds check 18's range-id clause
+/// trips on there, each a `RangeCreated { cause: split }` of a range its node held,
+/// restated after a restart on 605 and created by the first split on 25. Asserted at
+/// every tier (D-061: 70 %), each trip a split's creation on a seed check 18's range-id
+/// clause trips on too, so that what the clause sees here is the reused id. It is the
+/// clause's tripping variant because no other variant reaches it at a rate a tier can
+/// assert: `SnapshotOverlapsReplica`, whose harm §5 names, creates a range twice on one
+/// seed of the node sweep's thousand (seed 219, pinned:
+/// `seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`)
+/// and on none of `sim/split.rs` (i)'s. The run's own verdict names check 18 or an
+/// earlier check on every one of the 630, since the clause is asked last.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-116): and check 8's created-twice clause, its tripping variant.
 #[test]
-fn the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed() {
+fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed() {
     let seeds = range_folds_compared();
     let found = range_folds_under("IdBlockResumed", seeds, |seed| {
         node_records(seed, &[RangeVariant::IdBlockResumed])
     });
-    let by_clause = found
-        .iter()
-        .filter(|seed| {
-            [Fold::RangeIds, Fold::SplitLineage].iter().any(|fold| {
-                seed.tripped
-                    .get(fold)
-                    .is_some_and(|words| by_the_range_id_clause(words))
-            })
+    let reused = |seed: &FoldsFound| {
+        [Fold::RangeIds, Fold::SplitLineage].iter().any(|fold| {
+            seed.tripped
+                .get(fold)
+                .is_some_and(|words| by_the_range_id_clause(words))
         })
-        .count();
+    };
+    let by_clause = found.iter().filter(|seed| reused(seed)).count();
     println!("range folds: IdBlockResumed: check 18's range-id clause on {by_clause}/{seeds}");
     assert!(
         by_clause > 0,
         "check 18's range-id clause tripped on no compared seed of IdBlockResumed's {seeds}"
     );
+    // PROPOSED(D-116)
+    let twice: Vec<(usize, &str)> = found
+        .iter()
+        .enumerate()
+        .filter_map(|(seed, outcome)| {
+            outcome
+                .tripped
+                .get(&Fold::CreatedTwice)
+                .map(|words| (seed, words.as_str()))
+        })
+        .collect();
+    println!(
+        "range folds: IdBlockResumed: check 8's created-twice clause on {}/{seeds}",
+        twice.len()
+    );
+    assert!(
+        !twice.is_empty(),
+        "check 8's created-twice clause tripped on no compared seed of IdBlockResumed's \
+         {seeds}: no voter created again the right half whose id the second split took"
+    );
+    // What the node held the range by: on most seeds the restatement after the restart
+    // the variant needs, so the clause's holding is seen to include a restatement on a
+    // real trace (605 of the 630 trips of the thousand; the rest, the first split's
+    // creation).
+    let over_a_restatement = twice
+        .iter()
+        .filter(|(_, words)| words.contains("initialised, stated at applied index"))
+        .count();
+    println!(
+        "range folds: IdBlockResumed: check 8's created-twice clause over a restatement on \
+         {over_a_restatement} of those"
+    );
+    assert!(
+        over_a_restatement > 0,
+        "check 8's created-twice clause tripped under IdBlockResumed over no restatement on \
+         {seeds} compared seeds: a range a restarted node restated is not held"
+    );
+    for (seed, words) in twice {
+        assert!(
+            words.contains("traced a `RangeCreated { cause: split }`"),
+            "seed {seed}: check 8's created-twice clause tripped under IdBlockResumed at a \
+             creation that is not a split's: {words}"
+        );
+        assert!(
+            reused(&found[seed]),
+            "seed {seed}: check 8's created-twice clause tripped under IdBlockResumed where \
+             check 18's range-id clause did not, so what it saw is not the reused id: {words}"
+        );
+    }
 }
 
 /// Check 7 against `AnyFreshNodeBootstraps` on the membership scenario's five nodes,
@@ -3204,6 +3273,194 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         report.records[placeholder].at,
         report.records[created].at,
         report.records[crashed].at
+    );
+}
+
+/// **Seed 219 under `SnapshotOverlapsReplica`: one range created twice on one node, by
+/// a split's apply and then an install, and check 8's created-twice clause sees the
+/// second creation** (PROPOSED D-116, #181; found by D-110 §4). Node 3 made a placeholder
+/// of range 62 at 17.653 s, before its replica of range 5 applied the split at index 346
+/// that makes 62. A stream of 62 reached the placeholder, and the variant let its install
+/// past the overlap check while node 3's 5 still covered 62's span. Node 3's apply of the
+/// split then created 62 at 18.211 s (`RangeCreated { cause: split }`, floor 346), and the
+/// install's switch, landing after it, created 62 again at 18.289 s (`RangeCreated {
+/// cause: snapshot }`, floor 347). Node 3 then applied 347 again at 18.305 s, which is
+/// what the run's own verdict names: Raft's state machine safety, the raft checker being
+/// asked before the range layer's at every look. No two of node 3's spans overlapped when
+/// the install was traced, since the split had shrunk 5 first, so check 8's overlap clause
+/// is green; before this clause no check of the range layer saw the run. On the correct
+/// node node 3 refuses 62's install for overlap at 18.192 s, while its 5 still covers 62,
+/// and its apply of the split creates 62 once.
+///
+/// What is asserted: under the variant, the two creations on node 3 in that order with
+/// nothing between that lets node 3 drop 62, the placeholder before both; the clause,
+/// fed one record at a time, first in violation at the install's creation, in its own
+/// words; the overlap clause green; and the raft checker, fed the same way, first in
+/// violation after that record. On the correct node: green, the refusal for overlap
+/// before the split's apply, and 62 created on node 3 once. The day a schedule moves
+/// the seed off either, this says which, and the pin is re-audited (CLAUDE.md).
+// PROPOSED(D-116)
+#[test]
+fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second() {
+    let (seed, node, parent, index, right) = (219u64, 3u32, 5u64, 346u64, 62u64);
+    let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
+    let variant = raft::run_on_the_node(
+        seed,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]),
+    );
+    let records = &variant.records;
+    let find = |what: &str, from: usize, matches: &dyn Fn(&TraceEvent) -> bool| {
+        from + records[from..]
+            .iter()
+            .position(|record| on(record) && matches(&record.event))
+            .unwrap_or_else(|| {
+                panic!(
+                    "seed {seed} under SnapshotOverlapsReplica: node {node} never traced {what}; \
+                     the schedule has moved off the pin's shape, so re-audit it (CLAUDE.md)"
+                )
+            })
+    };
+    let placeholder = find(
+        "a placeholder of the right half",
+        0,
+        &|event| matches!(event, TraceEvent::RangeReplicaCreated { range } if *range == right),
+    );
+    let by_split = find(
+        "the right half's creation by the split",
+        placeholder,
+        &|event| {
+            matches!(event, TraceEvent::RangeCreated {
+            range, cause: ananke_env::RangeCause::Split, parent: Some(p), floor_index, ..
+        } if (*range, *p, *floor_index) == (right, parent, index))
+        },
+    );
+    let by_install = find(
+        "a second creation of the right half",
+        by_split + 1,
+        &|event| matches!(event, TraceEvent::RangeCreated { range, .. } if *range == right),
+    );
+    let floor = match &records[by_install].event {
+        TraceEvent::RangeCreated {
+            cause: ananke_env::RangeCause::Snapshot,
+            floor_index,
+            ..
+        } => *floor_index,
+        other => panic!(
+            "seed {seed}: node {node}'s second creation of {right} is not an install's: {other:?}"
+        ),
+    };
+    assert!(
+        !records[..by_split].iter().any(|record| on(record)
+            && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
+        "seed {seed}: node {node} created {right} before its split's apply did"
+    );
+    let dropped = records[by_split + 1..by_install].iter().find(|record| {
+        matches!(&record.event, TraceEvent::NodeCrashed { node: n } if n.get() == node)
+            || (on(record)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RaftRefused { .. } | TraceEvent::RangeRemoved { .. }
+                ))
+    });
+    assert!(
+        dropped.is_none(),
+        "seed {seed}: between node {node}'s two creations of {right} it let it go: {dropped:?}"
+    );
+    // The clause, one record at a time: first in violation at the install's creation.
+    let mut owners = invariants::OneOwnerPerKey::default();
+    let tripped = records.iter().position(|record| {
+        owners.push(record);
+        owners.created_twice_verdict().is_err()
+    });
+    assert_eq!(
+        tripped,
+        Some(by_install),
+        "seed {seed}: check 8's created-twice clause did not first trip at node {node}'s \
+         second creation of {right}"
+    );
+    let checker = invariants::folded(records);
+    assert_eq!(
+        checker.verdict_of(Fold::CreatedTwice),
+        Err(format!(
+            "one owner per key: node {node} traced a `RangeCreated {{ cause: snapshot }}` of \
+             range {right} at floor index {floor} while it holds range {right} initialised, \
+             created by a split at floor index {index}, with no `RangeRemoved` of it, crash or \
+             refusal of the node between: a replica created twice on one node (SHARD.md §5, \
+             the apply's \"R already initialised here\"; §8, check 8)"
+        )),
+        "seed {seed}: check 8's created-twice clause"
+    );
+    assert_eq!(
+        checker.verdict_of(Fold::Overlap),
+        Ok(()),
+        "seed {seed}: check 8's overlap clause, which the split's shrinking of {parent} keeps \
+         green here"
+    );
+    // Raft's state machine safety sees the harm later, at the re-apply.
+    let mut log = ananke_raft::invariants::Checker::new(raft::SERVERS as usize);
+    let raft_tripped = records
+        .iter()
+        .position(|record| {
+            log.extend(ananke_sim::traced(std::slice::from_ref(record)));
+            log.verdict().is_err()
+        })
+        .unwrap_or_else(|| panic!("seed {seed}: the raft checker never tripped"));
+    assert!(
+        by_install < raft_tripped,
+        "seed {seed}: the raft checker tripped at record {raft_tripped}, not after node \
+         {node}'s second creation of {right} at {by_install}"
+    );
+    let why = variant
+        .check()
+        .expect_err("seed 219 fails under SnapshotOverlapsReplica");
+    assert!(
+        why.contains("state machine safety"),
+        "seed {seed}: the run's verdict under SnapshotOverlapsReplica: {why}"
+    );
+    // The correct node: the install refused for overlap, and one creation.
+    let report = correct(seed);
+    checked(&report)
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let refused = report.records.iter().position(|record| {
+        on(record)
+            && matches!(&record.event, TraceEvent::RaftSnapshotStartOver {
+                range, reason: ananke_env::StartOver::Overlaps, ..
+            } if *range == right)
+    });
+    let created: Vec<usize> = report
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            on(record)
+                && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        matches!(&created[..], [one] if matches!(&report.records[*one].event,
+            TraceEvent::RangeCreated { cause: ananke_env::RangeCause::Split, floor_index, .. }
+                if *floor_index == index)),
+        "seed {seed}: the correct node 3 did not create {right} once, by the split at {index}: \
+         {created:?}"
+    );
+    assert!(
+        refused.is_some_and(|refused| refused < created[0]),
+        "seed {seed}: the correct node {node} did not refuse {right}'s install for overlap \
+         before its split's apply created it ({refused:?})"
+    );
+    println!(
+        "seed {seed}: under SnapshotOverlapsReplica node {node} made a placeholder of {right} at \
+         {:?}, created it by the split at {:?} and by the install at {:?}, which check 8's \
+         created-twice clause trips at; the raft checker trips at {:?}; the correct node refused \
+         the install for overlap at {:?} and created {right} once",
+        records[placeholder].at,
+        records[by_split].at,
+        records[by_install].at,
+        records[raft_tripped].at,
+        refused.map(|at| report.records[at].at)
     );
 }
 

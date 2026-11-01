@@ -486,6 +486,13 @@
 # them, and recomputes every header from the rows beneath it: shard 5 carries D-110's 226.1
 # and D-112's 0.4 and 0.3, 1754.2 -> 1981.0; shards 4 and 6 are D-110's 2015.7 and 1832.3.
 # The next row added goes into the lightest, which is shard 6.
+# PROPOSED D-116 (check 8's created-twice clause) renamed one `node` row in place, check 18's
+# comparison under `IdBlockResumed`, now `..._checks_18_and_8_trip_under_id_block_resumed`,
+# keeping its shard and weight: its new assertions read the folds it already compared. It
+# added seed 219's pin, two runs of one seed, weighed from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
+# two runs, under load averages 70 to 80 from other runs: 0.7 cpu s (0.66 + 0.04, 0.66 +
+# 0.03). Into the lightest shard, shard 6 at 1832.3 -> 1833.0.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -612,7 +619,7 @@
 5	node	0.2	seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse
 5	node	31.2	the_range_layers_folds_agree_one_by_one_on_the_correct_node
 5	node	29.3	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival
-5	node	23.1	the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed
+5	node	23.1	the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed
 5	node	0.4	seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
 5	node	18.0	a_placeholder_that_grants_votes_is_caught_by_check_20
 5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
@@ -621,7 +628,7 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 1832.3 cpu s
+# shard 6: 1833.0 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -667,3 +674,4 @@
 6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
+6	node	0.7	seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second
