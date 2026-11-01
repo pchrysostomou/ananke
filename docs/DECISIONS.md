@@ -22708,17 +22708,28 @@ A released phase's crate carries a wire addition, as D-090 made one. **PROPOSED.
 - **An install onto an initialised replica** (`finish`) is held to the same rule: the
   snapshot's descriptor, read out of the staged bytes, must overlap no other replica's
   descriptor on the node; otherwise the staged bytes are cleared, the answer is `Overlaps`
-  with the same trace, and the range's hold is released. A snapshot carrying no
-  descriptor names no span to refuse and installs as before.
+  with the same trace, and the range's hold is released. **A snapshot whose descriptor
+  cannot be found is refused** as a start-over (`Unusable`), as the placeholder's path
+  always refused one; as first built it was installed "as before", failing open (#180's
+  review, B2; §11).
+- **One decision for both paths** (`admission`, a free function): no span named,
+  `NoSpan`; a placeholder's install of a range made on the node meanwhile, `Overlaps`; a
+  span over another initialised replica, `Overlaps`, unless the variant; otherwise
+  `Install` (§11).
 - **The descriptor is read in the snapshot record's own walk**
-  (`snapshot::staged_record_and_next`), off the entry that ends the record's key in each
-  table: the descriptor's key (`PURPOSE_DESCRIPTOR`, 4) is the one that follows the
-  record's (`PURPOSE_SNAPSHOT`, 3) in a range's state. The first build read it with a
-  second `staged_value` walk, and that moved the schedule of every run with an install,
-  since the simulated disk draws a delay for every read: eight tests of the node binary
-  failed the gate, the pins of seeds 2809, 45, 633, 12 and 76 and the D-045 pair (its seed
-  8) among them. Read in the
-  record's walk the reads are the same and none moved.
+  (`snapshot::staged_record_and_next`). Each table's walk goes on from the record's key,
+  past any key below the descriptor's, and stops at its first entry at or past the
+  descriptor's: today that is the entry that ends the record's key, since the descriptor's
+  key (`PURPOSE_DESCRIPTOR`, 4) is the one that follows the record's (`PURPOSE_SNAPSHOT`,
+  3) in a range's state, so the walk reads exactly what `staged_record`'s reads; a key
+  added between the two later costs its own reads and hides nothing. The walk refuses a
+  key that does not sort after the record's (`InvalidInput`). The first build read the
+  descriptor with a second `staged_value` walk, and that moved the schedule of every run
+  with an install, since the simulated disk draws a delay for every read: **seven** tests
+  of the node binary failed the gate (corrected from "eight" after #180 merged, by its
+  review, N6): the pins of seeds 2809, 45, 633, 12 and 76, the D-045 pair (its seed 8),
+  check 16's comparison under `MetaOverwritesByArrival` and the correct node's fold
+  comparison. Read in the record's walk the reads are the same and none moved.
 - **On Stage C's tree the second path is unreachable on the correct system**, and is built
   because Q27 states one rule. An install needs a snapshot past the replica's applied
   index; a range's span only shrinks between two of its indices until merges exist; so a
@@ -22741,15 +22752,39 @@ the ask; the core then streams from its checkpoint or, with `retake`, takes a fr
 refused stream's version directory is pinned against the range's sweeps through the wait,
 as a stream's own is (D-043).
 
-**"Below the last split or merge" is read off the checkpoint**: `retake` when the
-descriptor in the refused stream's version directory names a span other than the one the
-range's descriptor names now. Spans change at a split or a merge and nothing else, and a
-snapshot whose span is the range's present one is exactly what a fresh take would stream,
-so retaking it could not stop an overlap. A version that cannot be read is retaken, since
-nothing then says it postdates either. The words of Q27 are an index comparison; this is
-the same test for every case Stage C reaches and costs no index bookkeeping that a restart
-would lose (an index of the last split is not durable on the node; a descriptor is).
-**PROPOSED.**
+**"Below the last split or merge" is read off the checkpoint, by its generation**
+(`retake_after_overlap`, a free function): `retake` when the descriptor in the refused
+stream's version directory is at a generation other than the range's descriptor's now.
+The generation rises at every split and merge (Q6), and on Stage C's tree only there, so
+a checkpoint below the range's generation is one taken before the range's last split or
+merge, which is Q27's words read exactly. Every doubt is a retake: a version that cannot
+be read, a range holding no descriptor, a generation above the range's own. A wrong "no"
+streams the same refused checkpoint after every wait for as long as nothing else moves
+the range's record on, which on an idle range is for ever; a wrong "yes" costs one take.
+**PROPOSED, recommended**: by generation.
+
+*Corrected after #180 merged* (#180's review, B1 and N2). As first built the test was by
+span: `retake` when the checkpoint's span was not the range's. It is the same answer for
+every case Stage C's correct system reaches, since spans change only at splits there, and
+two cases tell them apart. A split followed by a merge back (Stage D) restores a span at a
+higher generation, and the span test would stream the checkpoint from before the split,
+where Q27 asks a fresh take. And a configuration change raises the generation without
+moving the span (Q6, Stage D's moves), where the generation test retakes and the span
+test does not: the generation's cost, one take that a later stage may find needless.
+Both read the same key of the same version directory. The reason given against an index
+("an index of the last split is not durable on the node") does not apply to the
+descriptor's own generation, which is.
+
+**A retake after repeated refusals of one checkpoint is not needed for liveness, and is
+not built.** The documents settle it: Q27 streams again "from the same checkpoint, since
+the overlap is the receiver's to clear" wherever the checkpoint is not below the range's
+last split or merge. A checkpoint at the range's generation names the range's present
+span, which is what a fresh take would name, so a retake cannot stop the overlap; what
+ends it is the receiver's overlapping replica moving on — a lagging P installed past the
+split or applying it, in Stage D a stale replica collected (Q27). #173's third-`Restart`
+backstop, which S9 removes with the restart count (#177), retook a sound checkpoint and
+changed nothing at the receiver. The cost that remains is a restream about every 240 ms
+to a receiver that is still overlapped, bounded by the receiver's own progress.
 
 The wait lives in the node's `snapshot` task and not in the core, because the core names
 no range and has no notion of an overlap (Q40); `SnapshotFailed` is the input it already
@@ -22759,13 +22794,31 @@ has for "this stream is over, ask again".
 drives `step_for` and `booked` with `Overlaps` at every restart count and three times in
 a row, seed 595's count, and the restart counter stays at 0 with no `Unusable`. On the
 correct node's sweep, release, seeds 0 to 999: **13 refusals for overlap on 10 seeds**
-(D-109 counted 15 on 10, two of them the second and third of the start-overs that no
-longer happen), 12 waits ended (the 13th's answer reached a leader no longer sending), every
-one with `retake: false`, and **no fresh take after a refusal**: seed 595's range 38 now has
-the one take of 11.789 s and three refusals, each followed 100 ms later by a restream of the
-same checkpoint. The stragglers D-109 noted — chunks still in flight when the staged bytes
-were cleared, refused `Unusable` — are still refused (six on seed 595), and now answer a
-stream the leader has ended, so nothing counts them.
+(219, 261, 333, 466, 579, 595, 604, 878, 915 and 975), 12 waits ended, every one with
+`retake: false`, so no refusal caused a take. Seed 595's range 38 has the one take of
+11.789 s and three refusals, at 12.329, 12.564 and 12.804 s, each followed 104 to 106 ms
+later by a restream of the same checkpoint.
+
+*Corrected after #180 merged* (#180's review, N6): the two causes first given here were
+inferred, not measured, and both are now measured.
+
+- **D-109's 15 refusals against these 13.** A probe of `main` at 2aab845, which has
+  D-109's start-over, gives the same ten seeds with 15 refusals. Two seeds differ: seed 333
+  goes from 2 to 1 and seed 595 from 4 to 3. Under the start-over the leader streamed
+  again at once into a receiver that still overlapped. Seed 595's four refusals came
+  163–216 ms apart; under the wait, three came 235–240 ms apart. So one fewer stream
+  reached each receiver before it moved on.
+- **13 refusals against 12 waits.** Seed 219's one refusal (node 3, range 62, 18.192 s)
+  was answered `Overlaps`, and the network dropped the answer. Its leader never ended that
+  stream. The straggler start-overs that followed reached a stream still open, which
+  counted them, as it counts any start-over.
+
+The stragglers D-109 noted are chunks still in flight when the staged bytes were
+cleared, refused `Unusable`. They are still refused: **seven** on seed 595, six after the
+first refusal (12.338–12.376 s) and one after the third (12.818 s), corrected from "six"
+(N6). They now answer a stream the leader has ended, so nothing counts them. Takes by
+the snapshot threshold still follow a refusal on four seeds (333, 579, 604 and 975, six
+takes), as on any range taking writes. None is a retake.
 
 ### 4. `SnapshotOverlapsReplica`
 
@@ -22818,6 +22871,28 @@ lagging P replaying entries below `s` over R's newer keys, is not reached: (i) k
 away until P has compacted past `s`, as SHARD.md:1536-1538 says, so check 8 is the catch and
 linearizability is not asked to see it.
 
+### 5a. The fresh take, directed (`run_overlap_resplit`; #180's review, B1)
+
+(i) with R split again under the limit, so a stream of R refused for overlap is of a
+checkpoint from before R's last split: the case B1 sketched, on Stage C's tree. Its own
+stream, `split-resplit`, and (i)'s load, chunk and limit. From the heal R takes no more
+writes, so its record stays the checkpoint it took before the heal (one entry, the split,
+is under the snapshot threshold of twelve). Once `x` has refused R for overlap, R's leader
+is asked to split R at `k15`, and the run waits for the split within the split budget,
+holds the limit one second more, lifts it and runs five seconds. Per seed, on the correct
+system (`a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed`):
+its checks pass and (i)'s shape is built; no wait ended in a fresh take before its leader
+applied R's split; one did after it, and the leader then took R at or past the split; and
+`x` made R over `[k1, k15)` by a snapshot after its P moved off R's span. Measured at
+1 000 (release): **1 000 of 1 000**, each seed with exactly one wait ending in a fresh take
+and five or six ending in none after it, and `x` making R over `[k1, k15)` 174 to 496 ms
+after the lift. A leader that streamed the refused checkpoint again instead offers
+`x` R over `[k1, k2)`, which overlaps R′ once R′ is installed there, for as long as R
+stays idle. No variant of the node's set is built for it: whether `x` then also makes R
+depends on whether R's stale snapshot reaches `x` before R′'s does, so its catch would be
+the run's own reading of the decision, which the unit test and the task-level test already
+hold (§11).
+
 ### 6. Check 8 under the equivalence test against its variant
 
 `the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`
@@ -22854,21 +22929,87 @@ Three rows, weighed on this tree from the built release binaries at ANANKE_SEEDS
 ANANKE_DEEP_SEEDS=100 with other slices' runs beside them (load 282 to 294): (i) correct
 226.1 cpu s into shard 5, (i) under the variant 205.7 into shard 4, check 8's comparison
 22.2 into shard 6. The premerge runs (i)'s two sweeps at a thousand seeds each, about
-75 s real apiece on this machine under that load.
+75 s real apiece on this machine under that load. #180's review added a fourth, the
+resplit run (§5a), 284.1 cpu s (270.84 + 13.22, 124.2 s real, load 280 to 301), into shard
+6.
 
 ### 10. What is PROPOSED here, for the owner
 
 1. `Overlaps` as a wire status of `ananke-raft`'s, tag 4 (§1).
 2. The leader's wait in the node's `snapshot` task, the core's ask held through it, and a
    new ask for the same follower dropped meanwhile (§3).
-3. "Below the last split or merge" read as "the checkpoint's span is not the range's
-   now", an unreadable checkpoint retaken (§3).
+3. "Below the last split or merge" read as "the checkpoint's generation is not the
+   range's now", every doubt retaken (§3; by span until #180's review, N2), and no retake
+   backstop after repeated refusals of one checkpoint, since Q27 settles it (§3).
 4. The rule on an install onto an initialised replica, built though unreachable on Stage
-   C's correct system, its descriptor read in the record's walk (§2).
+   C's correct system, failing closed on a snapshot naming no span, its descriptor read in
+   the record's walk (§2).
 5. (i)'s constants: the 16 KiB chunk, the 8 KiB limit, the 1 s hold, the load (§5).
 6. Check 8's comparison against the variant on (i) rather than the node sweep (§6).
 7. The apply's "R already initialised here" not built, and recommended as a fold (§7,
    #181).
+8. The fresh take directed by a resplit run with no variant beside it (§5a).
+
+### 11. #180's review, and what each finding changed
+
+The review (#180, comment 6404585598) found no safety bug in the correct system and
+confirmed #177. Two findings blocked and ten did not. Each blocking one was a plant that
+left every test green, and each is now a plant that fails. #180 merged at 820b9c5 (`main`
+5e05942) before the fixes were committed, so they land on
+`phase-3-stage-c-overlap-rule-review`, in a PR of their own, as three commits: B1 and N2;
+B2; N1, N3 to N8 and this record. The sections above that changed carry "corrected after
+#180 merged".
+
+- **B1, the fresh take.** The decision moved into `retake_after_overlap` and is read by
+  generation (N2, §3). Three tests hold it:
+  - a unit test of eight cases: the same descriptor; a left half after a split; a span
+    moved at both ends; a split and a merge back; an unreadable checkpoint; no descriptor
+    now; neither; a generation above the range's;
+  - a task-level test of `waited`, which reads three real version directories and checks
+    each answer and trace: one from before the split is retaken, one at the range's
+    generation is not, an unreadable one is;
+  - the directed resplit run (§5a).
+- **B2, the overlap rule on an install onto a held replica.** It fails closed now, through
+  `admission`. Three tests hold it:
+  - a unit test of the decision on both paths, with and without the variant;
+  - a walk test on six table layouts: the descriptor in the record's table; in a later
+    table; alone in a table; absent; behind a key between the two; in two tables, the
+    newer winning. A second walk test refuses a key that sorts before the record's;
+  - a task-level test of `finish` on three installs: P's pre-split snapshot where R is
+    held is refused `Overlaps` and the range let go; a snapshot naming no span is refused
+    `Unusable`; P's post-split snapshot switches.
+- **N1**: a task-level test drops a core's ask inside a wait and acts on it outside one.
+- **N2**: the generation reading (§3).
+- **N3**: `SnapshotStatus::Overlaps`'s text names the node's sender as the one that
+  waits, and says the one-group server's arm is reached by no run.
+- **N4**: the marker is on every site.
+- **N5**: nine error strings mangled into runs of spaces are mended, and the premise's
+  words name the shape.
+- **N6**: seven tests, seven stragglers, and the two causes measured (§2, §3).
+- **N7**: the PR's description.
+- **N8**: the two events joined `sim/raft.rs`'s `range_of` and `replica_of`.
+- **N9**: #181 is scheduled in #162.
+- **N10**: filed as #183, not fixed here. A split's apply narrows P's descriptor and
+  inserts R's under two locks, which a multi-threaded runtime can run the overlap check
+  between.
+
+**The plants, before and after** (release, `ANANKE_SEEDS=20`, each planted alone on this
+tree and run against `ananke-shard`'s and `ananke-raft`'s unit tests and `sim/tests/split.rs`'s
+overlap sweeps). "Before" is the review's run on ca43d6e, where it applies:
+
+| Plant | Before | After |
+|---|---|---|
+| B1: the fresh take by span with `&&` (the review's) | every test green | the unit test, `waited`'s task-level test and the resplit run fail |
+| B1: the fresh take always "no" | — (as the review's) | the same three fail |
+| B1: by span with `\|\|`, the reading as first built | — | the unit test fails, on the split-and-merge-back case alone, as Stage C cannot tell the two apart |
+| B2: the walk never finds the descriptor (`next[1..]`, the review's) | every test green | the walk test and `finish`'s task-level test fail; with the rule failing closed, `x`'s P is never installed past P's split, so (i) correct, (i) under the variant and the resplit run fail |
+| B2: a held replica's install fails open on no span | — | `finish`'s task-level test fails |
+| B2: the rule ignores an overlap | — | `admission`'s unit test and `finish`'s task-level test fail, and (i) correct and the resplit run fail |
+| N1: an ask inside a wait acted on (`&& false`, the review's plant D) | every test green | the task-level test of the drop fails |
+
+The review's three plants that already failed fail unchanged: #173's counted `Restart` in
+place of `Overlaps` (the unit test of #177), the wait halved, and the refused version left
+unpinned (both in (i) correct).
 
 ---
 

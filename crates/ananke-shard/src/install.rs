@@ -694,6 +694,7 @@ impl<E: Environment> Task<E> {
 
     /// The nearest deadline of a chunk outstanding on any stream, or of a wait after
     /// an overlap refusal.
+    // PROPOSED(D-110): the leader's wait is a deadline of the task's loop.
     fn deadline(&self) -> Option<ananke_env::Instant> {
         self.sending
             .values()
@@ -737,6 +738,7 @@ impl<E: Environment> Task<E> {
     /// another's.
     async fn due(&mut self) {
         let now = self.env.clock().now();
+        // PROPOSED(D-110): every overlap refusal's wait that is over, first.
         self.waited(now).await;
         let due: Vec<(RangeId, ServerId)> = self
             .sending
@@ -3122,6 +3124,48 @@ mod tests {
             .checkpoint_spans(&[&span.start[..]..&span.end[..]], dir)
             .await
             .expect("the checkpoint");
+    }
+
+    /// A core's ask for a stream to a follower whose overlap refusal's wait is still
+    /// running is dropped (#180's review, N1): the wait stands whoever asks, and its end
+    /// lets the core ask again. Planted away (`&& false` on the drop), (i) stayed green
+    /// with the same figures, because no core of the tree asks inside a wait. The
+    /// control is the same ask outside a wait, which gets as far as finding no version
+    /// of the index and giving the stream up for a take.
+    // PROPOSED(D-110): the leader's wait drops an ask inside it.
+    #[test]
+    fn a_cores_ask_for_a_stream_inside_an_overlap_refusals_wait_is_dropped() {
+        let ((outside, inside), _) = on_a_node(|env| async move {
+            let (mut task, _store, local) =
+                task_on(&env, R2, &[described(R2, "k0", "k2", 1)]).await;
+            let to = ServerId(3);
+            let gave_up = |local: &Queue<crate::server::Local>| {
+                local.count(|answer| {
+                    matches!(answer, crate::server::Local::Snapshot(SnapAnswer::Failed {
+                        range, to: follower, retake: true
+                    }) if *range == R2 && *follower == to)
+                })
+            };
+            task.open(R2, to, 5, 1).await;
+            let outside = gave_up(&local);
+            let _ = local.remove_first(|_| true);
+            task.overlapped.insert(
+                (R2, to),
+                Overlapped {
+                    due: env.clock().now() + Duration::from_secs(60),
+                    version: PathBuf::from("/n1/snap-r2-5-1"),
+                },
+            );
+            task.open(R2, to, 5, 1).await;
+            let inside = (local.len(), task.sending.len());
+            (outside, inside)
+        });
+        assert_eq!(outside, 1, "outside a wait the ask is acted on");
+        assert_eq!(
+            inside,
+            (0, 0),
+            "inside a wait the ask is dropped: nothing answered, nothing opened"
+        );
     }
 
     /// A wait's end, through the task (#180's review, B1): the refused checkpoint's

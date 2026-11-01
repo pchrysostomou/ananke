@@ -124,6 +124,18 @@ pub enum Shape {
     Vote,
 }
 
+impl Shape {
+    /// The shape's name in a report: "(i)", "(i) with R split again", "(ii)".
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Shape::Overlap => "(i)",
+            Shape::Resplit => "(i) with R split again",
+            Shape::Vote => "(ii)",
+        }
+    }
+}
+
 /// What the writer writes to the left half: `keys` keys of `bytes`-byte values, or
 /// (ii)'s one key `k0` of short values.
 #[derive(Clone, Copy, Debug)]
@@ -496,12 +508,14 @@ impl Report {
                 } if *range == right && *from == to => {
                     let Some(refused) = open.remove(server) else {
                         return Err(format!(
-                            "seed {seed}: server {server} restreamed R to {to} with no                              overlap refusal to end"
+                            "seed {seed}: server {server} restreamed R to {to} with no \
+                             overlap refusal to end"
                         ));
                     };
                     if record.at.duration_since(refused) < min {
                         return Err(format!(
-                            "seed {seed}: server {server} waited {:?} after an overlap                              refusal of R by {to}, under a minimum election timeout",
+                            "seed {seed}: server {server} waited {:?} after an overlap \
+                             refusal of R by {to}, under a minimum election timeout",
                             record.at.duration_since(refused)
                         ));
                     }
@@ -514,7 +528,8 @@ impl Report {
                     ..
                 } if *range == right && *from == to && open.contains_key(server) => {
                     return Err(format!(
-                        "seed {seed}: server {server} opened a stream of R to {to} inside its                          wait after an overlap refusal"
+                        "seed {seed}: server {server} opened a stream of R to {to} inside its \
+                         wait after an overlap refusal"
                     ));
                 }
                 TraceEvent::NodeCrashed { node } => {
@@ -528,20 +543,22 @@ impl Report {
             && end.duration_since(*refused) > min * 2
         {
             return Err(format!(
-                "seed {seed}: server {server}'s wait after its overlap refusal of R by {to} at                  {refused:?} never ended"
+                "seed {seed}: server {server}'s wait after its overlap refusal of R by {to} at \
+                 {refused:?} never ended"
             ));
         }
         Ok(waits)
     }
 
-    /// Shape (ii)'s premise, per seed: `x` applied no split of P, `x`'s P was installed at
-    /// or past the split's index, and `x` created R, where it did, by a snapshot alone.
+    /// The premise shapes (i) and (ii) share, per seed: `x` applied no split of P, `x`'s P
+    /// was installed at or past the split's index, and `x` created R, where it did, by a
+    /// snapshot alone.
     ///
     /// # Errors
     ///
     /// Which of the three did not hold, with the seed.
     pub fn premise(&self) -> Result<(), String> {
-        let (seed, x) = (self.seed, self.x);
+        let (seed, x, shape) = (self.seed, self.x, self.shape.name());
         let Some((index, right)) = self.split else {
             return Err(format!(
                 "seed {seed}: P never split, so there is no premise"
@@ -552,7 +569,8 @@ impl Report {
             matches!(&record.event, TraceEvent::RangeSplit { range, .. } if *range == PARENT)
         }) {
             return Err(format!(
-                "seed {seed}: node {x} applied P's split at {index} by its log, where shape                  (ii) has its P reach past the split only by P's post-split snapshot"
+                "seed {seed}: node {x} applied P's split at {index} by its log, where shape \
+                 {shape} has its P reach past the split only by P's post-split snapshot"
             ));
         }
         let installed = self.records.iter().any(|record| {
@@ -562,7 +580,8 @@ impl Report {
         });
         if !installed {
             return Err(format!(
-                "seed {seed}: node {x}'s P was never installed at or past the split's index                  {index}, so nothing says how it got past the split, if it did"
+                "seed {seed}: node {x}'s P was never installed at or past the split's index \
+                 {index}, so nothing says how it got past the split, if it did"
             ));
         }
         let causes: Vec<ananke_env::RangeCause> = self
@@ -579,7 +598,8 @@ impl Report {
             .any(|cause| *cause != ananke_env::RangeCause::Snapshot)
         {
             return Err(format!(
-                "seed {seed}: node {x} created the right half {right} by {causes:?}, where                  shape (ii) has it hold no R but one a snapshot gave it"
+                "seed {seed}: node {x} created the right half {right} by {causes:?}, where \
+                 shape {shape} has it hold no R but one a snapshot gave it"
             ));
         }
         Ok(())
@@ -654,14 +674,20 @@ impl Report {
     pub fn overlap_shape(&self) -> Result<(), String> {
         let seed = self.seed;
         if let Some(why) = &self.unbuilt {
-            return Err(format!("seed {seed}: shape (i) was not built: {why}"));
+            return Err(format!(
+                "seed {seed}: shape {} was not built: {why}",
+                self.shape.name()
+            ));
         }
         self.premise()?;
         let (delivered, dropped) = self.limited_chunks();
         if delivered == 0 || dropped == 0 {
             return Err(format!(
-                "seed {seed}: while the limit of {FRAME_LIMIT} bytes held toward node {}, {delivered}                  chunks of R's stream reached it and {dropped} of P's were dropped as oversized,                  where shape (i) needs one of each",
-                self.x
+                "seed {seed}: while the limit of {FRAME_LIMIT} bytes held toward node {}, \
+                 {delivered} chunks of R's stream reached it and {dropped} of P's were dropped \
+                 as oversized, where shape {} needs one of each",
+                self.x,
+                self.shape.name()
             ));
         }
         Ok(())
@@ -1101,7 +1127,8 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
     while !x_answered_right(&sim.trace(), x, right) {
         if sim.now() >= deadline {
             report.unbuilt = Some(format!(
-                "node {x} neither refused nor installed R's snapshot within {LIMIT_BUDGET:?}                  of the limited heal"
+                "node {x} neither refused nor installed R's snapshot within {LIMIT_BUDGET:?} \
+                 of the limited heal"
             ));
             report.records = sim.trace();
             return report;

@@ -1654,7 +1654,8 @@ pub fn waiting(term: Term, staged: (Index, Term)) -> Message {
 /// because its span overlaps another initialised replica on the receiving node (the
 /// range layer's overlap rule, SHARD.md §5, Q27). Nothing is wrong with the checkpoint,
 /// so this is not a [`start_over`] and RAFT.md:210-212's restart bound does not count
-/// it (#177). The one-group server holds one group and never sends it.
+/// it (#177). Only a node's receiver sends it; the one-group server holds one group and
+/// never does.
 // PROPOSED(D-110): the overlap rule's refusal is its own status.
 #[must_use]
 pub fn overlaps(term: Term, staged: (Index, Term)) -> Message {
