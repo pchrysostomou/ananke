@@ -2117,7 +2117,10 @@ impl<E: Environment> Task<E> {
             .flatten()
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
             let now = lock(&self.descriptors).get(&range).cloned();
-            let retake = retake_after_overlap(streamed.as_ref(), now.as_ref());
+            // The variant: the refused checkpoint is streamed again, whatever it is.
+            // PROPOSED(D-110): the fresh take's variant (#185's review, NB2).
+            let retake = !self.variants.contains(NodeVariant::RetakeNeverAfterOverlap)
+                && retake_after_overlap(streamed.as_ref(), now.as_ref());
             self.env.trace(TraceEvent::RaftSnapshotRestream {
                 server: self.id.0,
                 range: range.get(),

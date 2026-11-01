@@ -181,6 +181,18 @@ pub fn server_config(id: u64, range_variants: RangeVariants) -> ServerConfig {
 /// (ii)'s the default.
 #[must_use]
 pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) -> ServerConfig {
+    server_config_with(id, range_variants, NodeVariants::correct(), shape)
+}
+
+/// One node's configuration for `shape` under the node's variants `node` too: the resplit
+/// run's pair (PROPOSED D-110, #185's review, NB2).
+#[must_use]
+pub fn server_config_with(
+    id: u64,
+    range_variants: RangeVariants,
+    node: NodeVariants,
+    shape: Shape,
+) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -205,7 +217,7 @@ pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) ->
         snapshot_cap: SNAPSHOT_CAP,
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
-        node: NodeVariants::correct(),
+        node,
         range_variants,
     }
 }
@@ -954,7 +966,12 @@ struct Prefix {
 }
 
 /// Builds the shared part of `shape` for `seed`.
-fn prefix(seed: u64, range_variants: RangeVariants, shape: Shape) -> Result<Prefix, Box<Report>> {
+fn prefix(
+    seed: u64,
+    range_variants: RangeVariants,
+    node: NodeVariants,
+    shape: Shape,
+) -> Result<Prefix, Box<Report>> {
     let (config, load, stream) = match shape {
         Shape::Overlap => (overlap_config(seed), OVERLAP_LOAD, "split-overlap"),
         Shape::Resplit => (resplit_config(seed), OVERLAP_LOAD, "split-resplit"),
@@ -964,7 +981,13 @@ fn prefix(seed: u64, range_variants: RangeVariants, shape: Shape) -> Result<Pref
     let nodes: Vec<NodeId> = (0..NODES).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
     for id in 1..=NODES {
-        spawn(&sim, nodes[id as usize - 1], id, range_variants, shape);
+        spawn(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            (range_variants, node),
+            shape,
+        );
     }
     let routes: Routes = Arc::default();
     let right_off: RightOff = Arc::default();
@@ -1058,7 +1081,7 @@ pub fn run(seed: u64, range_variants: RangeVariants) -> Report {
         nodes,
         mut report,
         ..
-    } = match prefix(seed, range_variants, Shape::Vote) {
+    } = match prefix(seed, range_variants, NodeVariants::correct(), Shape::Vote) {
         Ok(prefix) => prefix,
         Err(report) => return *report,
     };
@@ -1079,7 +1102,13 @@ pub fn run(seed: u64, range_variants: RangeVariants) -> Report {
     report.healed = Some(sim.now());
     sim.run_for(election_max() * 10);
     sim.restart(at_crashed);
-    spawn(&sim, at_crashed, crashed, range_variants, Shape::Vote);
+    spawn(
+        &sim,
+        at_crashed,
+        crashed,
+        (range_variants, NodeVariants::correct()),
+        Shape::Vote,
+    );
     sim.run_for(AFTER);
     report.records = sim.trace();
     report
@@ -1102,6 +1131,15 @@ fn x_answered_right(records: &[TraceRecord], x: u64, right: u64) -> bool {
     })
 }
 
+/// Whether `records` show a wait after an overlap refusal of R by `x` ended: a
+/// `RaftSnapshotRestream` of R toward `x`.
+fn restreamed_to(records: &[TraceRecord], x: u64, right: u64) -> bool {
+    records.iter().any(|record| {
+        matches!(&record.event, TraceEvent::RaftSnapshotRestream { range, to, .. }
+            if *range == right && *to == x)
+    })
+}
+
 /// Runs shape (i) for `seed` under `range_variants`.
 // PROPOSED(D-110)
 #[must_use]
@@ -1111,7 +1149,12 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
         nodes,
         mut report,
         ..
-    } = match prefix(seed, range_variants, Shape::Overlap) {
+    } = match prefix(
+        seed,
+        range_variants,
+        NodeVariants::correct(),
+        Shape::Overlap,
+    ) {
         Ok(prefix) => prefix,
         Err(report) => return *report,
     };
@@ -1143,29 +1186,32 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
     report
 }
 
-/// Runs shape (i) with R split again while the limit holds, for `seed` under
-/// `range_variants` (PROPOSED D-110, #180's review, B1): the overlap rule's fresh take.
+/// Runs shape (i) with R split again while the limit holds, for `seed` under the node's
+/// variants `node` (PROPOSED D-110; #180's review, B1; #185's review, NB1 and NB2): the
+/// overlap rule's fresh take.
 ///
 /// (i)'s prefix and limited heal, R left idle from the heal, so its record stays the
-/// checkpoint it took before the heal. Once `x` has refused R's install for overlap,
-/// R's leader is asked to split R at [`RESPLIT_KEY`]. A stream of that checkpoint, refused
-/// after the split, is of a checkpoint from before R's last split, so its wait ends in a
-/// fresh take, of `[k1, k15)`; the take's own stream, refused in turn, ends its wait in
-/// none. The limit holds [`OVERLAP_HOLD`] past R's split and is lifted: `x`'s P moves off
-/// R's span, and `x` makes R over `[k1, k15)` and R′ over `[k15, k2)`, each by a
-/// snapshot. A leader that streamed the refused checkpoint again instead would offer `x`
-/// R over `[k1, k2)`, which overlaps R′ once R′ is installed there, for as long as R
-/// stays idle.
+/// checkpoint it took before the heal. Once a wait after `x`'s refusal of R has ended —
+/// in no fresh take, R having split nothing since its take — R's leader is asked to
+/// split R at [`RESPLIT_KEY`]. A stream of that checkpoint, refused after the split, is
+/// of a checkpoint from before R's last split, so its wait ends in a fresh take, of
+/// `[k1, k15)`; the take's own stream, refused in turn, ends its wait in none. The limit
+/// holds [`OVERLAP_HOLD`] past R's split and is lifted: `x`'s P moves off R's span, and
+/// `x` makes R over `[k1, k15)` and R′ over `[k15, k2)`, each by a snapshot. Under
+/// `NodeVariant::RetakeNeverAfterOverlap` the leader streams the refused checkpoint again
+/// instead, offering `x` R over `[k1, k2)`: where R′ reaches `x` first, that overlaps R′
+/// there for as long as R stays idle, and `x` never makes R.
 // PROPOSED(D-110)
 #[must_use]
-pub fn run_overlap_resplit(seed: u64, range_variants: RangeVariants) -> Report {
+pub fn run_overlap_resplit(seed: u64, node: NodeVariants) -> Report {
+    let range_variants = RangeVariants::correct();
     let Prefix {
         mut sim,
         nodes,
         client,
         right_off,
         mut report,
-    } = match prefix(seed, range_variants, Shape::Resplit) {
+    } = match prefix(seed, range_variants, node, Shape::Resplit) {
         Ok(prefix) => prefix,
         Err(report) => return *report,
     };
@@ -1177,12 +1223,15 @@ pub fn run_overlap_resplit(seed: u64, range_variants: RangeVariants) -> Report {
     }
     *lock(&right_off) = true;
     report.healed = Some(sim.now());
+    // R's split is asked once one wait after a refusal of R by `x` has ended, so a wait
+    // ends before the split as well as after it, and the run sees both answers of the
+    // decision (#185's review, NB1).
     let deadline = sim.now() + LIMIT_BUDGET;
-    while !x_answered_right(&sim.trace(), x, right) {
+    while !restreamed_to(&sim.trace(), x, right) {
         if sim.now() >= deadline {
             report.unbuilt = Some(format!(
-                "node {x} neither refused nor installed R's snapshot within {LIMIT_BUDGET:?} \
-                 of the limited heal"
+                "no wait after a refusal of R by node {x} ended within {LIMIT_BUDGET:?} of \
+                 the limited heal"
             ));
             report.records = sim.trace();
             return report;
@@ -1218,10 +1267,17 @@ pub fn run_overlap_resplit(seed: u64, range_variants: RangeVariants) -> Report {
     report
 }
 
-fn spawn(sim: &Sim, at: NodeId, id: u64, range_variants: RangeVariants, shape: Shape) {
+fn spawn(
+    sim: &Sim,
+    at: NodeId,
+    id: u64,
+    (range_variants, node): (RangeVariants, NodeVariants),
+    shape: Shape,
+) {
     let env = sim.env(at);
     let inner = env.clone();
     env.spawn("node", async move {
-        let _ = ananke_shard::server::run(inner, server_config_of(id, range_variants, shape)).await;
+        let config = server_config_with(id, range_variants, node, shape);
+        let _ = ananke_shard::server::run(inner, config).await;
     });
 }
