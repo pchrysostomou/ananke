@@ -475,6 +475,11 @@
 # under the variant on (i), which compares min(seeds, 100) seeds, at 22.2 (21.61 + 0.62).
 # Longest-first into the lightest shard of the tree merged with #179 (D-111): shard 5 at
 # 1754.2 -> 1980.3, shard 4 at 1810.0 -> 2015.7, shard 6 at 1810.1 -> 1832.3.
+# #180's review (PROPOSED D-110 §5a) added one `split` row, the resplit run, weighed on its tree from
+# the built release binary (`split-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100,
+# as user + sys, on an Apple M2 of 8 cores on AC power with other slices' runs beside it (load
+# averages 280 to 301): 284.1 cpu s (270.84 + 13.22, 124.2 s real). Into the lightest shard, shard 6
+# at 1832.3 -> 2116.4.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -608,7 +613,7 @@
 5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
 5	node	0.9	seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 1832.3 cpu s
+# shard 6: 2116.4 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -654,3 +659,4 @@
 6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
+6	split	284.1	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed

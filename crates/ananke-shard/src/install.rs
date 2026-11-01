@@ -434,6 +434,34 @@ fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
     }
 }
 
+/// Whether the stream a refusal for overlap ended is streamed again from a fresh take,
+/// once its wait is over (SHARD.md §5, Q27): "from a fresh take if its checkpoint lies
+/// below the last split or merge its range applied, since only a newer snapshot can stop
+/// overlapping, and otherwise from the same checkpoint, since the overlap is the
+/// receiver's to clear".
+///
+/// `streamed` is the descriptor the refused checkpoint carries, read out of its version
+/// directory, and `now` the descriptor the range holds now. The checkpoint lies below
+/// the range's last split or merge exactly when its generation is below the range's:
+/// the generation rises at every split and merge (Q6), and only there on Stage C's tree.
+/// Any other answer retakes: a generation above the range's own is no checkpoint this
+/// replica took, and a checkpoint or a descriptor that cannot be read says nothing of
+/// when the checkpoint was taken. A wrong "no" is the costly mistake — the leader
+/// streams the same refused checkpoint again after every wait, for as long as nothing
+/// else moves the range's record on — and a wrong "yes" costs one take, so every doubt
+/// is a retake.
+///
+/// A free function for the reason [`step_for`] and [`booked`] are (D-090), and #180's
+/// review is why: inside the task's loop the decision was one expression that no test
+/// could fail, since no run of the tree computed anything but "no".
+// PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDescriptor>) -> bool {
+    match (streamed, now) {
+        (Some(streamed), Some(now)) => streamed.generation != now.generation,
+        _ => true,
+    }
+}
+
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
 /// variant — the start-over the node answered it with before this bound existed.
 // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
@@ -2014,11 +2042,8 @@ impl<E: Environment> Task<E> {
     /// range's last split or merge (SHARD.md §5, Q27).
     ///
     /// "Predates" is read off the checkpoint itself: its descriptor, out of the version
-    /// directory the refused stream read, names a span other than the range's
-    /// descriptor names now. Spans change at a split or a merge and at nothing else, and
-    /// a snapshot whose span is the range's present one is what a fresh take would
-    /// stream, so retaking it could not stop the overlap; a checkpoint that cannot be
-    /// read is retaken, since nothing then says it postdates either.
+    /// directory the refused stream read, is at a generation below the one the range's
+    /// descriptor is at now ([`retake_after_overlap`]).
     // PROPOSED(D-110): the leader's wait, and the fresh take.
     async fn waited(&mut self, now: ananke_env::Instant) {
         let over: Vec<(RangeId, ServerId)> = self
@@ -2040,13 +2065,8 @@ impl<E: Environment> Task<E> {
             .ok()
             .flatten()
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
-            let retake = match (streamed, self.user_span(range)) {
-                (Some(streamed), Some(now)) => {
-                    streamed.start != now.start || streamed.end != now.end
-                }
-                (None, _) => true,
-                (Some(_), None) => false,
-            };
+            let now = lock(&self.descriptors).get(&range).cloned();
+            let retake = retake_after_overlap(streamed.as_ref(), now.as_ref());
             self.env.trace(TraceEvent::RaftSnapshotRestream {
                 server: self.id.0,
                 range: range.get(),
@@ -2801,6 +2821,247 @@ mod tests {
             .3,
             SnapshotStatus::Restart,
             "the variant is meant to answer a cap-wait with a start-over"
+        );
+    }
+
+    // --- The overlap rule (SHARD.md §5, Q27; PROPOSED D-110, #180's review) ---
+
+    fn key(name: &str) -> Bytes {
+        ananke_raft::apply::user_key(name.as_bytes())
+    }
+
+    /// A live descriptor of `range` over `[start, end)` at `generation`.
+    fn described(range: RangeId, start: &str, end: &str, generation: u64) -> RangeDescriptor {
+        RangeDescriptor {
+            range,
+            start: key(start),
+            end: key(end),
+            generation,
+            voters: vec![ServerId(1), ServerId(2), ServerId(3)],
+            state: ananke_env::RangeState::Live,
+        }
+    }
+
+    /// The fresh take after an overlap refusal's wait, decided by the checkpoint's
+    /// generation (#180's review, B1 and N2). The decision was one expression in the
+    /// task's loop, read by span, and no run of the tree computed anything but "no", so
+    /// `||` planted as `&&` — the bug a split's left half meets, its start kept and its
+    /// end moved — passed everything. Each case here is one that reading gets wrong.
+    // PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+    #[test]
+    fn a_refused_checkpoint_is_retaken_exactly_when_its_generation_is_not_the_ranges() {
+        let before = described(R2, "k0", "k2", 1);
+        let left = described(R2, "k0", "k1", 2);
+        // The checkpoint the range holds now: streamed again as it is.
+        assert!(!retake_after_overlap(Some(&left), Some(&left)));
+        // A split's left half: the start kept, the end moved.
+        assert!(retake_after_overlap(Some(&before), Some(&left)));
+        // A span moved at both ends.
+        assert!(retake_after_overlap(
+            Some(&described(R2, "k1", "k2", 2)),
+            Some(&described(R2, "k0", "k3", 4))
+        ));
+        // A split and then a merge back: the span is the checkpoint's again, at a
+        // higher generation. The span reading streamed the pre-split checkpoint (N2).
+        assert!(retake_after_overlap(
+            Some(&before),
+            Some(&described(R2, "k0", "k2", 3))
+        ));
+        // A checkpoint that cannot be read, and a range with no descriptor: nothing says
+        // the checkpoint postdates either, and a wrong "no" streams it for ever.
+        assert!(retake_after_overlap(None, Some(&left)));
+        assert!(retake_after_overlap(Some(&left), None));
+        assert!(retake_after_overlap(None, None));
+        // A generation above the range's own is no checkpoint this replica took.
+        assert!(retake_after_overlap(Some(&left), Some(&before)));
+    }
+
+    /// Runs `body` on one simulated node, and hands back its result and the trace.
+    fn on_a_node<T, F>(
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(3));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let out: Arc<std::sync::Mutex<Option<T>>> = Arc::default();
+        env.clone().spawn("test", {
+            let out = out.clone();
+            async move {
+                let value = body(env).await;
+                *lock(&out) = Some(value);
+            }
+        });
+        sim.run_for(Duration::from_secs(10));
+        let value = lock(&out).take().expect("the body finished");
+        (value, sim.trace())
+    }
+
+    /// One node's `snapshot` task at `/n1`, holding `range`'s store, with `held` in the
+    /// host's descriptors: what the overlap rule's directed tests drive.
+    async fn task_on<E: Environment>(
+        env: &E,
+        range: RangeId,
+        held: &[RangeDescriptor],
+    ) -> (Task<E>, Arc<RaftStore<E>>, Queue<crate::server::Local>) {
+        let prefix = KeyPrefix::group(range.get());
+        let (store, _) = RaftStore::open_dir(
+            env.clone(),
+            ananke_storage::EngineConfig::new(PathBuf::from("/n1")),
+            prefix.clone(),
+        )
+        .await
+        .expect("the store opens");
+        let store = Arc::new(store);
+        let sock = Arc::new(
+            env.net()
+                .bind("10.0.0.1:7000".parse().expect("an address"))
+                .await
+                .expect("a socket"),
+        );
+        let stores = Arc::new(std::sync::Mutex::new(
+            [(range, store.clone())].into_iter().collect(),
+        ));
+        let descriptors = Arc::new(std::sync::Mutex::new(
+            held.iter().map(|held| (held.range, held.clone())).collect(),
+        ));
+        let mut plan = Snapshots::new("/n1", ServerId(1), 4, NodeVariants::correct());
+        let span = held.iter().find(|held| held.range == range).map_or_else(
+            || key("k0")..key("k9"),
+            |held| held.start.clone()..held.end.clone(),
+        );
+        plan.host(range, vec![prefix.span(), span]);
+        let local = Queue::new();
+        let task = Task::new(
+            env.clone(),
+            ServerId(1),
+            sock,
+            BTreeMap::new(),
+            stores,
+            RaftConfig::default(),
+            NodeVariants::correct(),
+            PathBuf::from("/n1"),
+            descriptors,
+            Arc::default(),
+            plan,
+            local.clone(),
+            Queue::new(),
+            Arc::default(),
+            store.clone(),
+            false,
+            RangeVariants::correct(),
+        );
+        (task, store, local)
+    }
+
+    /// A checkpoint of `range`'s Raft state into `dir`, as a leader at `/leader` holds it
+    /// at `index`: its snapshot record and, where given, its descriptor.
+    async fn checkpoint_of<E: Environment>(
+        env: &E,
+        range: RangeId,
+        index: Index,
+        descriptor: Option<&RangeDescriptor>,
+        dir: &Path,
+    ) {
+        let prefix = KeyPrefix::group(range.get());
+        let (leader, _) = RaftStore::open_dir(
+            env.clone(),
+            ananke_storage::EngineConfig::new(PathBuf::from("/leader")),
+            prefix.clone(),
+        )
+        .await
+        .expect("the leader's store opens");
+        let mut batch = ananke_storage::WriteBatch::new();
+        if let Some(descriptor) = descriptor {
+            batch.put(prefix.descriptor_key(), descriptor.encode());
+        } else {
+            batch.delete(prefix.descriptor_key());
+        }
+        leader
+            .engine()
+            .write(batch, true)
+            .await
+            .expect("the descriptor");
+        leader
+            .record_snapshot(&ananke_raft::store::SnapshotRecord {
+                last_index: index,
+                last_term: 2,
+                config: Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]),
+                dir: String::new(),
+                taken: true,
+                take: 1,
+            })
+            .await
+            .expect("the record");
+        let span = prefix.span();
+        leader
+            .engine()
+            .checkpoint_spans(&[&span.start[..]..&span.end[..]], dir)
+            .await
+            .expect("the checkpoint");
+    }
+
+    /// A wait's end, through the task (#180's review, B1): the refused checkpoint's
+    /// descriptor is read out of its version directory and held to the range's, so the
+    /// core is told to retake one from before the range's last split, to stream again
+    /// one at its present generation, and to retake one that cannot be read — and each
+    /// is traced as it is told.
+    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    #[test]
+    fn a_waits_end_retakes_a_checkpoint_from_before_the_ranges_split_and_no_other() {
+        let left = described(R2, "k0", "k1", 2);
+        let (told, trace) = on_a_node({
+            let left = left.clone();
+            move |env| async move {
+                let (mut task, _store, local) =
+                    task_on(&env, R2, std::slice::from_ref(&left)).await;
+                let to = ServerId(3);
+                let before = PathBuf::from("/n1/snap-r2-30-1");
+                let after = PathBuf::from("/n1/snap-r2-60-2");
+                checkpoint_of(&env, R2, 30, Some(&described(R2, "k0", "k2", 1)), &before).await;
+                checkpoint_of(&env, R2, 60, Some(&left), &after).await;
+                let mut told = Vec::new();
+                for version in [before, after, PathBuf::from("/n1/snap-r2-90-3")] {
+                    let now = env.clock().now();
+                    task.overlapped
+                        .insert((R2, to), Overlapped { due: now, version });
+                    task.waited(now).await;
+                    told.push(
+                        local
+                            .remove_first(|_| true)
+                            .and_then(|answer| match answer {
+                                crate::server::Local::Snapshot(SnapAnswer::Failed {
+                                    range,
+                                    to: follower,
+                                    retake,
+                                }) if range == R2 && follower == to => Some(retake),
+                                _ => None,
+                            }),
+                    );
+                }
+                told
+            }
+        });
+        assert_eq!(
+            told,
+            [Some(true), Some(false), Some(true)],
+            "a checkpoint from before the split is retaken, one at the range's generation \
+             streamed again, and one that cannot be read retaken"
+        );
+        let traced: Vec<bool> = trace
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshotRestream { retake, .. } => Some(*retake),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            traced,
+            [true, false, true],
+            "each wait's end is traced as told"
         );
     }
 }
