@@ -484,7 +484,8 @@ enum Admission {
 /// replica there". One decision for both paths, an install into a placeholder
 /// (`into_placeholder`, D-109 §2) and an install onto a replica the node holds.
 ///
-/// **It fails closed.** A snapshot whose descriptor cannot be found is refused, on both
+/// **It fails closed.** A snapshot whose descriptor cannot be found, or whose span is
+/// empty or inverted, is refused, on both
 /// paths, as the placeholder's path always refused one: before #180's review the second
 /// path installed it "as before", so a walk that missed the descriptor switched the rule
 /// off with every test still green. `SnapshotOverlapsReplica` installs whatever the span
@@ -499,7 +500,9 @@ fn admission(
     into_placeholder: bool,
     variants: RangeVariants,
 ) -> Admission {
-    let Some(streamed) = streamed else {
+    // A span that is empty or inverted names no key either, on either path: the filter
+    // stood on the placeholder's path alone until #185's review (NB4).
+    let Some(streamed) = streamed.filter(|streamed| streamed.start < streamed.end) else {
         return Admission::NoSpan;
     };
     if into_placeholder && held.contains_key(&range) {
@@ -1549,9 +1552,7 @@ impl<E: Environment> Task<E> {
         )
         .await
         {
-            Ok(Some(bytes)) => RangeDescriptor::decode(bytes)
-                .ok()
-                .filter(|descriptor| descriptor.start < descriptor.end),
+            Ok(Some(bytes)) => RangeDescriptor::decode(bytes).ok(),
             Ok(None) | Err(_) => None,
         };
         // A stream that carries no descriptor says nothing of the span it would install,
@@ -2974,8 +2975,19 @@ mod tests {
             admission(R9, Some(&split[&R9]), &BTreeMap::new(), true, correct),
             Admission::Install
         );
-        // No span named: refused on both paths, whatever the variant.
+        // No span named, or an empty or inverted one: refused on both paths, whatever the
+        // variant (#185's review, NB4).
+        let inverted = described(R2, "k2", "k0", 3);
+        let empty = described(R9, "k1", "k1", 3);
         for variants in [correct, every] {
+            assert_eq!(
+                admission(R2, Some(&inverted), &split, false, variants),
+                Admission::NoSpan
+            );
+            assert_eq!(
+                admission(R9, Some(&empty), &lagging, true, variants),
+                Admission::NoSpan
+            );
             assert_eq!(
                 admission(R2, None, &split, false, variants),
                 Admission::NoSpan
@@ -3025,13 +3037,26 @@ mod tests {
         (value, sim.trace())
     }
 
+    /// The follower the directed tests stream from, and the socket its answers reach.
+    const FOLLOWER: ServerId = ServerId(3);
+
+    /// The socket a task built by [`task_on`] answers [`FOLLOWER`] on.
+    type Follower<E> = Arc<<<E as Environment>::Net as Network>::Socket>;
+
     /// One node's `snapshot` task at `/n1`, holding `range`'s store, with `held` in the
-    /// host's descriptors: what the overlap rule's directed tests drive.
+    /// host's descriptors: what the overlap rule's directed tests drive. Its answers to
+    /// [`FOLLOWER`] reach the socket handed back with it, so a test reads the status the
+    /// task sent and not only the trace (#185's review, NB3).
     async fn task_on<E: Environment>(
         env: &E,
         range: RangeId,
         held: &[RangeDescriptor],
-    ) -> (Task<E>, Arc<RaftStore<E>>, Queue<crate::server::Local>) {
+    ) -> (
+        Task<E>,
+        Arc<RaftStore<E>>,
+        Queue<crate::server::Local>,
+        Follower<E>,
+    ) {
         let prefix = KeyPrefix::group(range.get());
         let (store, _) = RaftStore::open_dir(
             env.clone(),
@@ -3047,6 +3072,8 @@ mod tests {
                 .await
                 .expect("a socket"),
         );
+        let at: SocketAddr = "10.0.0.1:7003".parse().expect("an address");
+        let follower = Arc::new(env.net().bind(at).await.expect("the follower's socket"));
         let stores = Arc::new(std::sync::Mutex::new(
             [(range, store.clone())].into_iter().collect(),
         ));
@@ -3064,7 +3091,7 @@ mod tests {
             env.clone(),
             ServerId(1),
             sock,
-            BTreeMap::new(),
+            [(FOLLOWER, at)].into_iter().collect(),
             stores,
             RaftConfig::default(),
             NodeVariants::correct(),
@@ -3079,7 +3106,25 @@ mod tests {
             false,
             RangeVariants::correct(),
         );
-        (task, store, local)
+        (task, store, local, follower)
+    }
+
+    /// The status of the first snapshot answer `follower` receives within a second, if
+    /// one arrives.
+    async fn answered<E: Environment>(env: &E, follower: &Follower<E>) -> Option<SnapshotStatus> {
+        let recv = std::pin::pin!(follower.recv());
+        let timer = std::pin::pin!(env.clock().sleep(Duration::from_secs(1)));
+        let Either::Left(Ok((_, frame))) = race(env, recv, timer).await else {
+            return None;
+        };
+        crate::frame::decode(&frame)
+            .ok()?
+            .messages
+            .into_iter()
+            .find_map(|tagged| match tagged.frame.message {
+                Message::InstallSnapshotResponse { status, .. } => Some(status),
+                _ => None,
+            })
     }
 
     /// A checkpoint of `range`'s Raft state into `dir`, as a leader at `/leader` holds it
@@ -3139,7 +3184,7 @@ mod tests {
     #[test]
     fn a_cores_ask_for_a_stream_inside_an_overlap_refusals_wait_is_dropped() {
         let ((outside, inside), _) = on_a_node(|env| async move {
-            let (mut task, _store, local) =
+            let (mut task, _store, local, _follower) =
                 task_on(&env, R2, &[described(R2, "k0", "k2", 1)]).await;
             let to = ServerId(3);
             let gave_up = |local: &Queue<crate::server::Local>| {
@@ -3183,7 +3228,7 @@ mod tests {
         let (told, trace) = on_a_node({
             let left = left.clone();
             move |env| async move {
-                let (mut task, _store, local) =
+                let (mut task, _store, local, _follower) =
                     task_on(&env, R2, std::slice::from_ref(&left)).await;
                 let to = ServerId(3);
                 let before = PathBuf::from("/n1/snap-r2-30-1");
@@ -3251,8 +3296,8 @@ mod tests {
         ];
         for (case, (held, streamed)) in cases.into_iter().enumerate() {
             let (outcome, trace) = on_a_node(move |env| async move {
-                let (mut task, store, local) = task_on(&env, R2, &held).await;
-                let from = ServerId(3);
+                let (mut task, store, local, follower) = task_on(&env, R2, &held).await;
+                let from = FOLLOWER;
                 let source = PathBuf::from("/n1/staging-r2-s3");
                 checkpoint_of(&env, R2, 30, streamed.as_ref(), &source).await;
                 let span = held
@@ -3283,12 +3328,13 @@ mod tests {
                     incarnation: 7,
                 };
                 task.finish(R2, from, repair, env.decision()).await;
-                let answered = local.remove_first(|_| true).map(|answer| match answer {
+                let let_go = local.remove_first(|_| true).map(|answer| match answer {
                     crate::server::Local::Snapshot(SnapAnswer::Abandoned { .. }) => "let go",
                     crate::server::Local::Snapshot(SnapAnswer::Switched { .. }) => "switched",
                     _ => "something else",
                 });
-                (answered, store.applied())
+                let sent = answered(&env, &follower).await;
+                (let_go, store.applied(), sent)
             });
             let refused: Vec<StartOver> = trace
                 .iter()
@@ -3297,10 +3343,22 @@ mod tests {
                     _ => None,
                 })
                 .collect();
+            // What the sender is told, beside what the trace says (#185's review, NB3):
+            // the held path's refusal is `Overlaps`, which no bound counts, and not #177's
+            // `Restart`; a snapshot naming no span is a start-over.
             let expected = match case {
-                0 => ((Some("let go"), 0), vec![StartOver::Overlaps]),
-                1 => ((Some("let go"), 0), vec![StartOver::Unusable]),
-                _ => ((Some("switched"), 30), vec![]),
+                0 => (
+                    (Some("let go"), 0, Some(SnapshotStatus::Overlaps)),
+                    vec![StartOver::Overlaps],
+                ),
+                1 => (
+                    (Some("let go"), 0, Some(SnapshotStatus::Restart)),
+                    vec![StartOver::Unusable],
+                ),
+                _ => (
+                    (Some("switched"), 30, Some(SnapshotStatus::Installed)),
+                    vec![],
+                ),
             };
             assert_eq!(
                 (outcome, refused),
@@ -3308,6 +3366,67 @@ mod tests {
                 "case {case}: P's pre-split snapshot where R is held, a snapshot naming no \
                  span, and P's post-split snapshot"
             );
+        }
+    }
+
+    /// A placeholder's install, through the task (#185's review, NB4): one of a range the
+    /// node created meanwhile — its split's apply put R's descriptor in place while the
+    /// stream completed — is refused `Overlaps` and makes nothing, and the same install
+    /// where the range is not held creates R. The placeholder's path passes
+    /// `into_placeholder: true` to `admission`, which is what refuses the first: planted as
+    /// `false` the refusal went, every test green, and with it the guard against the double
+    /// creation D-110 §4 records for seed 219 under the variant.
+    // PROPOSED(D-110): the placeholder's path asks the decision as itself.
+    #[test]
+    fn a_placeholders_install_of_a_range_made_here_meanwhile_is_refused() {
+        let right = described(R9, "k1", "k2", 2);
+        let left = described(R2, "k0", "k1", 2);
+        for meanwhile in [true, false] {
+            let held = if meanwhile {
+                vec![left.clone(), right.clone()]
+            } else {
+                vec![left.clone()]
+            };
+            let streamed = right.clone();
+            let ((sent, created), trace) = on_a_node(move |env| async move {
+                let (mut task, _store, _local, follower) = task_on(&env, R2, &held).await;
+                let source = PathBuf::from("/n1/staging-r9-s3");
+                checkpoint_of(&env, R9, 40, Some(&streamed), &source).await;
+                let install = Install {
+                    range: R9,
+                    from: FOLLOWER,
+                    at: Identity {
+                        term: 2,
+                        last_index: 40,
+                        last_term: 2,
+                    },
+                    source,
+                    spans: vec![KeyPrefix::group(R9.get()).span()],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.install_placeholder(R9, FOLLOWER, install).await;
+                let created = lock(&task.stores).contains_key(&R9);
+                (answered(&env, &follower).await, created)
+            });
+            let made = trace.iter().any(|record| {
+                matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == R9.get())
+            });
+            if meanwhile {
+                assert_eq!(
+                    (sent, created, made),
+                    (Some(SnapshotStatus::Overlaps), false, false),
+                    "a placeholder's install of a range made here meanwhile is refused and \
+                     makes nothing"
+                );
+            } else {
+                assert_eq!(
+                    (sent, created, made),
+                    (Some(SnapshotStatus::Installed), true, true),
+                    "the same install where the range is not held creates it"
+                );
+            }
         }
     }
 }
