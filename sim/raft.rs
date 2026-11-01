@@ -341,6 +341,18 @@ impl Cluster {
         }
     }
 
+    /// What this cluster's clients draw their keys from: `k0` up to [`Cluster::keys`],
+    /// routed by [`Cluster::key_range`] where the cache cannot say.
+    // PROPOSED(D-113): the client's keys and first cache are its scenario's.
+    #[must_use]
+    pub fn client_keys(self) -> ClientKeys {
+        ClientKeys {
+            count: self.keys(),
+            name: plain_key,
+            fallback: self.key_range(),
+        }
+    }
+
     /// The cache client `n` of this cluster starts with, on the node cluster, by
     /// thirds: [`stale_descriptor`] for the first client and every third after it —
     /// a client that knew the cluster before its ranges were fixed, so that every seed
@@ -1976,7 +1988,7 @@ pub struct ClientStats {
     pub lookups: u64,
 }
 
-type SharedStats = Arc<Mutex<ClientStats>>;
+pub(crate) type SharedStats = Arc<Mutex<ClientStats>>;
 
 /// What one run produced.
 #[derive(Debug)]
@@ -7699,9 +7711,10 @@ async fn route_on<E: Environment>(
     servers: u64,
     key: &Bytes,
     stats: &SharedStats,
+    fallback: fn(&Bytes) -> u64,
 ) -> (u64, u64) {
     match cluster {
-        Cluster::OneGroup => (range_of_key(key), FIRST_GENERATION),
+        Cluster::OneGroup => (fallback(key), FIRST_GENERATION),
         Cluster::Node => {
             let encoded = user_key(key);
             if cache.lookup(&encoded).is_none() {
@@ -7710,7 +7723,7 @@ async fn route_on<E: Environment>(
             }
             cache
                 .lookup(&encoded)
-                .map_or((node_range_of_key(key), FIRST_GENERATION), |entry| {
+                .map_or((fallback(key), FIRST_GENERATION), |entry| {
                     (entry.range.get(), entry.generation)
                 })
         }
@@ -7857,6 +7870,56 @@ pub(crate) async fn client_on<E: Environment>(
     stats: SharedStats,
     range_variants: RangeVariants,
 ) {
+    client_over(
+        cluster,
+        env,
+        n,
+        servers,
+        stats,
+        range_variants,
+        cluster.client_keys(),
+        cluster.initial_cache(n),
+    )
+    .await;
+}
+
+/// The keys a client draws from, and the range it sends a key to when neither its
+/// cache nor a lookup places it: [`Cluster::client_keys`] for the two clusters of this
+/// file, and `sim/shard.rs`'s own for the sharded sweep, whose ranges are made by the
+/// splits its driver draws (PROPOSED D-113).
+// PROPOSED(D-113): the client's keys and first cache are its scenario's.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientKeys {
+    /// How many keys it draws among.
+    pub count: u64,
+    /// The key it draws as `i`.
+    pub name: fn(u64) -> Bytes,
+    /// The range a key goes to when the cache cannot say: on one group the only one,
+    /// on a node the scenario's fixed map.
+    pub fallback: fn(&Bytes) -> u64,
+}
+
+/// A key as the clients of this file name it: `k` and its number.
+fn plain_key(i: u64) -> Bytes {
+    Bytes::from(format!("k{i}"))
+}
+
+/// The client of [`client_on`] over `keys`, starting from `cache`: the same draws, the
+/// same deadlines and the same rules, with the scenario's own keys and first cache. Every
+/// draw falls where [`client_on`]'s fell before the two were told apart, so no schedule of
+/// this file moves (PROPOSED D-113).
+// PROPOSED(D-113): the client's keys and first cache are its scenario's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn client_over<E: Environment>(
+    cluster: Cluster,
+    env: E,
+    n: u64,
+    servers: u64,
+    stats: SharedStats,
+    range_variants: RangeVariants,
+    keys: ClientKeys,
+    cache: Cache,
+) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
     };
@@ -7866,7 +7929,7 @@ pub(crate) async fn client_on<E: Environment>(
     // What it knows of the ranges, and the leader it last heard of per range
     // (SHARD.md §3). On one group the cache holds no span and only the hint.
     // PROPOSED(D-097): the node cluster's client routes by its cache.
-    let mut cache = cluster.initial_cache(n);
+    let mut cache = cache;
     // The lookups' sequence numbers, from a base no operation reaches: a lookup
     // under an operation's number would be paired with it by the history's closure
     // (`invoked`), and the twenty-seed run saw a put answered with a lookup's value.
@@ -7875,7 +7938,7 @@ pub(crate) async fn client_on<E: Environment>(
     let mut avoid: Option<u64> = None;
     let mut known: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
     loop {
-        let key = Bytes::from(format!("k{}", env.rng().below(cluster.keys())));
+        let key = (keys.name)(env.rng().below(keys.count));
         let (mut range, mut generation) = route_on(
             cluster,
             &env,
@@ -7886,6 +7949,7 @@ pub(crate) async fn client_on<E: Environment>(
             servers,
             &key,
             &stats,
+            keys.fallback,
         )
         .await;
         // The operation's own number, which its `ClientInvoke` and `ClientReturn`
@@ -8047,6 +8111,7 @@ pub(crate) async fn client_on<E: Environment>(
                         servers,
                         &key,
                         &stats,
+                        keys.fallback,
                     )
                     .await;
                     target = cache

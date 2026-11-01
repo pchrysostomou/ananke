@@ -486,6 +486,11 @@
 # them, and recomputes every header from the rows beneath it: shard 5 carries D-110's 226.1
 # and D-112's 0.4 and 0.3, 1754.2 -> 1981.0; shards 4 and 6 are D-110's 2015.7 and 1832.3.
 # The next row added goes into the lightest, which is shard 6.
+# PROPOSED D-113 (`sim/shard.rs`, the sharded sweep) added one `shard` row, the correct system's
+# sweep, weighed on its tree from the built release binary (`shard-<hash> <test> --exact`) at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores beside two
+# other slices' builds and sweeps (load averages 97 to 118, so the figure is if anything high):
+# 191.3 cpu s (185.07 + 6.26, 81.6 s real). Into the lightest shard, shard 6 at 1832.3 -> 2023.6.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -621,7 +626,8 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 1832.3 cpu s
+# shard 6: 2023.6 cpu s
+6	shard	191.3	every_seed_passes_on_the_correct_sharded_sweep
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught

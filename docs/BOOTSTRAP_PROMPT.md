@@ -101,6 +101,21 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-shard-sim` (2026-11-01), off `main` at b1da6ec, PROPOSED D-113
+  (footer D-114), **#162's S10, `sim/shard.rs`, in progress and stopped for the owner**.
+  Built: five nodes, three bootstrap nodes writing ranges 0, 1 and 2 (range 2 over `[k, l)`),
+  nodes 4 and 5 holding nothing (asserted per seed); the driver on stream `shard` (splits of
+  current spans, halves included, and leadership transfers); four clients over `k00`–`k15`
+  through `raft::client_over` (no schedule of `sim/raft.rs` moves); Phase 2's network, clock
+  and disk faults with bit rot at 0.02; the raft sweep's checks over the trace. At 1 000 seeds
+  21 seeds fail the correct system: **7 linearizability failures from a server bug** — an
+  install onto a re-seeded replica replaces configuration's span `[k, l)` and deletes the
+  right halves the node had installed beside it (151 of 1 000 seeds lose data that way; #172's
+  case, S8 (c)'s to fix); **2 seeds trip `READS_OUTSTANDING`** on a leader whose two followers
+  are quarantined (reads never confirm, retries accumulate, #125); 12 seeds trip a check defect
+  of the slice's own (the write bound with #178's refusal reading). Next: the owner's word on
+  the two, then the per-range write bound, the meta convergence bound, #45's losses, D-092's
+  pair, the parallel test, the variants and the pins (D-113 §3).
 - Branch `phase-3-stage-c-overlap-rule` (2026-10-25), off `main` at 2d59c96, PR #180,
   PROPOSED D-110 (footer D-112 since the merge of `main` at 292cafc, #179 taking D-111), **#162's S9, the overlap rule (Q27)**. An install refused
   because its span overlaps another initialised replica on the node is answered
