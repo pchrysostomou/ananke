@@ -1000,23 +1000,25 @@ pub async fn staged_value<E: Environment>(
 }
 
 /// The snapshot record a *checkpoint directory* holds for `prefix`, as [`staged_record`]
-/// reads it, and with it the value of `next` **where `next` is the key that follows the
-/// record's in one of the directory's tables**: read off the entry the record's walk
-/// reads anyway to see the record's key end, and nowhere else, so this walk makes
-/// exactly the reads [`staged_record`]'s makes. A run's schedule draws a delay for
-/// every read (`FsFaults::latency_min..=latency_max`), so a second walk for `next`
-/// would move the schedule of every install, where this moves none.
+/// reads it, and with it the value of `next`, a key that sorts after the record's, read
+/// **in the record's own walk**: each table's walk goes on from the record's key past
+/// any key below `next` and stops at its first entry at or past `next`, which is
+/// `next`'s newest version in that table when it is `next`. Across tables the newest
+/// wins, as in [`staged_value`]. A run's schedule draws a delay for every read
+/// (`FsFaults::latency_min..=latency_max`), so a second walk for `next` would move the
+/// schedule of every install. One walk moves none where `next` is the first key after
+/// the record's, as the range's descriptor is in a range's state today
+/// (`PURPOSE_SNAPSHOT`, then `PURPOSE_DESCRIPTOR`): the entry a walk for the record alone
+/// reads to see the record's key end is then `next`'s, or past it. A key added between
+/// the two later costs the reads of its entries and does not hide `next`.
 ///
-/// The node's live install reads the range's descriptor this way, the key that follows
-/// the record's in a range's state (`PURPOSE_SNAPSHOT`, then `PURPOSE_DESCRIPTOR`), to
-/// hold the install to the overlap rule before it switches (SHARD.md §5, Q27). A table
-/// whose entry after the record's is another key gives `next` nothing; within a table
-/// the newest version of a key is its first entry, and across tables the newest wins,
-/// as in [`staged_value`].
+/// The node's live install reads the range's descriptor this way, to hold the install
+/// to the overlap rule before it switches (SHARD.md §5, Q27).
 ///
 /// # Errors
 ///
-/// As [`staged_record`]'s.
+/// As [`staged_record`]'s, and `InvalidInput` for a `next` that does not sort after the
+/// record's key, which the walk could not see.
 // PROPOSED(D-110): an install onto an initialised replica reads the streamed span
 // for the overlap rule, in the record's own walk.
 pub async fn staged_record_and_next<E: Environment>(
@@ -1026,6 +1028,12 @@ pub async fn staged_record_and_next<E: Environment>(
     next: &[u8],
 ) -> io::Result<(Option<SnapshotRecord>, Option<Bytes>)> {
     let key = prefix.snapshot_key();
+    if next <= &key[..] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the key read in the record's walk must sort after the record's",
+        ));
+    }
     let fs = env.fs();
     let Some(current) = read_whole(env, &manifest::current_path(dir)).await? else {
         return Err(bad("the staged directory has no CURRENT"));
@@ -1050,9 +1058,15 @@ pub async fn staged_record_and_next<E: Environment>(
         while let Some((raw, value)) = entries.next().await? {
             let (user, seq) = ikey::decode(&raw)?;
             if user[..] != key[..] {
-                // The entry that ends the record's key in this table: `next`'s newest
+                if user[..] < *next {
+                    // A key between the record's and `next`'s: none is written today,
+                    // and one added later is walked past rather than taken for the end.
+                    continue;
+                }
+                // The first entry at or past `next` in this table: `next`'s newest
                 // version here when it is `next`, and the walk of this table stops
-                // either way, where `staged_record`'s does.
+                // either way. Today it is the entry that ends the record's key, where
+                // `staged_record`'s walk stops too.
                 if user[..] == next[..]
                     && following.as_ref().is_none_or(|(at, _)| seq > *at)
                     && let Value::Live(bytes) = value
@@ -1652,5 +1666,235 @@ pub fn overlaps(term: Term, staged: (Index, Term)) -> Message {
         offset: 0,
         status: SnapshotStatus::Overlaps,
         incarnation: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use ananke_env::sim::{Sim, SimConfig};
+
+    use super::*;
+    use crate::store::{PURPOSE_DESCRIPTOR, PURPOSE_SNAPSHOT};
+
+    /// A table's entries, in key order: (user key, sequence number, value).
+    type Table = Vec<(Bytes, u64, Value)>;
+
+    /// Writes `tables` into `dir` as a checkpoint directory: each a table of its own,
+    /// numbered from 1, one manifest listing them oldest first, and `CURRENT` last.
+    async fn write_checkpoint<E: Environment>(env: &E, dir: &Path, tables: &[Table]) {
+        env.fs().create_dir_all(dir).await.expect("the directory");
+        let mut ssts = Vec::new();
+        for (at, table) in tables.iter().enumerate() {
+            let number = at as u64 + 1;
+            let mut writer = SstWriter::new();
+            for (key, seq, value) in table {
+                writer.add(key, *seq, value);
+            }
+            let (first_key, last_key) = writer.key_range().expect("a table of entries");
+            let (first_seq, max_seq) = writer.seq_range().expect("a table of entries");
+            let entries = writer.entries();
+            let bytes = writer.finish();
+            write_file(env, &manifest::sst_path(dir, number), &bytes, true)
+                .await
+                .expect("the table");
+            ssts.push(SstMeta {
+                number,
+                level: 0,
+                first_seq,
+                max_seq,
+                entries,
+                bytes: bytes.len() as u64,
+                first_key,
+                last_key,
+            });
+        }
+        let staged = Manifest {
+            number: 1,
+            next_sst: tables.len() as u64 + 1,
+            flushed_seq: 100,
+            ssts,
+        };
+        write_file(
+            env,
+            &manifest::manifest_path(dir, 1),
+            &staged.encode(),
+            true,
+        )
+        .await
+        .expect("the manifest");
+        write_file(
+            env,
+            &manifest::current_path(dir),
+            &manifest::encode_current(1),
+            true,
+        )
+        .await
+        .expect("CURRENT");
+    }
+
+    /// Runs `body` on one simulated node and returns what it returned.
+    fn on_a_node<T, F>(body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static) -> T
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut sim = Sim::new(SimConfig::new(3));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let out: Arc<Mutex<Option<T>>> = Arc::default();
+        env.clone().spawn("test", {
+            let out = out.clone();
+            async move {
+                let value = body(env).await;
+                *out.lock().expect("the result") = Some(value);
+            }
+        });
+        sim.run_for(Duration::from_secs(5));
+        let value = out.lock().expect("the result").take();
+        value.expect("the body finished")
+    }
+
+    /// The record and descriptor a walk finds in a checkpoint of `tables`, decoded: the
+    /// record's last index, and the descriptor's bytes.
+    fn walked(tables: Vec<Table>) -> io::Result<(Option<Index>, Option<Bytes>)> {
+        on_a_node(move |env| async move {
+            let dir = PathBuf::from("/staged");
+            write_checkpoint(&env, &dir, &tables).await;
+            let prefix = KeyPrefix::group(2);
+            staged_record_and_next(&env, &dir, &prefix, &prefix.descriptor_key())
+                .await
+                .map(|(record, next)| (record.map(|record| record.last_index), next))
+        })
+    }
+
+    fn record(at: Index) -> Value {
+        Value::Live(store::encode_snapshot_record(&SnapshotRecord {
+            last_index: at,
+            last_term: 2,
+            config: Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]),
+            dir: String::new(),
+            taken: true,
+            take: 1,
+        }))
+    }
+
+    fn live(bytes: &'static [u8]) -> Value {
+        Value::Live(Bytes::from_static(bytes))
+    }
+
+    /// The record's walk finds the descriptor wherever the checkpoint's tables put it,
+    /// and nothing where there is none (#180's review, B2): the overlap rule on an
+    /// install onto an initialised replica reads it here, and fails closed on a miss, so
+    /// a walk that never finds it now refuses every install rather than switching the
+    /// rule off. Six layouts: the descriptor in the record's table; in a later table
+    /// beside a key after it; alone in a table; absent; behind a key between the two,
+    /// which the walk skips; and in two tables, where the newer wins.
+    // PROPOSED(D-110): the record's walk reads the descriptor, wherever it is.
+    #[test]
+    fn the_records_walk_finds_the_descriptor_in_any_table_and_nothing_where_there_is_none() {
+        let prefix = KeyPrefix::group(2);
+        let (snapshot, descriptor) = (prefix.snapshot_key(), prefix.descriptor_key());
+        let hard = prefix.key(crate::store::PURPOSE_META, b"hard");
+        let after = prefix.key(PURPOSE_DESCRIPTOR + 1, b"after");
+        let between = prefix.key(PURPOSE_SNAPSHOT, b"zz-between");
+        assert!(snapshot < between && between < descriptor && descriptor < after);
+        let found = |tables: Vec<Table>| walked(tables).expect("the walk reads");
+        // In the record's own table, the entry after the record's.
+        assert_eq!(
+            found(vec![vec![
+                (hard.clone(), 9, live(b"hard")),
+                (snapshot.clone(), 9, record(40)),
+                (descriptor.clone(), 9, live(b"d")),
+                (after.clone(), 9, live(b"a")),
+            ]]),
+            (Some(40), Some(Bytes::from_static(b"d")))
+        );
+        // In a later table, beside a key after it.
+        assert_eq!(
+            found(vec![
+                vec![
+                    (hard.clone(), 9, live(b"hard")),
+                    (snapshot.clone(), 9, record(40))
+                ],
+                vec![
+                    (descriptor.clone(), 9, live(b"d")),
+                    (after.clone(), 9, live(b"a"))
+                ],
+            ]),
+            (Some(40), Some(Bytes::from_static(b"d")))
+        );
+        // Alone in a table.
+        assert_eq!(
+            found(vec![
+                vec![(snapshot.clone(), 9, record(40))],
+                vec![(descriptor.clone(), 9, live(b"d"))],
+            ]),
+            (Some(40), Some(Bytes::from_static(b"d")))
+        );
+        // Absent: the record and nothing else.
+        assert_eq!(
+            found(vec![vec![
+                (snapshot.clone(), 9, record(40)),
+                (after.clone(), 9, live(b"a")),
+            ]]),
+            (Some(40), None)
+        );
+        // Behind a key between the record's and the descriptor's.
+        assert_eq!(
+            found(vec![vec![
+                (snapshot.clone(), 9, record(40)),
+                (between.clone(), 9, live(b"b")),
+                (descriptor.clone(), 9, live(b"d")),
+            ]]),
+            (Some(40), Some(Bytes::from_static(b"d")))
+        );
+        // In two tables: the newer write wins, whichever table holds it.
+        assert_eq!(
+            found(vec![
+                vec![
+                    (snapshot.clone(), 9, record(40)),
+                    (descriptor.clone(), 12, live(b"new"))
+                ],
+                vec![(descriptor.clone(), 7, live(b"old"))],
+            ]),
+            (Some(40), Some(Bytes::from_static(b"new")))
+        );
+        // And the record alone is what `staged_record` reads.
+        let record_only = on_a_node(move |env| async move {
+            let dir = PathBuf::from("/staged");
+            write_checkpoint(
+                &env,
+                &dir,
+                &[vec![
+                    (snapshot.clone(), 9, record(40)),
+                    (descriptor.clone(), 9, live(b"d")),
+                ]],
+            )
+            .await;
+            staged_record(&env, &dir, &KeyPrefix::group(2))
+                .await
+                .map(|record| record.map(|record| record.last_index))
+        });
+        assert_eq!(record_only.expect("the walk reads"), Some(40));
+    }
+
+    /// A key that does not sort after the record's is refused, since the walk starts at
+    /// the record's key and could never see it.
+    // PROPOSED(D-110)
+    #[test]
+    fn the_records_walk_refuses_a_key_it_could_not_see() {
+        let refused = on_a_node(|env| async move {
+            let dir = PathBuf::from("/staged");
+            let prefix = KeyPrefix::group(2);
+            write_checkpoint(&env, &dir, &[vec![(prefix.snapshot_key(), 9, record(40))]]).await;
+            staged_record_and_next(&env, &dir, &prefix, &prefix.hard_key())
+                .await
+                .map(|_| ())
+                .map_err(|error| error.kind())
+        });
+        assert_eq!(refused, Err(io::ErrorKind::InvalidInput));
     }
 }

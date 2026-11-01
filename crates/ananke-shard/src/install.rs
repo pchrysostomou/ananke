@@ -462,6 +462,62 @@ fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDe
     }
 }
 
+/// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
+/// node whose initialised replicas' descriptors are `held`.
+// PROPOSED(D-110): one decision for both install paths, failing closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// Install it.
+    Install,
+    /// Refuse it with `Overlaps`: its span overlaps another initialised replica on the
+    /// node, or, for an install into a placeholder, the range itself was created on the
+    /// node meanwhile.
+    Overlaps,
+    /// Refuse it with a start-over (`Unusable`): its staged bytes name no span, so the
+    /// rule has nothing to check. No take of this tree makes such a snapshot.
+    NoSpan,
+}
+
+/// The overlap rule's decision for a completed stream of `range` whose staged bytes
+/// carry the descriptor `streamed`, on a node holding `held` (SHARD.md §5, Q27): "a
+/// snapshot is installed on a node only if its span overlaps no other initialised
+/// replica there". One decision for both paths, an install into a placeholder
+/// (`into_placeholder`, D-109 §2) and an install onto a replica the node holds.
+///
+/// **It fails closed.** A snapshot whose descriptor cannot be found is refused, on both
+/// paths, as the placeholder's path always refused one: before #180's review the second
+/// path installed it "as before", so a walk that missed the descriptor switched the rule
+/// off with every test still green. `SnapshotOverlapsReplica` installs whatever the span
+/// overlaps; it keeps the refusal of a placeholder's install of a range created on the
+/// node meanwhile, which is the same replica made twice rather than an overlap, and it
+/// keeps the refusal of a snapshot that names no span.
+// PROPOSED(D-110): one decision for both install paths, failing closed.
+fn admission(
+    range: RangeId,
+    streamed: Option<&RangeDescriptor>,
+    held: &BTreeMap<RangeId, RangeDescriptor>,
+    into_placeholder: bool,
+    variants: RangeVariants,
+) -> Admission {
+    let Some(streamed) = streamed else {
+        return Admission::NoSpan;
+    };
+    if into_placeholder && held.contains_key(&range) {
+        return Admission::Overlaps;
+    }
+    if variants.contains(RangeVariant::SnapshotOverlapsReplica) {
+        return Admission::Install;
+    }
+    let overlaps = held.iter().any(|(other, held)| {
+        *other != range && held.start < streamed.end && streamed.start < held.end
+    });
+    if overlaps {
+        Admission::Overlaps
+    } else {
+        Admission::Install
+    }
+}
+
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
 /// variant — the start-over the node answered it with before this bound existed.
 // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
@@ -1252,13 +1308,23 @@ impl<E: Environment> Task<E> {
         // holds: P's pre-split snapshot, whose span is P's whole span, on a node where R
         // is initialised. Refused with `Overlaps`, the range's hold released, and the
         // sender streams again after a minimum election timeout, from a fresh take,
-        // since only a newer snapshot can stop overlapping. A snapshot that carries no
-        // descriptor names no span to refuse, and is installed as before.
-        // PROPOSED(D-110): the same rule for an install onto an initialised replica.
-        if streamed
-            .as_ref()
-            .is_some_and(|streamed| self.overlaps_another(range, streamed))
-        {
+        // since only a newer snapshot can stop overlapping. **A snapshot whose
+        // descriptor cannot be found is refused** as a start-over, as the placeholder's
+        // path refuses one (`admission`): it was installed "as before" until #180's
+        // review, so a walk that missed the descriptor switched the rule off unseen.
+        // PROPOSED(D-110): the same rule for an install onto an initialised replica,
+        // failing closed.
+        let admitted = admission(
+            range,
+            streamed.as_ref(),
+            &lock(&self.descriptors),
+            false,
+            self.range_variants,
+        );
+        if admitted == Admission::NoSpan {
+            return self.restart(range, from, &install, &store).await;
+        }
+        if admitted == Admission::Overlaps {
             self.clear(&install.source).await;
             self.plan.finish(range, from);
             self.receiving.remove(&(range, from));
@@ -1487,30 +1553,31 @@ impl<E: Environment> Task<E> {
             Ok(None) | Err(_) => None,
         };
         // A stream that carries no descriptor says nothing of the span it would install,
-        // and nothing can be checked against it: no take of this tree makes one.
-        let Some(descriptor) = descriptor else {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Unusable)
-                .await;
+        // and nothing can be checked against it: no take of this tree makes one. The
+        // range itself initialised meanwhile — this node applied the split that makes it
+        // while the stream was read — is refused as an overlap: the replica is here now,
+        // and the sender's next stream lands on it (`admission`).
+        // PROPOSED(D-110): the overlap rule's one decision.
+        let admitted = admission(
+            range,
+            descriptor.as_ref(),
+            &lock(&self.descriptors),
+            true,
+            self.range_variants,
+        );
+        let descriptor = match (admitted, descriptor) {
+            (Admission::Install, Some(descriptor)) => descriptor,
+            (Admission::Overlaps, _) => {
+                return self
+                    .placeholder_refused(range, from, &install, StartOver::Overlaps)
+                    .await;
+            }
+            _ => {
+                return self
+                    .placeholder_refused(range, from, &install, StartOver::Unusable)
+                    .await;
+            }
         };
-        // The range itself initialised meanwhile — this node applied the split that
-        // makes it while the stream was read — is the same refusal: the replica is here
-        // now, and the sender's next stream lands on it.
-        // PROPOSED(D-110): `SnapshotOverlapsReplica` installs it whatever it overlaps,
-        // and keeps the refusal of a range created here meanwhile, which is no overlap
-        // with another replica but the same replica made twice.
-        let every = self
-            .range_variants
-            .contains(RangeVariant::SnapshotOverlapsReplica);
-        let overlaps = lock(&self.descriptors).iter().any(|(other, held)| {
-            *other == range
-                || (!every && held.start < descriptor.end && descriptor.start < held.end)
-        });
-        if overlaps {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Overlaps)
-                .await;
-        }
         // The engine, through the store it was opened through: the node has one engine
         // (Q2), and a node that joined holds no other store until this install.
         let beside = self.anchor.clone();
@@ -1687,24 +1754,6 @@ impl<E: Environment> Task<E> {
             (install.at.last_index, install.at.last_term),
         )
         .await;
-    }
-
-    /// Whether `span`, the span of a snapshot of `range`, overlaps another initialised
-    /// replica on this node: SHARD.md §5's overlap rule (Q27), for an install onto a
-    /// replica the node already holds. A range's own descriptor is the replica the
-    /// install replaces, and is not another. `SnapshotOverlapsReplica` says no to every
-    /// one.
-    // PROPOSED(D-110)
-    fn overlaps_another(&self, range: RangeId, span: &RangeDescriptor) -> bool {
-        if self
-            .range_variants
-            .contains(RangeVariant::SnapshotOverlapsReplica)
-        {
-            return false;
-        }
-        lock(&self.descriptors)
-            .iter()
-            .any(|(other, held)| *other != range && held.start < span.end && span.start < held.end)
     }
 
     /// The install did not switch: the staging directory starts over, the sender is
@@ -2842,6 +2891,8 @@ mod tests {
         }
     }
 
+    const R9: RangeId = RangeId(9);
+
     /// The fresh take after an overlap refusal's wait, decided by the checkpoint's
     /// generation (#180's review, B1 and N2). The decision was one expression in the
     /// task's loop, read by span, and no run of the tree computed anything but "no", so
@@ -2874,6 +2925,75 @@ mod tests {
         assert!(retake_after_overlap(None, None));
         // A generation above the range's own is no checkpoint this replica took.
         assert!(retake_after_overlap(Some(&left), Some(&before)));
+    }
+
+    /// The overlap rule's one decision for both install paths (#180's review, B2): a
+    /// snapshot is installed only where its span overlaps no other initialised replica
+    /// on the node, a snapshot naming no span is refused on both, and the variant
+    /// installs whatever its span overlaps and nothing else.
+    // PROPOSED(D-110): one decision for both install paths, failing closed.
+    #[test]
+    fn the_overlap_rule_admits_an_install_only_where_its_span_overlaps_no_other_replica() {
+        let correct = RangeVariants::correct();
+        let every = RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]);
+        let split: BTreeMap<RangeId, RangeDescriptor> = [
+            (R2, described(R2, "k0", "k1", 2)),
+            (R9, described(R9, "k1", "k2", 2)),
+        ]
+        .into_iter()
+        .collect();
+        let before = described(R2, "k0", "k2", 1);
+        // Onto a held replica: P's pre-split snapshot where R is initialised overlaps R;
+        // P's post-split snapshot overlaps nothing but P itself, which it replaces.
+        assert_eq!(
+            admission(R2, Some(&before), &split, false, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R2, Some(&split[&R2]), &split, false, correct),
+            Admission::Install
+        );
+        // Into a placeholder: R's snapshot where P still covers R's span, and R's where R
+        // was created here meanwhile.
+        let lagging: BTreeMap<RangeId, RangeDescriptor> =
+            [(R2, before.clone())].into_iter().collect();
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &lagging, true, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &split, true, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &BTreeMap::new(), true, correct),
+            Admission::Install
+        );
+        // No span named: refused on both paths, whatever the variant.
+        for variants in [correct, every] {
+            assert_eq!(
+                admission(R2, None, &split, false, variants),
+                Admission::NoSpan
+            );
+            assert_eq!(
+                admission(R9, None, &lagging, true, variants),
+                Admission::NoSpan
+            );
+        }
+        // The variant installs over an overlap, and still refuses the same replica made
+        // twice.
+        assert_eq!(
+            admission(R2, Some(&before), &split, false, every),
+            Admission::Install
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &lagging, true, every),
+            Admission::Install
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &split, true, every),
+            Admission::Overlaps
+        );
     }
 
     /// Runs `body` on one simulated node, and hands back its result and the trace.
@@ -3063,5 +3183,84 @@ mod tests {
             [true, false, true],
             "each wait's end is traced as told"
         );
+    }
+
+    /// An install onto a replica the node holds, through the task's `finish` (#180's
+    /// review, B2): P's pre-split snapshot, on a node where R is initialised, is refused
+    /// `Overlaps` and the range let go; a snapshot naming no span is refused as a
+    /// start-over, failing closed; and P's post-split snapshot, overlapping nothing,
+    /// switches. Before the review a walk that never found the descriptor installed the
+    /// first two with every test green.
+    // PROPOSED(D-110): the overlap rule on an install onto an initialised replica.
+    #[test]
+    fn an_install_onto_a_held_replica_is_refused_where_it_overlaps_another_or_names_no_span() {
+        let before = described(R2, "k0", "k2", 1);
+        let left = described(R2, "k0", "k1", 2);
+        let right = described(R9, "k1", "k2", 2);
+        let cases: [(Vec<RangeDescriptor>, Option<RangeDescriptor>); 3] = [
+            (vec![left.clone(), right], Some(before.clone())),
+            (vec![before.clone()], None),
+            (vec![before], Some(left)),
+        ];
+        for (case, (held, streamed)) in cases.into_iter().enumerate() {
+            let (outcome, trace) = on_a_node(move |env| async move {
+                let (mut task, store, local) = task_on(&env, R2, &held).await;
+                let from = ServerId(3);
+                let source = PathBuf::from("/n1/staging-r2-s3");
+                checkpoint_of(&env, R2, 30, streamed.as_ref(), &source).await;
+                let span = held
+                    .iter()
+                    .find(|held| held.range == R2)
+                    .map(|held| held.start.clone()..held.end.clone())
+                    .expect("R2 is held");
+                let install = Install {
+                    range: R2,
+                    from,
+                    at: Identity {
+                        term: 2,
+                        last_index: 30,
+                        last_term: 2,
+                    },
+                    source,
+                    spans: vec![KeyPrefix::group(R2.get()).span(), span],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.receiving.entry((R2, from)).or_default().pending = Some(Box::new(install));
+                let repair = Repair {
+                    term: 2,
+                    vote: None,
+                    tail: Vec::new(),
+                    quarantined: false,
+                    incarnation: 7,
+                };
+                task.finish(R2, from, repair, env.decision()).await;
+                let answered = local.remove_first(|_| true).map(|answer| match answer {
+                    crate::server::Local::Snapshot(SnapAnswer::Abandoned { .. }) => "let go",
+                    crate::server::Local::Snapshot(SnapAnswer::Switched { .. }) => "switched",
+                    _ => "something else",
+                });
+                (answered, store.applied())
+            });
+            let refused: Vec<StartOver> = trace
+                .iter()
+                .filter_map(|record| match &record.event {
+                    TraceEvent::RaftSnapshotStartOver { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            let expected = match case {
+                0 => ((Some("let go"), 0), vec![StartOver::Overlaps]),
+                1 => ((Some("let go"), 0), vec![StartOver::Unusable]),
+                _ => ((Some("switched"), 30), vec![]),
+            };
+            assert_eq!(
+                (outcome, refused),
+                expected,
+                "case {case}: P's pre-split snapshot where R is held, a snapshot naming no \
+                 span, and P's post-split snapshot"
+            );
+        }
     }
 }
