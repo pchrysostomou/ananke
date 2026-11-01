@@ -23332,4 +23332,60 @@ creation's own. The trace format is not changed for this.
 
 ---
 
-_Next entry: D-113. Add one before implementing anything not covered above._
+## PROPOSED D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for
+S10 in the tracking issue #162; D-114 is this slice's. The footer moves to D-115, and
+at a merge the entries are a union in numerical order with one footer, the highest plus
+one. The code site carries `// PROPOSED(D-114)`. Closes #183.
+
+**Context.** #180's review (N10) found it, and it predates S9. A voter's apply of a split
+wrote the two descriptors into the host's `descriptors` table under two acquisitions:
+P's narrowed descriptor first, then R's new one after the `RangeCreated { cause: split }`
+trace. The `snapshot` task's overlap rule (D-110) reads the same table in one
+acquisition, when it decides whether a placeholder's install of R may go in. Between the
+two acquisitions, the table held P off R's span and no R, and the rule admits R's
+install on that state.
+- **In the simulator** no task runs there: the executor is cooperative and nothing
+  between the two inserts awaits.
+- **Under `RealEnv`'s multi-thread runtime** the `snapshot` task can run on another worker
+  between them. A placeholder's install of R would then pass while the split's apply also
+  created R, the double creation seed 219 shows under `SnapshotOverlapsReplica` (#181),
+  on the correct node. It stayed latent because the real binary does not run the shard
+  server.
+
+**The rule.** The two inserts are one critical section. `put_split_descriptors`
+(`server.rs`) puts P's narrowed descriptor and, on a voter, R's into the table. It takes
+the table, not its lock, so the caller's one guard covers both. A reader of the table
+sees P's descriptor before the split or both halves after it, and the overlap rule
+refuses R's install in both states: by P's span before, by R itself after. A non-voter
+holds no R, and its table goes from P to P narrowed, as before.
+
+**The trace and the schedules do not change.** R's creation is still traced before its
+descriptor is in place. P's descriptor now goes in with R's, after that trace and not
+before it. Nothing between the two points awaits or draws, so every simulated run is
+the run it was.
+
+**The test, and why the window itself has none.**
+`a_splits_two_descriptors_reach_the_hosts_table_in_one_step` (a unit test in `server.rs`)
+holds the helper's update:
+- a voter's table goes from P alone to P narrowed and R, with the range beside untouched;
+- the overlap rule refuses an install of R's span in both states;
+- the state between, P narrowed with R absent, admits it, so it is the state no reader
+  may see;
+- a non-voter's table ends in P narrowed and no R.
+
+No test of this tree can reach the window itself, before or after the fix.
+- The simulator never ran a task between the two inserts.
+- A test that raced host threads against the table is what `clippy.toml` and
+  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040).
+- The real binary does not run the shard server.
+
+The one acquisition is held by the helper's signature, which takes the table rather than
+its lock. **PROPOSED.**
+
+**The nightly's rows (D-064).** No sweep is added, so no row.
+
+---
+
+_Next entry: D-115. Add one before implementing anything not covered above._
