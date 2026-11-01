@@ -342,6 +342,16 @@ enum Step {
     /// The restart bound is spent: count the checkpoint unusable and ask for a fresh
     /// take (RAFT.md:210-212).
     Unusable,
+    /// The receiver refused the completed stream under the overlap rule (SHARD.md §5,
+    /// Q27): the stream ends, nothing is counted against either bound, and the range's
+    /// core is let stream again only after a minimum election timeout, from a fresh
+    /// take where the checkpoint predates the range's last split or merge.
+    ///
+    /// Until D-110 this answer was a [`Step::Restart`], which spent RAFT.md:210-212's
+    /// bound on a checkpoint nothing was wrong with: at the third refusal the leader
+    /// counted it unusable and retook (#177).
+    // PROPOSED(D-110): the overlap rule's refusal ends the stream and counts nothing.
+    Overlapped,
 }
 
 /// The step one answer takes, given how many restarts this stream has already been
@@ -360,6 +370,8 @@ fn step_for(status: SnapshotStatus, restarts: u32, variants: NodeVariants) -> St
         SnapshotStatus::More => Step::Resume,
         SnapshotStatus::Installed => Step::Done,
         SnapshotStatus::Waiting => Step::Wait,
+        // PROPOSED(D-110): the overlap rule's refusal, counted against no bound.
+        SnapshotStatus::Overlaps => Step::Overlapped,
         SnapshotStatus::Restart if bounded && restarts >= STREAM_RESTARTS => Step::Unusable,
         SnapshotStatus::Restart => Step::Restart,
     }
@@ -395,8 +407,10 @@ fn booked(step: Step, counted: Counted) -> Counted {
             resends: 0,
             restarts: counted.restarts + 1,
         },
-        // The stream ends here, and its bookkeeping ends with it.
-        Step::Done | Step::Unusable => counted,
+        // The stream ends here, and its bookkeeping ends with it. An overlap refusal
+        // ends it too and counts nothing: the next stream after the wait opens with
+        // counters of its own (PROPOSED D-110).
+        Step::Done | Step::Unusable | Step::Overlapped => counted,
     }
 }
 
@@ -414,6 +428,8 @@ fn booked(step: Step, counted: Counted) -> Counted {
 fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
     match status {
         SnapshotStatus::Waiting => snapshot::waiting(term, at),
+        // PROPOSED(D-110): the overlap rule's refusal says so on the wire.
+        SnapshotStatus::Overlaps => snapshot::overlaps(term, at),
         _ => snapshot::start_over(term, at),
     }
 }
@@ -430,6 +446,18 @@ fn cap_status(variants: NodeVariants) -> SnapshotStatus {
         return SnapshotStatus::Restart;
     }
     SnapshotStatus::Waiting
+}
+
+/// A stream its receiver refused under the overlap rule (SHARD.md §5, Q27), ended and
+/// waiting out a minimum election timeout before its range's core may stream again.
+// PROPOSED(D-110): the leader's wait.
+struct Overlapped {
+    /// When the wait is over.
+    due: ananke_env::Instant,
+    /// The version directory the refused stream read: what says whether the checkpoint
+    /// predates the range's last split or merge. Pinned against the range's sweeps
+    /// until the wait is over, as a stream's version is for the stream's life.
+    version: PathBuf,
 }
 
 /// One stream being assembled from one sender of one range: where its bytes are going
@@ -473,6 +501,10 @@ pub struct Task<E: Environment> {
     snaps: Queue<SnapJob>,
     sending: BTreeMap<(RangeId, ServerId), Outbound>,
     receiving: BTreeMap<(RangeId, ServerId), Inbound>,
+    /// The streams refused under the overlap rule, waiting out a minimum election
+    /// timeout before their range's core may ask for them again (SHARD.md §5, Q27).
+    // PROPOSED(D-110): the leader's wait.
+    overlapped: BTreeMap<(RangeId, ServerId), Overlapped>,
     /// The host's placeholders (SHARD.md §5, Q22): the ranges this node holds no
     /// replica of and has had messages for, whose streams this task assembles and
     /// installs into a replica of its own creating.
@@ -538,6 +570,7 @@ impl<E: Environment> Task<E> {
             snaps,
             sending: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            overlapped: BTreeMap::new(),
             placeholders,
             as_placeholder: BTreeSet::new(),
             anchor,
@@ -575,9 +608,14 @@ impl<E: Environment> Task<E> {
         }
     }
 
-    /// The nearest deadline of a chunk outstanding on any stream.
+    /// The nearest deadline of a chunk outstanding on any stream, or of a wait after
+    /// an overlap refusal.
     fn deadline(&self) -> Option<ananke_env::Instant> {
-        self.sending.values().map(|out| out.deadline).min()
+        self.sending
+            .values()
+            .map(|out| out.deadline)
+            .chain(self.overlapped.values().map(|wait| wait.due))
+            .min()
     }
 
     /// One job.
@@ -615,6 +653,7 @@ impl<E: Environment> Task<E> {
     /// another's.
     async fn due(&mut self) {
         let now = self.env.clock().now();
+        self.waited(now).await;
         let due: Vec<(RangeId, ServerId)> = self
             .sending
             .iter()
@@ -666,6 +705,13 @@ impl<E: Environment> Task<E> {
         let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return;
         };
+        // A stream refused under the overlap rule waits out its minimum election
+        // timeout whoever asks meanwhile — a core that changed role asks again at once
+        // — and the wait's end lets the core ask again (`waited`).
+        // PROPOSED(D-110): the leader's wait.
+        if self.overlapped.contains_key(&(range, to)) {
+            return;
+        }
         // What the record names, if it names a take of its own: the fast path through
         // `find_version`, which falls back to scanning the engine directory.
         let recorded = match store.snapshot_record().await {
@@ -1069,6 +1115,28 @@ impl<E: Environment> Task<E> {
                 self.plan.sent(range, from);
                 self.retake(range, from);
             }
+            Step::Overlapped => {
+                // SHARD.md §5's overlap rule (Q27): the receiver's node holds another
+                // initialised replica this snapshot's span overlaps, and installed
+                // nothing. The stream ends here, counted against neither bound, and its
+                // version is kept for the wait: after a minimum election timeout the
+                // core is let ask again, and `waited` says whether from a fresh take.
+                // The core's own ask stays outstanding meanwhile, so it asks nothing
+                // else of this follower until then.
+                // PROPOSED(D-110): the leader's half of the overlap rule.
+                let version = out.sender.dir().to_path_buf();
+                self.sending.remove(&(range, from));
+                self.plan.sent(range, from);
+                self.env.trace(TraceEvent::RaftSnapshotOverlapped {
+                    server: self.id.0,
+                    range: range.get(),
+                    to: from.0,
+                    last_index,
+                });
+                let due = self.env.clock().now() + self.election_min();
+                self.overlapped
+                    .insert((range, from), Overlapped { due, version });
+            }
             Step::Wait => {
                 // A slot, not a start-over: nothing was staged, so this stream stands
                 // exactly where it stood and there is nothing to cover again. The
@@ -1131,14 +1199,52 @@ impl<E: Environment> Task<E> {
         let installing = held;
         // The configuration in force at the snapshot's last index, out of the streamed
         // bytes: no message carries it, and the receiver's own view of the membership
-        // is a replica's that is behind by definition (D-029).
-        let config = match snapshot::staged_record(&self.env, &install.source, store.prefix()).await
+        // is a replica's that is behind by definition (D-029). And the snapshot's
+        // descriptor beside it, read in the record's own walk
+        // so the walk's reads, and the run's schedule, are what they were before the
+        // overlap rule read it (`staged_record_and_next`).
+        // PROPOSED(D-110)
+        let (config, streamed) = match snapshot::staged_record_and_next(
+            &self.env,
+            &install.source,
+            store.prefix(),
+            &store.prefix().descriptor_key(),
+        )
+        .await
         {
-            Ok(Some(record)) => record.config,
+            Ok((Some(record), descriptor)) => (
+                record.config,
+                descriptor.and_then(|bytes| RangeDescriptor::decode(bytes).ok()),
+            ),
             // A stream whose bytes carry no snapshot record for this range is a stream
             // of a store that never took one; there is nothing to install from it.
-            Ok(None) | Err(_) => return self.restart(range, from, &install, &store).await,
+            Ok((None, _)) | Err(_) => return self.restart(range, from, &install, &store).await,
         };
+        // The overlap rule (SHARD.md §5, Q27) on an install onto a replica the node
+        // holds: P's pre-split snapshot, whose span is P's whole span, on a node where R
+        // is initialised. Refused with `Overlaps`, the range's hold released, and the
+        // sender streams again after a minimum election timeout, from a fresh take,
+        // since only a newer snapshot can stop overlapping. A snapshot that carries no
+        // descriptor names no span to refuse, and is installed as before.
+        // PROPOSED(D-110): the same rule for an install onto an initialised replica.
+        if streamed
+            .as_ref()
+            .is_some_and(|streamed| self.overlaps_another(range, streamed))
+        {
+            self.clear(&install.source).await;
+            self.plan.finish(range, from);
+            self.receiving.remove(&(range, from));
+            self.refuse(
+                range,
+                from,
+                SnapshotStatus::Overlaps,
+                StartOver::Overlaps,
+                repair.term,
+                (install.at.last_index, install.at.last_term),
+            )
+            .await;
+            return self.release(range);
+        }
         let source = match store.engine().open_span_source(&install.source).await {
             Ok(source) => source,
             // The staged directory is short — a crash inside the stream, a table left
@@ -1308,11 +1414,11 @@ impl<E: Environment> Task<E> {
     /// whose replica of a parent has not applied the split is fed the right half's
     /// snapshot whenever the right half's leader reaches its placeholder first, and
     /// installing it would put two owners on the right half's keys until the parent
-    /// moved on. The refusal is a start-over (`StartOver::Overlaps`) and the leader
-    /// streams again: by then the parent here has applied the split, which creates the
-    /// right half and ends the placeholder, or installed a snapshot past it, which moves
-    /// its span off the right half's. The rule's own answer, `Overlaps`, and the
-    /// leader's wait before it streams again are the overlap rule's slice's.
+    /// moved on. The refusal is answered `Overlaps` (traced `StartOver::Overlaps`), and
+    /// the leader streams again after a minimum election timeout, counting nothing
+    /// against its restart bound (PROPOSED D-110): by then the parent here may have
+    /// applied the split, which creates the right half and ends the placeholder, or
+    /// installed a snapshot past it, which moves its span off the right half's.
     ///
     /// Otherwise the repair is a placeholder's: the stream's term, no vote, no kept
     /// tail and an incarnation drawn fresh from the node's generator (Q26, D-042). It
@@ -1362,8 +1468,15 @@ impl<E: Environment> Task<E> {
         // The range itself initialised meanwhile — this node applied the split that
         // makes it while the stream was read — is the same refusal: the replica is here
         // now, and the sender's next stream lands on it.
+        // PROPOSED(D-110): `SnapshotOverlapsReplica` installs it whatever it overlaps,
+        // and keeps the refusal of a range created here meanwhile, which is no overlap
+        // with another replica but the same replica made twice.
+        let every = self
+            .range_variants
+            .contains(RangeVariant::SnapshotOverlapsReplica);
         let overlaps = lock(&self.descriptors).iter().any(|(other, held)| {
-            *other == range || (held.start < descriptor.end && descriptor.start < held.end)
+            *other == range
+                || (!every && held.start < descriptor.end && descriptor.start < held.end)
         });
         if overlaps {
             return self
@@ -1517,8 +1630,11 @@ impl<E: Environment> Task<E> {
     }
 
     /// A placeholder's install refused: its staged bytes go, and the sender is asked
-    /// for the stream again, saying why.
+    /// for the stream again, saying why. A refusal under the overlap rule is answered
+    /// `Overlaps`, which the sender counts against no bound and streams again after a
+    /// minimum election timeout (PROPOSED D-110); every other is a start-over.
     // PROPOSED(D-109)
+    // PROPOSED(D-110): the overlap rule's refusal answered as itself.
     async fn placeholder_refused(
         &mut self,
         range: RangeId,
@@ -1529,14 +1645,38 @@ impl<E: Environment> Task<E> {
         self.clear(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
-        self.start_over(
+        let status = if reason == StartOver::Overlaps {
+            SnapshotStatus::Overlaps
+        } else {
+            SnapshotStatus::Restart
+        };
+        self.refuse(
             range,
             from,
+            status,
             reason,
             install.at.term,
             (install.at.last_index, install.at.last_term),
         )
         .await;
+    }
+
+    /// Whether `span`, the span of a snapshot of `range`, overlaps another initialised
+    /// replica on this node: SHARD.md §5's overlap rule (Q27), for an install onto a
+    /// replica the node already holds. A range's own descriptor is the replica the
+    /// install replaces, and is not another. `SnapshotOverlapsReplica` says no to every
+    /// one.
+    // PROPOSED(D-110)
+    fn overlaps_another(&self, range: RangeId, span: &RangeDescriptor) -> bool {
+        if self
+            .range_variants
+            .contains(RangeVariant::SnapshotOverlapsReplica)
+        {
+            return false;
+        }
+        lock(&self.descriptors)
+            .iter()
+            .any(|(other, held)| *other != range && held.start < span.end && span.start < held.end)
     }
 
     /// The install did not switch: the staging directory starts over, the sender is
@@ -1597,6 +1737,19 @@ impl<E: Environment> Task<E> {
         for (key, out) in &self.sending {
             if key.0 == range {
                 keep.insert((out.sender.last_index, take_of(out.sender.dir())));
+            }
+        }
+        // And a version an overlap refusal's wait will read, until the wait is over.
+        // PROPOSED(D-110)
+        for (key, wait) in &self.overlapped {
+            if key.0 == range
+                && let Some((_, index, take)) = wait
+                    .version
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(crate::snapshot::parse_version)
+            {
+                keep.insert((index, take));
             }
         }
         let Ok(names) = self.env.fs().read_dir(&self.engine_dir).await else {
@@ -1846,6 +1999,67 @@ impl<E: Environment> Task<E> {
                 to,
                 retake: true,
             }));
+    }
+
+    /// A minimum election timeout: how long a stream refused under the overlap rule
+    /// waits before its range's core may stream again (SHARD.md §5, Q27).
+    // PROPOSED(D-110)
+    fn election_min(&self) -> Duration {
+        Duration::from_nanos(self.config.tick_nanos * self.config.election_ticks.0)
+    }
+
+    /// Every overlap refusal's wait that is over at `now`: the range's core is let
+    /// stream to that follower again (`SnapAnswer::Failed`, which clears the ask it
+    /// had outstanding), from a fresh take where the refused checkpoint predates the
+    /// range's last split or merge (SHARD.md §5, Q27).
+    ///
+    /// "Predates" is read off the checkpoint itself: its descriptor, out of the version
+    /// directory the refused stream read, names a span other than the range's
+    /// descriptor names now. Spans change at a split or a merge and at nothing else, and
+    /// a snapshot whose span is the range's present one is what a fresh take would
+    /// stream, so retaking it could not stop the overlap; a checkpoint that cannot be
+    /// read is retaken, since nothing then says it postdates either.
+    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    async fn waited(&mut self, now: ananke_env::Instant) {
+        let over: Vec<(RangeId, ServerId)> = self
+            .overlapped
+            .iter()
+            .filter(|(_, wait)| wait.due <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        for (range, to) in over {
+            let Some(wait) = self.overlapped.remove(&(range, to)) else {
+                continue;
+            };
+            let streamed = snapshot::staged_value(
+                &self.env,
+                &wait.version,
+                &KeyPrefix::group(range.get()).descriptor_key(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
+            let retake = match (streamed, self.user_span(range)) {
+                (Some(streamed), Some(now)) => {
+                    streamed.start != now.start || streamed.end != now.end
+                }
+                (None, _) => true,
+                (Some(_), None) => false,
+            };
+            self.env.trace(TraceEvent::RaftSnapshotRestream {
+                server: self.id.0,
+                range: range.get(),
+                to: to.0,
+                retake,
+            });
+            self.local
+                .push(crate::server::Local::Snapshot(SnapAnswer::Failed {
+                    range,
+                    to,
+                    retake,
+                }));
+        }
     }
 
     /// How long a chunk may be outstanding before it is resent, as the one-group task
@@ -2241,6 +2455,12 @@ mod tests {
                     Step::Done => stream.ended = Some(Ended::Installed),
                     Step::Restart => stream.chunks = 0,
                     Step::Unusable => stream.ended = Some(Ended::GaveUp { retake: true }),
+                    Step::Overlapped => {
+                        panic!(
+                            "{} was refused for overlap, which this check does not build",
+                            stream.range
+                        )
+                    }
                     Step::Wait => {
                         // The chunk falls due on the resend timer and is asked again,
                         // and the ask is what takes the slot. Nothing is given up for
@@ -2485,6 +2705,48 @@ mod tests {
             counted.restarts, STREAM_RESTARTS,
             "the bound is spent by exactly the restarts RAFT.md:210-212 allows"
         );
+    }
+
+    /// An overlap refusal leaves the restart count where it was, at any count, ends the
+    /// stream, and on the wire is an `Overlaps` and not a start-over: the done-when of
+    /// #177, where the refusal was a `Restart` that spent RAFT.md:210-212's bound, so
+    /// that at the third refusal of a sound checkpoint the leader retook it.
+    // PROPOSED(D-110): the overlap rule's refusal is counted against no bound.
+    #[test]
+    fn an_overlap_refusal_ends_the_stream_and_leaves_the_restart_count_unchanged() {
+        let correct = NodeVariants::correct();
+        for restarts in 0..=STREAM_RESTARTS + 2 {
+            assert_eq!(
+                step_for(SnapshotStatus::Overlaps, restarts, correct),
+                Step::Overlapped,
+                "an overlap refusal after {restarts} restarts"
+            );
+            let counted = Counted {
+                resends: 1,
+                restarts,
+            };
+            assert_eq!(
+                booked(Step::Overlapped, counted),
+                counted,
+                "an overlap refusal must count nothing against either bound"
+            );
+        }
+        // The three refusals seed 595 of the correct node drew before D-110 (#177): as a
+        // `Restart` the third spent the bound; as itself, none does.
+        let mut counted = Counted::default();
+        for _ in 0..3 {
+            let step = step_for(SnapshotStatus::Overlaps, counted.restarts, correct);
+            assert_ne!(step, Step::Unusable);
+            counted = booked(step, counted);
+        }
+        assert_eq!(counted.restarts, 0);
+        assert!(matches!(
+            refusal(SnapshotStatus::Overlaps, 4, (40, 3)),
+            Message::InstallSnapshotResponse {
+                status: SnapshotStatus::Overlaps,
+                ..
+            }
+        ));
     }
 
     /// The answer a cap-wait carries **on the wire**, which is the half of this entry a

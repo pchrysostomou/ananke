@@ -1,7 +1,14 @@
 //! `sim/split.rs` under the sweep (SHARD.md §10, §12): directed shapes about a split, on
 //! four nodes, nodes 1 to 3 the bootstrap nodes and node 4 a node that joins and holds
-//! nothing. Shape (ii), *vote*, is built here; (i) is the overlap rule's slice's and (iii)
-//! Stage D's.
+//! nothing. Shapes (i), *overlap*, and (ii), *vote*, are built here; (iii) is Stage D's.
+//!
+//! Shape (i), at every tier (PROPOSED D-110): the correct system passes every seed, and on
+//! every seed the shape is built, its premise holds, and while the limit held a chunk of
+//! R's stream reached `x` while a chunk of P's was dropped as oversized; `x` refused R's
+//! install for overlap, R's leader waited a minimum election timeout each time before it
+//! streamed again, from the same checkpoint, and `x` made R once its P had moved off R's
+//! span. Under `SnapshotOverlapsReplica` the shape is built too, and check 8's overlap
+//! clause trips on every seed at `x`'s `RangeCreated { cause: snapshot }` of R.
 //!
 //! What it asserts, at every tier (SHARD.md §12, Stage C's exit): the correct system
 //! passes every seed — checks 1 to 4, the range layer's folds and no node stopped — and
@@ -13,6 +20,7 @@
 //! right half's remaining replica its vote on every seed, and check 20 catches it on every
 //! seed.
 // PROPOSED(D-109): `sim/split.rs` (ii).
+// PROPOSED(D-110): `sim/split.rs` (i).
 
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{Environment, TraceEvent};
@@ -228,4 +236,200 @@ fn a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why() 
          expects: failures {failed:?}, sent {sent}, opened a WAL {opened}, spawned a task \
          {spawned}, created or restated a replica {replicas}"
     );
+}
+
+/// The span of `values`, as "min to max".
+fn span_of(values: &[usize]) -> String {
+    format!(
+        "{} to {}",
+        values.iter().min().copied().unwrap_or(0),
+        values.iter().max().copied().unwrap_or(0)
+    )
+}
+
+/// What one correct run of shape (i) measured: R's and P's largest chunk frames toward
+/// `x`, R's and P's chunks across the limit, `x`'s refusals for overlap, R's leader's
+/// waits, and how long after the lift `x` made R.
+#[derive(Default)]
+struct OverlapMeasured {
+    right_frame: usize,
+    parent_frame: usize,
+    delivered: usize,
+    dropped: usize,
+    refusals: usize,
+    waits: usize,
+    made_after_lift: u64,
+}
+
+/// Shape (i) on the correct system, every seed of the tier (SHARD.md §12, Stage C's exit;
+/// PROPOSED D-110): the run passes its checks and the shape is built, its premise held and
+/// across the limit a chunk of R's stream reached `x` while a chunk of P's was dropped as
+/// oversized. And the overlap rule's mechanism, on every seed: `x` refused R's install for
+/// overlap while its P still covered R's span; each refusal ended R's leader's stream, and
+/// the leader streamed again only after a minimum election timeout, from the same
+/// checkpoint, R having split nothing since it took it (`RaftSnapshotRestream { retake:
+/// false }`); and once `x`'s P was installed past the split, `x` made R by a snapshot.
+///
+/// The frame-length limit is measured here, every tier printing R's largest chunk frame
+/// toward `x` and P's, and asserted between them on every seed: a limit at or below R's
+/// largest frame would drop R's stream too, and one at or above P's would let P's through.
+#[test]
+fn every_seed_of_the_overlap_shape_passes_on_the_correct_node() {
+    let seeds = seeds();
+    let outcomes = sweep(seeds, |seed| {
+        let report = split::run_overlap(seed, RangeVariants::correct());
+        let mut measured = OverlapMeasured::default();
+        let outcome = report
+            .check()
+            .and_then(|()| report.shape())
+            .and_then(|()| overlap_mechanism(&report, &mut measured));
+        if outcome.is_err() {
+            write_trace(&format!("split-overlap-{seed}"), &report.jsonl());
+        }
+        (outcome, measured)
+    });
+    let pick = |what: fn(&OverlapMeasured) -> usize| -> Vec<usize> {
+        outcomes
+            .iter()
+            .map(|(_, measured)| what(measured))
+            .collect()
+    };
+    println!(
+        "split (i): {seeds} seeds under a limit of {} bytes toward x: R's largest chunk frame \
+         {} bytes, P's {} bytes; across the limit R's chunks delivered {} and P's dropped as \
+         oversized {}; x's refusals for overlap {}; R's leader's waits {}; x made R {} ms \
+         after the lift",
+        split::FRAME_LIMIT,
+        span_of(&pick(|m| m.right_frame)),
+        span_of(&pick(|m| m.parent_frame)),
+        span_of(&pick(|m| m.delivered)),
+        span_of(&pick(|m| m.dropped)),
+        span_of(&pick(|m| m.refusals)),
+        span_of(&pick(|m| m.waits)),
+        span_of(&pick(
+            |m| usize::try_from(m.made_after_lift).unwrap_or(usize::MAX)
+        )),
+    );
+    let verdicts: Vec<Result<(), String>> =
+        outcomes.into_iter().map(|(outcome, _)| outcome).collect();
+    verdict(&verdicts).expect("the correct node passes every seed of shape (i)");
+}
+
+/// The overlap rule's mechanism on one correct run of shape (i), measured into `measured`.
+fn overlap_mechanism(report: &split::Report, measured: &mut OverlapMeasured) -> Result<(), String> {
+    let (seed, x) = (report.seed, report.x);
+    let (_, right) = report.split.ok_or("no split")?;
+    measured.right_frame = report.largest_chunk_frame_to_x(right).unwrap_or(0);
+    measured.parent_frame = report.largest_chunk_frame_to_x(split::PARENT).unwrap_or(0);
+    if !(measured.right_frame < split::FRAME_LIMIT && split::FRAME_LIMIT < measured.parent_frame) {
+        return Err(format!(
+            "seed {seed}: the limit of {} bytes does not lie between R's largest chunk frame \
+             toward node {x}, {} bytes, and P's, {} bytes",
+            split::FRAME_LIMIT,
+            measured.right_frame,
+            measured.parent_frame
+        ));
+    }
+    (measured.delivered, measured.dropped) = report.limited_chunks();
+    let refusals = report.overlap_refusals();
+    measured.refusals = refusals.len();
+    let installed = report
+        .x_parent_installed_at()
+        .ok_or_else(|| format!("seed {seed}: node {x}'s P was never installed past the split"))?;
+    let Some(&first) = refusals.first() else {
+        return Err(format!(
+            "seed {seed}: node {x} never refused R's install for overlap, so its P never \
+             covered R's span when R's stream completed"
+        ));
+    };
+    if first > installed {
+        return Err(format!(
+            "seed {seed}: node {x}'s first refusal of R for overlap came after its P was \
+             installed past the split, when its P no longer covered R's span"
+        ));
+    }
+    let waits = report.waits()?;
+    measured.waits = waits.len();
+    if waits.is_empty() {
+        return Err(format!(
+            "seed {seed}: R's leader never ended a wait after an overlap refusal by node {x}"
+        ));
+    }
+    if waits.iter().any(|(_, _, retake)| *retake) {
+        return Err(format!(
+            "seed {seed}: R's leader retook its checkpoint after an overlap refusal, though R \
+             split nothing after it took it"
+        ));
+    }
+    let made = report.x_created_right_at().ok_or_else(|| {
+        format!("seed {seed}: node {x} never made R, though its P moved off R's span")
+    })?;
+    if made < installed {
+        return Err(format!(
+            "seed {seed}: node {x} made R before its P was installed past the split"
+        ));
+    }
+    let lifted = report.lifted.ok_or("never lifted")?;
+    measured.made_after_lift = report.records[made]
+        .at
+        .duration_since(lifted)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(())
+}
+
+/// Shape (i) under `SnapshotOverlapsReplica`, every seed of the tier (SHARD.md §10, §12;
+/// PROPOSED D-110): the shape is built, `x` installs R's snapshot while its P still covers
+/// R's span, and check 8's overlap clause trips on every seed at that install's
+/// `RangeCreated { cause: snapshot }` — the record at which the fold, fed one record at a
+/// time, first reads a violation is that creation, on `x`, of R. The correct system's test
+/// beside it holds check 8 green on every seed through the run's verdict.
+#[test]
+fn a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape() {
+    let seeds = seeds();
+    let outcomes = sweep(seeds, |seed| {
+        let report = split::run_overlap(
+            seed,
+            RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]),
+        );
+        let outcome = report.shape().and_then(|()| {
+            let (_, right) = report.split.ok_or("no split")?;
+            let at = report.overlap_tripped_at().ok_or_else(|| {
+                format!(
+                    "seed {seed}: under SnapshotOverlapsReplica check 8's overlap clause did \
+                     not trip"
+                )
+            })?;
+            let record = &report.records[at];
+            let on_x = record.node.map(|node| u64::from(node.get())) == Some(report.x);
+            if !(on_x
+                && matches!(&record.event, TraceEvent::RangeCreated {
+                    range, cause: ananke_env::RangeCause::Snapshot, ..
+                } if *range == right))
+            {
+                return Err(format!(
+                    "seed {seed}: check 8's overlap clause tripped at {:?}, not at node {}'s \
+                     install of R",
+                    record.event, report.x
+                ));
+            }
+            match invariants::folded(&report.records).verdict_of(Fold::Overlap) {
+                Err(words) if words.starts_with(Fold::Overlap.words()) => Ok(()),
+                other => Err(format!(
+                    "seed {seed}: check 8's overlap clause over the run said {other:?}"
+                )),
+            }
+        });
+        if outcome.is_err() {
+            write_trace(&format!("split-overlap-variant-{seed}"), &report.jsonl());
+        }
+        outcome
+    });
+    println!(
+        "split (i) under SnapshotOverlapsReplica: {seeds} seeds, check 8 caught {} of them at \
+         the install's RangeCreated",
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count()
+    );
+    verdict(&outcomes).expect("check 8 catches the variant on every seed of shape (i)");
 }

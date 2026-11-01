@@ -2153,6 +2153,20 @@ async fn snapshot_task<E: Environment>(
                         // PROPOSED(D-090): a cap-wait is not a start-over.
                         out.deadline = env.clock().now() + chunk_timeout;
                     }
+                    SnapshotStatus::Overlaps => {
+                        // The range layer's overlap rule (SHARD.md §5, Q27), which a
+                        // one-group receiver holding one group never answers. Heard
+                        // anyway, it is what it says on the node: the checkpoint is
+                        // sound and the receiver would not take it, so the stream ends
+                        // with no retake and nothing counted against the restart bound,
+                        // and the core asks again when it next replicates.
+                        // PROPOSED(D-110): the overlap rule's refusal is not a restart.
+                        inbox.push(Event::StreamFailed {
+                            to: from,
+                            retake: false,
+                        });
+                        ended = true;
+                    }
                     SnapshotStatus::More => {
                         if out.sender.on_more(&file, offset) {
                             env.trace(TraceEvent::RaftSnapshotResumed {

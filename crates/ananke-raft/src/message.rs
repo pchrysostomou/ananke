@@ -204,6 +204,20 @@ pub enum SnapshotStatus {
     // PROPOSED(D-090): a cap-wait is its own status, so the restart bound counts a
     // start-over and nothing else.
     Waiting,
+    /// The stream completed, and its snapshot's span overlaps another initialised
+    /// replica on the receiving node, so nothing was installed (the range layer's
+    /// overlap rule, SHARD.md §5, Q27). The sender ends the stream and streams again
+    /// after a minimum election timeout: from a fresh take if its checkpoint predates
+    /// its range's last split or merge, since only a newer snapshot can stop
+    /// overlapping, and otherwise from the same checkpoint, since the overlap is the
+    /// receiver's to clear.
+    ///
+    /// A status of its own for the reason [`Waiting`](SnapshotStatus::Waiting) is one:
+    /// the checkpoint is sound, so counting the refusal against RAFT.md:210-212's restart
+    /// bound would declare it unusable and force a retake that cannot help (#177). The
+    /// one-group server holds one group and never sends it.
+    // PROPOSED(D-110): the overlap rule's refusal is its own status.
+    Overlaps,
 }
 
 impl SnapshotStatus {
@@ -213,6 +227,7 @@ impl SnapshotStatus {
             SnapshotStatus::Installed => 1,
             SnapshotStatus::Restart => 2,
             SnapshotStatus::Waiting => 3,
+            SnapshotStatus::Overlaps => 4,
         }
     }
 
@@ -222,6 +237,7 @@ impl SnapshotStatus {
             1 => SnapshotStatus::Installed,
             2 => SnapshotStatus::Restart,
             3 => SnapshotStatus::Waiting,
+            4 => SnapshotStatus::Overlaps,
             _ => return Err(bad("snapshot status malformed")),
         })
     }
@@ -234,6 +250,7 @@ impl SnapshotStatus {
             SnapshotStatus::Installed => "installed",
             SnapshotStatus::Restart => "restart",
             SnapshotStatus::Waiting => "waiting",
+            SnapshotStatus::Overlaps => "overlaps",
         }
     }
 }
@@ -944,8 +961,10 @@ mod tests {
     /// `Waiting` is tag 3 and was added by D-090; until this existed nothing in the
     /// tree encoded or decoded it, because the one-group receiver never sends it and
     /// the node's own scenario does not reach its cap. A status that does not round
-    /// trip is a sender told to start over when it was told to wait.
+    /// trip is a sender told to start over when it was told to wait. `Overlaps` is tag
+    /// 4, added by D-110.
     // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
+    // PROPOSED(D-110): and so is the overlap rule's refusal.
     #[test]
     fn every_snapshot_status_round_trips_through_its_tag() {
         let every = [
@@ -953,6 +972,7 @@ mod tests {
             SnapshotStatus::Installed,
             SnapshotStatus::Restart,
             SnapshotStatus::Waiting,
+            SnapshotStatus::Overlaps,
         ];
         for status in every {
             assert_eq!(

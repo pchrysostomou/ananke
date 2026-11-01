@@ -999,6 +999,82 @@ pub async fn staged_value<E: Environment>(
     Ok(newest.map(|(_, bytes)| bytes))
 }
 
+/// The snapshot record a *checkpoint directory* holds for `prefix`, as [`staged_record`]
+/// reads it, and with it the value of `next` **where `next` is the key that follows the
+/// record's in one of the directory's tables**: read off the entry the record's walk
+/// reads anyway to see the record's key end, and nowhere else, so this walk makes
+/// exactly the reads [`staged_record`]'s makes. A run's schedule draws a delay for
+/// every read (`FsFaults::latency_min..=latency_max`), so a second walk for `next`
+/// would move the schedule of every install, where this moves none.
+///
+/// The node's live install reads the range's descriptor this way, the key that follows
+/// the record's in a range's state (`PURPOSE_SNAPSHOT`, then `PURPOSE_DESCRIPTOR`), to
+/// hold the install to the overlap rule before it switches (SHARD.md §5, Q27). A table
+/// whose entry after the record's is another key gives `next` nothing; within a table
+/// the newest version of a key is its first entry, and across tables the newest wins,
+/// as in [`staged_value`].
+///
+/// # Errors
+///
+/// As [`staged_record`]'s.
+// PROPOSED(D-110): an install onto an initialised replica reads the streamed span
+// for the overlap rule, in the record's own walk.
+pub async fn staged_record_and_next<E: Environment>(
+    env: &E,
+    dir: &Path,
+    prefix: &KeyPrefix,
+    next: &[u8],
+) -> io::Result<(Option<SnapshotRecord>, Option<Bytes>)> {
+    let key = prefix.snapshot_key();
+    let fs = env.fs();
+    let Some(current) = read_whole(env, &manifest::current_path(dir)).await? else {
+        return Err(bad("the staged directory has no CURRENT"));
+    };
+    let number = manifest::parse_current(&current).ok_or_else(|| bad("the staged CURRENT"))?;
+    let staged = match read_whole(env, &manifest::manifest_path(dir, number)).await? {
+        Some(bytes) => Manifest::decode(&bytes)?,
+        None => return Err(bad("the staged manifest")),
+    };
+    let mut newest: Option<(u64, Bytes)> = None;
+    let mut following: Option<(u64, Bytes)> = None;
+    for meta in &staged.ssts {
+        let file = fs
+            .open(
+                &manifest::sst_path(dir, meta.number),
+                OpenOptions::new().read(true),
+            )
+            .await?;
+        let reader = Arc::new(SstReader::open(file).await?);
+        let mut entries = reader.iter();
+        entries.seek(&ikey::lower_bound(&key)).await?;
+        while let Some((raw, value)) = entries.next().await? {
+            let (user, seq) = ikey::decode(&raw)?;
+            if user[..] != key[..] {
+                // The entry that ends the record's key in this table: `next`'s newest
+                // version here when it is `next`, and the walk of this table stops
+                // either way, where `staged_record`'s does.
+                if user[..] == next[..]
+                    && following.as_ref().is_none_or(|(at, _)| seq > *at)
+                    && let Value::Live(bytes) = value
+                {
+                    following = Some((seq, bytes));
+                }
+                break;
+            }
+            if newest.as_ref().is_none_or(|(at, _)| seq > *at)
+                && let Value::Live(bytes) = value
+            {
+                newest = Some((seq, bytes));
+            }
+        }
+    }
+    let record = match newest {
+        Some((_, bytes)) => Some(store::decode_snapshot_record(bytes)?),
+        None => None,
+    };
+    Ok((record, following.map(|(_, bytes)| bytes)))
+}
+
 /// The writes an install's repair makes under the **receiver's** key prefix
 /// (RAFT.md:225-233), in key order: the receiver's own identity, which must survive
 /// the switch.
@@ -1556,6 +1632,25 @@ pub fn waiting(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Waiting,
+        incarnation: 0,
+    }
+}
+
+/// The receiver's answer that the stream completed and its snapshot was not installed,
+/// because its span overlaps another initialised replica on the receiving node (the
+/// range layer's overlap rule, SHARD.md §5, Q27). Nothing is wrong with the checkpoint,
+/// so this is not a [`start_over`] and RAFT.md:210-212's restart bound does not count
+/// it (#177). The one-group server holds one group and never sends it.
+// PROPOSED(D-110): the overlap rule's refusal is its own status.
+#[must_use]
+pub fn overlaps(term: Term, staged: (Index, Term)) -> Message {
+    Message::InstallSnapshotResponse {
+        term,
+        last_index: staged.0,
+        last_term: staged.1,
+        file: Bytes::new(),
+        offset: 0,
+        status: SnapshotStatus::Overlaps,
         incarnation: 0,
     }
 }

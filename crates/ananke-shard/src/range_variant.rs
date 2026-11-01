@@ -18,12 +18,13 @@
 //! classified as well as given a bit:
 //!
 //! - **One of §10's twenty-four**, the variants SHARD.md tables, each breaking one
-//!   rule with a reference, built by the stage §12 assigns it. Six are built:
+//!   rule with a reference, built by the stage §12 assigns it. Seven are built:
 //!   [`RangeVariant::TrustStaleDescriptor`], [`RangeVariant::ApplyIgnoresSpan`] and
 //!   [`RangeVariant::ClientIgnoresMismatch`] (routing, PROPOSED D-097),
 //!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, PROPOSED D-098),
-//!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099) and
-//!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, PROPOSED D-109). The
+//!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099),
+//!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, PROPOSED D-109) and
+//!   [`RangeVariant::SnapshotOverlapsReplica`] (the overlap rule, PROPOSED D-110). The
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
@@ -141,6 +142,16 @@ pub enum RangeVariant {
     /// replicas are down elects with it.
     // PROPOSED(D-109)
     UninitialisedReplicaVotes,
+    /// A node installs every snapshot it is streamed, where SHARD.md §5's overlap rule
+    /// (Q27) installs one only if its span overlaps no other initialised replica on the
+    /// node, and otherwise answers `Overlaps`. A right half's snapshot installed into the
+    /// placeholder of a node whose parent has not applied the split puts two owners on
+    /// the right half's keys, and a lagging parent then applies its entries below the
+    /// split over the newer state the right half's snapshot put there. Check 8's overlap
+    /// clause sees it at the install's `RangeCreated { cause: snapshot }` (SHARD.md §8,
+    /// §10); `sim/split.rs` (i) makes the shape on every seed.
+    // PROPOSED(D-110)
+    SnapshotOverlapsReplica,
 }
 
 impl RangeVariant {
@@ -154,6 +165,7 @@ impl RangeVariant {
         RangeVariant::AnyFreshNodeBootstraps,
         RangeVariant::IncarnationPerRangeStream,
         RangeVariant::UninitialisedReplicaVotes,
+        RangeVariant::SnapshotOverlapsReplica,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -175,6 +187,8 @@ impl RangeVariant {
             RangeVariant::IncarnationPerRangeStream => 1 << 6,
             // PROPOSED(D-109): a placeholder that grants votes.
             RangeVariant::UninitialisedReplicaVotes => 1 << 7,
+            // PROPOSED(D-110): a node that installs every snapshot.
+            RangeVariant::SnapshotOverlapsReplica => 1 << 8,
         }
     }
 
@@ -189,7 +203,8 @@ impl RangeVariant {
             | RangeVariant::ClientIgnoresMismatch
             | RangeVariant::MetaOverwritesByArrival
             | RangeVariant::IdBlockResumed
-            | RangeVariant::UninitialisedReplicaVotes => true,
+            | RangeVariant::UninitialisedReplicaVotes
+            | RangeVariant::SnapshotOverlapsReplica => true,
             RangeVariant::AnyFreshNodeBootstraps | RangeVariant::IncarnationPerRangeStream => false,
         }
     }
@@ -206,6 +221,7 @@ impl RangeVariant {
             RangeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
             RangeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
+            RangeVariant::SnapshotOverlapsReplica => "SnapshotOverlapsReplica",
         }
     }
 }
@@ -321,10 +337,11 @@ mod tests {
             seen |= variant.bit();
         }
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
-        // the range-id blocks and D-109's one for placeholders, all of them §10's; and
+        // the range-id blocks, D-109's one for placeholders and D-110's one for the
+        // overlap rule, all of them §10's; and
         // the two instruments PROPOSED D-108 moved here from the node's set, neither of
         // them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 8);
+        assert_eq!(RangeVariant::BUGS.len(), 9);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -337,7 +354,7 @@ mod tests {
             .filter(|variant| variant.in_section_10())
             .count();
         assert!(counted <= SECTION_10.len());
-        assert_eq!(counted, 6, "§10's six built so far");
+        assert_eq!(counted, 7, "§10's seven built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
         // a replica's incarnation at its creation).
