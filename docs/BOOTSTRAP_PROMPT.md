@@ -109,14 +109,21 @@ _Update this section at the end of every session._
   install paths, failing closed, the record's walk past any key between, with walk,
   decision and `finish` tests; N1, N3 to N8 and D-110's corrections (seven tests, seven
   stragglers, both causes measured on `main`). Every plant the review left green now
-  fails a test. N10 filed as #183.
+  fails a test. N10 filed as #183. #185's review (D-110 §12), five non-blocking points:
+  the resplit run's split after its first wait with its counts asserted per seed (NB1);
+  `RetakeNeverAfterOverlap` built, `x` left without R on 607 of 1 000 seeds, asserted at
+  every tier (NB2); `finish`'s test reads the status sent (NB3); a placeholder's install of
+  a range made meanwhile refused through the task, and the span filter in `admission` for
+  both paths (NB4); D-110's title and markers, and "unreachable" said of the refusal arms
+  alone (NB5). Merged with `main` at b1da6ec (#184, D-112).
 - Branch `phase-3-stage-c-overlap-rule` (2026-10-25), off `main` at 2d59c96, PR #180,
   PROPOSED D-110, **#162's S9, the overlap rule (Q27)**. The footer is D-112 since the
   merges of `main` at 292cafc and 2aab845, #179 and #182 taking D-111.
   - **What it builds.** An install refused because its span overlaps another initialised
     replica on the node is answered `SnapshotStatus::Overlaps` (tag 4). That holds on a
-    placeholder's install and on an install onto an initialised replica; the latter is
-    unreachable on Stage C's correct system and fails closed on a snapshot naming no span.
+    placeholder's install and on an install onto an initialised replica. On the latter the
+    refusal arms are unreachable on Stage C's correct system, but the check runs on every
+    live install and fails closed on a snapshot naming no span.
     The leader ends the stream, counts nothing against D-090's restart bound, and lets the
     core stream again after a minimum election timeout. It streams from a fresh take where
     the checkpoint's generation is not the range's (`RaftSnapshotOverlapped`,
