@@ -24,6 +24,11 @@
 //! limit held a chunk of R's stream reached `x` while a chunk of P's was dropped as
 //! oversized (SHARD.md §12, Stage C's exit).
 //!
+//! **The resplit run** ([`run_overlap_resplit`], #180's review, B1) is (i) with R idle
+//! from the heal and split again at [`RESPLIT_KEY`] once `x` has refused it: a stream of
+//! R's checkpoint from before that split, refused for overlap, ends its wait in a fresh
+//! take, which no other run of the tree reaches.
+//!
 //! **Shape (ii)** (SHARD.md:1624-1630): P, range 2 over `[k0, k2)`, on nodes 1 to 3.
 //! A follower `x` of P is cut off from before a split of P at `k1` until P's leader and
 //! R have compacted past the split's index `s`, so `x`'s P can reach past `s` only by P's
@@ -98,6 +103,9 @@ pub const FRAME_LIMIT: usize = 8 * 1024;
 /// timeout and stream again several times.
 // PROPOSED(D-110)
 pub const OVERLAP_HOLD: Duration = Duration::from_millis(1_000);
+/// The key R splits at in the resplit run: R′ is `[k15, k2)`, R keeps `[k1, k15)`.
+// PROPOSED(D-110)
+pub const RESPLIT_KEY: &str = "k15";
 /// How long the limited heal may take to show the shape.
 const LIMIT_BUDGET: Duration = Duration::from_secs(6);
 /// How long the run goes on after the limit is lifted.
@@ -108,8 +116,24 @@ const AFTER_LIFT: Duration = Duration::from_secs(5);
 pub enum Shape {
     /// (i), *overlap*.
     Overlap,
+    /// (i) with R split again while the limit holds, so that a stream of R's refused for
+    /// overlap is of a checkpoint from before R's split: the overlap rule's fresh take
+    /// (PROPOSED D-110, #180's review, B1).
+    Resplit,
     /// (ii), *vote*.
     Vote,
+}
+
+impl Shape {
+    /// The shape's name in a report: "(i)", "(i) with R split again", "(ii)".
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Shape::Overlap => "(i)",
+            Shape::Resplit => "(i) with R split again",
+            Shape::Vote => "(ii)",
+        }
+    }
 }
 
 /// What the writer writes to the left half: `keys` keys of `bytes`-byte values, or
@@ -157,6 +181,18 @@ pub fn server_config(id: u64, range_variants: RangeVariants) -> ServerConfig {
 /// (ii)'s the default.
 #[must_use]
 pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) -> ServerConfig {
+    server_config_with(id, range_variants, NodeVariants::correct(), shape)
+}
+
+/// One node's configuration for `shape` under the node's variants `node` too: the resplit
+/// run's pair (PROPOSED D-110, #185's review, NB2).
+#[must_use]
+pub fn server_config_with(
+    id: u64,
+    range_variants: RangeVariants,
+    node: NodeVariants,
+    shape: Shape,
+) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -171,7 +207,7 @@ pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) ->
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             snapshot_threshold: SNAPSHOT_THRESHOLD,
             snapshot_chunk: match shape {
-                Shape::Overlap => OVERLAP_CHUNK,
+                Shape::Overlap | Shape::Resplit => OVERLAP_CHUNK,
                 Shape::Vote => RaftConfig::default().snapshot_chunk,
             },
             ..RaftConfig::default()
@@ -181,7 +217,7 @@ pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) ->
         snapshot_cap: SNAPSHOT_CAP,
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
-        node: NodeVariants::correct(),
+        node,
         range_variants,
     }
 }
@@ -218,6 +254,24 @@ pub fn overlap_config(seed: u64) -> SimConfig {
     config
 }
 
+/// The resplit run's simulator: (i)'s, with R's split's time in its run length.
+// PROPOSED(D-110)
+#[must_use]
+pub fn resplit_config(seed: u64) -> SimConfig {
+    let mut config = config(seed);
+    config.run_length_hint = SimConfig::run_length_hint_for(
+        u32::try_from(NODES + 1).expect("small"),
+        SETTLE
+            + BEFORE_SPLIT
+            + SPLIT_BUDGET
+            + COMPACT_BUDGET
+            + LIMIT_BUDGET
+            + SPLIT_BUDGET
+            + AFTER_LIFT,
+    );
+    config
+}
+
 /// What one run of shape (i) or (ii) built and traced.
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -243,6 +297,9 @@ pub struct Report {
     pub healed: Option<Instant>,
     /// In (i), when the frame-length limit toward `x` was lifted.
     pub lifted: Option<Instant>,
+    /// In the resplit run, R's own split while the limit held: its index and R′, its
+    /// right half.
+    pub resplit: Option<(u64, u64)>,
     /// What the driver could not build, if anything.
     pub unbuilt: Option<String>,
 }
@@ -463,12 +520,14 @@ impl Report {
                 } if *range == right && *from == to => {
                     let Some(refused) = open.remove(server) else {
                         return Err(format!(
-                            "seed {seed}: server {server} restreamed R to {to} with no                              overlap refusal to end"
+                            "seed {seed}: server {server} restreamed R to {to} with no \
+                             overlap refusal to end"
                         ));
                     };
                     if record.at.duration_since(refused) < min {
                         return Err(format!(
-                            "seed {seed}: server {server} waited {:?} after an overlap                              refusal of R by {to}, under a minimum election timeout",
+                            "seed {seed}: server {server} waited {:?} after an overlap \
+                             refusal of R by {to}, under a minimum election timeout",
                             record.at.duration_since(refused)
                         ));
                     }
@@ -481,7 +540,8 @@ impl Report {
                     ..
                 } if *range == right && *from == to && open.contains_key(server) => {
                     return Err(format!(
-                        "seed {seed}: server {server} opened a stream of R to {to} inside its                          wait after an overlap refusal"
+                        "seed {seed}: server {server} opened a stream of R to {to} inside its \
+                         wait after an overlap refusal"
                     ));
                 }
                 TraceEvent::NodeCrashed { node } => {
@@ -495,20 +555,22 @@ impl Report {
             && end.duration_since(*refused) > min * 2
         {
             return Err(format!(
-                "seed {seed}: server {server}'s wait after its overlap refusal of R by {to} at                  {refused:?} never ended"
+                "seed {seed}: server {server}'s wait after its overlap refusal of R by {to} at \
+                 {refused:?} never ended"
             ));
         }
         Ok(waits)
     }
 
-    /// Shape (ii)'s premise, per seed: `x` applied no split of P, `x`'s P was installed at
-    /// or past the split's index, and `x` created R, where it did, by a snapshot alone.
+    /// The premise shapes (i) and (ii) share, per seed: `x` applied no split of P, `x`'s P
+    /// was installed at or past the split's index, and `x` created R, where it did, by a
+    /// snapshot alone.
     ///
     /// # Errors
     ///
     /// Which of the three did not hold, with the seed.
     pub fn premise(&self) -> Result<(), String> {
-        let (seed, x) = (self.seed, self.x);
+        let (seed, x, shape) = (self.seed, self.x, self.shape.name());
         let Some((index, right)) = self.split else {
             return Err(format!(
                 "seed {seed}: P never split, so there is no premise"
@@ -519,7 +581,8 @@ impl Report {
             matches!(&record.event, TraceEvent::RangeSplit { range, .. } if *range == PARENT)
         }) {
             return Err(format!(
-                "seed {seed}: node {x} applied P's split at {index} by its log, where shape                  (ii) has its P reach past the split only by P's post-split snapshot"
+                "seed {seed}: node {x} applied P's split at {index} by its log, where shape \
+                 {shape} has its P reach past the split only by P's post-split snapshot"
             ));
         }
         let installed = self.records.iter().any(|record| {
@@ -529,7 +592,8 @@ impl Report {
         });
         if !installed {
             return Err(format!(
-                "seed {seed}: node {x}'s P was never installed at or past the split's index                  {index}, so nothing says how it got past the split, if it did"
+                "seed {seed}: node {x}'s P was never installed at or past the split's index \
+                 {index}, so nothing says how it got past the split, if it did"
             ));
         }
         let causes: Vec<ananke_env::RangeCause> = self
@@ -546,7 +610,8 @@ impl Report {
             .any(|cause| *cause != ananke_env::RangeCause::Snapshot)
         {
             return Err(format!(
-                "seed {seed}: node {x} created the right half {right} by {causes:?}, where                  shape (ii) has it hold no R but one a snapshot gave it"
+                "seed {seed}: node {x} created the right half {right} by {causes:?}, where \
+                 shape {shape} has it hold no R but one a snapshot gave it"
             ));
         }
         Ok(())
@@ -584,7 +649,7 @@ impl Report {
     /// What was not built or not reached, with the seed.
     pub fn shape(&self) -> Result<(), String> {
         let seed = self.seed;
-        if self.shape == Shape::Overlap {
+        if matches!(self.shape, Shape::Overlap | Shape::Resplit) {
             return self.overlap_shape();
         }
         if let Some(why) = &self.unbuilt {
@@ -621,14 +686,20 @@ impl Report {
     pub fn overlap_shape(&self) -> Result<(), String> {
         let seed = self.seed;
         if let Some(why) = &self.unbuilt {
-            return Err(format!("seed {seed}: shape (i) was not built: {why}"));
+            return Err(format!(
+                "seed {seed}: shape {} was not built: {why}",
+                self.shape.name()
+            ));
         }
         self.premise()?;
         let (delivered, dropped) = self.limited_chunks();
         if delivered == 0 || dropped == 0 {
             return Err(format!(
-                "seed {seed}: while the limit of {FRAME_LIMIT} bytes held toward node {}, {delivered}                  chunks of R's stream reached it and {dropped} of P's were dropped as oversized,                  where shape (i) needs one of each",
-                self.x
+                "seed {seed}: while the limit of {FRAME_LIMIT} bytes held toward node {}, \
+                 {delivered} chunks of R's stream reached it and {dropped} of P's were dropped \
+                 as oversized, where shape {} needs one of each",
+                self.x,
+                self.shape.name()
             ));
         }
         Ok(())
@@ -663,10 +734,14 @@ impl Report {
 /// The range a key is in, and its generation, as the writer last learnt them.
 type Routes = Arc<Mutex<BTreeMap<Bytes, (u64, u64)>>>;
 
+/// Set when the writer is to write the left half alone: the resplit run leaves R idle
+/// from the heal, so R's record stays its checkpoint from before R's own split.
+type RightOff = Arc<Mutex<bool>>;
+
 /// The writer: puts to the left half's key and the right half's in turn, so both halves
 /// of P go on taking entries and compact past the split. It routes by what a
 /// `RangeMismatch` tells it and follows `NotLeader`, and keeps nothing else.
-async fn writer<E: Environment>(env: E, routes: Routes, load: Load) {
+async fn writer<E: Environment>(env: E, routes: Routes, load: Load, right_off: RightOff) {
     let Ok(sock) = env.net().bind(client_addr(1)).await else {
         return;
     };
@@ -682,6 +757,9 @@ async fn writer<E: Environment>(env: E, routes: Routes, load: Load) {
         };
         round += 1;
         for (key, bytes) in [(left.as_str(), load.bytes), (RIGHT_KEY, 0)] {
+            if key == RIGHT_KEY && *lock(&right_off) {
+                continue;
+            }
             let key = Bytes::copy_from_slice(key.as_bytes());
             let (range, generation) = lock(&routes)
                 .get(&key)
@@ -770,19 +848,31 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The operator's split of P at [`SPLIT_KEY`], asked of `target` and following
 /// `NotLeader` round the bootstrap nodes; it records nothing, since the trace says
 /// whether the split took effect.
-async fn split<E: Environment>(env: E, mut target: u64) {
-    let Ok(sock) = env.net().bind(admin_addr(1)).await else {
+async fn split<E: Environment>(env: E, target: u64) {
+    split_range(env, target, (PARENT, FIRST_GENERATION), SPLIT_KEY, 1).await;
+}
+
+/// The operator's split of `range`, at `generation`, at `key`, from the admin address of
+/// client `admin`, asked of `target` and following `NotLeader` round the bootstrap nodes.
+async fn split_range<E: Environment>(
+    env: E,
+    mut target: u64,
+    (range, generation): (u64, u64),
+    key: &'static str,
+    admin: u64,
+) {
+    let Ok(sock) = env.net().bind(admin_addr(admin)).await else {
         return;
     };
     for _ in 0..BOOTSTRAP * 4 {
         let request = RangedRequest {
-            generation: FIRST_GENERATION,
-            range: RangeId(PARENT),
+            generation,
+            range: RangeId(range),
             request: Request {
                 client: u64::MAX >> 2,
                 seq: 1,
                 command: Command::Split {
-                    key: Bytes::from(SPLIT_KEY),
+                    key: Bytes::from(key),
                     right: 0,
                 },
             },
@@ -835,15 +925,19 @@ fn leader_of(records: &[TraceRecord], range: u64) -> Option<u64> {
 
 /// The split of P the trace names, by its first `RangeSplit`: (index, right half).
 fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
+    split_named(records, PARENT, SPLIT_KEY)
+}
+
+/// The split of `of` at `at` the trace names, by its first `RangeSplit`: (index, right
+/// half).
+fn split_named(records: &[TraceRecord], of: u64, at: &str) -> Option<(u64, u64)> {
     records.iter().find_map(|record| match &record.event {
         TraceEvent::RangeSplit {
             range,
             right,
             index,
             key,
-        } if *range == PARENT && user_key_of(key) == Some(SPLIT_KEY.as_bytes()) => {
-            Some((*index, *right))
-        }
+        } if *range == of && user_key_of(key) == Some(at.as_bytes()) => Some((*index, *right)),
         _ => None,
     })
 }
@@ -864,26 +958,46 @@ fn compacted_past(records: &[TraceRecord], range: u64, index: u64, by: Option<u6
 struct Prefix {
     sim: Sim,
     nodes: Vec<NodeId>,
+    /// The writer's and the operator's node.
+    client: NodeId,
+    /// The writer's switch for the right half's key.
+    right_off: RightOff,
     report: Report,
 }
 
 /// Builds the shared part of `shape` for `seed`.
-fn prefix(seed: u64, range_variants: RangeVariants, shape: Shape) -> Result<Prefix, Box<Report>> {
+fn prefix(
+    seed: u64,
+    range_variants: RangeVariants,
+    node: NodeVariants,
+    shape: Shape,
+) -> Result<Prefix, Box<Report>> {
     let (config, load, stream) = match shape {
         Shape::Overlap => (overlap_config(seed), OVERLAP_LOAD, "split-overlap"),
+        Shape::Resplit => (resplit_config(seed), OVERLAP_LOAD, "split-resplit"),
         Shape::Vote => (config(seed), VOTE_LOAD, "split-vote"),
     };
     let mut sim = Sim::new(config);
     let nodes: Vec<NodeId> = (0..NODES).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
     for id in 1..=NODES {
-        spawn(&sim, nodes[id as usize - 1], id, range_variants, shape);
+        spawn(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            (range_variants, node),
+            shape,
+        );
     }
     let routes: Routes = Arc::default();
+    let right_off: RightOff = Arc::default();
     {
         let env = sim.env(client);
         let inner = env.clone();
-        env.spawn("writer", writer(inner, routes.clone(), load));
+        env.spawn(
+            "writer",
+            writer(inner, routes.clone(), load, right_off.clone()),
+        );
     }
     sim.run_for(SETTLE);
     let mut draw = moirae_sched::stream(seed, stream);
@@ -910,6 +1024,7 @@ fn prefix(seed: u64, range_variants: RangeVariants, shape: Shape) -> Result<Pref
         cut,
         healed: None,
         lifted: None,
+        resplit: None,
         unbuilt: None,
     };
     sim.run_for(BEFORE_SPLIT);
@@ -949,7 +1064,13 @@ fn prefix(seed: u64, range_variants: RangeVariants, shape: Shape) -> Result<Pref
         }
         sim.run_for(SLICE);
     }
-    Ok(Prefix { sim, nodes, report })
+    Ok(Prefix {
+        sim,
+        nodes,
+        client,
+        right_off,
+        report,
+    })
 }
 
 /// Runs shape (ii) for `seed` under `range_variants`.
@@ -959,7 +1080,8 @@ pub fn run(seed: u64, range_variants: RangeVariants) -> Report {
         mut sim,
         nodes,
         mut report,
-    } = match prefix(seed, range_variants, Shape::Vote) {
+        ..
+    } = match prefix(seed, range_variants, NodeVariants::correct(), Shape::Vote) {
         Ok(prefix) => prefix,
         Err(report) => return *report,
     };
@@ -980,7 +1102,13 @@ pub fn run(seed: u64, range_variants: RangeVariants) -> Report {
     report.healed = Some(sim.now());
     sim.run_for(election_max() * 10);
     sim.restart(at_crashed);
-    spawn(&sim, at_crashed, crashed, range_variants, Shape::Vote);
+    spawn(
+        &sim,
+        at_crashed,
+        crashed,
+        (range_variants, NodeVariants::correct()),
+        Shape::Vote,
+    );
     sim.run_for(AFTER);
     report.records = sim.trace();
     report
@@ -1003,6 +1131,15 @@ fn x_answered_right(records: &[TraceRecord], x: u64, right: u64) -> bool {
     })
 }
 
+/// Whether `records` show a wait after an overlap refusal of R by `x` ended: a
+/// `RaftSnapshotRestream` of R toward `x`.
+fn restreamed_to(records: &[TraceRecord], x: u64, right: u64) -> bool {
+    records.iter().any(|record| {
+        matches!(&record.event, TraceEvent::RaftSnapshotRestream { range, to, .. }
+            if *range == right && *to == x)
+    })
+}
+
 /// Runs shape (i) for `seed` under `range_variants`.
 // PROPOSED(D-110)
 #[must_use]
@@ -1011,7 +1148,13 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
         mut sim,
         nodes,
         mut report,
-    } = match prefix(seed, range_variants, Shape::Overlap) {
+        ..
+    } = match prefix(
+        seed,
+        range_variants,
+        NodeVariants::correct(),
+        Shape::Overlap,
+    ) {
         Ok(prefix) => prefix,
         Err(report) => return *report,
     };
@@ -1027,7 +1170,8 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
     while !x_answered_right(&sim.trace(), x, right) {
         if sim.now() >= deadline {
             report.unbuilt = Some(format!(
-                "node {x} neither refused nor installed R's snapshot within {LIMIT_BUDGET:?}                  of the limited heal"
+                "node {x} neither refused nor installed R's snapshot within {LIMIT_BUDGET:?} \
+                 of the limited heal"
             ));
             report.records = sim.trace();
             return report;
@@ -1042,10 +1186,98 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
     report
 }
 
-fn spawn(sim: &Sim, at: NodeId, id: u64, range_variants: RangeVariants, shape: Shape) {
+/// Runs shape (i) with R split again while the limit holds, for `seed` under the node's
+/// variants `node` (PROPOSED D-110; #180's review, B1; #185's review, NB1 and NB2): the
+/// overlap rule's fresh take.
+///
+/// (i)'s prefix and limited heal, R left idle from the heal, so its record stays the
+/// checkpoint it took before the heal. Once a wait after `x`'s refusal of R has ended —
+/// in no fresh take, R having split nothing since its take — R's leader is asked to
+/// split R at [`RESPLIT_KEY`]. A stream of that checkpoint, refused after the split, is
+/// of a checkpoint from before R's last split, so its wait ends in a fresh take, of
+/// `[k1, k15)`; the take's own stream, refused in turn, ends its wait in none. The limit
+/// holds [`OVERLAP_HOLD`] past R's split and is lifted: `x`'s P moves off R's span, and
+/// `x` makes R over `[k1, k15)` and R′ over `[k15, k2)`, each by a snapshot. Under
+/// `NodeVariant::RetakeNeverAfterOverlap` the leader streams the refused checkpoint again
+/// instead, offering `x` R over `[k1, k2)`: where R′ reaches `x` first, that overlaps R′
+/// there for as long as R stays idle, and `x` never makes R.
+// PROPOSED(D-110)
+#[must_use]
+pub fn run_overlap_resplit(seed: u64, node: NodeVariants) -> Report {
+    let range_variants = RangeVariants::correct();
+    let Prefix {
+        mut sim,
+        nodes,
+        client,
+        right_off,
+        mut report,
+    } = match prefix(seed, range_variants, node, Shape::Resplit) {
+        Ok(prefix) => prefix,
+        Err(report) => return *report,
+    };
+    let (x, right) = (report.x, report.split.map_or(0, |(_, right)| right));
+    let at_x = nodes[x as usize - 1];
+    sim.heal();
+    for id in (1..=NODES).filter(|id| *id != x) {
+        sim.limit_frames(nodes[id as usize - 1], at_x, FRAME_LIMIT);
+    }
+    *lock(&right_off) = true;
+    report.healed = Some(sim.now());
+    // R's split is asked once one wait after a refusal of R by `x` has ended, so a wait
+    // ends before the split as well as after it, and the run sees both answers of the
+    // decision (#185's review, NB1).
+    let deadline = sim.now() + LIMIT_BUDGET;
+    while !restreamed_to(&sim.trace(), x, right) {
+        if sim.now() >= deadline {
+            report.unbuilt = Some(format!(
+                "no wait after a refusal of R by node {x} ended within {LIMIT_BUDGET:?} of \
+                 the limited heal"
+            ));
+            report.records = sim.trace();
+            return report;
+        }
+        sim.run_for(SLICE);
+    }
+    let target = leader_of(&sim.trace(), right).unwrap_or(1);
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn(
+            "split-right",
+            split_range(inner, target, (right, FIRST_GENERATION + 1), RESPLIT_KEY, 2),
+        );
+    }
+    let deadline = sim.now() + SPLIT_BUDGET;
+    while split_named(&sim.trace(), right, RESPLIT_KEY).is_none() {
+        if sim.now() >= deadline {
+            report.unbuilt = Some(format!(
+                "R never split at {RESPLIT_KEY} within {SPLIT_BUDGET:?} under the limit"
+            ));
+            report.records = sim.trace();
+            return report;
+        }
+        sim.run_for(SLICE);
+    }
+    report.resplit = split_named(&sim.trace(), right, RESPLIT_KEY);
+    sim.run_for(OVERLAP_HOLD);
+    sim.heal();
+    report.lifted = Some(sim.now());
+    sim.run_for(AFTER_LIFT);
+    report.records = sim.trace();
+    report
+}
+
+fn spawn(
+    sim: &Sim,
+    at: NodeId,
+    id: u64,
+    (range_variants, node): (RangeVariants, NodeVariants),
+    shape: Shape,
+) {
     let env = sim.env(at);
     let inner = env.clone();
     env.spawn("node", async move {
-        let _ = ananke_shard::server::run(inner, server_config_of(id, range_variants, shape)).await;
+        let config = server_config_with(id, range_variants, node, shape);
+        let _ = ananke_shard::server::run(inner, config).await;
     });
 }

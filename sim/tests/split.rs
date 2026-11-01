@@ -8,7 +8,10 @@
 //! install for overlap, R's leader waited a minimum election timeout each time before it
 //! streamed again, from the same checkpoint, and `x` made R once its P had moved off R's
 //! span. Under `SnapshotOverlapsReplica` the shape is built too, and check 8's overlap
-//! clause trips on every seed at `x`'s `RangeCreated { cause: snapshot }` of R.
+//! clause trips on every seed at `x`'s `RangeCreated { cause: snapshot }` of R. And (i)
+//! with R split again under the limit (#180's review, B1): on every seed a refused stream
+//! of R's pre-split checkpoint ends its wait in a fresh take, none does before R's split,
+//! and `x` makes R over its post-split span.
 //!
 //! What it asserts, at every tier (SHARD.md §12, Stage C's exit): the correct system
 //! passes every seed — checks 1 to 4, the range layer's folds and no node stopped — and
@@ -27,6 +30,7 @@ use ananke_env::{Environment, TraceEvent};
 use ananke_raft::ServerId;
 use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
+use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::{seeds, split, sweep, verdict, write_trace};
 
 /// The right half's votes and pre-votes `x` granted before `x` created the right half:
@@ -432,4 +436,261 @@ fn a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the
         outcomes.iter().filter(|outcome| outcome.is_ok()).count()
     );
     verdict(&outcomes).expect("check 8 catches the variant on every seed of shape (i)");
+}
+
+/// What the resplit run's mechanism came to on one seed: R's leader's waits after a
+/// refusal of R by `x` that ended before its apply of R's split, those after it that
+/// ended in a fresh take, those after the first fresh take that ended in none, and how
+/// long after the lift `x` made R over its post-split span.
+#[derive(Default)]
+struct ResplitMeasured {
+    before_split: usize,
+    retaken: usize,
+    restreamed_after: usize,
+    made_after_lift: u64,
+}
+
+/// The waits of one resplit run, read off its trace: [`ResplitMeasured`]'s counts, with
+/// the record and the leader of the first fresh take.
+///
+/// # Errors
+///
+/// A wait that ended in a fresh take before its leader applied R's split: nothing then
+/// says the checkpoint predates R's last split.
+fn waits_of(
+    report: &split::Report,
+    measured: &mut ResplitMeasured,
+) -> Result<Option<(usize, u64)>, String> {
+    let (seed, x) = (report.seed, report.x);
+    let (_, right) = report.split.ok_or("no split")?;
+    let (index, _) = report.resplit.ok_or("R never split again")?;
+    // Each server's apply of R's split, by record index.
+    let split_at = |server: u64| {
+        report.records.iter().position(|record| {
+            record.node.map(|n| u64::from(n.get())) == Some(server)
+                && matches!(&record.event, TraceEvent::RangeSplit { range, index: at, .. }
+                    if *range == right && *at == index)
+        })
+    };
+    let mut retook = None;
+    for (at, record) in report.records.iter().enumerate() {
+        let TraceEvent::RaftSnapshotRestream {
+            server,
+            range,
+            to,
+            retake,
+        } = &record.event
+        else {
+            continue;
+        };
+        if *range != right || *to != x {
+            continue;
+        }
+        let after_split = split_at(*server).is_some_and(|split| split < at);
+        match (retake, after_split) {
+            (true, false) => {
+                return Err(format!(
+                    "seed {seed}: server {server} retook R's checkpoint after an overlap \
+                     refusal before it applied R's split at {index}"
+                ));
+            }
+            (true, true) => {
+                measured.retaken += 1;
+                retook.get_or_insert((at, *server));
+            }
+            (false, false) => measured.before_split += 1,
+            (false, true) if retook.is_some() => measured.restreamed_after += 1,
+            (false, true) => {}
+        }
+    }
+    Ok(retook)
+}
+
+/// The record at which `x` made R over its post-split span `[k1, k15)`, by a snapshot.
+fn x_made_split_right(report: &split::Report) -> Option<usize> {
+    let (_, right) = report.split?;
+    let resplit_end = ananke_raft::apply::user_key(split::RESPLIT_KEY.as_bytes());
+    report.records.iter().position(|record| {
+        record.node.map(|n| u64::from(n.get())) == Some(report.x)
+            && matches!(&record.event, TraceEvent::RangeCreated {
+                range, cause: ananke_env::RangeCause::Snapshot, end, ..
+            } if *range == right && *end == resplit_end)
+    })
+}
+
+/// The overlap rule's fresh take on one correct run of the resplit shape (PROPOSED D-110,
+/// #180's review, B1; #185's review, NB1), measured into `measured`: one wait ended before
+/// R's split, in no fresh take; exactly one after it ended in a fresh take, and its
+/// leader took R at or past the split; at least one after that ended in none; and `x`
+/// made R over `[k1, k15)` after its P moved off R's span.
+fn fresh_take(report: &split::Report, measured: &mut ResplitMeasured) -> Result<(), String> {
+    let (seed, x) = (report.seed, report.x);
+    let (_, right) = report.split.ok_or("no split")?;
+    let (index, _) = report.resplit.ok_or("R never split again")?;
+    let retook = waits_of(report, measured)?;
+    let Some((retook, leader)) = retook else {
+        return Err(format!(
+            "seed {seed}: no wait after an overlap refusal of R by node {x} ended in a fresh \
+             take, though R split at {index} under the limit"
+        ));
+    };
+    if measured.before_split == 0 || measured.retaken != 1 || measured.restreamed_after == 0 {
+        return Err(format!(
+            "seed {seed}: R's leader's waits after refusals by node {x} were {} before R's \
+             split, {} retaken after it and {} after the take not retaken, where the overlap \
+             rule asks at least one, exactly one and at least one: a checkpoint retaken at \
+             every wait is a loop",
+            measured.before_split, measured.retaken, measured.restreamed_after
+        ));
+    }
+    // The fresh take: a take of R by that leader at or past R's split, after the wait.
+    if !report.records[retook..].iter().any(|record| {
+        matches!(&record.event, TraceEvent::RaftSnapshot {
+            server, range, last_index, taken: true, ..
+        } if *server == leader && *range == right && *last_index >= index)
+    }) {
+        return Err(format!(
+            "seed {seed}: server {leader} told its core to retake R's checkpoint and took \
+             none at or past R's split at {index}"
+        ));
+    }
+    // And `x` made R over its post-split span, after its P moved off it.
+    let installed = report
+        .x_parent_installed_at()
+        .ok_or_else(|| format!("seed {seed}: node {x}'s P was never installed past the split"))?;
+    let made = x_made_split_right(report).ok_or_else(|| {
+        format!("seed {seed}: node {x} never made R over its span after R's split at {index}")
+    })?;
+    if made < installed {
+        return Err(format!(
+            "seed {seed}: node {x} made R before its P was installed past P's split"
+        ));
+    }
+    let lifted = report.lifted.ok_or("never lifted")?;
+    measured.made_after_lift = report.records[made]
+        .at
+        .duration_since(lifted)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(())
+}
+
+/// The overlap rule's fresh take, every seed of the tier (SHARD.md §5, Q27; PROPOSED
+/// D-110, #180's review, B1; #185's review, NB1): shape (i) with R split again at `k15`
+/// while the limit holds, R idle from the heal and the split asked once a wait after a
+/// refusal of R has ended. On every seed the run passes its checks and (i)'s shape is
+/// built; a wait ends before R's split in no fresh take; exactly one after it ends in a
+/// fresh take, and the leader then takes R at or past the split; one after that ends in
+/// none; and `x` makes R over `[k1, k15)`, by a snapshot, after its P moved off R's span.
+/// Before #180's review no run of the tree ended a wait in a fresh take, so the decision
+/// could be planted always "no" with every test green; before #185's it could be planted
+/// always "yes", a retake at every wait, with this run green.
+#[test]
+fn a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed() {
+    let seeds = seeds();
+    let outcomes = sweep(seeds, |seed| {
+        let report = split::run_overlap_resplit(seed, NodeVariants::correct());
+        let mut measured = ResplitMeasured::default();
+        let outcome = report
+            .check()
+            .and_then(|()| report.shape())
+            .and_then(|()| fresh_take(&report, &mut measured));
+        if outcome.is_err() {
+            write_trace(&format!("split-resplit-{seed}"), &report.jsonl());
+        }
+        (outcome, measured)
+    });
+    let pick = |what: fn(&ResplitMeasured) -> usize| -> Vec<usize> {
+        outcomes
+            .iter()
+            .map(|(_, measured)| what(measured))
+            .collect()
+    };
+    println!(
+        "split (i) with R split again: {seeds} seeds; waits before the split {}; waits ending \
+         in a fresh take {}; waits ending in none after it {}; x made R over [k1, k15) {} ms \
+         after the lift",
+        span_of(&pick(|m| m.before_split)),
+        span_of(&pick(|m| m.retaken)),
+        span_of(&pick(|m| m.restreamed_after)),
+        span_of(&pick(
+            |m| usize::try_from(m.made_after_lift).unwrap_or(usize::MAX)
+        )),
+    );
+    let verdicts: Vec<Result<(), String>> =
+        outcomes.into_iter().map(|(outcome, _)| outcome).collect();
+    verdict(&verdicts).expect("the overlap rule's fresh take holds on every seed");
+}
+
+/// The fresh take's pair (PROPOSED D-110, #185's review, NB2): the resplit run under
+/// `RetakeNeverAfterOverlap`, a leader that streams a checkpoint refused for overlap
+/// again whatever it predates. On every seed the shape is built and the variant injected —
+/// a wait ends after R's split, and none in a fresh take. Its harm is liveness: where R′
+/// reaches `x` before R's stale snapshot of `[k1, k2)` does, that snapshot overlaps R′
+/// there and is refused for as long as R stays idle, and `x` never makes R. Where the
+/// stale snapshot gets in first, `x` makes R over `[k1, k2)` and splits it by its log, which
+/// is correct, so those seeds are not caught. Measured in release: `x` never made R on 13
+/// of the first 20 seeds, 66 of 100 and 607 of 1 000, so the catch is asserted at every
+/// tier, where twenty seeds at 60 % all miss about once in 10^8 (D-061). The correct
+/// system's run beside it makes R on every seed.
+#[test]
+fn a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half() {
+    let seeds = seeds();
+    let outcomes = sweep(seeds, |seed| {
+        let report = split::run_overlap_resplit(
+            seed,
+            NodeVariants::of(&[NodeVariant::RetakeNeverAfterOverlap]),
+        );
+        let mut measured = ResplitMeasured::default();
+        let outcome = report.shape().and_then(|()| {
+            let retook = waits_of(&report, &mut measured)?;
+            let after = report
+                .records
+                .iter()
+                .filter(|record| {
+                    matches!(&record.event, TraceEvent::RaftSnapshotRestream { range, to, .. }
+                        if Some(*range) == report.split.map(|(_, right)| right)
+                            && *to == report.x)
+                })
+                .count()
+                - measured.before_split;
+            if retook.is_some() || after == 0 {
+                return Err(format!(
+                    "seed {seed}: under RetakeNeverAfterOverlap R's leader retook {} times and \
+                     ended {after} waits after R's split, so the variant was not injected",
+                    measured.retaken
+                ));
+            }
+            Ok(())
+        });
+        let made_any = report.split.is_some_and(|(_, right)| {
+            report.records.iter().any(|record| {
+                record.node.map(|n| u64::from(n.get())) == Some(report.x)
+                    && matches!(&record.event, TraceEvent::RangeCreated { range, .. }
+                        if *range == right)
+            })
+        });
+        (outcome, !made_any)
+    });
+    let caught: Vec<u64> = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, caught))| *caught)
+        .map(|(seed, _)| seed as u64)
+        .collect();
+    println!(
+        "split (i) with R split again under RetakeNeverAfterOverlap: {seeds} seeds; x never \
+         made R on {} of them: {:?}",
+        caught.len(),
+        &caught[..caught.len().min(40)]
+    );
+    let verdicts: Vec<Result<(), String>> =
+        outcomes.into_iter().map(|(outcome, _)| outcome).collect();
+    verdict(&verdicts).expect("the variant is injected on every seed of the resplit run");
+    assert!(
+        !caught.is_empty(),
+        "under RetakeNeverAfterOverlap x made R on every one of {seeds} seeds: the stale \
+         checkpoint reached x before R′ on every seed, or the run no longer reaches the harm"
+    );
 }
