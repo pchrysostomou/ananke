@@ -606,6 +606,14 @@ impl Snapshots {
         self.hosted.insert(range, spans);
     }
 
+    /// The spans the plan hosts `range` at, which an install of it copies at its stream's
+    /// last chunk.
+    // PROPOSED(D-128): what a test of the install's re-host reads.
+    #[must_use]
+    pub fn hosted_at(&self, range: RangeId) -> Option<&[KeyRange<Bytes>]> {
+        self.hosted.get(&range).map(Vec::as_slice)
+    }
+
     /// What the task is carrying.
     #[must_use]
     pub fn meters(&self) -> Streams {

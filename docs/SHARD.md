@@ -804,8 +804,11 @@ snapshot can stop overlapping, and otherwise from the same checkpoint, since the
 is the receiver's to clear (Q27). A snapshot that installs onto a replica that is already
 initialised, P's post-split snapshot onto a lagging P for instance, changes that
 replica's descriptor and is traced as a `RangeDescriptor` at the snapshot's last index
-(§8). A node's replica of P that already applied past a snapshot answers it installed
-without switching (RAFT.md:222-224), so a replica of P that applied `s` is never set
+(§8). A replica with no descriptor, a re-seeded user range for instance, is not
+initialised, so the rule lets a right half in beside it: its install replaces its Raft
+interval and the snapshot's span, as a placeholder's does, and no key configuration
+names for it beyond that (D-128). A node's replica of P that already applied past a
+snapshot answers it installed without switching (RAFT.md:222-224), so a replica of P that applied `s` is never set
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
 R could have been installed on the node only if no replica of P covered its span, and
 then no replica of P is there to apply `s`. The apply asserts it.
@@ -1231,7 +1234,10 @@ when its consequence lands.
    `s`, or restated at an applied index at or past `s` — when some replica of P applied
    `s` with effect `took`, holds R initialised from then until a `RangeRemoved` of R or a
    `RaftRefused` on that node; a `RangesRestated` without it is a violation. A node that
-   is not a voter there traces no `RangeCreated { cause: split }` of R. Incremental: an
+   is not a voter there traces no `RangeCreated { cause: split }` of R. And the spans an
+   install replaces, `SpanInstalled`, overlap no span the node holds of a replica other
+   than the one installed, which its Raft keys among the spans name: a descriptor says
+   what a replica claims and a switch what it removes (D-128). Incremental: an
    interval map per node.
 9. **Serving within span.** Fold `RaftApply` and `RaftRead` with check 7's map. A
    `RaftApply` whose effect is `applied` and whose key lies outside the span of its
@@ -2477,8 +2483,9 @@ per-replica incarnation and quarantine (Q26), the re-seed shape and its variant
   fresh take if its checkpoint predates the range's last split.
 - The range layer's variant set in `ananke-shard`, beside `ananke-raft`'s unchanged
   `Variants(u32)` (Q37).
-- The folds: check 7; check 8's clause that no two of a node's spans overlap and its
-  clause that a voter of P at `s` that applied `s` holds R; checks 9, 10, 16, 17 and 20;
+- The folds: check 7; check 8's clause that no two of a node's spans overlap, its
+  clause that a voter of P at `s` that applied `s` holds R, and its clause that an
+  install replaces no other replica's span (D-128); checks 9, 10, 16, 17 and 20;
   check 18's split and range-id clauses; check 19; and, for check 18's split clause, the
   history per (range, index) of the configuration in force, built from each `RaftConfig`'s
   `index`, which §8 defines under check 11 and which check 18 folds (SHARD.md:1248-1250,

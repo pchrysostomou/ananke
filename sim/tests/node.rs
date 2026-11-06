@@ -2850,6 +2850,48 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_over
     }
 }
 
+/// Check 8's install clause against `InstallReplacesHostedSpan` (PROPOSED D-128), compared
+/// on `reseed::run_after_split`, where the right half's install lands before P's on about a
+/// third of seeds, so at every tier (D-061). The node sweep refuses no store (D-116), so
+/// it never makes a span-less replica. On every compared seed the folds agree fold by
+/// fold; on a seed the clause trips, every descriptor is right and it alone of the folds
+/// that stop a run is in violation. The correct node's run holds the clause green on the
+/// same seeds through its verdict (`sim/tests/reseed.rs`).
+// PROPOSED(D-128)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span() {
+    let compared = range_folds_compared();
+    let found = range_folds_under(
+        "InstallReplacesHostedSpan on the re-seed after a split",
+        compared,
+        |seed| {
+            ananke_sim::reseed::run_after_split_under(
+                seed,
+                NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]),
+            )
+            .records
+        },
+    );
+    assert!(
+        tripped_on(&found, Fold::InstallSpan) > 0,
+        "check 8's install clause did not trip on any compared seed of \
+         InstallReplacesHostedSpan"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        let stopping = stopping_folds(outcome);
+        if let Some(words) = outcome.tripped.get(&Fold::InstallSpan) {
+            assert!(
+                words.contains("replaced") && words.contains("its replica of range"),
+                "seed {seed}: check 8's install clause tripped in other words: {words}"
+            );
+        }
+        assert!(
+            stopping.keys().all(|fold| *fold == Fold::InstallSpan),
+            "seed {seed}: a fold other than check 8's install clause tripped: {stopping:?}"
+        );
+    }
+}
+
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
 /// the range and generation a mismatch has already corrected. Measured: 1 000 of seeds
 /// 0 to 999 — asserted on every compared seed.
