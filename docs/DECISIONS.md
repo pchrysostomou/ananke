@@ -23335,7 +23335,7 @@ creation's own. The trace format is not changed for this.
 ## PROPOSED D-113 — `sim/shard.rs`, Stage C's sharded sweep (S10): five nodes, a driver on stream `shard`, four clients over sixteen keys and Phase 2's faults; stopped at its first measurement on a correct-server failure, an install onto a re-seeded replica that deletes the right halves beside it
 
 **The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for this
-slice (#162's S10); the footer moves to D-114, and the slices beside it (#185, S8 (c), #181)
+slice (#162's S10); the footer moves past it, and the slices beside it (#185, S8 (c), #181)
 take D-114 and up. Every code site carries `// PROPOSED(D-113)`. **This entry is in
 progress**: it records what is built and why the slice stopped, and it grows as the slice
 resumes.
@@ -23464,4 +23464,135 @@ since both move what this sweep's figures mean.
 
 ---
 
-_Next entry: D-114. Add one before implementing anything not covered above._
+## PROPOSED D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for
+S10 in the tracking issue #162; D-114 is this slice's. The footer moves to D-115, and
+at a merge the entries are a union in numerical order with one footer, the highest plus
+one. The code site carries `// PROPOSED(D-114)`. Closes #183.
+
+**Context.** #180's review (N10) found it, and it predates S9. A voter's apply of a split
+wrote the two descriptors into the host's `descriptors` table under two acquisitions:
+P's narrowed descriptor first, then R's new one after the `RangeCreated { cause: split }`
+trace. The `snapshot` task's overlap rule (D-110) reads the same table in one
+acquisition, when it decides whether a placeholder's install of R may go in. Between the
+two acquisitions, the table held P off R's span and no R, and the rule admits R's
+install on that state.
+- **In the simulator** no task runs there: the executor is cooperative and nothing
+  between the two inserts awaits.
+- **Under `RealEnv`'s multi-thread runtime** the `snapshot` task can run on another worker
+  between them. A placeholder's install of R would then pass while the split's apply also
+  created R, the double creation seed 219 shows under `SnapshotOverlapsReplica` (#181),
+  on the correct node. It stayed latent because the real binary does not run the shard
+  server.
+
+**The rule.** The two inserts are one critical section. `put_split_descriptors`
+(`server.rs`) puts P's narrowed descriptor and, on a voter, R's into the table. It takes
+the table, not its lock, so the caller's one guard covers both. A reader of the table
+sees P's descriptor before the split or both halves after it, and the overlap rule
+refuses R's install in both states: by P's span before, by R itself after. A non-voter
+holds no R, and its table goes from P to P narrowed, as before.
+
+**The trace and the schedules do not change.** R's creation is still traced before its
+descriptor is in place. P's descriptor now goes in with R's, after that trace and not
+before it. Nothing between the two points awaits or draws, so every simulated run is
+the run it was.
+
+**The test, and why the window itself has none.**
+`a_splits_two_descriptors_reach_the_hosts_table_in_one_step` (a unit test in `server.rs`)
+holds the helper's update:
+- a voter's table goes from P alone to P narrowed and R, with the range beside untouched;
+- the overlap rule refuses an install of R's span in both states;
+- the state between, P narrowed with R absent, admits it, so it is the state no reader
+  may see;
+- a non-voter's table ends in P narrowed and no R.
+
+No test of this tree can reach the window itself, before or after the fix.
+- The simulator never ran a task between the two inserts.
+- A test that raced host threads against the table is what `clippy.toml` and
+  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040).
+- The real binary does not run the shard server.
+
+The one acquisition is held by the helper's signature, which takes the table rather than
+its lock. **PROPOSED.**
+
+**The nightly's rows (D-064).** No sweep is added, so no row.
+
+---
+
+## PROPOSED D-115 — A re-seed after a split holds an install creation's generation: P's install on the re-seeded node is created at the split's generation over its left half, check 7 holds it at its floor, and reverting the creation's generation fails the run
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for S10
+in the tracking issue #162, and D-114 for #183's fix (#186). This entry takes D-115, and the
+footer moves to D-116. At a merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-115)`. Closes #172.
+
+**Context.** D-107 §2 item 2 makes an install's creation (`RangeCreated { cause: snapshot }`)
+name the generation and voters of the descriptor the switch put in place. Before, it named
+the first generation whatever the snapshot held. #166's review (N4) found that no run
+reaches that reading. No seed re-seeded a node after a split, so a unit test of
+`created_from` held it, and a revert of the call site passes that test (#172).
+
+**What #173 built.** `reseed::run_after_split` (D-109 §2) is the shape #172 asks for:
+- an operator splits P, the first user range, at `k1`;
+- a follower `x` of P applies the split and is crashed;
+- `x` stays down until P's leader has compacted past the split;
+- `x` restarts on a store marked lost, so it is refused and re-seeded.
+
+Its `reached` already asks, on every seed, that `x`'s re-seed install P at generation 2
+with P's left half's end. The run's `check` folds check 7 over the trace. Two things were
+missing:
+- **Check 7 holding the creation.** Check 7 judges an install's creation as a statement at
+  its floor, and a statement with no value at or below its floor waits unjudged (D-107
+  §3). A green check 7 alone does not say the creation was compared with anything.
+- **The revert.** No run had been seen to fail with the reading reverted.
+
+**What is added.**
+1. `AfterSplit::parent_created_after_refusal` (`sim/reseed.rs`): `x`'s first install
+   creation of P after its refusal, with its floor index and the descriptor it names, as
+   check 7 holds a creation.
+2. `AfterSplit::parent_created_at_the_splits_generation`, #172's clause per seed:
+   - the creation names generation 2 and P's left half, `[k0, k1)`, both ends;
+   - check 7's own verdict holds (`Fold::DescriptorAgreement`);
+   - check 7's map has a value for P at or below the creation's floor, and the creation
+     equals it. So it was judged and agreed, not left waiting.
+3. `a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it`
+   (`sim/tests/reseed.rs`). On every seed of the tier, capped at the binary's `TIER_CAP` of
+   200 (D-081), it asks the run's `check`, its `reached` and the clause above. It is a
+   test of its own, beside D-109's quarantine test on the same run, so that the revert
+   fails a test named for what it reverts.
+4. The unit test of `created_from` (`server.rs`) no longer says no scenario reaches its
+   call site. It names this run as the one that does.
+
+**The revert, measured.** A scratch plant, reverted before the gate, gave the call site
+in `created_by_install` no descriptor: `created_from(None, config)`. That is the first
+generation and the configuration's voters, whatever the snapshot held, as before D-107.
+
+| | the plant | the correct tree |
+|---|---|---|
+| the new test, 20 seeds, debug | fails, 20 of 20 | passes, 20 of 20 |
+| per seed, 200 seeds at the cap, release | check 7 fails 200 of 200 on `x`'s install of range 2; the new clause fails 200 of 200; `reached` fails 200 of 200; every creation of P at generation 1 | none fails; every creation of P at generation 2 |
+| D-109's quarantine test, 20 seeds, debug | fails, 20 of 20, by check 7 (its `check` runs first) | passes |
+
+Seed 0 under the plant: "descriptor agreement: node Some(3)'s replica of range 2 was
+installed at index 128 with Held { …, generation: 1, voters: [1, 2, 3], state: Live },
+where the range's descriptor there is Held { …, generation: 2, voters: [1, 2, 3], state:
+Live }". The voters agree here, since P's configuration has not changed. The generation is
+what check 7 catches. The rate is 100 %, so the catch would hold at every tier (D-061). It
+is not a standing variant: #172 asks that the revert be seen to fail the run, and the
+plant is not shipped. **PROPOSED.**
+
+**What is not here.** #175 is the other half of a re-seed after a split, a node that replays
+the split from a pre-split snapshot and creates R unquarantined; it is the owner's question
+(D-109 §2). #178 is also the owner's. Neither is touched. #176, a re-seeded node staging in
+the directory it refused until its next start, is unchanged too, and nothing asserted here
+reads that directory.
+
+**The nightly's rows (D-064).** One `reseed` row, weighed in release from the built binary
+at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs the cap's 200: 34.7 cpu s, the median
+of three runs taken beside other slices' builds (load averages 86 to 100). It goes into the
+lightest shard, shard 6, at 1832.3 -> 1867.0.
+
+---
+
+_Next entry: D-116. Add one before implementing anything not covered above._

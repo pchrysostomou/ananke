@@ -2203,23 +2203,34 @@ impl<E: Environment> ServerApplier<E> {
                 left.start.clone()..left.end.clone(),
             ],
         });
-        lock(&self.descriptors).insert(range, left);
+        if voter {
+            self.env.trace(TraceEvent::RangeCreated {
+                range: right,
+                cause: RangeCause::Split,
+                parent: Some(range.get()),
+                start: created.start.clone(),
+                end: created.end.clone(),
+                generation: created.generation,
+                voters: created.voters.iter().map(|voter| voter.0).collect(),
+                floor_index: index,
+                floor_term: 1,
+                incarnation,
+            });
+        }
+        // Both halves' descriptors reach the host's table in one acquisition of it.
+        // The `snapshot` task's overlap rule reads the table in one acquisition too, when
+        // it decides whether a placeholder's install of R may go in, so it sees P's
+        // descriptor before the split or both of them after it. Put in two, a task run
+        // between them on another worker of a multi-threaded runtime found P already off
+        // R's span and R not yet there, and let the placeholder's install create R while
+        // this apply created it too (issue #183). The trace is unchanged: R's creation
+        // is traced before its descriptor is in place, as before, and nothing here
+        // awaits, so a simulated schedule is the same.
+        // PROPOSED(D-114)
+        put_split_descriptors(&mut lock(&self.descriptors), left, voter.then_some(created));
         if !voter {
             return Ok(Some((ApplyEffect::Took, Outcome::Done)));
         }
-        self.env.trace(TraceEvent::RangeCreated {
-            range: right,
-            cause: RangeCause::Split,
-            parent: Some(range.get()),
-            start: created.start.clone(),
-            end: created.end.clone(),
-            generation: created.generation,
-            voters: created.voters.iter().map(|voter| voter.0).collect(),
-            floor_index: index,
-            floor_term: 1,
-            incarnation,
-        });
-        lock(&self.descriptors).insert(right_id, created);
         // The right half's store beside the parent's, its core from the floor, and
         // the node's tables for it; the `raft` task puts the core in place.
         let (right_store, recovered) = store.open_sibling(right_prefix).await?;
@@ -2873,6 +2884,23 @@ fn descriptors_for(
             .cloned(),
     );
     out
+}
+
+/// A split's descriptors into the host's table `held`: P's, narrowed to `[start, key)`
+/// at the next generation, and, on a voter of the parent's configuration, R's over
+/// `[key, end)` (SHARD.md §5). It takes the table and not its lock, so the caller's one
+/// guard covers both inserts: a reader of the table, the `snapshot` task's overlap rule
+/// among them, sees both halves or neither, never P narrowed with R absent (issue #183).
+// PROPOSED(D-114)
+fn put_split_descriptors(
+    held: &mut BTreeMap<RangeId, RangeDescriptor>,
+    left: RangeDescriptor,
+    right: Option<RangeDescriptor>,
+) {
+    held.insert(left.range, left);
+    if let Some(right) = right {
+        held.insert(right.range, right);
+    }
 }
 
 /// How long a split's apply on a non-voter waits before asking the engine again when
@@ -4300,12 +4328,107 @@ mod tests {
         );
     }
 
+    /// Issue #183: a split's apply puts both halves' descriptors in the host's table in
+    /// one step (`put_split_descriptors`), so a reader of the table sees P's descriptor
+    /// alone, before it, or both halves, after it. An install of R's span is then refused
+    /// by the overlap rule in either state, by P's span before and by R itself after.
+    /// On a non-voter, which holds no R, P is narrowed and R stays absent.
+    ///
+    /// The window itself is not reachable by a test of this tree. It was a task run
+    /// between two acquisitions of the table on another worker of a multi-threaded
+    /// runtime. The simulator's executor is cooperative and nothing between the two
+    /// inserts ever awaited, so no simulated schedule ran a task there even before the
+    /// fix. A test racing host threads against the table is what `clippy.toml` and
+    /// `scripts/check-direct-io.sh` keep out of this crate (D-040). What this holds is
+    /// the helper's update, and its signature, which takes the table rather than its
+    /// lock, holds the one acquisition.
+    // PROPOSED(D-114)
+    #[test]
+    fn a_splits_two_descriptors_reach_the_hosts_table_in_one_step() {
+        let voters = vec![ServerId(1), ServerId(2), ServerId(3)];
+        let parent = RangeDescriptor {
+            range: RangeId(4),
+            start: user_key(b"k0"),
+            end: user_key(b"k9"),
+            generation: 1,
+            voters: voters.clone(),
+            state: RangeState::Live,
+        };
+        let beside = RangeDescriptor {
+            range: RangeId(5),
+            start: user_key(b"k9"),
+            end: user_key(b"kz"),
+            generation: 3,
+            voters: voters.clone(),
+            state: RangeState::Live,
+        };
+        let left = RangeDescriptor {
+            end: user_key(b"k5"),
+            generation: 2,
+            ..parent.clone()
+        };
+        let right = RangeDescriptor {
+            range: RangeId(9),
+            start: user_key(b"k5"),
+            end: user_key(b"k9"),
+            generation: 2,
+            voters,
+            state: RangeState::Live,
+        };
+        // What the overlap rule reads of an install of R: R itself already here, or a
+        // held descriptor over any of R's keys (`install_placeholder`).
+        let refuses_r = |held: &BTreeMap<RangeId, RangeDescriptor>| {
+            held.iter().any(|(range, descriptor)| {
+                *range == right.range
+                    || (descriptor.start < right.end && right.start < descriptor.end)
+            })
+        };
+        let before: BTreeMap<RangeId, RangeDescriptor> = [
+            (parent.range, parent.clone()),
+            (beside.range, beside.clone()),
+        ]
+        .into();
+        assert!(
+            refuses_r(&before),
+            "before the split, P's span holds R's keys"
+        );
+
+        let mut voter = before.clone();
+        put_split_descriptors(&mut voter, left.clone(), Some(right.clone()));
+        assert_eq!(
+            voter,
+            [
+                (parent.range, left.clone()),
+                (beside.range, beside.clone()),
+                (right.range, right.clone()),
+            ]
+            .into(),
+            "a voter's table holds P narrowed and R, and the range beside untouched"
+        );
+        assert!(refuses_r(&voter), "after the split, R itself is here");
+        // The state the two acquisitions let a reader see: P narrowed, R absent. The
+        // overlap rule let R's install through on it, which is the window closed here.
+        let between: BTreeMap<RangeId, RangeDescriptor> =
+            [(parent.range, left.clone()), (beside.range, beside.clone())].into();
+        assert!(!refuses_r(&between), "the state no reader may see admits R");
+
+        // A non-voter ends in that state and stays in it: it is in no configuration of
+        // R, and makes no R at the split, so an install is how R would reach it.
+        let mut non_voter = before;
+        put_split_descriptors(&mut non_voter, left, None);
+        assert_eq!(
+            non_voter, between,
+            "a non-voter's table holds P narrowed and no R"
+        );
+    }
+
     /// #166's review (N4): an install's creation names the generation and the voters of
     /// the descriptor its snapshot put in place — a re-seeded replica installed from a
     /// range that has split is created at the split's generation — and the first
-    /// generation only for a snapshot that carries no descriptor. What reaches it in a
-    /// run is a re-seed after a split, which no scenario of this tree makes (issue
-    /// #172); this holds the reading itself.
+    /// generation only for a snapshot that carries no descriptor. This holds the reading
+    /// itself, which a revert of its call site passes. What reaches the call site in a
+    /// run is a re-seed after a split, `reseed::run_after_split`, whose test of P's
+    /// install creation fails on that revert (issue #172; PROPOSED D-115).
     // PROPOSED(D-107)
     #[test]
     fn an_install_creation_names_the_snapshots_generation_and_voters() {
