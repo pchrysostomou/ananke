@@ -23463,4 +23463,133 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## PROPOSED D-120 — `Fault::SplitFromRestarted` with no split done is a wait of its settle alone, by design: `last_heal` stays at the last real heal and no gap follows (answers #147)
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. The brief that assigned
+this branch reserved **D-120** for it; other open branches hold the numbers between. The
+footer moves to D-121, and at a merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-120)`. Closes #147.
+
+**Context.** When no split is done yet, `Fault::SplitFromRestarted` (`run_on`,
+`sim/raft.rs`) waits its `settle` and `continue`s, past the `last_heal = sim.now()` and the
+`advance(gap)` every other arm reaches at the loop's foot; it is the one `continue` in that
+loop. D-102 read the branch for the liveness readings (its section
+"`SplitFromRestarted`'s no-split branch"): it does not corrupt `last_heal`; moving
+`last_heal` to the arm's end changes no verdict of the correct node and, under
+`SharedSnapshotDir`, turns 47 uniform liveness catches into passes and 2 passes into
+catches at ten thousand; and the skipped gap moved only `Schedule::total`. D-102 left the
+branch as it was and asked, through #147, whether the split slice (D-100) meant it.
+
+**The answer: it is meant, on both halves.** D-100's text does not speak of the branch: its
+point 9 describes the arm as reached and says nothing of the gap. What settles it is the
+definitions the branch is read against, which it keeps, and the arm's doc and the branch's
+comment as D-100 merged them (5ddc2fc), which say what it is.
+
+1. **`last_heal` stays.** SHARD.md §8 asks the bound "after the last fault heals", RAFT.md
+   asks it "of the last heal", and the field is "when the last fault healed or the last
+   crashed server restarted" (`Report::last_heal`). The branch heals nothing and restarts
+   no one: it asks no split, crashes no proposer and moves no lead. Set at the arm's end,
+   the field would be the end of a wait, which none of the three names. Where a later arm
+   follows, that arm sets the field and the move changes nothing. Where the arm is the
+   last, the move starts the readings' clock (the liveness fold per key and per range,
+   D-102's end-of-run exemption) late by the previous arm's gap and this arm's settle.
+   That stretch is not idle: it is the first of the cluster's recovery from the last real
+   heal, which is what the bound is there to time, and a slow recovery that ends inside it
+   would go unread with no fault to answer for the allowance. That is the looser reading
+   #147 warned of, and D-102 measured what it costs.
+2. **The gap is not owed.** `Schedule::faults` is "the faults, each healed before the next,
+   with `gaps[i]` of quiet after it", and `gaps` is "the quiet after each fault". The branch
+   injects no fault, so there is nothing to be quiet after. Its own wait is quiet, and at
+   800 to 1 200 ms (the node schedule's draw for this arm's `settle`) it is longer than any
+   gap a node schedule draws (100 to 300 ms for the split arms, 450 to 700 for the rest), so
+   the arm that follows still starts after more quiet than a gap would have given it.
+3. **D-100 wrote the arm as nothing.** Its doc as merged reads "Drawn after the split;
+   nothing if no split is done", and the branch's comment "the arm is a wait, counted as
+   not reached". The `continue` has been there since that commit. The sweep counts the arm
+   unreached too: `SplitStats::from_restarted` counts only the asks of a restarted proposer,
+   and `IdBlockResumed`'s test asserts the shape reached on some seed of its share
+   (`resumed > 0`), not on every seed.
+4. **The alternative buys nothing.** Spending the gap would redraw the run of every node
+   seed that takes the branch where it is not the last arm (32 of the first thousand), and
+   shift the window's end where it is (27), with the pins of those seeds, for nothing
+   anything reads: since D-102 the
+   end is read off the simulator, and `Schedule::total` already counts this arm at
+   `down + TRANSFER_WAIT + SPLIT_WAIT_BUDGET + settle` against the `settle` the branch
+   spends, so the gap is the smaller part of the total's overcount.
+
+**What changes.** No behaviour, no schedule and no trace: no pinned hash moves and no
+pinned seed is re-audited. The branch's comment says why it skips both, so the next reader
+does not "fix" it into the looser reading; the arm's doc, `Schedule::gaps` and
+`Report::last_heal` say the same in a line each. A test holds it:
+
+- `a_split_from_restarted_with_no_split_done_is_its_settle_alone` (`sim/raft.rs`, a unit
+  test of the library, run by the `rest` job, so no shard row is due). A hand-built node
+  schedule: a 1.2 s warmup, no lease trial, gaps of 200 ms, the arm (down 300 ms, settle
+  1 s), the 2.2 s liveness window and every clock true. **After a 500 ms isolation**, no
+  split asked and no server crashed: `last_heal` at the isolation's heal, 1.7 s, the run
+  stopped at 5.1 s, the heal plus the isolation's gap, the settle and the window, and
+  `check()` green. **After a `Split`** (settle 600 ms) on the same seed, the split done: the
+  arm asks once and crashes once, `last_heal` is its end with the gap and the window after
+  it, and `check()` green. Seed 5 is pinned because its split is done; seed 0's goes
+  unanswered within the admin's round on the same schedule (`done: 0, unanswered: 1`), an
+  ordinary outcome of a split asked (361 of 1 941 at D-100's thousand), and the second
+  half's first assertion says so if a change redraws seed 5 that way.
+
+**Plants, each applied alone to this tree and reverted** (`cargo test -p ananke-sim --lib`,
+debug):
+
+- **`last_heal = sim.now()` before the branch's `continue`**, the reading #147 warned of:
+  the first half fails, `last_heal` at 2.9 s, the arm's end, against the isolation's heal
+  at 1.7 s.
+- **`advance(&mut sim, *gap, &mut watch)` before it**, the gap spent: the first half fails,
+  the run stopped at 5.3 s against 5.1 s.
+- **The arm blind to a split done** (`proposer.filter(|_| false)` in the branch's
+  `let`): the second half fails, the arm asking nothing and crashing no one, (0, 0) against
+  (1, 1), though seed 5's split before it was done (`done: 1`). Without this half a test
+  whose first half could not tell the branch from a broken arm would pass.
+
+Reverted, the test passes.
+
+**Measured on this tree** (release; the counterfactual is D-102's: `last_heal` set to the
+no-split arm's end, which is `ended - schedule.settle` where the arm is last, and every
+draw unchanged; D-102's own figures are at ten thousand on its tree, these at the
+premerge's tier):
+
+- **The correct node, seeds 0 to 999.** The branch is taken on 59, as the last arm on 27,
+  13 of those uniform, where the liveness readings are asked. `check()` passes all 1 000 as
+  the tree stands, and with `last_heal` moved on the 27 no verdict of `check()` or of the
+  liveness fold changes. The stretch the move drops from the window is 934 ms at the least,
+  1 423 ms at the median and 1 726 ms at the most.
+- **`SharedSnapshotDir`, seeds 0 to 1 999, the 818 whose schedule ends in the arm.** The
+  branch is the last arm on 184, the figure #147 read on fdc5fc0, 105 of them uniform; the
+  818 carry 215 uniform liveness catches. The move turns 11 of those catches into passes:
+  slow writes or slow recoveries in the dropped stretch, as on seed 257, where a write to
+  k6 took 2.420 s from its call over the 2 s bound and the move reads it no more. `check()`'s
+  own verdict moves on 8 of the 11; on seed 268, one of the other 3, the read bound fails
+  the run either way. The move also turns 2 passes into catches, seeds 656 and 920, where
+  range 5's first write of the narrowed window took 2.045 s and 2.032 s: the range had
+  completed a write in the dropped stretch, so the kept reading has its recovery, and the
+  moved one asks the bound from a moment nothing healed at. These are the two directions
+  of D-102's 47 and 2 at ten thousand. The kept reading is therefore not a superset of the
+  moved one on every run; it is the one the spec's words name, and the one that catches
+  more.
+
+**Not taken.**
+- **`last_heal` at the no-split arm's end** (1 above): a looser reading with no fault behind
+  it.
+- **The gap spent with `last_heal` kept** (4 above): moves schedules and pins for nothing
+  read.
+- **Dropping the arm at the draw when no split will be done:** the draw cannot know; whether
+  a split is done by then is the run's, and
+  on 5 of the correct node's 59 the split was done only after the arm began, its admin
+  still inside its round when the arm came.
+- **`Fault::Split`'s `last_heal`.** The plain split arm sets `last_heal` at its end like
+  every arm that asks something of the cluster; it asks a split, done or refused, and its
+  settle is for the right half to elect and the clients to find it. That is not #147's
+  question and is unchanged.
+
+**The nightly's rows (D-064).** No sweep is added and the test is the library's, so no row.
+
+---
+
+_Next entry: D-121. Add one before implementing anything not covered above._
