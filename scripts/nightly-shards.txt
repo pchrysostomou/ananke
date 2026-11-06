@@ -509,6 +509,13 @@
 # with other slices' builds beside it (load averages 86 to 100, so the figure is if anything
 # high): 34.7 cpu s, the median (30.78 + 1.03, 33.73 + 0.92, 34.24 + 0.97). Into the lightest
 # shard, shard 6 at 2168.1 -> 2202.8.
+# #187's review (PROPOSED D-115, corrected after #187 merged, N1) folded that test's clauses into
+# D-109's test on the same run and removed that test and its row, 34.7. D-109's row is re-weighed
+# in place for the clause, from the built release binary (`reseed-<hash> <test> --exact`) at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, on an Apple M2 of 8 cores
+# with other slices' gates beside it (load averages 497 to 541, so the figure is if anything
+# high): 27.8 -> 41.9 cpu s, the median (33.88 + 5.97, 35.58 + 7.89, 34.88 + 7.00). Shard 6's
+# header, recomputed from its rows: 2202.8 -> 2182.2.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -645,7 +652,7 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 2202.8 cpu s
+# shard 6: 2182.2 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -688,8 +695,7 @@
 6	node	28.2	the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps
 6	node	0.6	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor
 6	node	0.5	the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch
-6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
-6	reseed	34.7	a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it
+6	reseed	41.9	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
 6	split	335.8	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed

@@ -23390,10 +23390,15 @@ its lock. **PROPOSED.**
 
 ## PROPOSED D-115 — A re-seed after a split holds an install creation's generation: P's install on the re-seeded node is created at the split's generation over its left half, check 7 holds it at its floor, and reverting the creation's generation fails the run
 
-**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for S10
-in the tracking issue #162, and D-114 for #183's fix (#186). This entry takes D-115, and the
-footer moves to D-116. At a merge the entries are a union in numerical order with one
-footer, the highest plus one. Every code site carries `// PROPOSED(D-115)`. Closes #172.
+**The number.** Off `main` at b1da6ec, whose footer read D-113. #162 records the
+reservations of 2026-11-01: D-113 for S10, D-114 for #186 (#183), D-115 for #187 (this,
+#172), D-116 for #181 and D-117 for #176 (*corrected after #187 merged*, #187's review, N3:
+this first cited #162 for a reservation it did not then record). This entry took D-115 and
+moved the footer to D-116. At a merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-115)` (*corrected after
+#187 merged*, N3: this said so first, and only `sim/reseed.rs` did). #187 closed #172. It
+merged at 2d9e8ad (`main` de9f4d7) before its review's fixes, and each correction is marked
+where it stands.
 
 **Context.** D-107 §2 item 2 makes an install's creation (`RangeCreated { cause: snapshot }`)
 name the generation and voters of the descriptor the switch put in place. Before, it named
@@ -23407,40 +23412,59 @@ reaches that reading. No seed re-seeded a node after a split, so a unit test of
 - `x` stays down until P's leader has compacted past the split;
 - `x` restarts on a store marked lost, so it is refused and re-seeded.
 
-Its `reached` already asks, on every seed, that `x`'s re-seed install P at generation 2
-with P's left half's end. The run's `check` folds check 7 over the trace. Two things were
-missing:
-- **Check 7 holding the creation.** Check 7 judges an install's creation as a statement at
-  its floor, and a statement with no value at or below its floor waits unjudged (D-107
-  §3). A green check 7 alone does not say the creation was compared with anything.
-- **The revert.** No run had been seen to fail with the reading reverted.
+D-109's test on it,
+`a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`, asks on every
+seed the run's `check`, which folds check 7, and its `reached`, which asks that `x`'s re-seed
+install P at generation 2 with P's left half's end.
+
+*Corrected after #187 merged* (#187's review, B1 and N1). This first said two things were
+missing: check 7 holding the creation, and a run that fails on the revert. Neither stands as
+written. `reached` alone fails the revert on every seed, so the revert already failed a
+standing test on `main`, and only the measurement was missing. In this run a value of P
+always lies under the creation's floor, P's bootstrap at index 0, so check 7 judges the
+creation on every seed and the case in which it waits unjudged does not arise here. What
+was missing was the measurement, and an ask of the creation whole: its start and its voters
+are read by neither `reached` nor anything else apart from check 7.
 
 **What is added.**
-1. `AfterSplit::parent_created_after_refusal` (`sim/reseed.rs`): `x`'s first install
-   creation of P after its refusal, with its floor index and the descriptor it names, as
-   check 7 holds a creation.
-2. `AfterSplit::parent_created_at_the_splits_generation`, #172's clause per seed:
+1. `AfterSplit::created_by_install_after_refusal` (`sim/reseed.rs`): `x`'s first install
+   creation of a range after its refusal, with its position, its floor index and the
+   descriptor it names, as check 7 holds a creation's. `installed_after_refusal` reads it,
+   so the search is one (*corrected after #187 merged*, N1: first a second search, for P
+   alone).
+2. `AfterSplit::parent_created_at_the_splits_generation`, #172's clause per seed, asked
+   after `check`:
    - the creation names generation 2 and P's left half, `[k0, k1)`, both ends;
-   - check 7's own verdict holds (`Fold::DescriptorAgreement`);
-   - check 7's map has a value for P at or below the creation's floor, and the creation
-     equals it. So it was judged and agreed, not left waiting.
-3. `a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it`
-   (`sim/tests/reseed.rs`). On every seed of the tier, capped at the binary's `TIER_CAP` of
-   200 (D-081), it asks the run's `check`, its `reached` and the clause above. It is a
-   test of its own, beside D-109's quarantine test on the same run, so that the revert
-   fails a test named for what it reverts.
+   - it equals the value check 7's map holds for P at or below its floor.
+
+   *Corrected after #187 merged* (#187's review, B1, which both its verifiers refuted as
+   blocking; N1). This first said the second half showed the creation "was judged and
+   agreed, not left waiting". It makes check 7's comparison again, and does not show check 7
+   made it: with check 7 blinded to install creations the clause stays green. That check 7
+   judges them is held by its own unit test,
+   `an_install_must_agree_with_the_descriptor_in_force_at_its_index`, and `check`, asked
+   first, is check 7 on this trace. The clause adds the voters and a fault check 7 would
+   miss. With check 7 blinded to install creations and the creation's voters reversed, seed
+   0 fails it, "node 3's install creation of range 2 at its floor 128 names Held { …,
+   voters: [3, 2, 1], … }", where D-109's test as it stood passed 200 of 200 (the review's
+   measure). It no longer asks `Fold::DescriptorAgreement` again, which repeated `check`.
+3. The clause is asked inside D-109's test, on the same 200 runs. *Corrected after #187
+   merged* (#187's review, N1): it first swept in a test of its own,
+   `a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it`,
+   which re-ran those deterministic runs for one more clause. That test and its nightly row
+   are gone.
 4. The unit test of `created_from` (`server.rs`) no longer says no scenario reaches its
    call site. It names this run as the one that does.
 
 **The revert, measured.** A scratch plant, reverted before the gate, gave the call site
 in `created_by_install` no descriptor: `created_from(None, config)`. That is the first
 generation and the configuration's voters, whatever the snapshot held, as before D-107.
+*Re-measured after #187 merged*, on the test as it now stands:
 
 | | the plant | the correct tree |
 |---|---|---|
-| the new test, 20 seeds, debug | fails, 20 of 20 | passes, 20 of 20 |
-| per seed, 200 seeds at the cap, release | check 7 fails 200 of 200 on `x`'s install of range 2; the new clause fails 200 of 200; `reached` fails 200 of 200; every creation of P at generation 1 | none fails; every creation of P at generation 2 |
-| D-109's quarantine test, 20 seeds, debug | fails, 20 of 20, by check 7 (its `check` runs first) | passes |
+| D-109's test with the clause, 20 seeds, debug | fails, 20 of 20, by check 7 (its `check` runs first) | passes, 20 of 20 |
+| per seed, 200 seeds at the cap, release | check 7 fails 200 of 200 on `x`'s install of range 2; the clause fails 200 of 200; `reached` fails 200 of 200; every creation of P at generation 1 | none fails; every creation of P at generation 2 |
 
 Seed 0 under the plant: "descriptor agreement: node Some(3)'s replica of range 2 was
 installed at index 128 with Held { …, generation: 1, voters: [1, 2, 3], state: Live },
@@ -23450,16 +23474,36 @@ what check 7 catches. The rate is 100 %, so the catch would hold at every tier (
 is not a standing variant: #172 asks that the revert be seen to fail the run, and the
 plant is not shipped. **PROPOSED.**
 
+**The tier: capped, on this run's own figures.** *Corrected after #187 merged* (#187's
+review, N2): this first cited D-081 for the cap, and D-081's case is `run`'s cost, 0.40 to
+0.47 CPU seconds a seed. `run_after_split` costs about 0.17 to 0.21 CPU seconds a seed:
+- D-109's test, with the clause, weighs 39.9 to 43.5 CPU seconds for its 200 seeds at load
+  averages of 497 to 541, and #187's own test on the same runs weighed 31.8 to 35.2 at 86
+  to 100;
+- its peak RSS was 0.21 to 0.24 GB at the first load and 1.42 GB in the review's run at a
+  lower one, which follows how many seeds run at once and not how many run in all.
+
+Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the nightly's ten
+thousand some 1 700 to 2 100, about a whole nightly shard (shards carry 1 977 to 2 237,
+D-064), for clauses that hold or fail on every seed at twenty. So the run stays under the
+binary's `TIER_CAP`, and that cap is put to the owner with D-081's. The cap samples the run's
+rarer schedules thinly: 5 of 200 seeds install P at floor 192, after a second compaction,
+against 127 to 129 on the rest (counted by the review, and again here), and nothing asserted
+reads that schedule apart. **PROPOSED.**
+
 **What is not here.** #175 is the other half of a re-seed after a split, a node that replays
 the split from a pre-split snapshot and creates R unquarantined; it is the owner's question
 (D-109 §2). #178 is also the owner's. Neither is touched. #176, a re-seeded node staging in
 the directory it refused until its next start, is unchanged too, and nothing asserted here
 reads that directory.
 
-**The nightly's rows (D-064).** One `reseed` row, weighed in release from the built binary
-at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs the cap's 200: 34.7 cpu s, the median
-of three runs taken beside other slices' builds (load averages 86 to 100). It goes into the
-lightest shard, shard 6, at 1832.3 -> 1867.0.
+**The nightly's rows (D-064).** *Corrected after #187 merged* (#187's review, N1): #187 added
+one `reseed` row for its own test at 34.7 cpu s, in shard 6, 1832.3 -> 1867.0, and 2168.1 ->
+2202.8 at #185's merge. That row is gone with the test. D-109's row, for the test that now
+asks the clause, is re-weighed in place, from the built release binary at ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100, which runs the cap's 200: 27.8 -> 41.9 cpu s, the median of three runs
+(33.88 + 5.97, 35.58 + 7.89, 34.88 + 7.00), at load averages of 497 to 541, so the figure is
+if anything high. Shard 6's header is recomputed from its rows: 2202.8 -> 2182.2.
 
 ---
 
