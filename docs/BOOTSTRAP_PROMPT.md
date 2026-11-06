@@ -101,6 +101,16 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-reseed-install-span` (2026-11-06), off `main` at de9f4d7, PROPOSED
+  D-128, **a correct-server data loss S10 found** (D-113, #188). A re-seeded user range has no
+  descriptor, so its plan held configuration's span, and its install replaced that, removing
+  the keys of any right half that came back first through its placeholder. The switch now
+  replaces its Raft interval and the snapshot's span, and the task re-hosts it there (amends
+  D-107 §4). The creation's read-back traces its state, over the streamed span. Check 8 has an
+  install clause, reading the engine's `SpanInstalled`, and `InstallReplacesHostedSpan` (node
+  bit 49) keeps the bug beside the fix. `reseed::run_after_split` writes right-half keys and
+  reads them back off the disk: 66 of 200 seeds lost them before, none now. S10's seven seeds
+  are green on a scratch copy of its scenario, which is not committed here.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

@@ -69,8 +69,8 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, File, FileSystem, Instant, Network, NodeId, OpenOptions,
-    RangeCause, RangeState, RecoveredAs, Rng, Socket, StartOver, TraceEvent, race,
+    ApplyEffect, Clock, Either, Environment, File, FileSystem, Instant, Network, NodeId,
+    OpenOptions, RangeCause, RangeState, RecoveredAs, Rng, Socket, StartOver, TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::Command;
@@ -79,13 +79,14 @@ use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::Message;
 use ananke_raft::store::{is_marked_lost, mark_store_lost};
 use ananke_shard::client::{RangedRequest, RangedResponse};
-use ananke_shard::descriptor::FIRST_GENERATION;
+use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
+use ananke_shard::generation_dir;
 use ananke_shard::invariants::{Fold, Held};
 use ananke_shard::range::RangeId;
 use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::server::ServerConfig;
 use ananke_shard::variant::NodeVariants;
-use ananke_storage::EngineConfig;
+use ananke_storage::{Engine, EngineConfig};
 use bytes::Bytes;
 
 use crate::raft::{TICK, client_addr, server_addr};
@@ -1241,6 +1242,8 @@ fn spawn(
 pub const SPLIT_PARENT: u64 = FIRST_RANGE;
 /// The key it splits at: the right half is `[k1, k2)`.
 pub const SPLIT_KEY: &str = "k1";
+/// The key past the right half's span.
+const RIGHT_END: &str = "k2";
 /// The key the run's writer writes, P's left half's, so that P's log goes on growing past
 /// the split and its leader takes and compacts past it.
 const LEFT_KEY: &str = "k0";
@@ -1256,6 +1259,14 @@ const SPLIT_SLICE: Duration = Duration::from_millis(50);
 /// How long the run goes on after `x` starts again on its lost store: its re-seed
 /// streams, and its right half's stream to its placeholder.
 const SPLIT_AFTER: Duration = Duration::from_secs(8);
+/// How many keys the right half's writer writes, each once: a key written twice would
+/// hide its own loss at its next write.
+// PROPOSED(D-128)
+const RIGHT_KEYS: u64 = 100;
+/// The gap between two of its writes, so its keys span the split and `x`'s crash and the
+/// right half's snapshot stays a few dozen chunks ([`SNAPSHOT_CHUNK`]).
+// PROPOSED(D-128)
+const RIGHT_EVERY: Duration = Duration::from_millis(40);
 
 /// What one run of the re-seed after a split built and traced
 /// ([`run_after_split`]).
@@ -1271,6 +1282,11 @@ pub struct AfterSplit {
     pub split: Option<(u64, u64)>,
     /// What the run could not build, if anything.
     pub unbuilt: Option<String>,
+    /// The user keys of the right half's span in `x`'s engine once the run is over,
+    /// read off its disk with the node stopped (`keys_on_disk`). `None` where the run
+    /// was not built or the read did not finish.
+    // PROPOSED(D-128)
+    pub right_keys_on_x: Option<BTreeSet<Bytes>>,
 }
 
 impl AfterSplit {
@@ -1434,6 +1450,170 @@ impl AfterSplit {
         }
     }
 
+    /// Whether `x`'s install of the right half landed before its install of P: the
+    /// order in which P's install meets a replica that holds keys of the span
+    /// configuration names for P. Both are creations, since `x`'s engine is fresh. It
+    /// reads the creations' records in the trace; a run that has not both reads `false`.
+    // PROPOSED(D-128)
+    #[must_use]
+    pub fn right_installed_first(&self) -> bool {
+        let Some((_, right)) = self.split else {
+            return false;
+        };
+        match (
+            self.installed_after_refusal(right),
+            self.installed_after_refusal(SPLIT_PARENT),
+        ) {
+            (Some((right_at, ..)), Some((parent_at, ..))) => right_at < parent_at,
+            _ => false,
+        }
+    }
+
+    /// The keys `x`'s install of the right half owes its span: every key of the span a
+    /// replica applied below the split, in P's log, or at or below the install's floor,
+    /// in the right half's own. The snapshot carries each of them, so each is in the
+    /// switch that created the replica, and the writer writes each key once, so nothing
+    /// after the switch can put one back.
+    // PROPOSED(D-128)
+    #[must_use]
+    pub fn right_keys_owed(&self) -> BTreeSet<Bytes> {
+        let Some((split, right)) = self.split else {
+            return BTreeSet::new();
+        };
+        let Some(floor) = self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Snapshot,
+                floor_index,
+                ..
+            } if *range == right && self.on_x(record) => Some(*floor_index),
+            _ => None,
+        }) else {
+            return BTreeSet::new();
+        };
+        let span = SPLIT_KEY.as_bytes()..RIGHT_END.as_bytes();
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftApply {
+                    range,
+                    index,
+                    key: Some(key),
+                    effect: ApplyEffect::Applied,
+                    ..
+                } if ((*range == SPLIT_PARENT && *index < split)
+                    || (*range == right && *index <= floor))
+                    && span.contains(&&key[..]) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The right half's keys survive on `x`, whichever of its two installs landed first
+    /// (SHARD.md §5, §11 storage 5): every key its install owes the span is in `x`'s
+    /// engine when the run is over. The traced descriptors say nothing of this: an
+    /// install's switch removes keys, and the only record of which is the engine's.
+    ///
+    /// # Errors
+    ///
+    /// What is missing, with the seed.
+    // PROPOSED(D-128)
+    pub fn right_keys_survive(&self) -> Result<(), String> {
+        let (seed, x) = (self.seed, self.x);
+        let Some(held) = &self.right_keys_on_x else {
+            return Err(format!(
+                "seed {seed}: node {x}'s engine was not read after the run"
+            ));
+        };
+        let owed = self.right_keys_owed();
+        if owed.is_empty() {
+            return Err(format!(
+                "seed {seed}: node {x}'s install of the right half owed its span no key, so \
+                 this run says nothing of them"
+            ));
+        }
+        let missing: Vec<&Bytes> = owed.difference(held).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "seed {seed}: node {x} lost {} of the {} keys its install of the right half owes \
+             its span (the right half installed {} P), first {:?}: its engine holds {} keys \
+             of the span",
+            missing.len(),
+            owed.len(),
+            if self.right_installed_first() {
+                "before"
+            } else {
+                "after"
+            },
+            missing[0],
+            held.len()
+        ))
+    }
+
+    /// What `x` read back of `range`'s install holds what the take that fed it held
+    /// (D-083): the state it traced at its switch, paired with another server's take by
+    /// `(range, last_index, last_term)`. P's replica on `x` has no descriptor in the
+    /// host's table until the host handles the switch, and until PROPOSED D-128 its
+    /// read-back found none and traced nothing, so this creation alone went uncompared.
+    /// The read is the snapshot's span and not configuration's: the right half's keys, if
+    /// its install landed first, are no part of what P's take held.
+    ///
+    /// # Errors
+    ///
+    /// What does not hold, with the seed.
+    // PROPOSED(D-128)
+    pub fn state_read_back_is_the_takes(&self, range: u64) -> Result<(), String> {
+        let (seed, x) = (self.seed, self.x);
+        let state = |record: &TraceRecord| match record.event {
+            TraceEvent::RaftSnapshotState {
+                server,
+                range: r,
+                last_index,
+                last_term,
+                user_keys,
+                user_digest,
+                ..
+            } if r == range => Some((server, last_index, last_term, user_keys, user_digest)),
+            _ => None,
+        };
+        // The first state `x` traces of the range after its refusal is its install's: it
+        // holds nothing of the range to take from before that.
+        let refused = self.refused_at().unwrap_or(0);
+        let Some((_, last_index, last_term, user_keys, user_digest)) = self.records[refused..]
+            .iter()
+            .filter_map(state)
+            .find(|(server, ..)| *server == x)
+        else {
+            return Err(format!(
+                "seed {seed}: node {x}'s install of range {range} traced no state read back"
+            ));
+        };
+        let taken = self
+            .records
+            .iter()
+            .filter_map(state)
+            .find(|(server, index, term, ..)| {
+                *server != x && (*index, *term) == (last_index, last_term)
+            });
+        match taken {
+            Some((_, _, _, keys, digest)) if (keys, digest) == (user_keys, user_digest) => Ok(()),
+            Some((server, _, _, keys, digest)) => Err(format!(
+                "seed {seed}: node {x}'s install of range {range} at {last_index} read back \
+                 {user_keys} keys, digest {user_digest:#x}, and server {server}'s take there \
+                 held {keys} keys, digest {digest:#x}"
+            )),
+            None => Err(format!(
+                "seed {seed}: no server's take of range {range} at {last_index} is traced for \
+                 node {x}'s install"
+            )),
+        }
+    }
+
     /// The votes and pre-votes `x` granted `range` after record `at`.
     #[must_use]
     pub fn granted_after(&self, range: u64, at: usize) -> usize {
@@ -1586,6 +1766,125 @@ async fn left_writer<E: Environment>(env: E) {
     }
 }
 
+/// The run's second writer: [`RIGHT_KEYS`] keys of the right half's span, each written
+/// once and in order, each resent until a node answers it. It asks P until a node's
+/// `RangeMismatch` names the range that holds the key, as a client's cache would learn
+/// it (SHARD.md §3), which needs no fixed map for a range the run's split makes.
+// PROPOSED(D-128)
+async fn right_writer<E: Environment>(env: E) {
+    let Ok(sock) = env.net().bind(client_addr(2)).await else {
+        return;
+    };
+    let mut leader: Option<u64> = None;
+    let mut range = RangeId(SPLIT_PARENT);
+    let mut generation = FIRST_GENERATION;
+    for seq in 1..=RIGHT_KEYS {
+        let key = Bytes::from(format!("{SPLIT_KEY}-{seq:04}"));
+        let encoded = ananke_raft::apply::user_key(&key);
+        loop {
+            let target = leader.unwrap_or_else(|| 1 + env.rng().below(SERVERS));
+            let request = RangedRequest {
+                generation,
+                range,
+                request: Request {
+                    client: 2,
+                    seq,
+                    command: Command::Put {
+                        key: key.clone(),
+                        value: Bytes::from(format!("v{seq}")),
+                    },
+                },
+            };
+            let _ = sock.send(server_addr(target), request.encode()).await;
+            let deadline = env.clock().now() + Duration::from_millis(80);
+            let answered = loop {
+                let recv = pin!(sock.recv());
+                let timer = pin!(env.clock().sleep_until(deadline));
+                let bytes = match race(&env, recv, timer).await {
+                    Either::Left(Ok((_, bytes))) => bytes,
+                    Either::Left(Err(_)) | Either::Right(()) => {
+                        leader = None;
+                        break false;
+                    }
+                };
+                let Ok(response) = RangedResponse::decode(bytes) else {
+                    continue;
+                };
+                if response.response.seq != seq {
+                    continue;
+                }
+                match response.response.reply {
+                    Reply::Outcome(_) => {
+                        leader = Some(target);
+                        break true;
+                    }
+                    Reply::NotLeader { leader: who } => {
+                        leader = who.map(|who| who.0);
+                        break false;
+                    }
+                    Reply::RangeMismatch { descriptors } => {
+                        let holder = descriptors.into_iter().find_map(|bytes| {
+                            RangeDescriptor::decode(bytes).ok().filter(|descriptor| {
+                                descriptor.start <= encoded && encoded < descriptor.end
+                            })
+                        });
+                        if let Some(holder) = holder {
+                            range = holder.range;
+                            generation = holder.generation;
+                        }
+                        leader = None;
+                        break false;
+                    }
+                }
+            };
+            if answered {
+                break;
+            }
+            env.clock().sleep(Duration::from_millis(4)).await;
+        }
+        env.clock().sleep(RIGHT_EVERY).await;
+    }
+}
+
+/// The user keys of `[from, to)` in the engine at `dir` on `at`, read off its disk: the
+/// node must be down. `None` where the read did not finish inside [`AUDIT_BUDGET`].
+// PROPOSED(D-128)
+fn keys_on_disk(
+    sim: &mut Sim,
+    at: NodeId,
+    dir: &Path,
+    from: Bytes,
+    to: Bytes,
+) -> Option<BTreeSet<Bytes>> {
+    let found: Arc<Mutex<Option<BTreeSet<Bytes>>>> = Arc::new(Mutex::new(None));
+    let out = found.clone();
+    let env = sim.env(at);
+    let inner = env.clone();
+    let dir = dir.to_path_buf();
+    env.spawn("keys-on-disk", async move {
+        let Ok((engine, _)) = Engine::open(inner, EngineConfig::new(dir)).await else {
+            return;
+        };
+        let version = engine.snapshot();
+        if let Ok(scanned) = engine.scan(&from[..]..&to[..], &version).await {
+            *out.lock().expect("the read") = Some(
+                scanned
+                    .into_iter()
+                    .filter_map(|(key, _)| {
+                        ananke_raft::apply::user_key_of(&key).map(Bytes::copy_from_slice)
+                    })
+                    .collect(),
+            );
+        }
+    });
+    let mut waited = Duration::ZERO;
+    while waited < AUDIT_BUDGET && found.lock().expect("the read").is_none() {
+        sim.run_for(AUDIT_STEP);
+        waited += AUDIT_STEP;
+    }
+    found.lock().expect("the read").take()
+}
+
 /// The operator's split of P at [`SPLIT_KEY`], asked of `target` and following
 /// `NotLeader`; it records nothing, since the trace says whether the split took effect.
 async fn split_operator<E: Environment>(env: E, mut target: u64) {
@@ -1674,13 +1973,26 @@ fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
 /// so R comes back to `x` only through its placeholder: R's leader reaches it, and is
 /// told to stream (SHARD.md §5, Q22). `x` may have voted in R before its loss, and the
 /// replica its placeholder's install creates is quarantined (PROPOSED D-109 §2).
+///
+/// A second writer puts keys of the right half's span, each once, through the split
+/// and `x`'s loss. Which of `x`'s two installs lands first is the schedule's draw: when
+/// the right half's does, P's install finds a replica holding keys of the span
+/// configuration names for P, and when the run is over `x`'s engine is read off its disk
+/// to say whether they are still there ([`AfterSplit::right_keys_survive`], PROPOSED
+/// D-128).
 #[must_use]
 pub fn run_after_split(seed: u64) -> AfterSplit {
+    run_after_split_under(seed, NodeVariants::correct())
+}
+
+/// [`run_after_split`] with the node's `node_variants`, on every server.
+// PROPOSED(D-128)
+#[must_use]
+pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSplit {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
     let variants = Variants::default();
-    let node_variants = NodeVariants::correct();
     for id in 1..=SERVERS {
         spawn(
             &sim,
@@ -1695,6 +2007,8 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
         let env = sim.env(client);
         let inner = env.clone();
         env.spawn("writer", left_writer(inner));
+        let inner = env.clone();
+        env.spawn("right-writer", right_writer(inner));
     }
     sim.run_for(SPLIT_SETTLE);
     let leader = leader_of(&sim.trace(), SPLIT_PARENT).unwrap_or(1);
@@ -1707,6 +2021,7 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
         x,
         split: None,
         unbuilt: None,
+        right_keys_on_x: None,
     };
     {
         let env = sim.env(client);
@@ -1772,5 +2087,18 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
     spawn(&sim, at, x, variants, node_variants, true);
     sim.run_for(SPLIT_AFTER);
     report.records = sim.trace();
+    // What `x`'s engine holds, read with the run's trace already taken, so the read moves
+    // nothing the run's checks see. The engine a re-seed built is the first generation
+    // past the refused one (D-041).
+    // PROPOSED(D-128)
+    sim.crash(at);
+    sim.restart(at);
+    report.right_keys_on_x = keys_on_disk(
+        &mut sim,
+        at,
+        &generation_dir(Path::new(DIR), 1),
+        ananke_raft::apply::user_key(SPLIT_KEY.as_bytes()),
+        ananke_raft::apply::user_key(RIGHT_END.as_bytes()),
+    );
     report
 }

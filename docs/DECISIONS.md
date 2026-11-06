@@ -23463,4 +23463,248 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,
+#188) and D-116 to D-127, and D-128 is reserved for this correction; the footer moves to
+D-129. At a merge the entries are a union in numerical order with one footer, the highest
+plus one. Every code site carries `// PROPOSED(D-128)`.
+
+**This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps
+one owner per key per node and installs a snapshot only where its span overlaps no other
+initialised replica. §11, storage 5, has an install remove "the span's keys". D-109 §2 gives
+the precedent: a replica whose span is unknown is hosted "at its Raft interval alone, since
+its span is the snapshot's and unknown until the stream completes", with a switch that
+replaces "the Raft interval and the descriptor's span". D-107 §4 records configuration's span
+for a replica without one, names this hazard for the *next* install, and fixes only that one.
+This entry amends D-107 §4: the *first* install of a replica with no descriptor is where the
+hazard is, and it is closed there.
+
+**The bug, on a correct server.** S10's sweep found it (D-113, #188), and an independent
+verifier reproduced it. A bootstrap node whose engine is refused re-seeds configuration's
+ranges 0, 1 and 2 into a fresh engine (`server::reseed`). It writes descriptors only for the
+system ranges, so the re-seeded user range 2 has no descriptor. Then:
+
+1. The snapshot task's plan hosts range 2 at configuration's span, for want of another
+   (`server::run`, "a replica without a descriptor"): the Raft interval plus `[u:k, u:l)`.
+2. Right halves the node held before its loss come back through placeholders (D-109 §2).
+   Their installs replace only their snapshot's span. The overlap rule lets them in (Q27,
+   `install::admission`), because range 2 is not an initialised replica: it has no entry in
+   the host's descriptors.
+3. Range 2's own install reaches `Task::finish`. Admission compares the streamed descriptor,
+   `[k, k08)`, with the initialised replicas, finds no overlap and returns `Install`. The
+   switch is then made with `install.spans`, the plan's hosted spans copied at the last chunk,
+   which are configuration's `[k, l)` and not the snapshot's span. `Engine::install_spans`
+   removes every key in them, so **the right halves' data on that node is deleted**.
+4. Only after the switch did the host re-host range 2 at the descriptor's span (D-107 §4).
+
+No fold saw it. Every traced descriptor is right, and check 8 folds descriptor spans, not
+engine switches. D-083's read-back skipped exactly this install too: `state_of` found no
+descriptor, because the host inserts it at `Switched`, so no `RaftSnapshotState` was traced.
+
+**What it did.** On S10's scenario linearizability fails on seeds 41, 119, 447, 466, 782, 793
+and 865 of 1 000. On seed 41, at 4.243 s, node 2's install of range 2 rewrites the table
+holding range 19's keys without its user keys, and node 2 later leads 19's right half 21 and
+serves `k15` as `None`. `reseed::run_after_split` reached the same order, but its right half
+held no user keys and the run checked no data, so nothing was seen.
+
+### 1. The switch, and the plan
+
+**What is built** (`crates/ananke-shard/src/install.rs`, `server.rs`).
+
+- `switched_spans`, a free function for the reason `admission` is one, decides what a switch
+  replaces. A replica whose descriptor the host holds replaces what the plan hosts it at, which
+  is that descriptor's span, as before. A replica with none replaces its Raft interval and
+  the snapshot's span: the same spans as `install_placeholder`.
+- `Task::finish` calls it after admission, so a span is known (`admission` fails closed on a
+  snapshot naming none), and switches those spans.
+- **Straight after the switch the task re-hosts the range there**, as `install_placeholder`
+  does. The host's comparison at `Switched` (D-107 §4) keeps its other case, an initialised
+  replica whose install moved its span, and loses this one: `hosted_at` no longer falls back
+  on configuration's span, and a replica with no descriptor before the switch pushes no
+  `SnapJob::Host`. Without the re-host a replica's next install is an initialised one's, and
+  it would replace what the plan still holds.
+
+An install that leaves a span-less replica at configuration's span, every install on a tree
+that has not split it, switches what it switched and hosts what it hosted.
+
+### 2. The creation's read-back (D-083)
+
+`read_back` takes its span from its caller. `finish` passes the host's descriptor's span where
+there is one and the streamed descriptor's where there is none, so a creation traces
+`RaftSnapshotState` at its switch like every other install, immediately before its
+`RaftSnapshot`, at one instant (D-091's fourth arm, D-097's silence).
+`install_placeholder` passes the descriptor it read. An initialised replica's install reads
+what it read, so the read's cost and its schedule there are unchanged. The read is the
+snapshot's span, not configuration's: if the right half's install landed first, its keys are no
+part of what P's take held.
+
+`reseed::run_after_split` now holds the pairing: `AfterSplit::state_read_back_is_the_takes`
+compares what `x` read back of P's and R's installs with the take of the same `(range,
+last_index, last_term)` on another server, keys and digest.
+
+### 3. Check 8's install clause
+
+**What is built** (`invariants::OneOwnerPerKey`, `Fold::InstallSpan`). A descriptor says what a
+replica claims and a switch what it removes, so the overlap clause holds with every descriptor
+right and another replica's keys gone. The new clause folds the engine's own `SpanInstalled`
+against check 8's per-node span map: **a keyspace span an install replaced overlaps no span the
+node holds of a replica other than the one installed**. The replica installed is named by the
+Raft keys among the spans, read by the layout `KeyPrefix::group` writes: its Raft interval on
+an install, and one-key spans of P's Raft state on a split's non-voter's step
+(`RaftStore::apply_removing`, D-107 §1), which removes the right span and is no other replica's
+business. A crash and a refusal forget the node's spans, as they do for the overlap clause.
+
+- **It reads the engine and not the plan**, so no error in how spans are chosen in the shard
+  crate can get past it.
+- **In `Fold::ALL` and `Fold::VERDICT`, after the overlap clause.** No violation another fold
+  reports moves to it. A `SnapshotOverlapsReplica` install trips it at `SpanInstalled` and the
+  overlap clause at the `RangeCreated` after; the verdict still names the overlap clause.
+- It runs under the per-fold equivalence test on the correct node and under every pair, and in
+  violation on `reseed::run_after_split` under its variant (section 4).
+- Two unit tests build its shapes by hand: the switch that overlaps, and what is not one (the
+  snapshot's own span, another node, a crash, a refusal, a range's own span, a non-voter's step);
+  and its place after the overlap clause.
+
+### 4. `NodeVariant::InstallReplacesHostedSpan`, the pair
+
+The switch replaces what the plan hosts on a replica with no descriptor too: the tree before
+this entry, its re-host kept. It is the node's, at **bit 49**, since it breaks the `snapshot`
+task's handling of the plan, and a sibling of `InstallWrongRangesSpans`; it is not one of §10's.
+Bit 25 is free on `main` as well, and #176 proposes it for `TasksOnTheRefusedDir`, so it is left
+alone; bits 50 to 53 stay free.
+
+| on `reseed::run_after_split`, seeds 0 to 199, release | the variant | the correct node |
+|---|---|---|
+| the right half's install lands before P's | 66 of 200 | 66 of 200, the same seeds |
+| the right half's keys gone from `x`'s disk | **66 of 200**, those seeds | **0 of 200** |
+| check 8's install clause | trips on those 66 | green on all 200 |
+| check 8's overlap clause, check 7 | green on all 200 | green on all 200 |
+
+The rate is 33 %, so its catch is asserted at every tier (D-061), by
+`a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so`.
+It asserts more than a catch: on every seed the three go together, the order, the keys and the
+clause, and the keys' message names the order. At the gate's twenty the seeds are 3, 11, 14, 15
+and 17. The directed test (section 5) catches it on its one shape every time. The per-fold
+equivalence test compares it on the same run at every tier:
+`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span`,
+38 of 100 in violation, the clause alone of the folds that stop a run.
+
+### 5. What says so
+
+**`reseed::run_after_split` reads the data.** Item 4 of what this entry was asked for. A second
+writer, `right_writer`, puts 100 keys of the right half's span, `k1-0001` onwards, each once, 40 ms
+apart, so they span the split and `x`'s crash and no later write can put one back. It asks P and
+follows `RangeMismatch` to the right half. When the run is over, with the trace already taken,
+`x` is crashed and its engine opened and scanned (`keys_on_disk`). `AfterSplit::right_keys_survive`
+holds every key a replica applied below the split or at or below `x`'s install's floor to be
+there, and fails a run whose install owed the span nothing. So the writer moves every schedule of
+this run, and only this run; every other assertion on it holds.
+
+| | the tree before this entry, with the writer | this entry |
+|---|---|---|
+| `a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first`, 20 seeds, release | fails, seeds 3, 11, 14, 15 and 17 | passes |
+| the same, the cap's 200 | **fails on 66 of 200**: 3, 11, 14, 15, 17, 22, 25, 26, 29, 30, 31, 39, 40, 44, 46, 50, 52, 54, 55, 59, 61, 65, 66, 67, 69, 70, 71, 72, 73, 75, 80, 81, 83, 91, 96, 97, 98, 99, 101, 102, 103, 104, 106, 107, 109, 113, 123, 125, 129, 130, 132, 136, 143, 144, 150, 153, 158, 162, 170, 172, 174, 175, 180, 183, 189 and 194 | **passes on 200 of 200**; the right half's install lands first on those same 66 |
+| seed 3 | "node 3 lost 14 of the 14 keys its install of the right half owes its span (the right half installed before P), first `k1-0001`: its engine holds 5 keys of the span" | holds them |
+
+The writer's keys raised the order's rate from about a quarter to a third.
+
+**Directed, through the task** (`install.rs`):
+`an_install_onto_a_replica_with_no_descriptor_replaces_the_snapshots_span_alone`, on the correct
+node and under the variant: the switch's spans as `SpanInstalled` names them, R9's key kept or
+gone, the plan hosting the snapshot's span from the switch, the state read back with one key
+though the host holds no descriptor, and check 8's two clauses over the same trace.
+`an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of` holds
+`switched_spans` on its four inputs.
+
+**On S10's scenario.** `sim/shard.rs` is not on `main`, and is not in this PR. Applied from
+`phase-3-stage-c-shard-sim` (f3977a5) to a scratch copy of this tree, in release:
+
+| | the tree before this entry, as D-113 measured it at f3977a5 | this entry |
+|---|---|---|
+| seeds 41, 119, 447, 466, 782, 793 and 865 | linearizability fails on all seven | **the verdict is green on all seven**, and the install clause |
+| linearizability failures over the thousand | 7 | **0** |
+| an install replacing another initialised replica's keys, over the thousand | 151 (D-113's probe) | **0** (check 8's install clause) |
+| under `InstallReplacesHostedSpan`, over the thousand | | the install clause trips on 150, the seven among them; each is the run's verdict |
+| the verdict over the thousand | 21 fail | 11 fail, every one D-113's (b) or (c) |
+
+The 11 are not this entry's. Seed 986 is D-113's (b), `READS_OUTSTANDING` on a leader that can no
+longer confirm a read. Seeds 217, 253, 281, 309, 329, 361, 376, 465, 657 and 769 are its (c),
+"no client write completed after the last heal", and each has two nodes refused. Which seeds show
+them moved, because the read-back and the narrower switch move every re-seeded seed's schedule:
+128 and 643 no longer show (b), for one. Neither mechanism is touched here.
+
+So S10's seed 41 pin is left for S10, which holds the shape's trace.
+
+### 6. Not taken: hosting a span-less replica at its Raft interval alone
+
+The other half of what D-113 recommended, `run`'s plan hosting a replica with no descriptor at
+its Raft interval until its install names a span. Alone, it fails closed: the switch's spans no
+longer cover the source's user keys, the engine refuses it, the stream starts over, and on seeds
+41 and 793 of S10's scenario the re-seeded range never comes back (the verifier's measurement).
+Beside this entry's fix it changes nothing a correct node does: `switched_spans` does not read
+what the plan hosts for such a replica, and the task re-hosts it at the switch. All it would do
+is turn `InstallReplacesHostedSpan` from the bug this entry fixes into a liveness failure, losing
+the pair. So it is not built. `run`'s comment says what the copy is still read for.
+
+### 7. What moves
+
+To come in this slice's next commit.
+
+### 8. Plants
+
+Each applied alone to this tree, at the gate's twenty seeds, in debug, and reverted:
+
+To come in this slice's next commit.
+
+### 9. What is not here
+
+- **D-113's (b) and (c)**, S10's and the owner's, as above. S10's pin of seed 41 is S10's, on the
+  scenario that makes it.
+- **#175 and #178**, the owner's, unchanged.
+- **A window the correction does not close, argued and not reached.** An initialised replica
+  replaces `install.spans`, the plan's copy at the stream's last chunk. A split of P whose apply
+  job was queued before the hold can land between that chunk and `finish` (D-083's reason for
+  the re-check there): R is created over `[cut, end)`, the post-split snapshot passes admission,
+  and the switch replaces the stale `[start, end)`, R's keys with it. It needs a split's apply
+  to land inside that window, on a follower far enough behind to be streamed. Check 8's install
+  clause would name it: it trips on no seed of the correct node's sweep or of S10's thousand
+  (section 7). Reading the span from the host's descriptors at the switch would close it. It
+  is a change for an initialised replica, which this correction leaves alone, so it is a
+  candidate for an issue of its own.
+- **A replica with no descriptor applying the log.** "One without is checked against nothing"
+  (the apply check, D-097), so a re-seeded user range that replays its log from index 1 with a
+  right half beside it would write that right half's keys, the overlap rule's first concern by
+  another road. Measured over S10's thousand: such a replica applies a keyed entry on **0** seeds,
+  since every user range re-seeded there is behind a compacted prefix. Not reached; beside #175,
+  and a candidate for the same issue.
+
+### 10. The nightly's rows (D-064)
+
+Three rows and two re-weighed, from the built release binaries at `ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100`, three runs each, medians of user + sys, with other slices' builds beside
+them (load averages 350 to 960, so the figures are if anything high). New, longest first into the
+lightest shard: `reseed` `a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first`
+at 38.3, shard 1 at 1977.1 -> 2015.4; `reseed`
+`a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so` at 31.8,
+shard 5 at 1981.0 -> 2012.8; `node`
+`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span` at
+18.4, shard 5 again, -> 2031.2. Re-weighed in place, since the run now carries a second writer and
+a read of the disk at its end: the quarantine row 27.8 -> 36.9, and D-115's row 34.7 -> 35.2, shard
+6 at 2202.8 -> 2212.4. The `reseed` rows run the binary's `TIER_CAP` of 200.
+
+### 11. For the owner (PROPOSED)
+
+The outcome is settled by the documents, as above, so what is the owner's is the shape:
+
+1. The install clause as a clause of check 8 rather than a fold of its own. It reads check 8's
+   map and answers check 8's question, one owner per key on a node, for what a switch does
+   rather than what a descriptor says. §8 and §12 are amended.
+2. Its place in the verdict, after the overlap clause.
+3. The variant in the node's set rather than as a range-layer instrument, since it breaks the
+   `snapshot` task's use of its plan as `InstallWrongRangesSpans` does.
+4. The hosting at the Raft interval not taken (section 6).
+
+---
+
+_Next entry: D-129. Add one before implementing anything not covered above._
