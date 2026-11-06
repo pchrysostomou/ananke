@@ -83,6 +83,140 @@ fn on_node<T: Send + 'static>(
     out.lock().unwrap().take().expect("the task finished")
 }
 
+/// The one-group server's side of D-129's refusal: a leader whose two followers' answers
+/// echo 0 answers a read `NotLeader` **naming nobody**, as a server that knows no leader
+/// does. A client that follows hints retries a named server with no sleep (`sim/raft.rs`,
+/// its reader and writer alike), so naming itself would turn each refused read into a
+/// flood of them at the one server that will keep refusing. The two followers are written
+/// here by hand, since the frames are all this test is about: they grant what they are
+/// asked and answer every AppendEntries as a quarantined server does. A write in the same
+/// state commits through them, which is the asymmetry D-035 decides.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_one_group_leader_answers_a_read_it_can_never_confirm_naming_nobody() {
+    let mut sim = Sim::new(SimConfig::new(11));
+    let server = sim.add_node();
+    let followers: Vec<NodeId> = (0..2).map(|_| sim.add_node()).collect();
+    let client = sim.add_node();
+    spawn_server(&sim, server, node_config(1, &[1, 2, 3]));
+    for (at, &node) in followers.iter().enumerate() {
+        let id = at as u64 + 2;
+        let env = sim.env(node);
+        let inner = env.clone();
+        env.spawn("quarantined", async move {
+            let sock = inner.net().bind(addr(id)).await.unwrap();
+            let mut log_end = 0;
+            loop {
+                let (_, bytes) = sock.recv().await.unwrap();
+                let Ok(frame) = Frame::decode(bytes) else {
+                    continue;
+                };
+                let answer = match frame.message {
+                    Message::PreVote { term, .. } => Message::PreVoteResponse {
+                        term,
+                        granted: true,
+                    },
+                    Message::RequestVote { term, .. } => Message::RequestVoteResponse {
+                        term,
+                        granted: true,
+                    },
+                    Message::AppendEntries {
+                        term,
+                        prev_index,
+                        entries,
+                        ..
+                    } => {
+                        log_end = (prev_index + entries.len() as u64).max(log_end);
+                        Message::AppendEntriesResponse {
+                            term,
+                            success: true,
+                            prev_index,
+                            match_index: prev_index + entries.len() as u64,
+                            hint: 0,
+                            echo: 0,
+                            local: 1,
+                            incarnation: 2,
+                            refused: false,
+                        }
+                    }
+                    _ => continue,
+                };
+                let frame = Frame {
+                    from: ServerId(id),
+                    message: answer,
+                };
+                let _ = sock.send(addr(1), frame.encode()).await;
+            }
+        });
+    }
+    sim.run_for(Duration::from_millis(500));
+    let replies = on_node(&mut sim, client, |env| {
+        Box::pin(async move {
+            let sock = env.net().bind(addr(9)).await.unwrap();
+            let mut replies = Vec::new();
+            for (seq, command) in [
+                Command::Get {
+                    key: Bytes::from_static(b"k"),
+                },
+                Command::Put {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                },
+                Command::Get {
+                    key: Bytes::from_static(b"k"),
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = Request {
+                    client: 1,
+                    seq: seq as u64,
+                    command,
+                };
+                sock.send(addr(1), request.encode()).await.unwrap();
+                loop {
+                    let (_, bytes) = sock.recv().await.unwrap();
+                    let response = Response::decode(bytes).unwrap();
+                    if response.seq == seq as u64 {
+                        replies.push(response.reply);
+                        break;
+                    }
+                }
+            }
+            replies
+        })
+    });
+    assert_eq!(
+        replies,
+        vec![
+            Reply::NotLeader { leader: None },
+            Reply::Outcome(Outcome::Done),
+            Reply::NotLeader { leader: None },
+        ],
+        "both reads refused naming nobody, the write between them committed"
+    );
+    let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::RaftReadRefused { server: 1, .. }))
+            .count(),
+        2
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TraceEvent::RaftReadsConfirmable {
+                server: 1,
+                confirmable: false,
+                ..
+            }
+        )),
+        "the state is traced"
+    );
+}
+
 #[test]
 fn three_servers_elect_a_leader_and_a_clients_write_is_applied_on_every_server() {
     let mut sim = Sim::new(SimConfig::new(3));

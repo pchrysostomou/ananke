@@ -18,9 +18,12 @@
 //! - a re-seeded node's right half, which configuration never names, comes back through
 //!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2);
 //! - the same run's install of the parent is created at the split's generation, and
-//!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115).
+//!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115);
+//! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
+//!   on committing, and the leader as it was is caught by the read bound
+//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
 
-use ananke_raft::core::Variants;
+use ananke_raft::core::{Variant, Variants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::reseed::{self, Report};
 use ananke_sim::{seeds, sweep, verdict};
@@ -379,4 +382,135 @@ fn a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_
     });
     verdict(&verdicts)
         .expect("a re-seed after a split creates P at the split's generation on every seed");
+}
+
+/// The figures the two halves of D-129's pair print.
+fn unconfirmable_figures(what: &str, run: u64, reports: &[(u64, u64, u64, usize)]) {
+    let most = reports.iter().map(|(_, o, _, _)| *o).max().unwrap_or(0);
+    let refused: usize = reports.iter().map(|(_, _, _, r)| *r).sum();
+    let dropped: u64 = reports.iter().map(|(_, _, d, _)| *d).sum();
+    let least_refused = reports.iter().map(|(_, _, _, r)| *r).min().unwrap_or(0);
+    println!(
+        "{what}: over {run} seeds a replica held at most {most} registered reads; the leader \
+         refused {refused} reads (at least {least_refused} on a seed) and dropped {dropped}"
+    );
+}
+
+/// A leader that can confirm no read refuses it, and goes on committing (the owner's ruling
+/// in D-129, amending D-035's consequences): `reseed::run_unconfirmable_reads`, on every
+/// seed of the tier.
+///
+/// The run holds a leader with both followers re-seeded and quarantined and two clients
+/// reading. The state is asserted reached and then each thing the ruling asks of it: reads
+/// refused, the reads waiting on the second follower dropped at its first answer, what the
+/// replica holds bounded, none confirmed there, writes committing the whole time. The state
+/// is built on every seed and each clause holds there by construction, so it is asserted at
+/// every tier (D-061), and the run is capped as this binary's are (`TIER_CAP`).
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_leader_that_can_confirm_no_read_refuses_it_and_goes_on_committing() {
+    let run = shape_seeds();
+    tier("a leader that can confirm no read", run);
+    let results = sweep(run, |seed| {
+        let report = reseed::run_unconfirmable_reads(seed, Variants::default());
+        let verdict = report
+            .check()
+            .and_then(|()| report.reached())
+            .and_then(|()| report.refused_and_committing());
+        let figures = (
+            seed,
+            report.outstanding(),
+            report.dropped(),
+            report.refused_from(0),
+        );
+        (verdict, figures)
+    });
+    let figures: Vec<(u64, u64, u64, usize)> = results.iter().map(|(_, f)| *f).collect();
+    unconfirmable_figures("the correct leader", run, &figures);
+    let verdicts: Vec<Result<(), String>> = results.into_iter().map(|(v, _)| v).collect();
+    verdict(&verdicts).expect("the correct leader refuses what it can never confirm");
+}
+
+/// The buggy half: the leader as it was, on the correct half's first seeds. It reaches the
+/// same state, keeps every read it can never confirm, and passes `READS_OUTSTANDING`, the
+/// bound that stays at 38 and is what the sweep tripped on (S10's seeds 128 and 643). Caught
+/// on every seed by that bound and nothing else, so asserted at every tier (D-061), on
+/// [`HIGH_RATE_SHARE`] seeds as this binary's other high-rate variants are.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound() {
+    let run = HIGH_RATE_SHARE;
+    tier("a leader that keeps the reads it can never confirm", run);
+    let results = sweep(run, |seed| {
+        let report = reseed::run_unconfirmable_reads(seed, Variant::UnconfirmableReadKept);
+        let verdict =
+            report
+                .reached()
+                .and_then(|()| match (report.over_the_bound(), report.check()) {
+                    (Some(_), Err(violation)) if violation.contains("registered reads") => Ok(()),
+                    (bound, check) => Err(format!(
+                        "seed {seed}: the run reached the state, and the bound did not catch the \
+                     read it kept: bound {bound:?}, check {check:?}"
+                    )),
+                });
+        let verdict = verdict.and_then(|()| {
+            if report.refused_from(0) == 0 && report.dropped() == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "seed {seed}: the variant refused {} reads and dropped {}: it is not the \
+                     leader as it was",
+                    report.refused_from(0),
+                    report.dropped()
+                ))
+            }
+        });
+        (
+            verdict,
+            (
+                seed,
+                report.outstanding(),
+                report.dropped(),
+                report.refused_from(0),
+            ),
+        )
+    });
+    let figures: Vec<(u64, u64, u64, usize)> = results.iter().map(|(_, f)| *f).collect();
+    unconfirmable_figures("UnconfirmableReadKept", run, &figures);
+    let caught = results.iter().filter(|(v, _)| v.is_ok()).count();
+    println!("UnconfirmableReadKept: caught by the bound on {caught} of {run} seeds");
+    let verdicts: Vec<Result<(), String>> = results.into_iter().map(|(v, _)| v).collect();
+    verdict(&verdicts).expect("the leader as it was is caught by the bound on every seed");
+}
+
+/// How a refused follower counts, the one thing the verifiers read differently (PROPOSED
+/// D-129 §2): the same as a quarantined one, since the mark is no promise of a later
+/// confirmation and a stream can stall for as long as the leader's other follower keeps it
+/// in office. So the second follower's stream is lost for good here, it stays refused, and
+/// the correct leader refuses reads and commits on exactly as in the state's other shape.
+/// With "echo 0 and no refused mark" this run trips the bound on the correct system: the
+/// entry has the rate. On [`HIGH_RATE_SHARE`] seeds, since the state is built on each.
+// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
+#[test]
+fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {
+    let run = HIGH_RATE_SHARE;
+    tier("a refused follower whose stream stalls", run);
+    let results = sweep(run, |seed| {
+        let report = reseed::run_unconfirmable_reads_stalled(seed);
+        let verdict = report
+            .check()
+            .and_then(|()| report.reached())
+            .and_then(|()| report.refused_and_committing());
+        let figures = (
+            seed,
+            report.outstanding(),
+            report.dropped(),
+            report.refused_from(0),
+        );
+        (verdict, figures)
+    });
+    let figures: Vec<(u64, u64, u64, usize)> = results.iter().map(|(_, f)| *f).collect();
+    unconfirmable_figures("a stalled refused follower", run, &figures);
+    let verdicts: Vec<Result<(), String>> = results.into_iter().map(|(v, _)| v).collect();
+    verdict(&verdicts).expect("a refused follower that stays refused counts as unable");
 }

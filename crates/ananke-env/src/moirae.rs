@@ -36,6 +36,7 @@
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
 //! | `RaftReplicaRefused`                     | `log` `ananke.raft.replica-refused`           |
 //! | `RaftReadsOutstanding`                     | `log` `ananke.raft.reads-outstanding`           |
+//! | `RaftReadsConfirmable` / `RaftReadRefused` | `log` `ananke.raft.reads-confirmable` / `.read-refused` |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
@@ -1041,6 +1042,38 @@ fn convert(
                 ("server", int(*server)),
                 ("range", int(*range)),
                 ("outstanding", int(*outstanding)),
+            ])),
+        ),
+        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        TraceEvent::RaftReadsConfirmable {
+            server,
+            range,
+            term,
+            confirmable,
+            follower,
+            dropped,
+        } => log(
+            "ananke.raft.reads-confirmable",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("term", int(*term)),
+                ("confirmable", Json::Bool(*confirmable)),
+                ("follower", int(*follower)),
+                ("dropped", int(*dropped)),
+            ])),
+        ),
+        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        TraceEvent::RaftReadRefused {
+            server,
+            range,
+            term,
+        } => log(
+            "ananke.raft.read-refused",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("term", int(*term)),
             ])),
         ),
         TraceEvent::RaftServerFailed { server, reason } => log(

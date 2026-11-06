@@ -777,7 +777,9 @@ rejection with a hint of 1, an echo of zero and store incarnation 0. The hint mo
 leader's `next` for it to 1, which feeds it the snapshot once the log is compacted and
 otherwise draws the previous-index-0 rejection that designates it (D-037). Its answers
 count for nothing in a lease or read-index round, as a zero echo does, and for check
-quorum only as D-049 counts a refused server's (Q22). A placeholder on a node whose P
+quorum only as D-049 counts a refused server's (Q22). A leader counts it as unable to
+confirm a read until an install's answer and an echo say otherwise (RAFT.md §1, PROPOSED
+D-129). A placeholder on a node whose P
 still covers its span has its install refused by the overlap rule until P moves on, so
 such an answer can start streams that are refused; that cost is accepted with Q22.
 

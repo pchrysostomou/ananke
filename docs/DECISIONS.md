@@ -1563,6 +1563,14 @@ any later install carries it forward, and the repair tombstones the key
 otherwise so the leader's own tenant 0 cannot quarantine a receiver. Every
 affected site is marked `D-035`.
 
+**Amended by D-129 (the owner's ruling, 2026-11-06).** The entry says what a re-seeded
+server's acks count for and not what a leader does with a read they can never confirm. With
+two of three quarantined the leader commits, keeps its office under check quorum, can never
+be replaced, and confirms no read: S10's sweep found its registered reads rising until
+`READS_OUTSTANDING` tripped. Such a leader now refuses those reads and drops the pending ones;
+the bound stays at 38. The arithmetic above and the asymmetry it decides stand: a quarantined
+ack still counts for commits and not for read-index.
+
 ---
 
 ## D-036 — The snapshot's metadata is made exact by taking it in the apply task
@@ -23463,4 +23471,154 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## D-129 — A leader refuses a read it can never confirm, and drops the ones it holds; READS_OUTSTANDING stays 38
+
+**The number.** Reserved for this slice in #162 (D-116 to D-128 are other slices' and not yet
+merged); off `main` at de9f4d7, whose footer reads D-116. The footer here moves to D-130, and
+at the merges the entries are a union in numerical order with one footer, the highest plus
+one. Every code site carries `// PROPOSED(D-129)`.
+
+**The owner's ruling (2026-11-06).** The leader **refuses** reads it can never confirm, and
+`READS_OUTSTANDING` stays at 38, unchanged in meaning. That is the owner's and amends D-035's
+consequences; everything below marked PROPOSED is how this slice carried it out.
+
+**Context.** S10's sweep (#188, D-113 §2 (b)), reproduced by two independent verifiers. On
+seed 128 node 1 leads range 2, and nodes 2 and 3 are refused and installed quarantined. A
+quarantined replica echoes 0 (`core.rs`: `echo = if self.quarantined { 0 } else { sent }`) and
+so does a refused one, and `on_append_entries_response` adds an ack to a pending read only `if
+echo != 0`, so `serve_reads` never reaches a majority. Writes still commit: `maybe_commit`
+counts every voter's `matched`, and check quorum counts these followers as active. So the leader
+stays in office for good and no election can succeed (D-035). Its registrations only rise, about
+eight to ten a second: 39 at 7.41 s, where the node fails itself on `READS_OUTSTANDING`. Seed 643
+is the same on a right half. Retries (#125) are not the main driver. Most are fresh gets after
+the client's operation timeout, so the growth is linear in time and no bound holds it. D-035 and
+RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with such a read.
+
+**Decision.**
+
+1. *The per-follower state.* `Progress::echoed_zero`: the follower's latest AppendEntries answer
+   echoed 0, from a server that answered. It is set on such an answer, cleared on an answer with
+   any other echo, and forgotten at a new store incarnation (D-042), at the same place as
+   `match_started` and whether or not the leader's variant resets its progress, so a store an
+   operator replaces can confirm again. Taking office starts every follower clear. A crashed,
+   partitioned or silent follower keeps what it last said, so one that has not said it counts as
+   **able**: that transient is what D-076's measured figure covers.
+2. *A refused follower counts as a quarantined one* (**PROPOSED**; the verifiers read this two
+   ways, "last answer echoed 0" and "echo 0 and no refused mark"). It takes the first. See
+   "How a refused follower counts" below.
+3. *The rule.* `Raft::can_confirm(acks)`: the leader, the followers able to confirm and the
+   read's own acknowledgements form a majority of every voter set in force, counted per set
+   while a change is joint, by `Configuration::has_majority`, the same call `serve_reads` makes,
+   so a leader outside `C_new` counts nothing for itself there.
+4. *The refusal.* With no lease holding and `can_confirm(&[])` false, `on_read` answers
+   `Output::Rejected { leader: None }` and registers nothing. The node takes the registration
+   back through the path it already has (`Replica::refuse`, D-076 point 10). Its client is not
+   answered at the step, as for any refused read on the node. The one-group server answers
+   `NotLeader { leader: None }`. Naming itself would make `sim/raft.rs`'s client retry the same
+   server with no sleep (`ananke-raft`'s `node.rs`, where a read's `Rejected` is answered).
+   A lease read is confirmed by promises already made and is served: the ruling is about reads
+   no round can confirm (**PROPOSED** reading).
+5. *The drop.* As soon as an answer shows the state, `note_reads_confirmable` drops every pending
+   read no round can now confirm, `Output::ReadDropped`, which both servers answer `NotLeader`
+   naming nobody. Otherwise the reads registered between the second follower's crash and its
+   first quarantined answer wait for ever (seed 128: about seven). Not every pending read goes
+   (**PROPOSED**): a read a lease or a majority confirmed waits only for its state, and one whose
+   acknowledgements still make a majority with those able was acknowledged while this leader
+   could confirm it, and needs only the no-op's commit. So this is not `drop_reads`, which drops
+   them all because the server stopped leading.
+6. *The trace* (**PROPOSED**; CLAUDE.md, every transition that matters). `RaftReadsConfirmable {
+   confirmable, follower, dropped }`, at an answer that changed sides or dropped a read, and
+   `RaftReadRefused` per refusal, which is all a client of the node sees of it. Both appear only
+   in the state, so a run that never reaches it traces what it traced.
+7. *The bound.* `READS_OUTSTANDING` stays 38. Its failure message no longer presumes the
+   refused-read leak: "nothing is answering or refusing them, whether a registration was left
+   behind or the core is holding reads it cannot confirm". "registered reads" stays in it, which
+   the sweeps' attribution reads.
+8. *The variant* (**PROPOSED**): `Variant::UnconfirmableReadKept`, bit 17 of the core's set, the
+   next free one: the rule is the core's, so it is not one of `NodeVariant`'s (#176 proposes bit
+   25 there) or `RangeVariant`'s (D-128 is adding one). No open branch touches the core's bits.
+   It keeps the flag and the trace of the state and removes the refusal and the drop.
+
+**How a refused follower counts.** A refused server answers hint 1, echo 0, the mark, and takes a
+re-seed that leaves it quarantined for good (RAFT.md §3). Nothing it can become on that store ever
+confirms a read, so it is as unable as a quarantined one, and only the mark tells them apart.
+"Echo 0 and no refused mark" would count it as able through its whole re-seed.
+
+D-049 makes the difference bite. Check quorum counts a refused follower only beside re-seed progress,
+but the leader's other follower, quarantined with the log in it, is enough on its own. So a leader
+beside one quarantined and one refused follower keeps its office however its stream to the refused
+one goes. With the stream stalled for good (a path-MTU black
+hole, as `sim/quorum.rs` blocks one), the other reading counts the refused follower as able for
+ever, the reads wait, and the bound trips on the correct system. Measured on that run, at twenty seeds
+in release: under the other reading the node fails on **20 of 20**, "range 2 holds 39 registered reads";
+under the rule taken it passes 20 of 20, holding at most 9. That run is now a test,
+`a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm`.
+
+The seeds alone do not separate them: 128 and 643 clear the bound under both, since their re-seeds
+complete. Seed 128 goes through both states and shows the cost: under the rule taken the state
+shows at 3.322 s with 3 reads dropped and at most 3 held, and under the other at 3.493 s with 6 and
+6. Seed 643: 3 held at 5.611 s against 10 at 5.834 s (7 and 10 at most).
+
+A placeholder answers the same bytes (D-109), and it is the one such answer that can later confirm:
+an install on a node that was not re-seeded makes an ordinary replica. It is counted as unable until
+the install's answer and the next echo say otherwise, so a leader needing placeholders for a majority
+refuses reads meanwhile, where the other reading would hold them until the install. Such a leader
+cannot commit through them either. The client's cost is one retry; the other reading's cost is the
+failure above.
+
+**Alternatives.** Each is the owner's to reopen; neither is built.
+
+- *A relaxed read rule: count a quarantined ack for read-index.* The alternative the owner did not
+  take, left as a question. A read-index round proves that a majority still recognised this leader
+  when the read arrived, so no newer leader can have committed past the read index. The obstacle is
+  D-035's own: the state a quarantined server lost may have included a vote. Say it voted for N at
+  term 5, then lost its store and was re-seeded by the old leader L, still at term 4 and cut off
+  from N. It acknowledges L, and L counts itself and it as a majority while N commits. Any relaxed
+  rule has to answer that, and today none is sound on the echo alone.
+- *Leader-side read expiry.* A leader could also drop a read it has held for some time, whoever it
+  is waiting on. That would also bound the case below, and it would add a clock to a rule that is
+  otherwise a function of answers. Left as a question.
+- *Stepping down.* It would give up the writes D-035 keeps, and with two of three quarantined nothing
+  could lead afterwards.
+- *Counting such seeds apart in the sweep, or widening the bound.* Hides a leader holding reads it
+  cannot answer. CLAUDE.md does not let a bound be widened for this.
+
+**Consequences.**
+
+- *What it costs.* A range with two of three quarantined serves no read but a lease's until an operator
+  replaces a store or changes the membership, and it was already serving none. It now says so, the
+  one-group client at once and the node's client by its timeout, and the node keeps no state for it.
+- *What stays open.* A follower that is silent counts as able, as ruled. A leader beside one
+  quarantined follower and one that stays silent commits, keeps its office and registers reads for
+  as long as the silence lasts. So the bound can still trip on a correct system if a silence outlasts
+  what D-076 measured over: about four seconds at the rate seed 128's clients read. S10's sweep does not reach it on a thousand
+  seeds (below). That is what the read-expiry question would answer, and the bound stays the oracle for it.
+- *`refused` reads on the node are still not answered at the step* (D-076's "next slice's first job"),
+  so the node's client waits out its timeout on each. It is not touched here: answering moves every
+  schedule that reaches it.
+
+**The pair** (CLAUDE.md, D-061). `reseed::run_unconfirmable_reads`: the three servers of the re-seed
+shape, a writer and two readers of one range. Each follower is lost in turn as the shape loses one,
+so what the leader goes on committing with is a quarantined replica. The second is down for 300 ms,
+through which reads wait on its silence. The run holds the state for four seconds. S10's scenario is
+not on `main` yet, so this is what reaches the state here. Asserted per seed: the state reached,
+its leader still leading at the end, and both followers re-seeded into counting; reads refused,
+reads dropped, what the replica holds within its figure, no read confirmed by a round in the hold,
+and writes committing throughout. The figures are owed by the next commit.
+
+**Phase 2 (the frozen one-group server shares this core).** Owed by the next commit.
+
+**S10's seeds, on a scratch copy of `sim/shard.rs` at f3977a5.** Over a thousand seeds in release: the
+read bound trips on none, and the most any replica held is 12. The state is reached on 14 seeds, reads
+refused on 12 and dropped on 9. Seed 643 passes. Seed 128 lands in S10's own finding (c), "liveness: no
+client write completed after the last heal", beside (c)'s twelve, which are S10's to fix. The seven of
+finding (a), D-128's, stand as they were. Nothing new fails.
+
+**The plants.** Owed by the next commit.
+
+**The nightly's rows (D-064).** Three `reseed` rows at provisional weights, read off a twenty-seed run in
+release; weighed properly in the next commit.
+
+---
+
+_Next entry: D-130. Add one before implementing anything not covered above._
