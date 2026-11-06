@@ -942,9 +942,9 @@ impl<E: Environment> ServerHost<E> {
     // PROPOSED(D-083): the replica a switch builds replaces the one it replaced.
     //
     // `descriptor` is the one the switch put in place, read back from the store, and
-    // `changed` the same when it differs from the one the replica held before: an
-    // install creates a replica with the snapshot's descriptor and changes an
-    // initialised one's to it (SHARD.md §8; PROPOSED D-107).
+    // `before` the one the replica held: an install creates a replica that held none
+    // with the snapshot's descriptor, and changes an initialised one's to it where the
+    // two differ (SHARD.md §8; PROPOSED D-107, D-116).
     fn installed(
         &self,
         range: RangeId,
@@ -952,8 +952,9 @@ impl<E: Environment> ServerHost<E> {
         at: &Identity,
         config: &Configuration,
         descriptor: Option<&RangeDescriptor>,
-        changed: Option<&RangeDescriptor>,
+        before: Option<&RangeDescriptor>,
     ) -> Option<Raft> {
+        let changed = descriptor.filter(|descriptor| before != Some(*descriptor));
         // The switched range's span: its descriptor as the host holds it, which a
         // split's right half has and configuration never names (PROPOSED D-100), and
         // for a replica without one — a re-seed's, before its install — the hosted
@@ -973,7 +974,14 @@ impl<E: Environment> ServerHost<E> {
         // range — is a creation, and §8 wants it traced with its cause. On a node whose
         // ranges are fixed at bootstrap this is the re-seed's case: a fresh engine
         // whose replicas are built by the streams that fill it (Q15).
-        let created = core.applied() == 0 && core.last_index() == 0 && core.snapshot() == (0, 0);
+        // PROPOSED(D-116): a replica that held a descriptor is initialised, whatever it
+        // has applied.
+        let created = install_creates(
+            before.is_some(),
+            core.applied(),
+            core.last_index(),
+            core.snapshot(),
+        );
         // Q13, D-057: the replica draws its election timeout from its own range's
         // stream, as the one this start built did.
         let seed = self.env.range_rng(range.get()).next_u64();
@@ -1677,10 +1685,14 @@ impl<E: Environment> Host for ServerHost<E> {
                         ],
                     });
                 }
-                let changed = descriptor
-                    .as_deref()
-                    .filter(|descriptor| before.as_ref() != Some(*descriptor));
-                match self.installed(*range, core, at, config, descriptor.as_deref(), changed) {
+                match self.installed(
+                    *range,
+                    core,
+                    at,
+                    config,
+                    descriptor.as_deref(),
+                    before.as_ref(),
+                ) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => CoreWork::Release,
                 }
@@ -4186,6 +4198,19 @@ fn restate<E: Environment>(
     });
 }
 
+/// Whether an install creates the replica it fills (`RangeCreated { cause: snapshot }`):
+/// SHARD.md §8's "an install on a node that held no initialised replica of the range". An
+/// empty replica with no descriptor is such a one, a re-seed's user range before its
+/// install. An empty replica that holds a descriptor is initialised and is not: a re-seed's
+/// system range, whose descriptor and index-0 state the re-seed wrote and whose start
+/// restated it, or a bootstrap's replica installed before it applied anything. Read off
+/// the core alone, both were traced as created a second time, which check 8's created-twice
+/// clause sees (PROPOSED D-116 §4).
+// PROPOSED(D-116)
+fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Index, Term)) -> bool {
+    !held && applied == 0 && last_index == 0 && snapshot == (0, 0)
+}
+
 /// The generation and the voters an install's creation names (`RangeCreated { cause:
 /// snapshot }`, SHARD.md §8): the descriptor the switch put in place, read back from the
 /// store, and for a snapshot that carries none, which no take of this tree makes, the
@@ -4443,6 +4468,36 @@ mod tests {
         let config = Configuration::of(&[ServerId(4), ServerId(5)]);
         assert_eq!(created_from(Some(&split), &config), (2, vec![1, 2, 3]));
         assert_eq!(created_from(None, &config), (FIRST_GENERATION, vec![4, 5]));
+    }
+
+    /// An install creates only a replica that holds no descriptor and nothing else: what
+    /// a re-seed's user range is before its install. A re-seed's system range holds the
+    /// descriptor its re-seed wrote, and a bootstrap's replica the one its bootstrap
+    /// wrote, each at applied 0 with an empty log, and neither is created (PROPOSED D-116
+    /// §4). `split::run_cut_from_the_start` reaches the second in a run.
+    // PROPOSED(D-116)
+    #[test]
+    fn an_install_creates_only_a_replica_that_holds_no_descriptor() {
+        assert!(
+            install_creates(false, 0, 0, (0, 0)),
+            "a re-seed's user range"
+        );
+        assert!(
+            !install_creates(true, 0, 0, (0, 0)),
+            "an empty replica that holds a descriptor is initialised"
+        );
+        assert!(
+            !install_creates(false, 3, 3, (0, 0)),
+            "a replica that applied"
+        );
+        assert!(
+            !install_creates(false, 0, 2, (0, 0)),
+            "a replica with a log"
+        );
+        assert!(
+            !install_creates(false, 0, 0, (5, 2)),
+            "a replica with a snapshot"
+        );
     }
 
     fn client_addr() -> SocketAddr {

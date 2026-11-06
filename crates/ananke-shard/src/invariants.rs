@@ -17,11 +17,13 @@
 //! below that index (PROPOSED D-107). Every other check reads "the descriptor in force
 //! before an index" off this map: the latest value strictly below it.
 //!
-//! **Check 8**, [`OneOwnerPerKey`], Stage C's two clauses: no two of a node's spans
+//! **Check 8**, [`OneOwnerPerKey`], Stage C's three clauses: no two of a node's spans
 //! overlap, and a voter of P at a split that applied it holds R at every restatement
-//! after (PROPOSED D-107). The second clause is folded, compared under the equivalence
-//! test, and not in the [`Checker`]'s verdict ([`Fold::RightHalf`]): the correct node
-//! trips it until placeholders exist.
+//! after (PROPOSED D-107); and no node creates a replica it already holds initialised
+//! (PROPOSED D-116), SHARD.md §5's "R already initialised here" asked of the trace. The
+//! second clause is folded, compared under the equivalence test, and not in the
+//! [`Checker`]'s verdict ([`Fold::RightHalf`]): the correct node trips it until
+//! placeholders exist.
 //!
 //! **Check 9**: a `RaftApply` whose effect is `applied` and whose key lies outside the
 //! span of its range's descriptor in force before its index, or whose descriptor is
@@ -57,11 +59,12 @@
 //!
 //! **Each fold has a verdict of its own** ([`Fold`], [`Checker::verdict_of`]), so that a
 //! run in which two folds are in violation shows both: [`Checker::verdict`], which
-//! stops a run, reports the first of them in the order 7, 9, 10, 16, 17, 18 and then
-//! check 8's overlap clause, and a catch read through it alone would credit every write
-//! applied outside its span to check 9 and never show check 10 trip on the same write
-//! (PROPOSED D-106). Check 8's two clauses are a verdict each ([`Fold::Overlap`],
-//! [`Fold::RightHalf`]), and the right half's is not in the checker's (PROPOSED D-107).
+//! stops a run, reports the first of them in the order 7, 9, 10, 16, 17, 18, 20 and then
+//! check 8's overlap and created-twice clauses, and a catch read through it alone would
+//! credit every write applied outside its span to check 9 and never show check 10 trip
+//! on the same write (PROPOSED D-106). Check 8's three clauses are a verdict each ([`Fold::Overlap`],
+//! [`Fold::RightHalf`], [`Fold::CreatedTwice`]), and the right half's is not in the
+//! checker's (PROPOSED D-107, D-116).
 //!
 //! The keys the trace carries are user keys; the spans are encoded (§1), so every
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
@@ -69,6 +72,7 @@
 // PROPOSED(D-098): check 16, and check 9's lookups.
 // PROPOSED(D-106): a verdict per fold, and check 18's configuration history.
 // PROPOSED(D-107): check 7's restatement clause, and check 8.
+// PROPOSED(D-116): check 8's created-twice clause.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -392,7 +396,28 @@ impl Descriptors {
     }
 }
 
-/// Check 8, one owner per key on a node (SHARD.md §8), Stage C's two clauses, an
+/// What put a range among a node's spans, for check 8's created-twice clause's words:
+/// a creation, with its cause and floor index, or a statement of its descriptor at an
+/// applied index (a restatement, where the range was not held already).
+// PROPOSED(D-116)
+#[derive(Clone, Copy, Debug)]
+enum Since {
+    Created(RangeCause, u64),
+    Stated(u64),
+}
+
+impl std::fmt::Display for Since {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created(cause, floor) => {
+                write!(f, "created by a {} at floor index {floor}", cause.as_str())
+            }
+            Self::Stated(applied) => write!(f, "stated at applied index {applied}"),
+        }
+    }
+}
+
+/// Check 8, one owner per key on a node (SHARD.md §8), Stage C's three clauses, an
 /// interval map per node folded from `RangeCreated`, `RangeDescriptor`,
 /// `RangeRemoved`, `RangesRestated`, `NodeCrashed` and the node's `RaftRefused`.
 ///
@@ -418,13 +443,32 @@ impl Descriptors {
 /// that is not a voter there, that it traces no creation of R, is Stage D's (SHARD.md
 /// §12).
 ///
+/// **The created-twice clause**: a `RangeCreated` of R on a node whose spans already
+/// hold R — created there, or restated there since its last crash, with no
+/// `RangeRemoved` of R and no `RaftRefused` of the node between — is a violation,
+/// whatever made either creation: a split's apply, an install or a bootstrap. It is
+/// SHARD.md §5's "the apply asserts" that R is not "already initialised here", which
+/// the overlap rule and a fresh right half's id make unreachable, asked of the trace
+/// rather than of the node: as a node failure it stopped every voter of a split whose
+/// id was taken twice before check 18 could read the reused id (PROPOSED D-109 §2),
+/// and a fold stops nothing (PROPOSED D-116). It reads the spans the overlap clause
+/// folds, which a crash forgets and the node's restatement states again: what the node
+/// holds is what its trace has said since its last start, and a node that restates no R
+/// holds none, which for a voter of R's split is the right half's clause's to see.
+///
 /// Each clause keeps its own verdict ([`OneOwnerPerKey::overlap_verdict`],
-/// [`OneOwnerPerKey::right_half_verdict`]), so a scenario can read them apart.
+/// [`OneOwnerPerKey::right_half_verdict`], [`OneOwnerPerKey::created_twice_verdict`]),
+/// so a scenario can read them apart.
 // PROPOSED(D-107): check 8's two Stage C clauses.
+// PROPOSED(D-116): and the created-twice clause.
 #[derive(Clone, Debug, Default)]
 pub struct OneOwnerPerKey {
     /// Per node, the span of every initialised replica it holds.
     spans: BTreeMap<u64, BTreeMap<u64, (Bytes, Bytes)>>,
+    /// Per (node, range) in [`OneOwnerPerKey::spans`], what first put it there since the
+    /// node's last crash, which the created-twice clause's words name.
+    // PROPOSED(D-116)
+    held_since: BTreeMap<(u64, u64), Since>,
     /// The nodes that closed their restatement since their last crash.
     restated: BTreeSet<u64>,
     /// The server each node is, from the `RaftRecovered` its restatement traces.
@@ -449,6 +493,8 @@ pub struct OneOwnerPerKey {
     owed: BTreeMap<u64, BTreeMap<u64, (u64, u64)>>,
     overlap: Option<String>,
     right_half: Option<String>,
+    // PROPOSED(D-116)
+    created_twice: Option<String>,
 }
 
 impl OneOwnerPerKey {
@@ -536,8 +582,9 @@ impl OneOwnerPerKey {
     }
 
     /// `node` holds `range` over `[start, end)` from here: no other of its spans may
-    /// overlap it.
-    fn hold(&mut self, node: u64, range: u64, start: &Bytes, end: &Bytes) {
+    /// overlap it. `since` is the record that put it there, where it was not already.
+    fn hold(&mut self, node: u64, range: u64, start: &Bytes, end: &Bytes, since: Since) {
+        self.held_since.entry((node, range)).or_insert(since);
         let held = self.spans.entry(node).or_default();
         held.insert(range, (start.clone(), end.clone()));
         if self.overlap.is_some() {
@@ -586,7 +633,27 @@ impl OneOwnerPerKey {
                 floor_index,
                 ..
             } => {
-                self.hold(node, *range, start, end);
+                // PROPOSED(D-116): the created-twice clause, asked before the creation
+                // is held.
+                if self.created_twice.is_none()
+                    && let Some(since) = self.held_since.get(&(node, *range))
+                {
+                    self.created_twice = Some(format!(
+                        "one owner per key: node {node} traced a `RangeCreated {{ cause: {} }}` \
+                         of range {range} at floor index {floor_index} while it holds range \
+                         {range} initialised, {since}, with no `RangeRemoved` of it, crash or \
+                         refusal of the node between: a replica created twice on one node \
+                         (SHARD.md §5, the apply's \"R already initialised here\"; §8, check 8)",
+                        cause.as_str()
+                    ));
+                }
+                self.hold(
+                    node,
+                    *range,
+                    start,
+                    end,
+                    Since::Created(*cause, *floor_index),
+                );
                 if *cause == RangeCause::Split
                     && let Some(parent) = parent
                 {
@@ -602,7 +669,7 @@ impl OneOwnerPerKey {
                 voters,
                 ..
             } => {
-                self.hold(node, *range, start, end);
+                self.hold(node, *range, start, end, Since::Stated(*applied));
                 // A split's own change of P, after its `RangeSplit`: the split is
                 // known from here, with P's voters at it, whether or not R is
                 // created after (PROPOSED D-107, #166's review).
@@ -651,17 +718,20 @@ impl OneOwnerPerKey {
                 if let Some(held) = self.spans.get_mut(&node) {
                     held.remove(range);
                 }
+                self.held_since.remove(&(node, *range));
                 if let Some(owed) = self.owed.get_mut(&node) {
                     owed.remove(range);
                 }
             }
             TraceEvent::NodeCrashed { .. } => {
                 self.spans.remove(&node);
+                self.held_since.retain(|(of, _), _| *of != node);
                 self.restated.remove(&node);
                 self.splitting.remove(&node);
             }
             TraceEvent::RaftRefused { .. } => {
                 self.spans.remove(&node);
+                self.held_since.retain(|(of, _), _| *of != node);
                 self.owed.remove(&node);
                 self.applied_splits.remove(&node);
                 self.splitting.remove(&node);
@@ -702,13 +772,25 @@ impl OneOwnerPerKey {
         self.right_half.clone().map_or(Ok(()), Err)
     }
 
-    /// Both clauses' first violation, the overlap clause's first.
+    /// The created-twice clause's first violation.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    // PROPOSED(D-116)
+    pub fn created_twice_verdict(&self) -> Result<(), String> {
+        self.created_twice.clone().map_or(Ok(()), Err)
+    }
+
+    /// Every clause's first violation, the overlap clause's first, then the
+    /// created-twice clause's, then the right half's.
     ///
     /// # Errors
     ///
     /// The violation, in words naming it.
     pub fn verdict(&self) -> Result<(), String> {
         self.overlap_verdict()?;
+        self.created_twice_verdict()?;
         self.right_half_verdict()
     }
 }
@@ -1660,7 +1742,7 @@ impl PlaceholderGrantsNothing {
 }
 
 /// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16, 17 and 20,
-/// check 18's two clauses, and check 8's two, each of which keeps a verdict of its own
+/// check 18's two clauses, and check 8's three, each of which keeps a verdict of its own
 /// in [`Checker`].
 // PROPOSED(D-106): a verdict per fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1688,16 +1770,20 @@ pub enum Fold {
     /// trips it until placeholders exist.
     // PROPOSED(D-107)
     RightHalf,
+    /// Check 8's created-twice clause ([`OneOwnerPerKey::created_twice_verdict`]): asked
+    /// by [`Checker::verdict`] after the overlap clause, last.
+    // PROPOSED(D-116)
+    CreatedTwice,
     /// Check 20, a placeholder grants nothing ([`PlaceholderGrantsNothing`]).
     // PROPOSED(D-109)
     PlaceholderGrants,
 }
 
 impl Fold {
-    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20
-    /// and check 8's overlap clause — and then check 8's right half's clause, which it
-    /// does not ask ([`Fold::VERDICT`]).
-    pub const ALL: [Self; 10] = [
+    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20,
+    /// check 8's overlap clause and its created-twice clause — and then check 8's right
+    /// half's clause, which it does not ask ([`Fold::VERDICT`]).
+    pub const ALL: [Self; 11] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1707,14 +1793,18 @@ impl Fold {
         Self::SplitLineage,
         Self::PlaceholderGrants,
         Self::Overlap,
+        Self::CreatedTwice,
         Self::RightHalf,
     ];
 
-    /// The folds [`Checker::verdict`] asks, in its order: check 8's overlap clause
-    /// last, so that no violation a fold before it reports moves to it, and check 8's
-    /// right half's clause not at all (PROPOSED D-107).
+    /// The folds [`Checker::verdict`] asks, in its order: check 8's overlap clause and
+    /// then its created-twice clause last, so that no violation a fold before them
+    /// reports moves to them — check 18's reused id, which the created-twice clause
+    /// also sees at the second split's creation, stays check 18's (PROPOSED D-116) —
+    /// and check 8's right half's clause not at all (PROPOSED D-107).
     // PROPOSED(D-107)
-    pub const VERDICT: [Self; 9] = [
+    // PROPOSED(D-116): the created-twice clause, last.
+    pub const VERDICT: [Self; 10] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1724,14 +1814,15 @@ impl Fold {
         Self::SplitLineage,
         Self::PlaceholderGrants,
         Self::Overlap,
+        Self::CreatedTwice,
     ];
 
-    /// The check of SHARD.md §8 the fold is; checks 8 and 18 are two folds each.
+    /// The check of SHARD.md §8 the fold is; check 8 is three folds and check 18 two.
     #[must_use]
     pub const fn check(self) -> u32 {
         match self {
             Self::DescriptorAgreement => 7,
-            Self::Overlap | Self::RightHalf => 8,
+            Self::Overlap | Self::RightHalf | Self::CreatedTwice => 8,
             Self::ServingWithinSpan => 9,
             Self::GenerationsRise => 10,
             Self::MetaNeverGoesBack => 16,
@@ -1741,7 +1832,7 @@ impl Fold {
         }
     }
 
-    /// The words every violation of the fold begins with: check 8's two clauses share
+    /// The words every violation of the fold begins with: check 8's three clauses share
     /// theirs, and [`Fold`]'s `Display` tells them apart.
     #[must_use]
     pub const fn words(self) -> &'static str {
@@ -1753,7 +1844,7 @@ impl Fold {
             Self::ClientRefreshes => "client refreshes:",
             Self::RangeIds => "range ids:",
             Self::SplitLineage => "descriptor lineage:",
-            Self::Overlap | Self::RightHalf => "one owner per key:",
+            Self::Overlap | Self::RightHalf | Self::CreatedTwice => "one owner per key:",
             Self::PlaceholderGrants => "placeholder grants nothing:",
         }
     }
@@ -1765,6 +1856,7 @@ impl std::fmt::Display for Fold {
         let clause = match self {
             Self::Overlap => ", the overlap clause",
             Self::RightHalf => ", the right half's clause",
+            Self::CreatedTwice => ", the created-twice clause",
             _ => "",
         };
         write!(
@@ -1842,13 +1934,14 @@ impl Checker {
     /// latches its message and stops judging at its violation; one whose state another
     /// fold reads goes on folding that state — check 7's map, which every fold here
     /// reads, and check 18's grants, which the split clause reads ([`IdsUnique`]). Check
-    /// 8's two clauses are one fold's ([`OneOwnerPerKey`]), each latching its own.
+    /// 8's three clauses are one fold's ([`OneOwnerPerKey`]), each latching its own.
     ///
     /// # Errors
     ///
     /// The fold's violation, in words naming it ([`Fold::words`]).
     // PROPOSED(D-106): a verdict per fold.
     // PROPOSED(D-107): check 8's two clauses.
+    // PROPOSED(D-116): and its third.
     pub fn verdict_of(&self, fold: Fold) -> Result<(), String> {
         match fold {
             Fold::DescriptorAgreement => self.descriptors.verdict(),
@@ -1860,19 +1953,20 @@ impl Checker {
             Fold::SplitLineage => self.lineage.verdict(),
             Fold::Overlap => self.owners.overlap_verdict(),
             Fold::RightHalf => self.owners.right_half_verdict(),
+            Fold::CreatedTwice => self.owners.created_twice_verdict(),
             Fold::PlaceholderGrants => self.placeholders.verdict(),
         }
     }
 
     /// Every fold's own verdict, in [`Fold::ALL`]'s order.
     // PROPOSED(D-106): a verdict per fold.
-    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 10] {
+    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 11] {
         Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
     }
 
-    /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, and then
-    /// check 8's overlap clause, last so that no violation a fold before it reports
-    /// moves to it. This is what stops a run, and it names one fold where several may
+    /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, 20, and
+    /// then check 8's overlap clause and its created-twice clause, last so that no
+    /// violation a fold before them reports moves to them. This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
     /// right half's clause is folded and **not** in it: the correct node trips it on a
     /// voter installed past a split, which holds no placeholder for the right half
@@ -2642,6 +2736,204 @@ mod tests {
         assert!(apart.verdict().is_ok(), "{:?}", apart.verdict());
     }
 
+    /// An install's creation of `range` over `[start, end)` on `node`, at the snapshot's
+    /// last index `floor`: a placeholder's install, or a re-seed's.
+    // PROPOSED(D-116)
+    fn installed_as_created(
+        node: u64,
+        range: u64,
+        floor: u64,
+        start: &[u8],
+        end: &[u8],
+        generation: u64,
+    ) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Snapshot,
+                parent: None,
+                start: user_key(start),
+                end: user_key(end),
+                generation,
+                voters: vec![1, 2, 3],
+                floor_index: floor,
+                floor_term: 2,
+                incarnation: 7,
+            },
+        )
+    }
+
+    /// Check 8's created-twice clause (PROPOSED D-116): a `RangeCreated` of a range its
+    /// node already holds initialised is a violation whichever creation came first —
+    /// seed 219's split and then an install, SHARD.md §5's install and then a split's
+    /// apply — and is no violation where the node let the range go between: a
+    /// `RangeRemoved`, a crash before the range was restated, a refusal. The overlap
+    /// clause sees none of the first, where the second creation has the first's span.
+    // PROPOSED(D-116)
+    #[test]
+    fn a_replica_created_twice_on_one_node_is_caught_by_check_8_whatever_made_either() {
+        // Seed 219's order: node 1's apply of the split creates 6, and an install that
+        // passed its check before the apply creates 6 again.
+        let mut owners = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            owners.push(record);
+        }
+        assert!(owners.verdict().is_ok(), "{:?}", owners.verdict());
+        owners.push(&installed_as_created(1, 6, 10, b"m", b"z", 2));
+        let why = owners.created_twice_verdict().unwrap_err();
+        assert!(why.starts_with(Fold::CreatedTwice.words()), "{why}");
+        assert!(
+            why.contains(
+                "node 1 traced a `RangeCreated { cause: snapshot }` of range 6 at floor index \
+                 10 while it holds range 6 initialised, created by a split at floor index 9"
+            ),
+            "{why}"
+        );
+        assert_eq!(owners.overlap_verdict(), Ok(()), "one range, one span");
+        assert_eq!(owners.verdict(), Err(why.clone()));
+        // Latched: a third creation does not move it.
+        owners.push(&installed_as_created(2, 6, 11, b"m", b"z", 2));
+        assert_eq!(owners.created_twice_verdict(), Err(why));
+        // §5's order: node 3's P is lagging below the split, R's install goes in over
+        // it (the overlap clause), and its apply of the split creates R again.
+        let mut lagging = OneOwnerPerKey::default();
+        lagging.push(&created(3, 2, b"a", b"z", 1, &[1, 2, 3]));
+        lagging.push(&installed_as_created(3, 6, 12, b"m", b"z", 2));
+        assert!(lagging.overlap_verdict().is_err());
+        assert_eq!(lagging.created_twice_verdict(), Ok(()));
+        for record in &split_records(3, 2, 9, 2, b"m", b"a", b"z", 1, 6) {
+            lagging.push(record);
+        }
+        let why = lagging.created_twice_verdict().unwrap_err();
+        assert!(
+            why.contains(
+                "`RangeCreated { cause: split }` of range 6 at floor index 9 while it holds \
+                 range 6 initialised, created by a snapshot at floor index 12"
+            ),
+            "{why}"
+        );
+        // A restatement after a crash holds the range as its creation did.
+        let mut restarted = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            restarted.push(record);
+        }
+        for record in [
+            crashed(1),
+            recovered(1, 2, 12),
+            stated(1, 2, 12, b"a", b"m", 2),
+            recovered(1, 6, 12),
+            stated(1, 6, 12, b"m", b"z", 2),
+            restated(1, &[2, 6]),
+        ] {
+            restarted.push(&record);
+        }
+        restarted.push(&installed_as_created(1, 6, 14, b"m", b"z", 2));
+        let why = restarted.created_twice_verdict().unwrap_err();
+        assert!(why.contains("stated at applied index 12"), "{why}");
+        // Let go between, it is no violation: removed, ...
+        let mut removed = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            removed.push(record);
+        }
+        removed.push(&record(
+            1,
+            TraceEvent::RangeRemoved {
+                range: 6,
+                generation: 2,
+                incarnation: 5,
+                cause: ananke_env::RangeRemovedCause::Collected,
+            },
+        ));
+        removed.push(&installed_as_created(1, 6, 14, b"m", b"z", 2));
+        assert!(removed.verdict().is_ok(), "{:?}", removed.verdict());
+        // ... a crash after which the node restated no R: it holds what it restates
+        // (a voter of the split that restates no R is the right half's clause's) ...
+        let mut lost = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            lost.push(record);
+        }
+        for record in [
+            crashed(2),
+            recovered(2, 2, 8),
+            stated(2, 2, 8, b"a", b"z", 1),
+            restated(2, &[2]),
+        ] {
+            lost.push(&record);
+        }
+        for record in &split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6) {
+            lost.push(record);
+        }
+        assert_eq!(lost.created_twice_verdict(), Ok(()));
+        // ... or a refused node's re-seed, whose install creates what the engine it
+        // refused held. A refusal ends the holding on its own, as it ends check 8's
+        // spans: on this tree it is traced only at a restart, after the crash that
+        // already ended it.
+        let mut refused = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            refused.push(record);
+        }
+        for record in [
+            record(
+                2,
+                TraceEvent::RaftRefused {
+                    server: 2,
+                    reason: "lost".into(),
+                },
+            ),
+            restated(2, &[]),
+            installed_as_created(2, 2, 20, b"a", b"m", 2),
+            installed_as_created(2, 6, 20, b"m", b"z", 2),
+        ] {
+            refused.push(&record);
+        }
+        assert_eq!(refused.created_twice_verdict(), Ok(()));
+        // Another node's creation is that node's.
+        let mut apart = OneOwnerPerKey::default();
+        for record in &a_split_applied() {
+            apart.push(record);
+        }
+        apart.push(&installed_as_created(3, 6, 14, b"m", b"z", 2));
+        assert!(apart.verdict().is_ok(), "{:?}", apart.verdict());
+    }
+
+    /// The created-twice clause in the checker (PROPOSED D-116): asked last, after the
+    /// overlap clause, so a split whose right half's id another split took first — every
+    /// voter holding that id creates it again, `IdBlockResumed`'s shape — is check 18's
+    /// in the checker's verdict, as before the clause, and the clause's in its own.
+    // PROPOSED(D-116)
+    #[test]
+    fn check_8s_created_twice_clause_is_asked_last_and_a_reused_id_stays_check_18s() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        checker.verdict().unwrap();
+        // Range 2, now `[a, m)`, splits again at `f` and names 6 again.
+        checker.extend(&split_records(1, 2, 12, 2, b"f", b"a", b"m", 2, 6));
+        let eighteen = checker.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            eighteen.contains("which a creation or a split had named before it"),
+            "{eighteen}"
+        );
+        let twice = checker.verdict_of(Fold::CreatedTwice).unwrap_err();
+        assert!(twice.starts_with(Fold::CreatedTwice.words()), "{twice}");
+        assert!(
+            twice.contains("of range 6 at floor index 12 while it holds range 6"),
+            "{twice}"
+        );
+        assert_eq!(checker.verdict(), Err(eighteen));
+        // Alone, it stops a run.
+        let mut alone = Checker::new(true);
+        alone.extend(&a_split_applied());
+        alone.push(&installed_as_created(1, 6, 10, b"m", b"z", 2));
+        let words = alone.verdict_of(Fold::CreatedTwice).unwrap_err();
+        assert_eq!(alone.verdict(), Err(words));
+        assert_eq!(
+            Fold::CreatedTwice.to_string(),
+            "check 8 (one owner per key, the created-twice clause)"
+        );
+    }
+
     #[test]
     fn a_voter_that_applied_a_split_restates_its_right_half_or_check_8_says_so() {
         let mut owners = OneOwnerPerKey::default();
@@ -3304,12 +3596,12 @@ mod tests {
         }
         assert_eq!(
             Fold::VERDICT.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8],
             "the order the checker's verdict asks the folds in"
         );
         assert_eq!(
             Fold::ALL.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8],
             "every fold, the verdict's first and check 8's right half's clause last"
         );
         assert_eq!(
@@ -3483,11 +3775,13 @@ mod tests {
             0,
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
-        let mut left = created(1, 2, b"a", b"k", 2, &[1, 2, 3]);
+        // The split's two values at 5, traced on node 2: on node 1, which holds range 2
+        // from its bootstrap, a second creation of it is check 8's (PROPOSED D-116).
+        let mut left = created(2, 2, b"a", b"k", 2, &[1, 2, 3]);
         if let TraceEvent::RangeCreated { floor_index, .. } = &mut left.event {
             *floor_index = 5;
         }
-        let mut right = created(1, 3, b"k", b"z", 2, &[1, 2, 3]);
+        let mut right = created(2, 3, b"k", b"z", 2, &[1, 2, 3]);
         if let TraceEvent::RangeCreated {
             cause, floor_index, ..
         } = &mut right.event
