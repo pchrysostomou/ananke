@@ -2261,6 +2261,181 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     );
 }
 
+/// One right half a split created on a voter of its parent, read off its
+/// `RangeCreated { cause: split }`, against the draws of its node's stream for it.
+struct RightHalfDraw {
+    /// The node that created it.
+    node: ananke_env::NodeId,
+    /// The right half.
+    range: u64,
+    /// The incarnation it was created with.
+    incarnation: u64,
+    /// Which of the stream's draws the incarnation is, counting from 1, among the draws
+    /// the creation could have taken (see [`right_half_draws`]); `None` for none of them.
+    position: Option<usize>,
+}
+
+/// Every right half a split created over `records`, each matched against the draws
+/// that its node's stream for it, `n{id}/r{range}/protocol` (`Environment::range_rng`),
+/// gives under `seed`.
+///
+/// The stream is read off a fresh simulation of the same seed, through the call the
+/// node makes, and a fresh one for each creation since `range_rng` hands back one shared
+/// stream: a range's stream is made from the seed and its name the first time it is
+/// asked for and draws from no other stream (D-017, PROPOSED D-057), so its values are
+/// the run's whatever else the run drew.
+///
+/// Under `IncarnationPerRangeStream` the split's draw is the stream's first on the
+/// node. The right half's id is fresh from a block (Q17), and nothing on a node draws
+/// from its stream before that node's apply of the split: a placeholder draws nothing,
+/// and a placeholder's install, which does, is refused while the node's parent still
+/// covers the right half (Q27). In the apply the incarnation is drawn before the core's
+/// seed (`ServerApplier::split`). The one way past it is an apply that drew and never
+/// reached its synced batch, which only a crash of the node interrupts: the restarted
+/// node applies the split again and draws again, and only the second is traced. So a
+/// creation is matched against the stream's first `1 + c` draws, `c` the crashes of its
+/// node the trace holds before it.
+fn right_half_draws(seed: u64, records: &[TraceRecord]) -> Vec<RightHalfDraw> {
+    use ananke_env::{Environment, Rng};
+    let mut crashes: BTreeMap<ananke_env::NodeId, usize> = BTreeMap::new();
+    let mut out = Vec::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::NodeCrashed { node } => *crashes.entry(*node).or_default() += 1,
+            TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Split,
+                incarnation,
+                ..
+            } => {
+                let Some(node) = record.node else {
+                    continue;
+                };
+                let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(seed));
+                let mut at = sim.add_node();
+                while at < node {
+                    at = sim.add_node();
+                }
+                let stream = sim.env(at).range_rng(*range);
+                // The floor the apply puts under every draw (Q26).
+                let draws: Vec<u64> = (0..=crashes.get(&node).copied().unwrap_or(0))
+                    .map(|_| {
+                        stream
+                            .next_u64()
+                            .max(ananke_raft::store::FIRST_INCARNATION + 1)
+                    })
+                    .collect();
+                out.push(RightHalfDraw {
+                    node,
+                    range: *range,
+                    incarnation: *incarnation,
+                    position: draws
+                        .iter()
+                        .position(|draw| draw == incarnation)
+                        .map(|at| at + 1),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `IncarnationPerRangeStream` at a split's right half: every right half a split
+/// creates on a voter of its parent restates the incarnation its node's stream for it,
+/// `n{id}/r{range}/protocol`, draws first, and the correct node's restates a number no
+/// such draw gives, the node generator's (SHARD.md §8, Q26; issue #160).
+///
+/// The variant is read at three sites of a creation. The directed refusal scenario
+/// asserts the first, Q15's re-seed (`sim/tests/ranges.rs`). This is the second, a
+/// split's apply (`ServerApplier::split`, PROPOSED D-100), which only a scenario that
+/// splits reaches and which no test ran until now: D-108's M6, the split's draw reading
+/// the correct set, failed nothing. The third, a placeholder's install (PROPOSED
+/// D-109), this test does not read (PROPOSED D-123). Nothing downstream can see what the
+/// variant draws at a split: `range_rng` continues across draws, handles and restarts,
+/// so it repeats no incarnation, and a right half is new on every node anyway. So what
+/// is asserted is the draw itself, as the refusal test asserts the re-seed's, on both
+/// systems: the variant's draw is the stream's, and the correct node's is not.
+///
+/// Measured before asserted (D-061), in release over seeds 0 to 999 on both systems: a
+/// split creates a right half on 20 of the first twenty seeds, 100 of the first hundred
+/// and 999 of the thousand (seed 680 lands no split). That is far above D-061's 5 %, so
+/// the reach is asserted at every tier, over [`high_rate_share`] as every instrument on
+/// the node caught at a high rate runs. The draws are asserted of every creation, at no
+/// rate: every one of the variant's 4 871 creations is its stream's first draw, 2 442 of
+/// them on a node that had crashed before it, and none of the correct node's 4 854 is a
+/// draw of that stream. So no seed of the thousand needs [`right_half_draws`]'s allowance
+/// for a crash: it is reasoned from the apply, for the schedule that lands a crash there.
+// PROPOSED(D-108): the instrument at its second site.
+// PROPOSED(D-123)
+#[test]
+fn a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument() {
+    let seeds = high_rate_share();
+    let instrument = RangeVariants::of(&[RangeVariant::IncarnationPerRangeStream]);
+    let runs: Vec<(Vec<RightHalfDraw>, Vec<RightHalfDraw>)> = sweep(seeds, |seed| {
+        let report = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            instrument,
+        );
+        (
+            right_half_draws(seed, &report.records),
+            right_half_draws(seed, &correct(seed).records),
+        )
+    });
+    let variant_seeds = runs.iter().filter(|(of, _)| !of.is_empty()).count();
+    let correct_seeds = runs.iter().filter(|(_, of)| !of.is_empty()).count();
+    let mut positions: BTreeMap<Option<usize>, usize> = BTreeMap::new();
+    for draw in runs.iter().flat_map(|(of, _)| of) {
+        *positions.entry(draw.position).or_default() += 1;
+    }
+    let correct_created = runs.iter().map(|(_, of)| of.len()).sum::<usize>();
+    let correct_on_the_stream = runs
+        .iter()
+        .flat_map(|(_, of)| of)
+        .filter(|draw| draw.position.is_some())
+        .count();
+    println!(
+        "node: IncarnationPerRangeStream: right halves created by a split on {variant_seeds}/\
+         {seeds} seeds, {} in all, by which draw of their node's stream for them {positions:?}; \
+         the correct node's on {correct_seeds}/{seeds} seeds, {correct_created} in all, \
+         {correct_on_the_stream} of them a draw of that stream",
+        positions.values().sum::<usize>(),
+    );
+    assert!(
+        variant_seeds > 0 && correct_seeds > 0,
+        "no split created a right half on a voter on any of {seeds} seeds (the variant's on \
+         {variant_seeds}, the correct node's on {correct_seeds}), so the split's draw was not \
+         reached and this test asserts nothing"
+    );
+    for (seed, (variant, correct)) in (0u64..).zip(&runs) {
+        for draw in variant {
+            assert!(
+                draw.position.is_some(),
+                "seed {seed}: under IncarnationPerRangeStream node {} created right half {} with \
+                 incarnation {}, which no draw of its stream for the range gives: the split's \
+                 draw does not read the variant (issue #160)",
+                draw.node,
+                draw.range,
+                draw.incarnation
+            );
+        }
+        for draw in correct {
+            assert!(
+                draw.position.is_none(),
+                "seed {seed}: the correct node {} created right half {} with incarnation {}, its \
+                 stream's draw {:?} for the range, where SHARD.md §8 draws it from the node's \
+                 generator (Q26)",
+                draw.node,
+                draw.range,
+                draw.incarnation,
+                draw.position
+            );
+        }
+    }
+}
+
 #[test]
 fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
     let outcomes = routing_variant(

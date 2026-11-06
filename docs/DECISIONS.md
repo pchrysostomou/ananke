@@ -23463,4 +23463,118 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## PROPOSED D-123 — `IncarnationPerRangeStream`'s read at a split's right half is run: under it every right half a split creates on a voter restates its stream's draw and the correct node's restates none, asserted of the draw itself
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-122 are held by
+the slices beside this one, and the brief that assigned this one gives it **D-123**. The
+footer moves to D-124, and at a merge the entries are a union in numerical order with one
+footer, the highest plus one. The test carries `// PROPOSED(D-123)`, and `// PROPOSED(D-108)`
+beside it, since D-108 marks the tests that run the two instruments and this is a third.
+Closes #160.
+
+**Context.** D-108 named the split's read as the variant's second and measured that nothing
+fails when it is wrong: its M6, the split's draw reading the correct set, failed no test
+(#160). #160 and its second comment leave two routes open: assert the draw at the split, as
+the directed refusal test does at the re-seed, or remove the read if the owner rules the
+variant is the re-seed's alone. This entry takes the first. It moves no code, so the second
+stays the owner's to take.
+
+**Why the draw and not a check.** `range_rng` continues across draws, handles and restarts,
+so the variant repeats no incarnation, and a right half is new on every node anyway (D-108).
+Nothing downstream can see what it draws. Measured again on this tree, the run's checks fail
+none of the thousand seeds below, on either system.
+
+### The test
+
+`a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument`
+(`sim/tests/node.rs`) runs the node sweep on `high_rate_share` seeds: twenty at the gate and
+in CI, a hundred at the premerge, a thousand in the nightly. Each seed runs under the variant
+and under the correct node. Each `RangeCreated { cause: split }` is matched against its node's
+`n{id}/r{range}/protocol`, read through `range_rng` off a fresh `Sim` of the same seed, with
+the floor the apply puts under a draw (Q26). It asserts:
+
+- **the reach:** a split created a right half on a voter on some seed of each system, so a run
+  that stops reaching the draw says so and does not pass on nothing;
+- **the variant:** every creation restates one of its stream's first `1 + c` draws, `c` being
+  the crashes of its node the trace holds before the creation;
+- **the correct node:** every creation restates none of them.
+
+**Why `1 + c`.** Nothing on a node draws from R's stream before that node's apply of the split.
+R's id is fresh from a block (Q17). A placeholder draws nothing, and a placeholder's install,
+which does, is refused while the node's parent still covers R (Q27). Inside the apply the
+incarnation is drawn before the core's seed (`ServerApplier::split`). The one way past the
+first draw is an apply that drew and never reached its synced batch, which only a crash
+interrupts: the restarted node applies the split again and draws again, and only the second is
+traced. `store.apply` syncs (`engine.write(writes, true)`), so an apply that reached the trace
+is not applied again.
+
+**No seed of the thousand needs that allowance**, and it is reasoned, not observed. It stays
+so that a schedule a later change moves into that window does not fail a correct tree. Its
+cost is that a draw moved to the stream's second is not seen on a creation after a crash of its
+node. Half of the creations have none before them, so that mistake is still caught at every
+tier (the plant below).
+
+### Measured
+
+In release on de9f4d7, seeds 0 to 999, from one untracked harness that ran both systems and is
+not committed. Each tier's figure is over the seeds it runs. Three runs of the test at the
+premerge's hundred printed these same figures for the hundred.
+
+| Over seeds | 20 | 100 | 1 000 |
+|---|---|---|---|
+| a split created a right half, variant | 20 | 100 | 999 |
+| a split created a right half, correct | 20 | 100 | 999 |
+| the variant's creations | 90 | 472 | 4 871 |
+| of them the stream's first draw | 90 | 472 | 4 871 |
+| of them on a node that had crashed before | 51 | 241 | 2 442 |
+| the correct node's creations | 93 | 476 | 4 854 |
+| of them a draw of that stream | 0 | 0 | 0 |
+| the run's checks fail, variant | 0 | 0 | 0 |
+| the run's checks fail, correct | 0 | 0 | 0 |
+
+Seed 680 lands no split on either system, D-108's 999 of 1 000. The reach is far above D-061's
+5 %, so it is asserted at every tier, and the draws are asserted of every creation, at no rate.
+
+### The plants
+
+Each was planted alone in `crates/ananke-shard/src/` and reverted, the test built in release
+and run at the gate's twenty. M6 is D-108's and had builds of its own. The others shared one
+build, each switched on alone by an environment variable the build read, never committed. On
+this tree only the refusal test and this one run the variant.
+
+| | Plant | The refusal test | This test |
+|---|---|---|---|
+| | none | passes | passes: `{Some(1): 90}`, the correct node's 0 of 93 on the stream |
+| M6 | the split's draw reads the correct set | **passes**: the "before", as D-108 found it | **fails**: `{None: 93}`, *"seed 0: under IncarnationPerRangeStream node n1 created right half 14 with incarnation 11742426426398889910, which no draw of its stream for the range gives"* |
+| P1 | the correct node's split also draws from R's stream | not run | **fails**: the correct node's 90 of 90 on the stream, *"seed 0: the correct node n1 created right half 14 with incarnation 9039933487526354782, its stream's draw Some(1) for the range"* |
+| P2 | under the variant something draws from R's stream first | not run | **fails**: `{None: 40, Some(2): 53}`, the 40 being the creations with no crash before them |
+| P3 | the split's creation is traced with another cause | not run | **fails**: the reach, *"no split created a right half on a voter on any of 20 seeds"* |
+| P4 | a placeholder's install draws from the correct set | passes | passes: see below |
+
+### What is not here
+
+**The variant's third read.** D-108 counted two sites, and D-109 added a third: a placeholder's
+install (`install.rs`), a creation with `cause: snapshot`. This test does not read it, and P4
+shows that no test does. Over the same seeds the variant creates through it on 0 of 20, 2 of 100
+and 19 of 1 000 seeds. That is under D-061's 5 %, so its catch belongs at the premerge's
+thousand, which this test's share does not run, and a stream that a non-voter's apply of the
+split has already drawn from gives it no fixed position. It wants a test of its own and is left
+as a finding. The doc of `RangeVariant::IncarnationPerRangeStream` and its module's now name all
+three reads and say this one is unread.
+
+**A comment that contradicts D-108.** `install.rs` says that the variant's draw "gives a replica
+created again for the same (range, node) the number its predecessor drew". D-108 withdrew that
+claim from the variant's own doc: the stream continues, so it repeats no number. It is left as
+a finding with the third read, since it is that site's comment.
+
+**Nothing moves.** No code outside a test changes, only doc comments in `range_variant.rs`, so
+no schedule, trace or pinned hash can. **PROPOSED.**
+
+**The nightly's rows (D-064).** One `node` row, weighed in release from the built binary at
+ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs a hundred seeds of both systems: 111.5 cpu s,
+the median of three runs taken beside other slices' builds (load averages 480 to 870). It goes
+into the lightest shard, shard 1, at 1977.1 -> 2088.6.
+
+---
+
+_Next entry: D-124. Add one before implementing anything not covered above._

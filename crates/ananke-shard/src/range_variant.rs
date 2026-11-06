@@ -35,11 +35,12 @@
 //!   the initial state and is check 7's instrument on the membership scenario
 //!   (PROPOSED D-096), and [`RangeVariant::IncarnationPerRangeStream`] draws a
 //!   replica's incarnation at its creation from the range's protocol stream instead
-//!   of the node's generator, at Q15's re-seed and at a split's right half (D-077,
-//!   PROPOSED D-100). Two more are proposed and not built: D-093's `SplitLeavesGap`
-//!   for check 19's fold, and Stage D's variant for the re-add window assertion (§12,
-//!   Stage D's question 1), which needs a stream derived anew at each creation and so
-//!   is not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
+//!   of the node's generator, at Q15's re-seed, at a split's right half and at a
+//!   placeholder's install (D-077, PROPOSED D-100, D-109). Two more are proposed and
+//!   not built: D-093's `SplitLeavesGap` for check 19's fold, and Stage D's variant for
+//!   the re-add window assertion (§12, Stage D's question 1), which needs a stream
+//!   derived anew at each creation and so is not `IncarnationPerRangeStream` read at
+//!   one more site (PROPOSED D-108).
 //!
 //! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
 //! and the four instruments built or proposed beside them, two of each, would leave a
@@ -117,11 +118,14 @@ pub enum RangeVariant {
     /// A replica's incarnation drawn at its creation from the range's protocol
     /// stream, `n{id}/r{range}/protocol` (`Environment::range_rng`), rather than from
     /// the node's own generator, from which SHARD.md §8 draws a fresh incarnation
-    /// (Q26). It is read wherever the node draws one: Q15's re-seed (D-077) and a
-    /// split's right half (PROPOSED D-100). What catches it is the draw itself: the
-    /// directed refusal scenario finds every re-seeded replica's incarnation different
-    /// from the node generator's (`sim/tests/ranges.rs`), and no test runs it through
-    /// a split (issue #160).
+    /// (Q26). It is read wherever the node draws one: Q15's re-seed (D-077), a split's
+    /// right half (PROPOSED D-100) and a placeholder's install (PROPOSED D-109). What
+    /// catches it is the draw itself: the directed refusal scenario finds every
+    /// re-seeded replica's incarnation different from the node generator's
+    /// (`sim/tests/ranges.rs`), and the node sweep finds every right half a split
+    /// creates on a voter restating its stream's draw, where the correct node's restates
+    /// no such draw (`sim/tests/node.rs`, issue #160, PROPOSED D-123). No test reads the
+    /// install's.
     ///
     /// It does not reach the harm §8 names for a stream derived anew at each creation:
     /// a replica created again drawing its predecessor's number, which a leader that

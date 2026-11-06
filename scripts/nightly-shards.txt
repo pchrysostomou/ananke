@@ -509,8 +509,15 @@
 # with other slices' builds beside it (load averages 86 to 100, so the figure is if anything
 # high): 34.7 cpu s, the median (30.78 + 1.03, 33.73 + 0.92, 34.24 + 0.97). Into the lightest
 # shard, shard 6 at 2168.1 -> 2202.8.
+# PROPOSED D-123 (#160: IncarnationPerRangeStream's read at a split's right half is run) added one
+# `node` row, which runs `high_rate_share`, a hundred seeds of both systems at this tier: weighed
+# on its tree from the built release binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, three runs side by side, on an Apple M2 of 8 cores with
+# other slices' builds beside them (load averages 480 to 870, so the figure is if anything high):
+# 111.5 cpu s, the median (77.11 + 34.42, 77.02 + 34.54, 76.82 + 34.43). Into the lightest shard,
+# shard 1 at 1977.1 -> 2088.6.
 # shard	binary	cpu_s	test
-# shard 1: 1977.1 cpu s
+# shard 1: 2088.6 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -534,6 +541,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+1	node	111.5	a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
