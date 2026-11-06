@@ -23611,24 +23611,47 @@ verdict. `SnapshotOverlapsReplica` on (i) trips the overlap clause on 1 000 of 1
 the created-twice clause on none: `x`'s P is installed past the split and never applies
 it.
 
-**A latent case, unreached on every run above: a re-seeded system replica.**
-- The re-seed writes a system range's descriptor and its index-0 state into the fresh
-  engine (D-098). The start therefore restates that replica as initialised.
-- If its leader has compacted, the replica is caught up by an install. The node's
-  `installed` classifies that install as a creation: applied 0, no log, no snapshot. It
-  traces `RangeCreated { cause: snapshot }` of a range the node has just restated, and the
-  clause would trip.
-- §8 defines `RangeCreated` as "an install on a node that held no initialised replica of
-  the range". So the clause is right to flag it. The trace is what is wrong.
-- Measured: none of the scenarios above creates range 0 or range 1 on a node after its
-  refusal on any of its thousand seeds. The node sweep refuses no store on any of the
-  10 000 seeds of the nightly on 7d15a83 (run 41330474538: "0 store refusals over 10000
-  seeds").
-- It becomes reachable the day a scenario both refuses a store and compacts a system range
-  past it. S10's `sim/shard.rs`, with Phase 2's disk faults, may be that scenario.
-- **Not fixed here.** The fix is in the node's trace, not in the check: a replica that held
-  a descriptor before its install is not created by it. Recommended as its own issue, with
-  a directed run that reaches it.
+**A false creation the clause found, and what is fixed here.** The node traced a creation
+it had not made. `installed` read a creation off the core alone: applied 0, no log, no
+snapshot. §8 defines `RangeCreated` at an install as "an install on a node that held no
+initialised replica of the range", and an empty replica can hold a descriptor in two ways:
+- **A re-seed's system range.** The re-seed writes its descriptor and index-0 state into the
+  fresh engine (D-098), so the start restates it as initialised. If its leader has compacted,
+  an install catches it up.
+- **A bootstrap's replica installed before it applied anything.** Its node created it at
+  its bootstrap and restated it, and it has applied nothing when the snapshot arrives.
+
+So the clause is right to flag both, and the trace was wrong.
+
+**The fix.** `install_creates` asks whether the replica held a descriptor before the switch.
+A replica that did is installed and not created. Checks 2 to 4 lose nothing: an installed
+snapshot sets the floor exactly as a creation does (`ananke_raft::invariants`, `snapshot`).
+A descriptor that changes is traced as a `RangeDescriptor`, as on any initialised replica.
+SHARD.md §8 says so of the re-seeded system replica.
+
+**Where it is reached.** On this tree nothing reached the first way: none of the runs above
+creates range 0 or range 1 on a node after its refusal on any of its thousand seeds, and the
+node sweep refused no store on any of the 10 000 seeds of the nightly on 7d15a83 (run
+41330474538). S10's `sim/shard.rs` does reach it. Measured on #188's tip f3977a5, in release,
+with the clause's reading folded beside its correct sweep:
+
+| S10's correct sweep | Seeds | Seeds with a refusal | A second creation | The run's own check |
+|---|---|---|---|---|
+| without the fix | 100 | 31 | 7, every one range 1 on a node refused before it, over its restatement at applied 0 | not read |
+| with the fix | 1 000 | 293 | 0 | fails on 21, the seeds D-113 lists on its three mechanisms |
+
+So this clause, merged without the fix, would have failed S10's correct sweep on about 7 % of
+seeds.
+
+**The tests.**
+- `an_install_creates_only_a_replica_that_holds_no_descriptor` holds the decision.
+- `split::run_cut_from_the_start` reaches the second way in a run: a follower of P, cut off
+  before its first start reaches anyone, restates P at applied 0, applies nothing, and is
+  installed after P's leader compacts. Its test asserts each of those per seed, that the
+  run's checks pass, and that the follower's only creation of P is its bootstrap's. Green on
+  20 of 20 and 1 000 of 1 000. With the old reading it fails: §7.
+- No test on this tree reaches the first way. S10's sweep, with the clause in its verdict,
+  is what asks it, from the day both are merged.
 
 ### 5. Its tripping variant: `IdBlockResumed` on the node sweep
 
@@ -23712,17 +23735,21 @@ seed 219 pin and the correct node's sweep, then the `reseed`, `split`, `ranges` 
 | M4: a refusal does not end the holding | the unit test's refusal case, since it now holds a refusal alone. First run against a case with the crash before the refusal, nothing failed: every refusal on this tree follows its node's crash |
 | M5: a crash does not end the holding (§1's stronger reading) | the unit test's case of a crash after which nothing is restated. Every sweep is green |
 | M6: a restatement does not hold the range | the unit test's restatement case, and the `IdBlockResumed` comparison's trip over a restatement. First run without that assertion, the comparison passed on the trips over a first split's creation |
+| M7: an install's creation read off the core alone again (§4) | the run cut off from the first start, in the clause's words: "seed 0: one owner per key: node 2 traced a `RangeCreated { cause: snapshot }` of range 2 at floor index 12 while it holds range 2 initialised, created by a bootstrap at floor index 0, ..."; the decision's unit test |
 
 ### 8. Traces, schedules and the nightly
 
-- No trace event is added and no schedule moves. A fold reads the trace. A check moves a
-  run only where it stops the run at a look where nothing else had, and §3 and §4 measure
-  none. No pinned hash moved.
+- No trace event is added and no schedule moves. A fold reads the trace, and an install that
+  no longer traces a creation draws nothing less. A check moves a run only where it stops the
+  run at a look where nothing else had, and §3 and §4 measure none. No pinned hash moved.
 - D-064 nightly rows:
   - the comparison is renamed in place, keeping its shard 5 and its 23.1 cpu s; its
     created-twice assertions read the folds it already compared;
   - seed 219's pin is weighed from the built release binary at 0.7 cpu s and goes into the
-    lightest shard, shard 6: 1832.3 -> 1833.0. After the merge of §10 it is 2203.5.
+    lightest shard, shard 6: 1832.3 -> 1833.0. After the merge of §10 it is 2203.5;
+  - the run cut off from the first start, weighed the same way at ANANKE_SEEDS=1000, 80.0
+    cpu s (74.18 + 5.78, under load averages of about 480, so if anything high), goes into
+    the lightest shard, shard 1: 1977.1 -> 2057.1.
 - The premerge runs nothing new at its thousand.
 
 ### 10. The merge of `main` at de9f4d7 (#185, #186, #187)
@@ -23748,10 +23775,15 @@ nanosecond on the merged tree.
 **`IdBlockResumed`'s comparison is unchanged on the merged tree**: 14 of 20 (13 over a
 restatement) and 71 of 100 (67), against check 18's range-id clause on the same 14 and 71.
 
-**The thousand seeds.** The figures of §3 to §5 were measured off b1da6ec. They were measured
-again on the merge of `main` at 7b02530, where every one was unchanged and the resplit run was
-green with the clause on 1 000 of 1 000. That merge was not committed: `main` moved first, and
-this one replaces it.
+**The thousand seeds, measured again on the merged tree** (release, seeds 0 to 999, before
+§4's fix, which moves no run of this tree, since none of them traces a second creation).
+Every figure of §3 to §5 is unchanged:
+- the node sweep's correct node: the clause in violation on 0, green on 1 000;
+- `IdBlockResumed`: 14, 71 and 630 (13, 67 and 605 over a restatement), on the seeds of check
+  18's range-id clause, with the run verdicts of §3;
+- `SnapshotOverlapsReplica` on the node sweep: the clause on seed 219 alone and the overlap
+  clause on 8; on (i), the overlap clause on 1 000 and the clause on none;
+- every row of §4 at 0, with #185's resplit run added.
 
 `RetakeNeverAfterOverlap`'s test reads `x`'s creations and its waits, not the run's verdict,
 so the clause does not touch it.
@@ -23765,8 +23797,10 @@ so the clause does not touch it.
 4. `IdBlockResumed` on the node sweep as its tripping variant, and seed 219 pinned for
    `SnapshotOverlapsReplica`. A directed shape for that variant's second creation — (i)
    with `x`'s P left to catch up by its log — is not built (§5).
-5. The re-seeded system replica's install traced as a creation of a replica its node had
-   just restated: latent, recommended as its own issue (§4).
+5. An install onto an empty replica that holds a descriptor creates nothing, fixed here
+   because the clause turns it into a failure of S10's correct sweep (§4). The re-seeded
+   system replica's way is held by a unit test and by S10's sweep once merged, not by a run
+   on this tree.
 6. SHARD.md §5, §8 and §12 amended (§1).
 
 ---

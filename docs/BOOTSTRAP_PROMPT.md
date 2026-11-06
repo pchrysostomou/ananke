@@ -113,10 +113,12 @@ _Update this section at the end of every session._
   `IdBlockResumed` on the node sweep: 14 of 20, 71 of 100 and 630 of 1 000, the same seeds
   as check 18's range-id clause, asserted at every tier. Seed 219 under
   `SnapshotOverlapsReplica` is pinned: the clause trips at node 3's install's creation of
-  62 after its split's, 16 ms before Raft's state machine safety. A latent case is left as
-  an issue: a re-seeded system replica's install is traced as a creation of a replica just
-  restated, which no run reaches. Seed 219 and the comparison's figures reproduce on the
-  merged tree (D-116 §10).
+  62 after its split's, 16 ms before Raft's state machine safety. The clause found a false
+  creation, fixed here: an install onto an empty replica that holds a descriptor (a re-seed's
+  system range, or a bootstrap's replica that has applied nothing) was traced as created, on
+  about 7 % of S10's correct seeds; 0 of 1 000 there with the fix, with the 21 seeds D-113
+  lists failing as before. `split::run_cut_from_the_start` is its directed run. Every figure
+  reproduces on the merged tree (D-116 §10).
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

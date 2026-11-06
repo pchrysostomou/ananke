@@ -520,8 +520,12 @@
 # takes the union of both sides' rows, keeps every row in the shard its own side placed it in,
 # and recomputes every header from the rows beneath it: shard 6 carries #185's resplit run at
 # 335.8, D-115's 34.7 and D-116's 0.7, 1832.3 -> 2203.5.
+# D-116 then added the run cut off from the first start, one `split` row, weighed from the built
+# release binary (`split-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+# user + sys, under load averages of about 480, so if anything high: 80.0 cpu s (74.18 + 5.78,
+# 210.5 s real). Into the lightest shard, shard 1 at 1977.1 -> 2057.1.
 # shard	binary	cpu_s	test
-# shard 1: 1977.1 cpu s
+# shard 1: 2057.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -545,6 +549,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+1	split	80.0	a_replica_cut_off_from_its_first_start_is_installed_and_not_created_twice
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed

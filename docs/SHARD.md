@@ -1140,7 +1140,10 @@ replica on the node counts as refused in the per-range majority rule below.
 `RaftRecovered`, `RaftReseeded` and `RaftProgressReset` are per replica and gain
 `range`, and `RaftRecovered`'s `incarnation` is the replica's (Q26). A replica's re-seed
 install traces `RangeCreated { cause: snapshot }` on its node, which restarts that
-replica's floors in checks 2 to 4. A refused node re-seeds into a fresh engine in a new
+replica's floors in checks 2 to 4. A re-seeded system replica is the exception: its re-seed
+writes its descriptor and index-0 state and its start restates it, so it is initialised,
+and its install, as any install onto an initialised replica, creates nothing and restarts
+the floors by the installed snapshot (D-116). A refused node re-seeds into a fresh engine in a new
 directory, opened at once, each range installed live as its stream completes (Q15; §11,
 storage 8).
 
