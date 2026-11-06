@@ -400,6 +400,16 @@ pub enum NodeVariant {
     /// cross-range hold folds trip on.
     // PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
     ApplyWaitsForEveryRange,
+    /// A stream refused under the overlap rule is never retaken: at every wait's end the
+    /// leader streams the same checkpoint again, where SHARD.md §5 (Q27) streams "from a
+    /// fresh take if its checkpoint lies below the last split or merge its range
+    /// applied, since only a newer snapshot can stop overlapping". A checkpoint of R
+    /// from before R's own split names `[k1, k2)`; once R's right half is installed on
+    /// the refusing node it overlaps it there, and on an idle range, which takes nothing
+    /// by its threshold, it is refused for ever. The resplit run (`sim/split.rs`) catches
+    /// it by its liveness: the node never makes R (PROPOSED D-110, #185's review, NB2).
+    // PROPOSED(D-110): the fresh take's variant.
+    RetakeNeverAfterOverlap,
 }
 
 impl NodeVariant {
@@ -452,6 +462,7 @@ impl NodeVariant {
         NodeVariant::RefusedReadLeft,
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
+        NodeVariant::RetakeNeverAfterOverlap,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the five ways to get a node's
@@ -639,6 +650,9 @@ impl NodeVariant {
             // (`crate::range_variant`).
             // PROPOSED(D-108): bits 25 and 48 to 53 are free, and seventeen bits are
             // left.
+            // PROPOSED(D-110): the overlap rule's fresh take never made. Bits 25 and 49
+            // to 53 are free, and sixteen bits are left.
+            NodeVariant::RetakeNeverAfterOverlap => 1 << 48,
         }
     }
 
@@ -693,6 +707,7 @@ impl NodeVariant {
             NodeVariant::RefusedReadLeft => "RefusedReadLeft",
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
+            NodeVariant::RetakeNeverAfterOverlap => "RetakeNeverAfterOverlap",
         }
     }
 }
@@ -787,8 +802,10 @@ mod tests {
         // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
         // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
+        // D-110's one is the overlap rule's fresh take never made.
         // PROPOSED(D-108)
-        assert_eq!(NodeVariant::BUGS.len(), 47);
+        // PROPOSED(D-110)
+        assert_eq!(NodeVariant::BUGS.len(), 48);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

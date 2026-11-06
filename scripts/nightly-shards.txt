@@ -486,6 +486,29 @@
 # them, and recomputes every header from the rows beneath it: shard 5 carries D-110's 226.1
 # and D-112's 0.4 and 0.3, 1754.2 -> 1981.0; shards 4 and 6 are D-110's 2015.7 and 1832.3.
 # The next row added goes into the lightest, which is shard 6.
+# #180's review (PROPOSED D-110 §5a) added one `split` row, the resplit run, weighed on its tree from
+# the built release binary (`split-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100,
+# as user + sys, on an Apple M2 of 8 cores on AC power with other slices' runs beside it (load
+# averages 280 to 301): 284.1 cpu s (270.84 + 13.22, 124.2 s real). Into the lightest shard, shard 6
+# at 1832.3 -> 2116.4.
+# #185's review (PROPOSED D-110 §5a, NB1 and NB2) asked the resplit run's split after the first
+# wait and added its pair, `RetakeNeverAfterOverlap`. Both weighed on this tree from the built
+# release binary (`split-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+# user + sys, on an Apple M2 of 8 cores on AC power (load averages 10 to 17): the resplit run,
+# re-weighed in place, at 335.8 cpu s (328.56 + 7.24, 45.1 s real; the review measured 328.2),
+# shard 6 2116.4 -> 2168.1; the variant at 318.8 (311.80 + 6.98, 42.6 s real), into the lightest
+# shard, shard 3 at 1918.6 -> 2237.4.
+# The merge of `main` at b1da6ec (#184, D-112) into #185 takes the union of both sides' rows,
+# keeps every row in the shard its own side placed it in, and recomputes every header from the
+# rows beneath it: shard 5 carries D-112's 0.4 and 0.3 (1980.3 -> 1981.0), shard 6 #185's
+# resplit run at 335.8 (2168.1) and shard 3 its variant at 318.8 (2237.4).
+# PROPOSED D-115 (#172: a re-seed after a split creates P at the split's generation, and check 7
+# holds it) added one `reseed` row, which runs the binary's TIER_CAP of 200 seeds at the nightly:
+# weighed on its tree from the built release binary (`reseed-<hash> <test> --exact`) at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, on an Apple M2 of 8 cores
+# with other slices' builds beside it (load averages 86 to 100, so the figure is if anything
+# high): 34.7 cpu s, the median (30.78 + 1.03, 33.73 + 0.92, 34.24 + 0.97). Into the lightest
+# shard, shard 6 at 2168.1 -> 2202.8.
 # PROPOSED D-116 (check 8's created-twice clause) renamed one `node` row in place, check 18's
 # comparison under `IdBlockResumed`, now `..._checks_18_and_8_trip_under_id_block_resumed`,
 # keeping its shard and weight: its new assertions read the folds it already compared. It
@@ -493,6 +516,10 @@
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
 # two runs, under load averages 70 to 80 from other runs: 0.7 cpu s (0.66 + 0.04, 0.66 +
 # 0.03). Into the lightest shard, shard 6 at 1832.3 -> 1833.0.
+# The merge of `main` at de9f4d7 (#185's D-110, #186's D-114, #187's D-115) into D-116's branch
+# takes the union of both sides' rows, keeps every row in the shard its own side placed it in,
+# and recomputes every header from the rows beneath it: shard 6 carries #185's resplit run at
+# 335.8, D-115's 34.7 and D-116's 0.7, 1832.3 -> 2203.5.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -537,7 +564,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	179.0	an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node
-# shard 3: 1918.6 cpu s
+# shard 3: 2237.4 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -562,6 +589,7 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
+3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
 # shard 4: 2015.7 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
@@ -628,7 +656,7 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 1833.0 cpu s
+# shard 6: 2203.5 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -672,6 +700,8 @@
 6	node	0.6	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor
 6	node	0.5	the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch
 6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
+6	reseed	34.7	a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
+6	split	335.8	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed
 6	node	0.7	seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second

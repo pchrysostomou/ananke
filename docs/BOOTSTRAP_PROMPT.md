@@ -101,8 +101,8 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Branch `phase-3-stage-c-created-twice-fold` (2026-11-01), off `main` at b1da6ec,
-  PROPOSED D-116 (footer D-117; D-113 to D-115 are other slices'), **#181: check 8's
+- Branch `phase-3-stage-c-created-twice-fold` (2026-11-01, merged with `main` at de9f4d7 on
+  2026-11-06), off `main` at b1da6ec, PROPOSED D-116 (footer D-117), **#181: check 8's
   created-twice clause**. A `RangeCreated` of a range on a node whose check-8 spans already
   hold it is a violation, whatever made either creation: §5's "the apply asserts" that R is
   not "already initialised here", asked of the trace instead of failing the node, so it no
@@ -115,26 +115,49 @@ _Update this section at the end of every session._
   `SnapshotOverlapsReplica` is pinned: the clause trips at node 3's install's creation of
   62 after its split's, 16 ms before Raft's state machine safety. A latent case is left as
   an issue: a re-seeded system replica's install is traced as a creation of a replica just
-  restated, which no run reaches.
+  restated, which no run reaches. Seed 219 and the comparison's figures reproduce on the
+  merged tree (D-116 §10).
+- Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
+  review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
+  each gated: B1 and N2, the fresh take read by generation as a free function, with a unit
+  test, a task-level test of the wait's end and the resplit run (shape (i) with R split
+  again, a fresh take on 1 000 of 1 000); B2, the overlap rule's one decision for both
+  install paths, failing closed, the record's walk past any key between, with walk,
+  decision and `finish` tests; N1, N3 to N8 and D-110's corrections (seven tests, seven
+  stragglers, both causes measured on `main`). Every plant the review left green now
+  fails a test. N10 filed as #183. #185's review (D-110 §12), five non-blocking points:
+  the resplit run's split after its first wait with its counts asserted per seed (NB1);
+  `RetakeNeverAfterOverlap` built, `x` left without R on 607 of 1 000 seeds, asserted at
+  every tier (NB2); `finish`'s test reads the status sent (NB3); a placeholder's install of
+  a range made meanwhile refused through the task, and the span filter in `admission` for
+  both paths (NB4); D-110's title and markers, and "unreachable" said of the refusal arms
+  alone (NB5). Merged with `main` at b1da6ec (#184, D-112).
 - Branch `phase-3-stage-c-overlap-rule` (2026-10-25), off `main` at 2d59c96, PR #180,
-  PROPOSED D-110 (footer D-112 since the merge of `main` at 292cafc, #179 taking D-111), **#162's S9, the overlap rule (Q27)**. An install refused
-  because its span overlaps another initialised replica on the node is answered
-  `SnapshotStatus::Overlaps` (tag 4), on a placeholder's install and on an install onto an
-  initialised replica (the latter unreachable on Stage C's correct system, its descriptor
-  read in the snapshot record's own walk so no schedule moves); the leader ends the
-  stream, counts nothing against D-090's restart bound and lets the core stream again after
-  a minimum election timeout, from a fresh take where the checkpoint's span is not the
-  range's (`RaftSnapshotOverlapped`, `RaftSnapshotRestream`). Closes #177: seed 595 retakes
-  nothing now; the correct node's thousand seeds have 13 refusals on 10, every restream from
-  the same checkpoint. `SnapshotOverlapsReplica` (bit 8) built; `sim/split.rs` (i) built on
-  (ii)'s prefix, a 16 KiB chunk and an 8 KiB limit toward `x` (R's largest chunk frame
-  731–732 bytes, P's 16 469, measured over 1 000 seeds): the correct system green with its
-  mechanism asserted on 1 000 of 1 000, the variant caught by check 8 at `x`'s
-  `RangeCreated { cause: snapshot }` on 1 000 of 1 000, and check 8 under the equivalence
-  test against it on (i), 100 of 100. On the node sweep the variant is caught by check 8 on
-  8 of 1 000 and by state machine safety on seed 219, a replica created twice that no
-  range-layer check sees (#181, with the apply's "R already initialised here" assertion,
-  not built).
+  PROPOSED D-110, **#162's S9, the overlap rule (Q27)**. The footer is D-112 since the
+  merges of `main` at 292cafc and 2aab845, #179 and #182 taking D-111.
+  - **What it builds.** An install refused because its span overlaps another initialised
+    replica on the node is answered `SnapshotStatus::Overlaps` (tag 4). That holds on a
+    placeholder's install and on an install onto an initialised replica. On the latter the
+    refusal arms are unreachable on Stage C's correct system, but the check runs on every
+    live install and fails closed on a snapshot naming no span.
+    The leader ends the stream, counts nothing against D-090's restart bound, and lets the
+    core stream again after a minimum election timeout. It streams from a fresh take where
+    the checkpoint's generation is not the range's (`RaftSnapshotOverlapped`,
+    `RaftSnapshotRestream`).
+  - **#177 closed.** Seed 595 retakes nothing now. The correct node's thousand seeds have
+    13 refusals on 10, every restream from the same checkpoint.
+  - **`SnapshotOverlapsReplica`** (bit 8) is built.
+  - **`sim/split.rs` (i)** is built on (ii)'s prefix, with a 16 KiB chunk and an 8 KiB
+    limit toward `x` (R's largest chunk frame 731–732 bytes, P's 16 469, over 1 000
+    seeds):
+    - the correct system is green with its mechanism asserted on 1 000 of 1 000;
+    - the variant is caught by check 8 at `x`'s `RangeCreated { cause: snapshot }` on
+      1 000 of 1 000;
+    - check 8 under the equivalence test against it on (i), 100 of 100.
+  - **On the node sweep** the variant is caught by check 8 on 8 of 1 000, and by state
+    machine safety on seed 219, a replica created twice that no range-layer check sees
+    (#181, with the apply's "R already initialised here" assertion, not built).
+  - Merged as 5e05942 (2026-10-25); its review's fixes are the branch above.
 - Branch `phase-3-stage-c-joiners-split-vote` (2026-10-18), stacked on
   `phase-3-stage-c-placeholders` (PR #173), PROPOSED D-109 §7–§8, **#162's S8 (b)**: exactly
   three bootstrap nodes, enforced as a node failure at the start; a node that joins holds

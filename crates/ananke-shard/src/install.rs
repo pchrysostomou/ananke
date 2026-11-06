@@ -434,6 +434,93 @@ fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
     }
 }
 
+/// Whether the stream a refusal for overlap ended is streamed again from a fresh take,
+/// once its wait is over (SHARD.md §5, Q27): "from a fresh take if its checkpoint lies
+/// below the last split or merge its range applied, since only a newer snapshot can stop
+/// overlapping, and otherwise from the same checkpoint, since the overlap is the
+/// receiver's to clear".
+///
+/// `streamed` is the descriptor the refused checkpoint carries, read out of its version
+/// directory, and `now` the descriptor the range holds now. The checkpoint lies below
+/// the range's last split or merge exactly when its generation is below the range's:
+/// the generation rises at every split and merge (Q6), and only there on Stage C's tree.
+/// Any other answer retakes: a generation above the range's own is no checkpoint this
+/// replica took, and a checkpoint or a descriptor that cannot be read says nothing of
+/// when the checkpoint was taken. A wrong "no" is the costly mistake — the leader
+/// streams the same refused checkpoint again after every wait, for as long as nothing
+/// else moves the range's record on — and a wrong "yes" costs one take, so every doubt
+/// is a retake.
+///
+/// A free function for the reason [`step_for`] and [`booked`] are (D-090), and #180's
+/// review is why: inside the task's loop the decision was one expression that no test
+/// could fail, since no run of the tree computed anything but "no".
+// PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDescriptor>) -> bool {
+    match (streamed, now) {
+        (Some(streamed), Some(now)) => streamed.generation != now.generation,
+        _ => true,
+    }
+}
+
+/// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
+/// node whose initialised replicas' descriptors are `held`.
+// PROPOSED(D-110): one decision for both install paths, failing closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// Install it.
+    Install,
+    /// Refuse it with `Overlaps`: its span overlaps another initialised replica on the
+    /// node, or, for an install into a placeholder, the range itself was created on the
+    /// node meanwhile.
+    Overlaps,
+    /// Refuse it with a start-over (`Unusable`): its staged bytes name no span, so the
+    /// rule has nothing to check. No take of this tree makes such a snapshot.
+    NoSpan,
+}
+
+/// The overlap rule's decision for a completed stream of `range` whose staged bytes
+/// carry the descriptor `streamed`, on a node holding `held` (SHARD.md §5, Q27): "a
+/// snapshot is installed on a node only if its span overlaps no other initialised
+/// replica there". One decision for both paths, an install into a placeholder
+/// (`into_placeholder`, D-109 §2) and an install onto a replica the node holds.
+///
+/// **It fails closed.** A snapshot whose descriptor cannot be found, or whose span is
+/// empty or inverted, is refused, on both
+/// paths, as the placeholder's path always refused one: before #180's review the second
+/// path installed it "as before", so a walk that missed the descriptor switched the rule
+/// off with every test still green. `SnapshotOverlapsReplica` installs whatever the span
+/// overlaps; it keeps the refusal of a placeholder's install of a range created on the
+/// node meanwhile, which is the same replica made twice rather than an overlap, and it
+/// keeps the refusal of a snapshot that names no span.
+// PROPOSED(D-110): one decision for both install paths, failing closed.
+fn admission(
+    range: RangeId,
+    streamed: Option<&RangeDescriptor>,
+    held: &BTreeMap<RangeId, RangeDescriptor>,
+    into_placeholder: bool,
+    variants: RangeVariants,
+) -> Admission {
+    // A span that is empty or inverted names no key either, on either path: the filter
+    // stood on the placeholder's path alone until #185's review (NB4).
+    let Some(streamed) = streamed.filter(|streamed| streamed.start < streamed.end) else {
+        return Admission::NoSpan;
+    };
+    if into_placeholder && held.contains_key(&range) {
+        return Admission::Overlaps;
+    }
+    if variants.contains(RangeVariant::SnapshotOverlapsReplica) {
+        return Admission::Install;
+    }
+    let overlaps = held.iter().any(|(other, held)| {
+        *other != range && held.start < streamed.end && streamed.start < held.end
+    });
+    if overlaps {
+        Admission::Overlaps
+    } else {
+        Admission::Install
+    }
+}
+
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
 /// variant — the start-over the node answered it with before this bound existed.
 // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
@@ -610,6 +697,7 @@ impl<E: Environment> Task<E> {
 
     /// The nearest deadline of a chunk outstanding on any stream, or of a wait after
     /// an overlap refusal.
+    // PROPOSED(D-110): the leader's wait is a deadline of the task's loop.
     fn deadline(&self) -> Option<ananke_env::Instant> {
         self.sending
             .values()
@@ -653,6 +741,7 @@ impl<E: Environment> Task<E> {
     /// another's.
     async fn due(&mut self) {
         let now = self.env.clock().now();
+        // PROPOSED(D-110): every overlap refusal's wait that is over, first.
         self.waited(now).await;
         let due: Vec<(RangeId, ServerId)> = self
             .sending
@@ -1224,13 +1313,23 @@ impl<E: Environment> Task<E> {
         // holds: P's pre-split snapshot, whose span is P's whole span, on a node where R
         // is initialised. Refused with `Overlaps`, the range's hold released, and the
         // sender streams again after a minimum election timeout, from a fresh take,
-        // since only a newer snapshot can stop overlapping. A snapshot that carries no
-        // descriptor names no span to refuse, and is installed as before.
-        // PROPOSED(D-110): the same rule for an install onto an initialised replica.
-        if streamed
-            .as_ref()
-            .is_some_and(|streamed| self.overlaps_another(range, streamed))
-        {
+        // since only a newer snapshot can stop overlapping. **A snapshot whose
+        // descriptor cannot be found is refused** as a start-over, as the placeholder's
+        // path refuses one (`admission`): it was installed "as before" until #180's
+        // review, so a walk that missed the descriptor switched the rule off unseen.
+        // PROPOSED(D-110): the same rule for an install onto an initialised replica,
+        // failing closed.
+        let admitted = admission(
+            range,
+            streamed.as_ref(),
+            &lock(&self.descriptors),
+            false,
+            self.range_variants,
+        );
+        if admitted == Admission::NoSpan {
+            return self.restart(range, from, &install, &store).await;
+        }
+        if admitted == Admission::Overlaps {
             self.clear(&install.source).await;
             self.plan.finish(range, from);
             self.receiving.remove(&(range, from));
@@ -1453,36 +1552,35 @@ impl<E: Environment> Task<E> {
         )
         .await
         {
-            Ok(Some(bytes)) => RangeDescriptor::decode(bytes)
-                .ok()
-                .filter(|descriptor| descriptor.start < descriptor.end),
+            Ok(Some(bytes)) => RangeDescriptor::decode(bytes).ok(),
             Ok(None) | Err(_) => None,
         };
         // A stream that carries no descriptor says nothing of the span it would install,
-        // and nothing can be checked against it: no take of this tree makes one.
-        let Some(descriptor) = descriptor else {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Unusable)
-                .await;
+        // and nothing can be checked against it: no take of this tree makes one. The
+        // range itself initialised meanwhile — this node applied the split that makes it
+        // while the stream was read — is refused as an overlap: the replica is here now,
+        // and the sender's next stream lands on it (`admission`).
+        // PROPOSED(D-110): the overlap rule's one decision.
+        let admitted = admission(
+            range,
+            descriptor.as_ref(),
+            &lock(&self.descriptors),
+            true,
+            self.range_variants,
+        );
+        let descriptor = match (admitted, descriptor) {
+            (Admission::Install, Some(descriptor)) => descriptor,
+            (Admission::Overlaps, _) => {
+                return self
+                    .placeholder_refused(range, from, &install, StartOver::Overlaps)
+                    .await;
+            }
+            _ => {
+                return self
+                    .placeholder_refused(range, from, &install, StartOver::Unusable)
+                    .await;
+            }
         };
-        // The range itself initialised meanwhile — this node applied the split that
-        // makes it while the stream was read — is the same refusal: the replica is here
-        // now, and the sender's next stream lands on it.
-        // PROPOSED(D-110): `SnapshotOverlapsReplica` installs it whatever it overlaps,
-        // and keeps the refusal of a range created here meanwhile, which is no overlap
-        // with another replica but the same replica made twice.
-        let every = self
-            .range_variants
-            .contains(RangeVariant::SnapshotOverlapsReplica);
-        let overlaps = lock(&self.descriptors).iter().any(|(other, held)| {
-            *other == range
-                || (!every && held.start < descriptor.end && descriptor.start < held.end)
-        });
-        if overlaps {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Overlaps)
-                .await;
-        }
         // The engine, through the store it was opened through: the node has one engine
         // (Q2), and a node that joined holds no other store until this install.
         let beside = self.anchor.clone();
@@ -1659,24 +1757,6 @@ impl<E: Environment> Task<E> {
             (install.at.last_index, install.at.last_term),
         )
         .await;
-    }
-
-    /// Whether `span`, the span of a snapshot of `range`, overlaps another initialised
-    /// replica on this node: SHARD.md §5's overlap rule (Q27), for an install onto a
-    /// replica the node already holds. A range's own descriptor is the replica the
-    /// install replaces, and is not another. `SnapshotOverlapsReplica` says no to every
-    /// one.
-    // PROPOSED(D-110)
-    fn overlaps_another(&self, range: RangeId, span: &RangeDescriptor) -> bool {
-        if self
-            .range_variants
-            .contains(RangeVariant::SnapshotOverlapsReplica)
-        {
-            return false;
-        }
-        lock(&self.descriptors)
-            .iter()
-            .any(|(other, held)| *other != range && held.start < span.end && span.start < held.end)
     }
 
     /// The install did not switch: the staging directory starts over, the sender is
@@ -2014,11 +2094,8 @@ impl<E: Environment> Task<E> {
     /// range's last split or merge (SHARD.md §5, Q27).
     ///
     /// "Predates" is read off the checkpoint itself: its descriptor, out of the version
-    /// directory the refused stream read, names a span other than the range's
-    /// descriptor names now. Spans change at a split or a merge and at nothing else, and
-    /// a snapshot whose span is the range's present one is what a fresh take would
-    /// stream, so retaking it could not stop the overlap; a checkpoint that cannot be
-    /// read is retaken, since nothing then says it postdates either.
+    /// directory the refused stream read, is at a generation below the one the range's
+    /// descriptor is at now ([`retake_after_overlap`]).
     // PROPOSED(D-110): the leader's wait, and the fresh take.
     async fn waited(&mut self, now: ananke_env::Instant) {
         let over: Vec<(RangeId, ServerId)> = self
@@ -2040,13 +2117,11 @@ impl<E: Environment> Task<E> {
             .ok()
             .flatten()
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
-            let retake = match (streamed, self.user_span(range)) {
-                (Some(streamed), Some(now)) => {
-                    streamed.start != now.start || streamed.end != now.end
-                }
-                (None, _) => true,
-                (Some(_), None) => false,
-            };
+            let now = lock(&self.descriptors).get(&range).cloned();
+            // The variant: the refused checkpoint is streamed again, whatever it is.
+            // PROPOSED(D-110): the fresh take's variant (#185's review, NB2).
+            let retake = !self.variants.contains(NodeVariant::RetakeNeverAfterOverlap)
+                && retake_after_overlap(streamed.as_ref(), now.as_ref());
             self.env.trace(TraceEvent::RaftSnapshotRestream {
                 server: self.id.0,
                 range: range.get(),
@@ -2802,5 +2877,556 @@ mod tests {
             SnapshotStatus::Restart,
             "the variant is meant to answer a cap-wait with a start-over"
         );
+    }
+
+    // --- The overlap rule (SHARD.md §5, Q27; PROPOSED D-110, #180's review) ---
+
+    fn key(name: &str) -> Bytes {
+        ananke_raft::apply::user_key(name.as_bytes())
+    }
+
+    /// A live descriptor of `range` over `[start, end)` at `generation`.
+    fn described(range: RangeId, start: &str, end: &str, generation: u64) -> RangeDescriptor {
+        RangeDescriptor {
+            range,
+            start: key(start),
+            end: key(end),
+            generation,
+            voters: vec![ServerId(1), ServerId(2), ServerId(3)],
+            state: ananke_env::RangeState::Live,
+        }
+    }
+
+    const R9: RangeId = RangeId(9);
+
+    /// The fresh take after an overlap refusal's wait, decided by the checkpoint's
+    /// generation (#180's review, B1 and N2). The decision was one expression in the
+    /// task's loop, read by span, and no run of the tree computed anything but "no", so
+    /// `||` planted as `&&` — the bug a split's left half meets, its start kept and its
+    /// end moved — passed everything. Each case here is one that reading gets wrong.
+    // PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+    #[test]
+    fn a_refused_checkpoint_is_retaken_exactly_when_its_generation_is_not_the_ranges() {
+        let before = described(R2, "k0", "k2", 1);
+        let left = described(R2, "k0", "k1", 2);
+        // The checkpoint the range holds now: streamed again as it is.
+        assert!(!retake_after_overlap(Some(&left), Some(&left)));
+        // A split's left half: the start kept, the end moved.
+        assert!(retake_after_overlap(Some(&before), Some(&left)));
+        // A span moved at both ends.
+        assert!(retake_after_overlap(
+            Some(&described(R2, "k1", "k2", 2)),
+            Some(&described(R2, "k0", "k3", 4))
+        ));
+        // A split and then a merge back: the span is the checkpoint's again, at a
+        // higher generation. The span reading streamed the pre-split checkpoint (N2).
+        assert!(retake_after_overlap(
+            Some(&before),
+            Some(&described(R2, "k0", "k2", 3))
+        ));
+        // A checkpoint that cannot be read, and a range with no descriptor: nothing says
+        // the checkpoint postdates either, and a wrong "no" streams it for ever.
+        assert!(retake_after_overlap(None, Some(&left)));
+        assert!(retake_after_overlap(Some(&left), None));
+        assert!(retake_after_overlap(None, None));
+        // A generation above the range's own is no checkpoint this replica took.
+        assert!(retake_after_overlap(Some(&left), Some(&before)));
+    }
+
+    /// The overlap rule's one decision for both install paths (#180's review, B2): a
+    /// snapshot is installed only where its span overlaps no other initialised replica
+    /// on the node, a snapshot naming no span is refused on both, and the variant
+    /// installs whatever its span overlaps and nothing else.
+    // PROPOSED(D-110): one decision for both install paths, failing closed.
+    #[test]
+    fn the_overlap_rule_admits_an_install_only_where_its_span_overlaps_no_other_replica() {
+        let correct = RangeVariants::correct();
+        let every = RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]);
+        let split: BTreeMap<RangeId, RangeDescriptor> = [
+            (R2, described(R2, "k0", "k1", 2)),
+            (R9, described(R9, "k1", "k2", 2)),
+        ]
+        .into_iter()
+        .collect();
+        let before = described(R2, "k0", "k2", 1);
+        // Onto a held replica: P's pre-split snapshot where R is initialised overlaps R;
+        // P's post-split snapshot overlaps nothing but P itself, which it replaces.
+        assert_eq!(
+            admission(R2, Some(&before), &split, false, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R2, Some(&split[&R2]), &split, false, correct),
+            Admission::Install
+        );
+        // Into a placeholder: R's snapshot where P still covers R's span, and R's where R
+        // was created here meanwhile.
+        let lagging: BTreeMap<RangeId, RangeDescriptor> =
+            [(R2, before.clone())].into_iter().collect();
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &lagging, true, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &split, true, correct),
+            Admission::Overlaps
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &BTreeMap::new(), true, correct),
+            Admission::Install
+        );
+        // No span named, or an empty or inverted one: refused on both paths, whatever the
+        // variant (#185's review, NB4).
+        let inverted = described(R2, "k2", "k0", 3);
+        let empty = described(R9, "k1", "k1", 3);
+        for variants in [correct, every] {
+            assert_eq!(
+                admission(R2, Some(&inverted), &split, false, variants),
+                Admission::NoSpan
+            );
+            assert_eq!(
+                admission(R9, Some(&empty), &lagging, true, variants),
+                Admission::NoSpan
+            );
+            assert_eq!(
+                admission(R2, None, &split, false, variants),
+                Admission::NoSpan
+            );
+            assert_eq!(
+                admission(R9, None, &lagging, true, variants),
+                Admission::NoSpan
+            );
+        }
+        // The variant installs over an overlap, and still refuses the same replica made
+        // twice.
+        assert_eq!(
+            admission(R2, Some(&before), &split, false, every),
+            Admission::Install
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &lagging, true, every),
+            Admission::Install
+        );
+        assert_eq!(
+            admission(R9, Some(&split[&R9]), &split, true, every),
+            Admission::Overlaps
+        );
+    }
+
+    /// Runs `body` on one simulated node, and hands back its result and the trace.
+    fn on_a_node<T, F>(
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(3));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let out: Arc<std::sync::Mutex<Option<T>>> = Arc::default();
+        env.clone().spawn("test", {
+            let out = out.clone();
+            async move {
+                let value = body(env).await;
+                *lock(&out) = Some(value);
+            }
+        });
+        sim.run_for(Duration::from_secs(10));
+        let value = lock(&out).take().expect("the body finished");
+        (value, sim.trace())
+    }
+
+    /// The follower the directed tests stream from, and the socket its answers reach.
+    const FOLLOWER: ServerId = ServerId(3);
+
+    /// The socket a task built by [`task_on`] answers [`FOLLOWER`] on.
+    type Follower<E> = Arc<<<E as Environment>::Net as Network>::Socket>;
+
+    /// One node's `snapshot` task at `/n1`, holding `range`'s store, with `held` in the
+    /// host's descriptors: what the overlap rule's directed tests drive. Its answers to
+    /// [`FOLLOWER`] reach the socket handed back with it, so a test reads the status the
+    /// task sent and not only the trace (#185's review, NB3).
+    async fn task_on<E: Environment>(
+        env: &E,
+        range: RangeId,
+        held: &[RangeDescriptor],
+    ) -> (
+        Task<E>,
+        Arc<RaftStore<E>>,
+        Queue<crate::server::Local>,
+        Follower<E>,
+    ) {
+        let prefix = KeyPrefix::group(range.get());
+        let (store, _) = RaftStore::open_dir(
+            env.clone(),
+            ananke_storage::EngineConfig::new(PathBuf::from("/n1")),
+            prefix.clone(),
+        )
+        .await
+        .expect("the store opens");
+        let store = Arc::new(store);
+        let sock = Arc::new(
+            env.net()
+                .bind("10.0.0.1:7000".parse().expect("an address"))
+                .await
+                .expect("a socket"),
+        );
+        let at: SocketAddr = "10.0.0.1:7003".parse().expect("an address");
+        let follower = Arc::new(env.net().bind(at).await.expect("the follower's socket"));
+        let stores = Arc::new(std::sync::Mutex::new(
+            [(range, store.clone())].into_iter().collect(),
+        ));
+        let descriptors = Arc::new(std::sync::Mutex::new(
+            held.iter().map(|held| (held.range, held.clone())).collect(),
+        ));
+        let mut plan = Snapshots::new("/n1", ServerId(1), 4, NodeVariants::correct());
+        let span = held.iter().find(|held| held.range == range).map_or_else(
+            || key("k0")..key("k9"),
+            |held| held.start.clone()..held.end.clone(),
+        );
+        plan.host(range, vec![prefix.span(), span]);
+        let local = Queue::new();
+        let task = Task::new(
+            env.clone(),
+            ServerId(1),
+            sock,
+            [(FOLLOWER, at)].into_iter().collect(),
+            stores,
+            RaftConfig::default(),
+            NodeVariants::correct(),
+            PathBuf::from("/n1"),
+            descriptors,
+            Arc::default(),
+            plan,
+            local.clone(),
+            Queue::new(),
+            Arc::default(),
+            store.clone(),
+            false,
+            RangeVariants::correct(),
+        );
+        (task, store, local, follower)
+    }
+
+    /// The status of the first snapshot answer `follower` receives within a second, if
+    /// one arrives.
+    async fn answered<E: Environment>(env: &E, follower: &Follower<E>) -> Option<SnapshotStatus> {
+        let recv = std::pin::pin!(follower.recv());
+        let timer = std::pin::pin!(env.clock().sleep(Duration::from_secs(1)));
+        let Either::Left(Ok((_, frame))) = race(env, recv, timer).await else {
+            return None;
+        };
+        crate::frame::decode(&frame)
+            .ok()?
+            .messages
+            .into_iter()
+            .find_map(|tagged| match tagged.frame.message {
+                Message::InstallSnapshotResponse { status, .. } => Some(status),
+                _ => None,
+            })
+    }
+
+    /// A checkpoint of `range`'s Raft state into `dir`, as a leader at `/leader` holds it
+    /// at `index`: its snapshot record and, where given, its descriptor.
+    async fn checkpoint_of<E: Environment>(
+        env: &E,
+        range: RangeId,
+        index: Index,
+        descriptor: Option<&RangeDescriptor>,
+        dir: &Path,
+    ) {
+        let prefix = KeyPrefix::group(range.get());
+        let (leader, _) = RaftStore::open_dir(
+            env.clone(),
+            ananke_storage::EngineConfig::new(PathBuf::from("/leader")),
+            prefix.clone(),
+        )
+        .await
+        .expect("the leader's store opens");
+        let mut batch = ananke_storage::WriteBatch::new();
+        if let Some(descriptor) = descriptor {
+            batch.put(prefix.descriptor_key(), descriptor.encode());
+        } else {
+            batch.delete(prefix.descriptor_key());
+        }
+        leader
+            .engine()
+            .write(batch, true)
+            .await
+            .expect("the descriptor");
+        leader
+            .record_snapshot(&ananke_raft::store::SnapshotRecord {
+                last_index: index,
+                last_term: 2,
+                config: Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]),
+                dir: String::new(),
+                taken: true,
+                take: 1,
+            })
+            .await
+            .expect("the record");
+        let span = prefix.span();
+        leader
+            .engine()
+            .checkpoint_spans(&[&span.start[..]..&span.end[..]], dir)
+            .await
+            .expect("the checkpoint");
+    }
+
+    /// A core's ask for a stream to a follower whose overlap refusal's wait is still
+    /// running is dropped (#180's review, N1): the wait stands whoever asks, and its end
+    /// lets the core ask again. Planted away (`&& false` on the drop), (i) stayed green
+    /// with the same figures, because no core of the tree asks inside a wait. The
+    /// control is the same ask outside a wait, which gets as far as finding no version
+    /// of the index and giving the stream up for a take.
+    // PROPOSED(D-110): the leader's wait drops an ask inside it.
+    #[test]
+    fn a_cores_ask_for_a_stream_inside_an_overlap_refusals_wait_is_dropped() {
+        let ((outside, inside), _) = on_a_node(|env| async move {
+            let (mut task, _store, local, _follower) =
+                task_on(&env, R2, &[described(R2, "k0", "k2", 1)]).await;
+            let to = ServerId(3);
+            let gave_up = |local: &Queue<crate::server::Local>| {
+                local.count(|answer| {
+                    matches!(answer, crate::server::Local::Snapshot(SnapAnswer::Failed {
+                        range, to: follower, retake: true
+                    }) if *range == R2 && *follower == to)
+                })
+            };
+            task.open(R2, to, 5, 1).await;
+            let outside = gave_up(&local);
+            let _ = local.remove_first(|_| true);
+            task.overlapped.insert(
+                (R2, to),
+                Overlapped {
+                    due: env.clock().now() + Duration::from_secs(60),
+                    version: PathBuf::from("/n1/snap-r2-5-1"),
+                },
+            );
+            task.open(R2, to, 5, 1).await;
+            let inside = (local.len(), task.sending.len());
+            (outside, inside)
+        });
+        assert_eq!(outside, 1, "outside a wait the ask is acted on");
+        assert_eq!(
+            inside,
+            (0, 0),
+            "inside a wait the ask is dropped: nothing answered, nothing opened"
+        );
+    }
+
+    /// A wait's end, through the task (#180's review, B1): the refused checkpoint's
+    /// descriptor is read out of its version directory and held to the range's, so the
+    /// core is told to retake one from before the range's last split, to stream again
+    /// one at its present generation, and to retake one that cannot be read — and each
+    /// is traced as it is told.
+    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    #[test]
+    fn a_waits_end_retakes_a_checkpoint_from_before_the_ranges_split_and_no_other() {
+        let left = described(R2, "k0", "k1", 2);
+        let (told, trace) = on_a_node({
+            let left = left.clone();
+            move |env| async move {
+                let (mut task, _store, local, _follower) =
+                    task_on(&env, R2, std::slice::from_ref(&left)).await;
+                let to = ServerId(3);
+                let before = PathBuf::from("/n1/snap-r2-30-1");
+                let after = PathBuf::from("/n1/snap-r2-60-2");
+                checkpoint_of(&env, R2, 30, Some(&described(R2, "k0", "k2", 1)), &before).await;
+                checkpoint_of(&env, R2, 60, Some(&left), &after).await;
+                let mut told = Vec::new();
+                for version in [before, after, PathBuf::from("/n1/snap-r2-90-3")] {
+                    let now = env.clock().now();
+                    task.overlapped
+                        .insert((R2, to), Overlapped { due: now, version });
+                    task.waited(now).await;
+                    told.push(
+                        local
+                            .remove_first(|_| true)
+                            .and_then(|answer| match answer {
+                                crate::server::Local::Snapshot(SnapAnswer::Failed {
+                                    range,
+                                    to: follower,
+                                    retake,
+                                }) if range == R2 && follower == to => Some(retake),
+                                _ => None,
+                            }),
+                    );
+                }
+                told
+            }
+        });
+        assert_eq!(
+            told,
+            [Some(true), Some(false), Some(true)],
+            "a checkpoint from before the split is retaken, one at the range's generation \
+             streamed again, and one that cannot be read retaken"
+        );
+        let traced: Vec<bool> = trace
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshotRestream { retake, .. } => Some(*retake),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            traced,
+            [true, false, true],
+            "each wait's end is traced as told"
+        );
+    }
+
+    /// An install onto a replica the node holds, through the task's `finish` (#180's
+    /// review, B2): P's pre-split snapshot, on a node where R is initialised, is refused
+    /// `Overlaps` and the range let go; a snapshot naming no span is refused as a
+    /// start-over, failing closed; and P's post-split snapshot, overlapping nothing,
+    /// switches. Before the review a walk that never found the descriptor installed the
+    /// first two with every test green.
+    // PROPOSED(D-110): the overlap rule on an install onto an initialised replica.
+    #[test]
+    fn an_install_onto_a_held_replica_is_refused_where_it_overlaps_another_or_names_no_span() {
+        let before = described(R2, "k0", "k2", 1);
+        let left = described(R2, "k0", "k1", 2);
+        let right = described(R9, "k1", "k2", 2);
+        let cases: [(Vec<RangeDescriptor>, Option<RangeDescriptor>); 3] = [
+            (vec![left.clone(), right], Some(before.clone())),
+            (vec![before.clone()], None),
+            (vec![before], Some(left)),
+        ];
+        for (case, (held, streamed)) in cases.into_iter().enumerate() {
+            let (outcome, trace) = on_a_node(move |env| async move {
+                let (mut task, store, local, follower) = task_on(&env, R2, &held).await;
+                let from = FOLLOWER;
+                let source = PathBuf::from("/n1/staging-r2-s3");
+                checkpoint_of(&env, R2, 30, streamed.as_ref(), &source).await;
+                let span = held
+                    .iter()
+                    .find(|held| held.range == R2)
+                    .map(|held| held.start.clone()..held.end.clone())
+                    .expect("R2 is held");
+                let install = Install {
+                    range: R2,
+                    from,
+                    at: Identity {
+                        term: 2,
+                        last_index: 30,
+                        last_term: 2,
+                    },
+                    source,
+                    spans: vec![KeyPrefix::group(R2.get()).span(), span],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.receiving.entry((R2, from)).or_default().pending = Some(Box::new(install));
+                let repair = Repair {
+                    term: 2,
+                    vote: None,
+                    tail: Vec::new(),
+                    quarantined: false,
+                    incarnation: 7,
+                };
+                task.finish(R2, from, repair, env.decision()).await;
+                let let_go = local.remove_first(|_| true).map(|answer| match answer {
+                    crate::server::Local::Snapshot(SnapAnswer::Abandoned { .. }) => "let go",
+                    crate::server::Local::Snapshot(SnapAnswer::Switched { .. }) => "switched",
+                    _ => "something else",
+                });
+                let sent = answered(&env, &follower).await;
+                (let_go, store.applied(), sent)
+            });
+            let refused: Vec<StartOver> = trace
+                .iter()
+                .filter_map(|record| match &record.event {
+                    TraceEvent::RaftSnapshotStartOver { reason, .. } => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            // What the sender is told, beside what the trace says (#185's review, NB3):
+            // the held path's refusal is `Overlaps`, which no bound counts, and not #177's
+            // `Restart`; a snapshot naming no span is a start-over.
+            let expected = match case {
+                0 => (
+                    (Some("let go"), 0, Some(SnapshotStatus::Overlaps)),
+                    vec![StartOver::Overlaps],
+                ),
+                1 => (
+                    (Some("let go"), 0, Some(SnapshotStatus::Restart)),
+                    vec![StartOver::Unusable],
+                ),
+                _ => (
+                    (Some("switched"), 30, Some(SnapshotStatus::Installed)),
+                    vec![],
+                ),
+            };
+            assert_eq!(
+                (outcome, refused),
+                expected,
+                "case {case}: P's pre-split snapshot where R is held, a snapshot naming no \
+                 span, and P's post-split snapshot"
+            );
+        }
+    }
+
+    /// A placeholder's install, through the task (#185's review, NB4): one of a range the
+    /// node created meanwhile — its split's apply put R's descriptor in place while the
+    /// stream completed — is refused `Overlaps` and makes nothing, and the same install
+    /// where the range is not held creates R. The placeholder's path passes
+    /// `into_placeholder: true` to `admission`, which is what refuses the first: planted as
+    /// `false` the refusal went, every test green, and with it the guard against the double
+    /// creation D-110 §4 records for seed 219 under the variant.
+    // PROPOSED(D-110): the placeholder's path asks the decision as itself.
+    #[test]
+    fn a_placeholders_install_of_a_range_made_here_meanwhile_is_refused() {
+        let right = described(R9, "k1", "k2", 2);
+        let left = described(R2, "k0", "k1", 2);
+        for meanwhile in [true, false] {
+            let held = if meanwhile {
+                vec![left.clone(), right.clone()]
+            } else {
+                vec![left.clone()]
+            };
+            let streamed = right.clone();
+            let ((sent, created), trace) = on_a_node(move |env| async move {
+                let (mut task, _store, _local, follower) = task_on(&env, R2, &held).await;
+                let source = PathBuf::from("/n1/staging-r9-s3");
+                checkpoint_of(&env, R9, 40, Some(&streamed), &source).await;
+                let install = Install {
+                    range: R9,
+                    from: FOLLOWER,
+                    at: Identity {
+                        term: 2,
+                        last_index: 40,
+                        last_term: 2,
+                    },
+                    source,
+                    spans: vec![KeyPrefix::group(R9.get()).span()],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.install_placeholder(R9, FOLLOWER, install).await;
+                let created = lock(&task.stores).contains_key(&R9);
+                (answered(&env, &follower).await, created)
+            });
+            let made = trace.iter().any(|record| {
+                matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == R9.get())
+            });
+            if meanwhile {
+                assert_eq!(
+                    (sent, created, made),
+                    (Some(SnapshotStatus::Overlaps), false, false),
+                    "a placeholder's install of a range made here meanwhile is refused and \
+                     makes nothing"
+                );
+            } else {
+                assert_eq!(
+                    (sent, created, made),
+                    (Some(SnapshotStatus::Installed), true, true),
+                    "the same install where the range is not held creates it"
+                );
+            }
+        }
     }
 }

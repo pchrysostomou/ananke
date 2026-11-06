@@ -2155,11 +2155,14 @@ async fn snapshot_task<E: Environment>(
                     }
                     SnapshotStatus::Overlaps => {
                         // The range layer's overlap rule (SHARD.md §5, Q27), which a
-                        // one-group receiver holding one group never answers. Heard
-                        // anyway, it is what it says on the node: the checkpoint is
-                        // sound and the receiver would not take it, so the stream ends
-                        // with no retake and nothing counted against the restart bound,
-                        // and the core asks again when it next replicates.
+                        // one-group receiver holding one group never answers, so no run
+                        // reaches this arm. Heard anyway, it is what it says on the node:
+                        // the checkpoint is sound and the receiver would not take it, so
+                        // the stream ends with no retake and nothing counted against the
+                        // restart bound, and the core asks again when it next
+                        // replicates. Unlike the node's sender it does not wait out a
+                        // minimum election timeout first: a one-group server has no
+                        // other replica a receiver's span could overlap.
                         // PROPOSED(D-110): the overlap rule's refusal is not a restart.
                         inbox.push(Event::StreamFailed {
                             to: from,

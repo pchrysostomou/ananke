@@ -16,7 +16,9 @@
 //! - (c)'s second half — a replica answering *after its own install* — is shown not to be
 //!   a constant, which is what it was when it was keyed on the mark alone;
 //! - a re-seeded node's right half, which configuration never names, comes back through
-//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2).
+//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2);
+//! - the same run's install of the parent is created at the split's generation, and
+//!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115).
 
 use ananke_raft::core::Variants;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -344,4 +346,37 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
         }
     });
     verdict(&verdicts).expect("a re-seeded node's right half comes back quarantined on every seed");
+}
+
+/// A re-seed after a split creates the parent by an install at the split's generation,
+/// and check 7 holds it (issue #172; PROPOSED D-107 §2, D-115): `reseed::run_after_split`,
+/// on every seed of the tier.
+///
+/// `x` applied the split before its loss, and P's leader compacted past it while `x` was
+/// down. So the re-seed's stream of P carries a checkpoint past the split, and the
+/// install that creates P on `x`'s fresh engine puts P's left half in place, `[k0, k1)`
+/// at generation 2. Its `RangeCreated { cause: snapshot }` must name that descriptor
+/// (SHARD.md §8), and check 7 must hold it at its floor: equal to the value check 7's
+/// map holds for P there, not waiting for one.
+///
+/// Reverting the creation's reading to the first generation, whatever the snapshot held,
+/// fails this on every seed by check 7. The revert gives the call site of `created_from`
+/// in `ananke-shard`'s `server.rs` no descriptor. Measured: 20 of 20 seeds in debug and
+/// 200 of 200 at the cap in release. Seed 0 fails with "descriptor agreement: node
+/// Some(3)'s replica of range 2 was installed at index 128 with Held { …, generation: 1,
+/// … }, where the range's descriptor there is Held { …, generation: 2, … }". The unit test
+/// of `created_from` passes that revert, so this run is what holds the call site
+/// (PROPOSED D-115).
+#[test]
+fn a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it() {
+    let run = shape_seeds();
+    tier("the re-seed after a split, P's install creation", run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_after_split(seed);
+        report.check()?;
+        report.reached()?;
+        report.parent_created_at_the_splits_generation()
+    });
+    verdict(&verdicts)
+        .expect("a re-seed after a split creates P at the split's generation on every seed");
 }

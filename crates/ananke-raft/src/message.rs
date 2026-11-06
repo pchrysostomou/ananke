@@ -206,16 +206,18 @@ pub enum SnapshotStatus {
     Waiting,
     /// The stream completed, and its snapshot's span overlaps another initialised
     /// replica on the receiving node, so nothing was installed (the range layer's
-    /// overlap rule, SHARD.md §5, Q27). The sender ends the stream and streams again
-    /// after a minimum election timeout: from a fresh take if its checkpoint predates
-    /// its range's last split or merge, since only a newer snapshot can stop
-    /// overlapping, and otherwise from the same checkpoint, since the overlap is the
-    /// receiver's to clear.
+    /// overlap rule, SHARD.md §5, Q27). A node's sender — the range layer's `snapshot`
+    /// task — ends the stream and lets its range's core stream again after a minimum
+    /// election timeout: from a fresh take if its checkpoint predates its range's last
+    /// split or merge, since only a newer snapshot can stop overlapping, and otherwise
+    /// from the same checkpoint, since the overlap is the receiver's to clear.
     ///
     /// A status of its own for the reason [`Waiting`](SnapshotStatus::Waiting) is one:
     /// the checkpoint is sound, so counting the refusal against RAFT.md:210-212's restart
     /// bound would declare it unusable and force a retake that cannot help (#177). The
-    /// one-group server holds one group and never sends it.
+    /// one-group server holds one group, so no receiver of its ever sends it; its sender,
+    /// were it to hear one, ends the stream with no retake and no wait, and its core asks
+    /// again at its next replication (`node.rs`). That arm is reached by no run.
     // PROPOSED(D-110): the overlap rule's refusal is its own status.
     Overlaps,
 }

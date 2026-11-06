@@ -1180,6 +1180,7 @@ fn convert(
                 ("log_keys", int(*log_keys)),
             ])),
         ),
+        // PROPOSED(D-110): the leader's half of the overlap rule.
         TraceEvent::RaftSnapshotOverlapped {
             server,
             range,
@@ -1194,6 +1195,7 @@ fn convert(
                 ("last_index", int(*last_index)),
             ])),
         ),
+        // PROPOSED(D-110): the leader's half of the overlap rule.
         TraceEvent::RaftSnapshotRestream {
             server,
             range,
