@@ -67,10 +67,10 @@ use ananke_env::{
     Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, Socket,
     TraceEvent, race,
 };
+use ananke_raft::ServerId;
 use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
-use ananke_raft::{ServerId, invariants};
 use ananke_shard::client::{Cache, RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::range::RangeId;
@@ -82,8 +82,8 @@ use bytes::Bytes;
 
 use crate::lin::History;
 use crate::raft::{
-    self, CHECK_EVERY, ClientKeys, ClientStats, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE,
-    SharedStats, TICK, TRACE_CAP, admin_addr, election_max, server_addr,
+    self, ClientKeys, ClientStats, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, SharedStats, TICK,
+    admin_addr, election_max, server_addr,
 };
 use crate::ranges::{DIR, FIRST_RANGE, ID_BLOCK, INBOX_BYTES, META_RANGE, REFILL_AT, ROOT_RANGE};
 
@@ -342,37 +342,11 @@ impl Schedule {
 /// node is a bootstrap node because only those lead anything here. Offsets are within
 /// fifty milliseconds either way.
 fn clocks(seed: u64) -> (Vec<i64>, Vec<i64>) {
-    let mut rng = moirae_sched::stream(seed, "shard-clocks");
-    let within = rng.below(2) == 0;
-    let severe = rng.below(2) == 0;
-    let slow = rng.below(BOOTSTRAP);
-    let mut drifts = Vec::new();
-    let mut skews = Vec::new();
-    for i in 0..NODES {
-        let (magnitude, sign) = if within {
-            let sign = if rng.below(2) == 0 { 1 } else { -1 };
-            (rng.below(DRIFT_BOUND_PPM / 3 + 1), sign)
-        } else if severe {
-            let (lo, hi) = if i == slow {
-                (650_000, 750_000)
-            } else {
-                (250_000, 350_000)
-            };
-            (lo + rng.below(hi - lo + 1), if i == slow { -1 } else { 1 })
-        } else {
-            let lo = 2_000f64.ln();
-            let hi = 100_000f64.ln();
-            let u = rng.below(1_000_000) as f64 / 1_000_000.0;
-            (
-                (lo + (hi - lo) * u).exp() as u64,
-                if i == slow { -1 } else { 1 },
-            )
-        };
-        drifts.push(sign * i64::try_from(magnitude).expect("small"));
-        let skew = i64::try_from(rng.below(50_000_000)).expect("small");
-        skews.push(if rng.below(2) == 0 { skew } else { -skew });
-    }
-    (drifts, skews)
+    raft::draw_clocks(
+        &mut moirae_sched::stream(seed, "shard-clocks"),
+        BOOTSTRAP,
+        NODES,
+    )
 }
 
 /// The key the clients draw as `i`: `k` and two digits, so the keys sort as their
@@ -479,17 +453,7 @@ pub fn server_config(
 /// (`raft::config`), Phase 2's bit rot, and a run-length hint for the schedule.
 #[must_use]
 pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
-    let mut config = SimConfig::new(seed);
-    config.net.p_drop = 0.05;
-    config.net.p_duplicate = 0.05;
-    config.net.delay_min = Duration::from_millis(1);
-    config.net.delay_max = Duration::from_millis(10);
-    config.clock.max_skew = Duration::from_millis(50);
-    config.clock.max_drift_ppm = 500;
-    config.fs.p_durable = 1.0;
-    config.fs.p_bitrot = BITROT;
-    config.fs.latency_min = Duration::from_micros(100);
-    config.fs.latency_max = Duration::from_millis(2);
+    let mut config = raft::faults_config(seed, BITROT);
     config.run_length_hint = SimConfig::run_length_hint_for(
         u32::try_from(NODES + CLIENTS).expect("small"),
         schedule.total(),
@@ -781,74 +745,35 @@ async fn transfer_admin<E: Environment>(
     lock(&stats).outstanding -= 1;
 }
 
-/// What the sliced advance watches for: the incremental checkers, fed every
-/// [`CHECK_EVERY`] slices and stopping the run at the first violation (D-046), and the
-/// latest descriptors the driver draws from.
+/// What the sliced advance watches for: the raft sweep's watch over the incremental
+/// checkers, which stops the run at the first violation (D-046), and the latest descriptors
+/// the driver draws from.
 struct Watch {
-    slices: u32,
-    stopped: Option<String>,
-    checker: invariants::Checker,
-    shard: ananke_shard::invariants::Checker,
+    checks: raft::Watch,
     spans: Spans,
-    checked: usize,
 }
 
 impl Watch {
     fn new() -> Self {
         Self {
-            slices: 0,
-            stopped: None,
-            checker: invariants::Checker::new(usize::try_from(BOOTSTRAP).expect("small")),
-            shard: ananke_shard::invariants::Checker::new(true),
+            checks: raft::Watch::of_descriptors(),
             spans: Spans::default(),
-            checked: 0,
         }
     }
 
     /// Folds what the trace holds past the last look, and stops the run at a violation.
     fn look(&mut self, sim: &Sim) {
-        let records = sim.trace_from(self.checked);
-        self.checked += records.len();
-        self.spans.extend(&records);
-        self.checker.extend(crate::traced(&records));
-        if let Err(violation) = self.checker.verdict() {
-            self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
-            return;
-        }
-        self.shard.extend(&records);
-        if let Err(violation) = self.shard.verdict() {
-            self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
-        }
+        let spans = &mut self.spans;
+        self.checks.look(sim, |records| spans.extend(records));
     }
 }
 
-/// Advances the run by `duration` in [`SLICE`]s, looking every [`CHECK_EVERY`] of them
-/// and stopping a runaway past [`TRACE_CAP`].
+/// Advances the run by `duration`, as the raft sweep's advance does.
 fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
-    if watch.stopped.is_some() {
-        return;
-    }
-    let mut left = duration;
-    while left > Duration::ZERO {
-        let step = left.min(SLICE);
-        sim.run_for(step);
-        left -= step;
-        watch.slices += 1;
-        let len = sim.trace_len();
-        if len > TRACE_CAP {
-            watch.stopped = Some(format!(
-                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
-                sim.now()
-            ));
-            return;
-        }
-        if watch.slices.is_multiple_of(CHECK_EVERY) {
-            watch.look(sim);
-            if watch.stopped.is_some() {
-                return;
-            }
-        }
-    }
+    let Watch { checks, spans } = watch;
+    raft::advance_with(sim, duration, checks, |checks, sim| {
+        checks.look(sim, |records| spans.extend(records));
+    });
 }
 
 /// Advances the run to `at`, if it is ahead.
@@ -1000,7 +925,7 @@ pub fn run_with(
     let mut last_heal = sim.now();
     for (at, _, step) in steps {
         advance_to(&mut sim, at, &mut watch);
-        if watch.stopped.is_some() {
+        if watch.checks.stopped.is_some() {
             break;
         }
         match step {
@@ -1070,7 +995,7 @@ pub fn run_with(
                 // The action is resolved against the trace as it stands now, not as
                 // the last look left it.
                 watch.look(&sim);
-                if watch.stopped.is_some() {
+                if watch.checks.stopped.is_some() {
                     break;
                 }
                 act(&sim, admin, j, &schedule.actions[j], &watch.spans, &driver);
@@ -1080,7 +1005,7 @@ pub fn run_with(
     // The driver's admins still asking finish before the liveness window opens: the
     // window is about a cluster the adversary has stopped touching.
     let drain = sim.now() + DRIVER_DRAIN;
-    while watch.stopped.is_none() && lock(&driver).outstanding > 0 && sim.now() < drain {
+    while watch.checks.stopped.is_none() && lock(&driver).outstanding > 0 && sim.now() < drain {
         advance(&mut sim, SLICE, &mut watch);
     }
     last_heal = last_heal.max(sim.now());
@@ -1110,7 +1035,7 @@ pub fn run_with(
         clients: clients_total,
         ranges: vec![ROOT_RANGE, META_RANGE, FIRST_RANGE],
         key_range: first_range_of_key,
-        stopped: watch.stopped,
+        stopped: watch.checks.stopped,
     });
     // The timer check reads each server's clock rate from the schedule.
     checked.schedule.drifts.clone_from(&schedule.drifts);

@@ -1488,6 +1488,52 @@ const SPREAD: u64 = 97 << 32;
 /// (D-043).
 const SPREAD_VALUE_BYTES: usize = 400;
 
+/// Every server's clock, `nodes` of them, as the module documentation says, from `rng`:
+/// each one's rate error in parts per million and its offset in nanoseconds, by server
+/// index. The slow server is drawn among the first `slow_among`: this sweep's three, and
+/// `sim/shard.rs`'s bootstrap nodes of five, since only those lead anything there.
+pub(crate) fn draw_clocks(
+    rng: &mut moirae_sched::Pcg32,
+    slow_among: u64,
+    nodes: u64,
+) -> (Vec<i64>, Vec<i64>) {
+    // Clocks, as the module documentation says: within the bound, or one
+    // server slow and two fast, moderately or severely.
+    let within = rng.below(2) == 0;
+    let severe = rng.below(2) == 0;
+    let slow = rng.below(slow_among);
+    let mut drifts = Vec::new();
+    let mut skews = Vec::new();
+    for i in 0..nodes {
+        let (magnitude, sign) = if within {
+            let sign = if rng.below(2) == 0 { 1 } else { -1 };
+            (rng.below(DRIFT_BOUND_PPM / 3 + 1), sign)
+        } else if severe {
+            // The slow server's heartbeats, at a fifth of its clock's timeout,
+            // must still arrive within the fast followers' minimum timeout, or
+            // it cannot lead at all: the rates stay within a factor of five.
+            let (lo, hi) = if i == slow {
+                (650_000, 750_000)
+            } else {
+                (250_000, 350_000)
+            };
+            (lo + rng.below(hi - lo + 1), if i == slow { -1 } else { 1 })
+        } else {
+            let lo = 2_000f64.ln();
+            let hi = 100_000f64.ln();
+            let u = rng.below(1_000_000) as f64 / 1_000_000.0;
+            (
+                (lo + (hi - lo) * u).exp() as u64,
+                if i == slow { -1 } else { 1 },
+            )
+        };
+        drifts.push(sign * i64::try_from(magnitude).expect("small"));
+        let skew = i64::try_from(rng.below(50_000_000)).expect("small");
+        skews.push(if rng.below(2) == 0 { skew } else { -skew });
+    }
+    (drifts, skews)
+}
+
 /// The fault schedule of one run, in global virtual time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
@@ -1676,40 +1722,7 @@ impl Schedule {
             });
             gaps.push(ms(&mut retake, 450, 700));
         }
-        // Clocks, as the module documentation says: within the bound, or one
-        // server slow and two fast, moderately or severely.
-        let within = rng.below(2) == 0;
-        let severe = rng.below(2) == 0;
-        let slow = rng.below(SERVERS);
-        let mut drifts = Vec::new();
-        let mut skews = Vec::new();
-        for i in 0..SERVERS {
-            let (magnitude, sign) = if within {
-                let sign = if rng.below(2) == 0 { 1 } else { -1 };
-                (rng.below(DRIFT_BOUND_PPM / 3 + 1), sign)
-            } else if severe {
-                // The slow server's heartbeats, at a fifth of its clock's timeout,
-                // must still arrive within the fast followers' minimum timeout, or
-                // it cannot lead at all: the rates stay within a factor of five.
-                let (lo, hi) = if i == slow {
-                    (650_000, 750_000)
-                } else {
-                    (250_000, 350_000)
-                };
-                (lo + rng.below(hi - lo + 1), if i == slow { -1 } else { 1 })
-            } else {
-                let lo = 2_000f64.ln();
-                let hi = 100_000f64.ln();
-                let u = rng.below(1_000_000) as f64 / 1_000_000.0;
-                (
-                    (lo + (hi - lo) * u).exp() as u64,
-                    if i == slow { -1 } else { 1 },
-                )
-            };
-            drifts.push(sign * i64::try_from(magnitude).expect("small"));
-            let skew = i64::try_from(rng.below(50_000_000)).expect("small");
-            skews.push(if rng.below(2) == 0 { skew } else { -skew });
-        }
+        let (drifts, skews) = draw_clocks(&mut rng, SERVERS, SERVERS);
         Self {
             warmup: Duration::from_millis(1200),
             trials: vec![
@@ -7346,6 +7359,17 @@ pub struct StaleProgress {
 /// The simulator configuration for `seed` and `schedule`.
 #[must_use]
 pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
+    let mut config = faults_config(seed, 0.02);
+    config.run_length_hint = SimConfig::run_length_hint_for(
+        u32::try_from(SERVERS + CLIENTS).expect("small"),
+        schedule.total(),
+    );
+    config
+}
+
+/// The network, clocks and disk this sweep runs under, with `bitrot` as the disk's rate of
+/// rot: what `sim/shard.rs` runs under too. The run-length hint is each caller's own.
+pub(crate) fn faults_config(seed: u64, bitrot: f64) -> SimConfig {
     let mut config = SimConfig::new(seed);
     config.net.p_drop = 0.05;
     config.net.p_duplicate = 0.05;
@@ -7354,13 +7378,9 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     config.clock.max_skew = Duration::from_millis(50);
     config.clock.max_drift_ppm = 500;
     config.fs.p_durable = 1.0;
-    config.fs.p_bitrot = 0.02;
+    config.fs.p_bitrot = bitrot;
     config.fs.latency_min = Duration::from_micros(100);
     config.fs.latency_max = Duration::from_millis(2);
-    config.run_length_hint = SimConfig::run_length_hint_for(
-        u32::try_from(SERVERS + CLIENTS).expect("small"),
-        schedule.total(),
-    );
     config
 }
 
@@ -9000,9 +9020,9 @@ pub fn run_on(
 }
 
 /// What the sliced advance watches for.
-struct Watch {
+pub(crate) struct Watch {
     slices: u32,
-    stopped: Option<String>,
+    pub(crate) stopped: Option<String>,
     /// The safety checks, one checker for the whole run with the state of each
     /// check kept across looks, so a look costs only the records since the last
     /// one (D-046).
@@ -9023,6 +9043,33 @@ impl Default for Watch {
             checker: invariants::Checker::new(SERVERS as usize),
             shard: ananke_shard::invariants::Checker::new(false),
             checked: 0,
+        }
+    }
+}
+
+impl Watch {
+    /// A watch whose range layer's checks fold, as the node's traces need.
+    pub(crate) fn of_descriptors() -> Self {
+        Self {
+            shard: ananke_shard::invariants::Checker::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Folds what the trace holds past the last look, handing it to `read` first, and stops
+    /// the run at a violation.
+    pub(crate) fn look(&mut self, sim: &Sim, read: impl FnOnce(&[TraceRecord])) {
+        let records = sim.trace_from(self.checked);
+        self.checked += records.len();
+        read(&records);
+        self.checker.extend(crate::traced(&records));
+        if let Err(violation) = self.checker.verdict() {
+            self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
+            return;
+        }
+        self.shard.extend(&records);
+        if let Err(violation) = self.shard.verdict() {
+            self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
         }
     }
 }
@@ -9406,6 +9453,16 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
 /// over a hundred seeds, and [`Report::check`] folds from the first record again at
 /// the end of every run.
 fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
+    advance_with(sim, duration, watch, |watch, sim| watch.look(sim, |_| {}));
+}
+
+/// The sliced advance, with `look` as what every [`CHECK_EVERY`] slices do.
+pub(crate) fn advance_with(
+    sim: &mut Sim,
+    duration: Duration,
+    watch: &mut Watch,
+    mut look: impl FnMut(&mut Watch, &Sim),
+) {
     if watch.stopped.is_some() {
         return;
     }
@@ -9424,16 +9481,8 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
             return;
         }
         if watch.slices.is_multiple_of(CHECK_EVERY) {
-            let records = sim.trace_from(watch.checked);
-            watch.checked += records.len();
-            watch.checker.extend(crate::traced(&records));
-            if let Err(violation) = watch.checker.verdict() {
-                watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
-                return;
-            }
-            watch.shard.extend(&records);
-            if let Err(violation) = watch.shard.verdict() {
-                watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
+            look(watch, sim);
+            if watch.stopped.is_some() {
                 return;
             }
         }
