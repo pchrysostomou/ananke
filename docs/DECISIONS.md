@@ -23463,4 +23463,161 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## PROPOSED D-117 — The start that re-seeded runs its tasks on the directory the re-seed built: `engine` rebound for the `apply` task's takes, the `snapshot` task's staging and its sweeps, so the refused directory is never written again (#176)
+
+**The number.** This branch is off `main` at de9f4d7, whose footer reads D-116. D-116 is
+reserved for #181 and D-113 is S10's (#188), neither merged yet; D-114 (#186) and D-115
+(#187) are on `main`. D-117 was reserved for #176. This entry takes it and sets the footer
+to D-118, the next after this one. At the merges of D-113 and D-116 the entries are a union
+in numerical order with one footer, the highest number plus one. Every code site carries
+`// PROPOSED(D-117)`.
+
+**Context: a correct-server failure against D-041.** D-041 and D-044, as Q15 applies them on
+the node (SHARD.md §11, storage 8; D-077), say a refused directory stays marked lost and
+quiesced, and is never written again. #176, found in #173's triage, suspected the node broke
+that rule from the code alone. A probe in #173's triage then confirmed it at seed 0.
+
+**What `run()` did.**
+1. A start picks `engine.dir`: the newest directory not marked lost (D-066).
+2. A loss found at that start refuses that directory, and `reseed` builds a fresh engine in
+   a new directory beside it.
+3. `engine` was not rebound afterwards. The fresh directory existed only inside `reseed` and
+   in the stores it returned.
+4. Three consumers were then handed `engine.dir`, which was still the refused directory:
+   - the `apply` task's `engine_dir`, which is where a take's version directory goes
+     (`snapshot::version_dir`);
+   - the snapshot planner, `Snapshots::with_cores`, whose `staging` names every stream's
+     staging directory;
+   - the `snapshot` task, `install::Task::new`, whose two sweeps list that directory:
+     `sweep` after a take, and `clear_staging` after an install.
+
+This lasted until the node's next start. From then on, D-066 opens the fresh directory as
+the newest one not marked lost.
+
+**The reproduction.** `reseed::run_after_split` (#173) is a natural shape for it. Its `x`
+applies a split, loses its store, and is re-seeded. It is then **not** restarted, and that
+same start receives two streams: its re-seed's stream of P, and the right half's stream to
+its placeholder. This entry gives the run two audits, both taken with `x` down:
+- one of `x`'s refused directory just before the restart that refuses it;
+- one at the run's end, after `x` is crashed.
+
+Both use a new recursive audit, `audit_tree`, which descends into directories. The re-seed
+shape's `audit` reads only files, so it would have missed a staging directory (#190).
+
+On `main` at 7b02530, in release, the refused directory changed on 200 of 200 seeds. On
+each, exactly two new directories appeared: P's re-seed staging and the right half's
+staging, `staging-r2-s<leader>/` and `staging-r<R>-s<leader>/`. Both were empty by the end.
+Every file the store held kept its size and checksum.
+
+**Seed 0, in full.** `x` is node 3, P is range 2, R is range 6, and the leader is server 1.
+The refusal is at 6.110 s, and the re-seed's marks at 6.169 s. The timings come from
+temporary prints in each consumer, which were not committed.
+
+| Consumer | What it did | Where |
+|---|---|---|
+| `snapshot` task, staging (`Snapshots::staging` → `install::Task::stage`) | Created the directory, then wrote and synced every chunk, duplicate chunks rewritten: `RAFT-FORMAT` (74 B), `000001.sst` (512 B, then 134 or 91 B at offset 512), `CURRENT` (25 B), `MANIFEST-000001` (138 or 154 B). From 6.169 to 6.259 s. | `/node/staging-r6-s1/`, `/node/staging-r2-s1/` |
+| `snapshot` task, `clear_staging` | Listed `/node`, removed the four files of each staging directory after its install, and synced the directory: r6 at 6.359 s, r2 at 6.442 s. | the same two directories |
+| `apply` task, take (`version_dir`) | Computed `/node/snap-r2-192-0`, then `-257-0`, `-322-0` and `-386-0`, and wrote nothing. These are follower record-only takes (D-065, D-078): no version directory is made, and `record.dir` stays empty. | (nothing written) |
+
+**Why nothing caught it.**
+- The re-seed shape's `reseed-crash` arm restarts the refused node on its first refused
+  mark, before any stream arrives. From that restart on, D-066 opens the fresh directory.
+- The shape's (e) takes its baseline at that crash, and reads only top-level files (#190).
+- The scenarios that re-seed a node and keep it running assert nothing about the refused
+  directory: the node sweep's refusals, about one seed in 10 000, and none in 1 000 probed
+  here; `sim/quorum.rs`'s refused node; and `sim/install.rs`'s joiner.
+
+**Takes and sweeps: unreachable today, covered by the fix anyway.** A checkpoint take, and
+the sweep that follows it, need a replica on the node that leads.
+- In the start that re-seeded, every replica the re-seed rebuilt is quarantined, and a
+  quarantined core never campaigns (D-035; `core.rs` 1369-1371 and 1527-1529).
+- So is every replica a placeholder's install creates on that node (PROPOSED D-109 §2).
+- What is left is a split's right half created **after** the re-seed. The split writes no
+  quarantine for it (Q20, Q26), so it may lead. It would then take checkpoints into
+  `snap-r<id>-…` under whatever directory it was handed, and sweep its own versions there.
+- The worst case #176 named is not reachable on the correct server: a sweep emptying the
+  refused store's *own old* checkpoints. A range's sweep matches only its own id, and an id
+  leased after the re-seed is new.
+
+No scenario on `main` reaches even the split's right half. It needs a node refused,
+re-seeded and not restarted, which then applies a split of a range it holds and leads the
+right half. S10's sharded sweep (`sim/shard.rs`, #188) may reach it, if its schedule refuses
+a node and later splits a range on it within that start. Since the rebinding is the one
+directory every consumer reads, the take and both sweeps land in the fresh directory too.
+
+**Decision.**
+1. `reseed` returns the fresh engine's configuration, the refused one's in the new
+   directory, as `Reseeded::engine`.
+2. `run()` makes the start's `engine` mutable and rebinds it in the `Start::Refused` arm, as
+   soon as the re-seed returns.
+3. Everything after that reads the rebound value: the `apply` task's `engine_dir`,
+   `Snapshots::with_cores` and `install::Task::new`.
+4. The two facts the start also reads from `engine.dir` mean what they meant:
+   - `bootstrapped_now` checks `!reseeded_now` before comparing `engine.dir` with
+     `base_dir`;
+   - `on_a_reseed` is `reseeded_now || engine.dir != base_dir`, and is true either way.
+5. The refused directory is touched after the refusal only by the refusal itself: its marker
+   (D-044), written before `RaftRefused`.
+
+**Alternatives.**
+- **Leave it to the next start**, as D-066 has it. That is the bug.
+- **Rebind each consumer separately**, handing the fresh directory to three call sites.
+  Rejected: three sites to keep in step, and a fourth consumer added later would get the
+  stale directory by default. The rebinding makes the directory the node runs on the only
+  one there is to hand out.
+- **`Snapshots::adopt_fresh`**, D-075's switch of the planner to a fresh directory, which
+  drops what the old one was assembling. That is for a node that adopts a directory mid-run
+  with streams in flight. At a start, nothing is in flight and the planner is built after
+  the re-seed, so building it on the right directory is simpler.
+
+**The pair.**
+- **The buggy half.** `NodeVariant::TasksOnTheRefusedDir` keeps today's binding: under it,
+  the `Refused` arm does not rebind `engine`.
+  - It takes bit 25, free since PROPOSED D-108. Nothing on `main` at de9f4d7, in #188 or on any
+    other open branch uses that bit; it is to be asked again at the merge.
+  - It is Q15's sixth way to get the refusal wrong, in `NodeVariant::RESEED`, which grows
+    from five to six. `BUGS` grows from 48 to 49.
+  - It changes nothing any trace check reads: the stores, the installs and every event are
+    the correct node's. So only the directory audit can see it.
+- **The correct half** is folded into
+  `a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`, which
+  already runs `run_after_split` on every seed of the tier. That spares a second sweep over
+  the same runs. Its name and nightly row are kept, and its doc lists what it now holds. On
+  every seed, beside D-109 §2's quarantine, it asserts:
+  - `AfterSplit::refused_untouched`: the marker still says lost, and no entry of the refused
+    directory, at any depth and other than the marker, differs between the two audits;
+  - `AfterSplit::staged_where_it_runs`: the fresh directory, `reseed::fresh_dir()`, holds a
+    staging directory of P and one of the right half, so the first clause is asserted of
+    runs whose streams staged somewhere, and the somewhere is named.
+
+  `run_after_split` takes the node's variants.
+- **The variant's test** is `a_node_whose_tasks_stay_on_the_refused_directory_is_caught`, on
+  `HIGH_RATE_SHARE`'s twenty seeds at every tier. On every seed it asserts that:
+  - the run passes every check of the trace and reaches its situation;
+  - `refused_untouched` fails;
+  - what changed is staging alone, and includes a stream of P and one of the right half;
+  - `staged_where_it_runs` fails, so that clause has been seen to fail as well.
+
+  #187 landed its D-115 clause as a test of its own, so `run_after_split`'s other test passes
+  `NodeVariants::correct()` and is otherwise unchanged.
+
+**Measured, release, on this tree, merged with `main` at de9f4d7.**
+- The correct node passes the right half's test at 200 of 200 seeds (`TIER_CAP`), with both
+  new clauses, and D-115's test at 200 of 200 on the audited run.
+- `TasksOnTheRefusedDir` is caught on 200 of 200. On each, the trace checks pass, what
+  changed is staging alone and includes both streams, and the fresh directory holds neither.
+- At 100 %, the catch is asserted at every tier (D-061).
+
+**The rows (D-064).**
+- The right half's test is re-weighed in place at 30.2 cpu s, from 27.8.
+- The variant's test is a new row at 2.8 cpu s, in the lightest shard, shard 1.
+- `scripts/nightly-shards.txt` gives the measurements, and every header is recomputed from
+  the rows beneath it.
+
+**What this does not change.** The re-seed shape's `run()` and its (e) are as they were.
+Giving them `audit_tree` moves that shape's schedules and its pins, which is #190's work.
+**PROPOSED.**
+
+---
+
+_Next entry: D-118. Add one before implementing anything not covered above._

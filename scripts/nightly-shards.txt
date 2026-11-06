@@ -509,8 +509,18 @@
 # with other slices' builds beside it (load averages 86 to 100, so the figure is if anything
 # high): 34.7 cpu s, the median (30.78 + 1.03, 33.73 + 0.92, 34.24 + 0.97). Into the lightest
 # shard, shard 6 at 2168.1 -> 2202.8.
+# PROPOSED D-117 (#176, the start's tasks on the directory the re-seed built) folded its
+# correct-node clauses into the `reseed` row of the right half's test and added one `reseed`
+# row, `TasksOnTheRefusedDir`'s catch on twenty seeds at every tier. Both weighed on its tree
+# from the built release binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, two runs each, on an Apple M2 of 8 cores on AC power
+# with other slices' runs beside it (load averages 144 to 180, so the figures are if anything
+# high): the right half's test, re-weighed in place, at 30.2 cpu s (29.43 + 1.22, 28.66 +
+# 1.17), shard 6 2202.8 -> 2205.2; the variant at 2.8 (2.61 + 0.16, 2.71 + 0.14), into the
+# lightest shard, shard 1 at 1977.1 -> 1979.9. D-115's row above runs the same scenario and
+# was not re-weighed: the audits this entry adds to the run are a small part of its 34.7.
 # shard	binary	cpu_s	test
-# shard 1: 1977.1 cpu s
+# shard 1: 1979.9 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -534,6 +544,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+1	reseed	2.8	a_node_whose_tasks_stay_on_the_refused_directory_is_caught
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
@@ -645,7 +656,7 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 2202.8 cpu s
+# shard 6: 2205.2 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -688,7 +699,7 @@
 6	node	28.2	the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps
 6	node	0.6	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor
 6	node	0.5	the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch
-6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
+6	reseed	30.2	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
 6	reseed	34.7	a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
