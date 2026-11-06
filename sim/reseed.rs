@@ -80,7 +80,7 @@ use ananke_raft::message::Message;
 use ananke_raft::store::{is_marked_lost, mark_store_lost};
 use ananke_shard::client::{RangedRequest, RangedResponse};
 use ananke_shard::descriptor::FIRST_GENERATION;
-use ananke_shard::invariants::{Fold, Held};
+use ananke_shard::invariants::Held;
 use ananke_shard::range::RangeId;
 use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::server::ServerConfig;
@@ -1312,8 +1312,19 @@ impl AfterSplit {
 
     /// `x`'s creation of `range` by an install after its refusal: where it stands, and the
     /// generation and span it names.
+    // PROPOSED(D-115): reads the one search below.
     #[must_use]
     pub fn installed_after_refusal(&self, range: u64) -> Option<(usize, u64, Bytes, Bytes)> {
+        self.created_by_install_after_refusal(range)
+            .map(|(at, _, held)| (at, held.generation, held.start, held.end))
+    }
+
+    /// `x`'s first creation of `range` by an install after its refusal, its `RangeCreated
+    /// { cause: snapshot }`: where it stands, its floor index, and the descriptor it names,
+    /// as check 7 holds a creation's.
+    // PROPOSED(D-115)
+    #[must_use]
+    pub fn created_by_install_after_refusal(&self, range: u64) -> Option<(usize, u64, Held)> {
         let refused = self.refused_at()?;
         self.records
             .iter()
@@ -1323,13 +1334,23 @@ impl AfterSplit {
                 TraceEvent::RangeCreated {
                     range: r,
                     cause: RangeCause::Snapshot,
-                    generation,
                     start,
                     end,
+                    generation,
+                    voters,
+                    floor_index,
                     ..
-                } if *r == range && self.on_x(record) => {
-                    Some((at, *generation, start.clone(), end.clone()))
-                }
+                } if *r == range && self.on_x(record) => Some((
+                    at,
+                    *floor_index,
+                    Held {
+                        start: start.clone(),
+                        end: end.clone(),
+                        generation: *generation,
+                        voters: voters.clone(),
+                        state: RangeState::Live,
+                    },
+                )),
                 _ => None,
             })
     }
@@ -1350,47 +1371,22 @@ impl AfterSplit {
         marked && stated
     }
 
-    /// `x`'s creation of P by its re-seed's install: the first `RangeCreated { cause:
-    /// snapshot }` of [`SPLIT_PARENT`] on `x` after its refusal, with its floor index and
-    /// the descriptor it names, as check 7 holds a creation.
-    // PROPOSED(D-115)
-    #[must_use]
-    pub fn parent_created_after_refusal(&self) -> Option<(u64, Held)> {
-        let refused = self.refused_at()?;
-        self.records[refused..]
-            .iter()
-            .find_map(|record| match &record.event {
-                TraceEvent::RangeCreated {
-                    range,
-                    cause: RangeCause::Snapshot,
-                    start,
-                    end,
-                    generation,
-                    voters,
-                    floor_index,
-                    ..
-                } if *range == SPLIT_PARENT && self.on_x(record) => Some((
-                    *floor_index,
-                    Held {
-                        start: start.clone(),
-                        end: end.clone(),
-                        generation: *generation,
-                        voters: voters.clone(),
-                        state: RangeState::Live,
-                    },
-                )),
-                _ => None,
-            })
-    }
-
-    /// Issue #172's clause, per seed: `x`'s re-seed creates P by an install at the
-    /// split's generation over P's left half, `[k0, k1)`, and check 7 holds that
-    /// creation. Holding it means check 7's map has a value for P at or below the
-    /// creation's floor and the creation equals it, so the creation was judged and
-    /// agreed, not left waiting for a value. An install's creation names the descriptor
-    /// its snapshot put in place (PROPOSED D-107 §2). Before D-107 it named the first
-    /// generation whatever the snapshot held, and with that reading put back check 7
-    /// fails this run (PROPOSED D-115).
+    /// Issue #172's clause, per seed, asked after [`check`](Self::check): `x`'s re-seed
+    /// creates P by an install at the split's generation over P's left half, `[k0, k1)`,
+    /// and the creation equals the value check 7's map holds for P at or below its floor.
+    ///
+    /// The second half makes check 7's comparison again here; it does not show that check
+    /// 7 made it. That check 7 judges an install's creation is held by its own unit test,
+    /// `an_install_must_agree_with_the_descriptor_in_force_at_its_index`, in `ananke-shard`'s
+    /// `invariants.rs`, and [`check`](Self::check) runs check 7 on this trace first. The
+    /// comparison adds the voters, which [`reached`](Self::reached) does not read, and a
+    /// fault check 7 would miss. In this run a value of P always lies under the floor, P's
+    /// bootstrap at index 0, so the case where check 7 leaves a creation waiting for a
+    /// value does not arise here.
+    ///
+    /// An install's creation names the descriptor its snapshot put in place (PROPOSED
+    /// D-107 §2). With the first generation put back, whatever the snapshot held, check 7
+    /// fails this run on every seed (PROPOSED D-115).
     ///
     /// # Errors
     ///
@@ -1398,7 +1394,7 @@ impl AfterSplit {
     // PROPOSED(D-115)
     pub fn parent_created_at_the_splits_generation(&self) -> Result<(), String> {
         let (seed, x) = (self.seed, self.x);
-        let Some((floor, created)) = self.parent_created_after_refusal() else {
+        let Some((_, floor, created)) = self.created_by_install_after_refusal(SPLIT_PARENT) else {
             return Err(format!(
                 "seed {seed}: node {x}'s re-seed created no replica of range {SPLIT_PARENT} \
                  by an install"
@@ -1421,15 +1417,11 @@ impl AfterSplit {
             ));
         }
         let checker = ananke_shard::invariants::folded(&self.records);
-        if let Err(violation) = checker.verdict_of(Fold::DescriptorAgreement) {
-            return Err(format!("seed {seed}: {violation}"));
-        }
         match checker.descriptors().at(SPLIT_PARENT, floor) {
             Some(value) if *value == created => Ok(()),
             value => Err(format!(
-                "seed {seed}: check 7 does not hold node {x}'s install creation of range \
-                 {SPLIT_PARENT} at its floor {floor}: it names {created:?}, and check 7's \
-                 value there is {value:?}"
+                "seed {seed}: node {x}'s install creation of range {SPLIT_PARENT} at its floor \
+                 {floor} names {created:?}, and check 7's value there is {value:?}"
             )),
         }
     }

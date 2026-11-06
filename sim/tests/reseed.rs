@@ -16,9 +16,9 @@
 //! - (c)'s second half — a replica answering *after its own install* — is shown not to be
 //!   a constant, which is what it was when it was keyed on the mark alone;
 //! - a re-seeded node's right half, which configuration never names, comes back through
-//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2);
-//! - the same run's install of the parent is created at the split's generation, and
-//!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115).
+//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2), and the
+//!   same run's install of the parent is created at the split's generation and agrees
+//!   with check 7's map at its floor (issue #172; PROPOSED D-107 §2, D-115).
 
 use ananke_raft::core::Variants;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -54,6 +54,15 @@ fn with(seed: u64, variant: NodeVariant) -> Report {
 /// hundred run in full; the premerge and the nightly run two hundred. Every test here
 /// prints the tier it was asked for and the number it ran, so a capped run never reads
 /// as a full one.
+///
+/// The binary's other shape, the re-seed after a split (`reseed::run_after_split`), runs
+/// under this cap on its own figures, not this shape's: about 98 000 trace records and
+/// 0.17 to 0.21 CPU seconds a seed in release, measured at load averages from 86 to 541.
+/// Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the
+/// nightly's ten thousand some 1 700 to 2 100, a whole nightly shard (D-064), for clauses
+/// that hold or fail on every seed at twenty. Like this shape's, that cap is the owner's
+/// to rule on (PROPOSED D-115).
+// PROPOSED(D-115): the second shape's cap, on its own figures.
 const TIER_CAP: u64 = 200;
 
 /// The seeds this binary's sweeps run: the tier's, capped.
@@ -315,6 +324,20 @@ fn caught(variant: NodeVariant, run: u64) {
 /// and the replica that install creates is quarantined — stated so, `RaftReseeded` and
 /// `RaftRecovered { state: quarantined }` — and grants the right half nothing. Before the
 /// fix it was installed unquarantined, and this failed on every seed.
+///
+/// The same run holds an install creation's generation (issue #172; PROPOSED D-107 §2,
+/// D-115). `x` applied the split before its loss, and P's leader compacted past it while
+/// `x` was down, so the install that creates P on `x`'s fresh engine puts P's left half in
+/// place, `[k0, k1)` at generation 2. Its `RangeCreated { cause: snapshot }` must name
+/// that descriptor (SHARD.md §8) and equal check 7's value for P at its floor
+/// (`AfterSplit::parent_created_at_the_splits_generation`). Reverting the creation's
+/// reading to the first generation, whatever the snapshot held, fails this on every seed
+/// by check 7. The revert gives the call site of `created_from` in `ananke-shard`'s
+/// `server.rs` no descriptor. Seed 0 then fails with "descriptor agreement: node Some(3)'s
+/// replica of range 2 was installed at index 128 with Held { …, generation: 1, … }, where
+/// the range's descriptor there is Held { …, generation: 2, … }". The unit test of
+/// `created_from` passes that revert, so this run is what holds the call site.
+// PROPOSED(D-115): the parent's install creation, asked on the same run.
 #[test]
 fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
     let run = shape_seeds();
@@ -323,6 +346,7 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
         let report = reseed::run_after_split(seed);
         report.check()?;
         report.reached()?;
+        report.parent_created_at_the_splits_generation()?;
         let (_, right) = report.split.expect("`reached` names the split");
         let (at, ..) = report
             .installed_after_refusal(right)
@@ -346,37 +370,4 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
         }
     });
     verdict(&verdicts).expect("a re-seeded node's right half comes back quarantined on every seed");
-}
-
-/// A re-seed after a split creates the parent by an install at the split's generation,
-/// and check 7 holds it (issue #172; PROPOSED D-107 §2, D-115): `reseed::run_after_split`,
-/// on every seed of the tier.
-///
-/// `x` applied the split before its loss, and P's leader compacted past it while `x` was
-/// down. So the re-seed's stream of P carries a checkpoint past the split, and the
-/// install that creates P on `x`'s fresh engine puts P's left half in place, `[k0, k1)`
-/// at generation 2. Its `RangeCreated { cause: snapshot }` must name that descriptor
-/// (SHARD.md §8), and check 7 must hold it at its floor: equal to the value check 7's
-/// map holds for P there, not waiting for one.
-///
-/// Reverting the creation's reading to the first generation, whatever the snapshot held,
-/// fails this on every seed by check 7. The revert gives the call site of `created_from`
-/// in `ananke-shard`'s `server.rs` no descriptor. Measured: 20 of 20 seeds in debug and
-/// 200 of 200 at the cap in release. Seed 0 fails with "descriptor agreement: node
-/// Some(3)'s replica of range 2 was installed at index 128 with Held { …, generation: 1,
-/// … }, where the range's descriptor there is Held { …, generation: 2, … }". The unit test
-/// of `created_from` passes that revert, so this run is what holds the call site
-/// (PROPOSED D-115).
-#[test]
-fn a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it() {
-    let run = shape_seeds();
-    tier("the re-seed after a split, P's install creation", run);
-    let verdicts = sweep(run, |seed| {
-        let report = reseed::run_after_split(seed);
-        report.check()?;
-        report.reached()?;
-        report.parent_created_at_the_splits_generation()
-    });
-    verdict(&verdicts)
-        .expect("a re-seed after a split creates P at the split's generation on every seed");
 }

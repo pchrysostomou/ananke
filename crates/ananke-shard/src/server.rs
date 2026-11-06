@@ -4427,9 +4427,10 @@ mod tests {
     /// range that has split is created at the split's generation — and the first
     /// generation only for a snapshot that carries no descriptor. This holds the reading
     /// itself, which a revert of its call site passes. What reaches the call site in a
-    /// run is a re-seed after a split, `reseed::run_after_split`, whose test of P's
-    /// install creation fails on that revert (issue #172; PROPOSED D-115).
+    /// run is a re-seed after a split, `reseed::run_after_split`, whose test fails on that
+    /// revert (issue #172; PROPOSED D-115).
     // PROPOSED(D-107)
+    // PROPOSED(D-115): the run that holds the call site, named above.
     #[test]
     fn an_install_creation_names_the_snapshots_generation_and_voters() {
         let split = RangeDescriptor {
