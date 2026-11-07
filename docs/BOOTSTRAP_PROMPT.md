@@ -101,6 +101,16 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-reseed-engine-dir` (2026-11-06), off `main` at de9f4d7, PROPOSED
+  D-117, **#176: the start that re-seeded runs its tasks on the directory the re-seed
+  built**. `reseed` returns the fresh engine's configuration and `run()` rebinds `engine`,
+  so the `apply` task's takes, the `snapshot` task's staging and its two sweeps no longer
+  write into the refused directory until the next start (D-041). `run_after_split` audits
+  the refused directory recursively before `x`'s restart and at the end, both with `x`
+  down: before the fix it changed on 200 of 200 seeds, two staging directories staged,
+  synced and cleared there; after, on none, and both streams staged in `/node-g1`. The pair is
+  `TasksOnTheRefusedDir` (bit 25, Q15's sixth), caught on 200 of 200. The re-seed shape's
+  own top-level-only audit is #190.
 - Branch `phase-3-stage-c-shard-sim` (2026-11-01), off `main` at b1da6ec, PROPOSED D-113
   (footer D-114), **#162's S10, `sim/shard.rs`, in progress and stopped for the owner**,
   PR #188, merged with `main` at 7b02530 (#185).

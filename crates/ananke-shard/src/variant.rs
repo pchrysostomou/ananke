@@ -221,6 +221,13 @@ pub enum NodeVariant {
     /// answers first is a replica that may vote again on state its node lost (D-035)
     /// and whose leader keeps a `matched` the rebuilt log cannot honour (D-042).
     ServeBeforeRefusedMark,
+    /// The start that re-seeded hands its tasks the refused directory rather than the
+    /// one the re-seed built: the `apply` task's takes, the `snapshot` task's staging,
+    /// and both of its sweeps then run in a directory D-041 marks lost and never writes
+    /// again, until the node's next start opens the new directory (D-066). The node as it
+    /// stood before #176: every re-seed's streams stage, sync and are cleared there.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    TasksOnTheRefusedDir,
     /// A range whose live install is between its decision and its manifest switch is
     /// stepped anyway, rather than held. The replica being replaced is behind its
     /// leader by definition, so a step of it in that window appends entries at indices
@@ -444,6 +451,7 @@ impl NodeVariant {
         NodeVariant::ReuseLostGeneration,
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::TasksOnTheRefusedDir,
         NodeVariant::StepWhileInstalling,
         NodeVariant::InstallKeepsTheOldCore,
         NodeVariant::ChunksToTheInbox,
@@ -465,22 +473,27 @@ impl NodeVariant {
         NodeVariant::RetakeNeverAfterOverlap,
     ];
 
-    /// Q15's whole-node refusal and re-seed, in order: the five ways to get a node's
-    /// refusal wrong (SHARD.md §11, storage 8; D-077). Three of the five are mutations
-    /// a single-range world could not catch at all — with one range on a node, refusing
-    /// only that range *is* refusing the node — and the two about directories need a
-    /// node refused twice in a run, which one range reaches no sooner but which no
+    /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
+    /// refusal wrong (SHARD.md §11, storage 8; D-077). Three of D-077's five are
+    /// mutations a single-range world could not catch at all — with one range on a node,
+    /// refusing only that range *is* refusing the node — and the two about directories
+    /// need a node refused twice in a run, which one range reaches no sooner but which no
     /// check before D-077 asked of any node. D-077 built six: the sixth, a re-seeded
     /// replica's incarnation drawn from its range's stream, is a rule of the range
     /// layer's, a replica's incarnation at its creation, and is
-    /// `RangeVariant::IncarnationPerRangeStream` since PROPOSED D-108.
+    /// `RangeVariant::IncarnationPerRangeStream` since PROPOSED D-108. The sixth here is
+    /// D-117's, [`TasksOnTheRefusedDir`](Self::TasksOnTheRefusedDir): a third about
+    /// directories, which needs a node that is re-seeded and runs on, streams arriving,
+    /// with no start between.
     // PROPOSED(D-108): D-077's sixth moved to the range layer's set.
+    // PROPOSED(D-117): the start's tasks on the refused directory.
     pub const RESEED: &'static [NodeVariant] = &[
         NodeVariant::RefuseOneRangeOnly,
         NodeVariant::ReseedIntoRefusedDir,
         NodeVariant::ReuseLostGeneration,
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::TasksOnTheRefusedDir,
     ];
 
     /// The `snapshot` task's own, in order: the fifteen ways to get a snapshot keyed by
@@ -605,7 +618,10 @@ impl NodeVariant {
             NodeVariant::OpenNewestEvenIfLost => 1 << 23,
             NodeVariant::ServeBeforeRefusedMark => 1 << 24,
             // PROPOSED(D-108): bit 25 held D-077's sixth, `IncarnationPerRangeStream`,
-            // until it moved to the range layer's set; it is free.
+            // until it moved to the range layer's set.
+            // PROPOSED(D-117): bit 25 is D-117's, the start's tasks on the refused
+            // directory.
+            NodeVariant::TasksOnTheRefusedDir => 1 << 25,
             // Bits 20 to 25 were D-077's six, which `main` took while the snapshot
             // review's slice was open; before that merge the review's four held 20 to
             // 23. They take 26 to 29 instead, and D-083's ten follow at 30 to 39, so no
@@ -652,6 +668,8 @@ impl NodeVariant {
             // left.
             // PROPOSED(D-110): the overlap rule's fresh take never made. Bits 25 and 49
             // to 53 are free, and sixteen bits are left.
+            // PROPOSED(D-117): bit 25 taken above; bits 49 to 53 are free, and fifteen
+            // bits are left.
             NodeVariant::RetakeNeverAfterOverlap => 1 << 48,
         }
     }
@@ -685,6 +703,7 @@ impl NodeVariant {
             NodeVariant::ReuseLostGeneration => "ReuseLostGeneration",
             NodeVariant::OpenNewestEvenIfLost => "OpenNewestEvenIfLost",
             NodeVariant::ServeBeforeRefusedMark => "ServeBeforeRefusedMark",
+            NodeVariant::TasksOnTheRefusedDir => "TasksOnTheRefusedDir",
             NodeVariant::InstallWrongRangesSpans => "InstallWrongRangesSpans",
             NodeVariant::AdmitsAnUnhostedRange => "AdmitsAnUnhostedRange",
             NodeVariant::AssemblyHeldForDepartedSender => "AssemblyHeldForDepartedSender",
@@ -802,10 +821,12 @@ mod tests {
         // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
         // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
-        // D-110's one is the overlap rule's fresh take never made.
+        // D-110's one is the overlap rule's fresh take never made. D-117's one, the
+        // start's tasks on the refused directory, is Q15's sixth.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
-        assert_eq!(NodeVariant::BUGS.len(), 48);
+        // PROPOSED(D-117)
+        assert_eq!(NodeVariant::BUGS.len(), 49);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -820,7 +841,7 @@ mod tests {
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
-        assert_eq!(NodeVariant::RESEED.len(), 5);
+        assert_eq!(NodeVariant::RESEED.len(), 6);
         assert_eq!(NodeVariant::SHAPE.len(), 3);
         assert_eq!(NodeVariant::BOUNDS.len(), 2);
         // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise

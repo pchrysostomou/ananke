@@ -3361,7 +3361,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // the re-seed built, and the refused one is stepped over for the rest of the run.
     let base_dir = engine.dir.clone();
     let present = generations(&env, &base_dir).await?;
-    let engine = EngineConfig {
+    let mut engine = EngineConfig {
         dir: newest_not_lost(&present, node_variants)
             .map_or_else(|| base_dir.clone(), |candidate| candidate.path.clone()),
         ..engine
@@ -3417,6 +3417,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             )
             .await?;
             reseeded_meta = reseeded.meta;
+            // D-041: the refused directory is marked lost and never written again, and
+            // the node now runs on the one the re-seed built. The rest of this start
+            // hands its tasks `engine.dir` — the `apply` task's takes, the `snapshot`
+            // task's staging and both of its sweeps — so it is rebound here, and not
+            // left to the next start's choice of the newest directory not marked lost
+            // (D-066). Left as it was, every stream of this start staged, synced and was
+            // cleared in the refused directory (#176).
+            // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+            if !node_variants.contains(NodeVariant::TasksOnTheRefusedDir) {
+                engine = reseeded.engine;
+            }
             (reseeded.anchor, reseeded.opened)
         }
         Start::Opened {
@@ -4067,6 +4078,7 @@ async fn reseed<E: Environment>(
         anchor,
         opened,
         meta: reseeded_meta,
+        engine: fresh,
     })
 }
 
@@ -4075,14 +4087,19 @@ async fn reseed<E: Environment>(
 type Opened<E> = Vec<(Range, Arc<RaftStore<E>>, Recovered)>;
 
 /// What a re-seed hands back: the store the fresh engine was opened through, each
-/// range's store, and the meta range's index-0 state when the re-seed rebuilt a
-/// replica of it (PROPOSED D-098).
+/// range's store, the meta range's index-0 state when the re-seed rebuilt a replica of
+/// it (PROPOSED D-098), and the fresh engine's configuration, whose directory the rest
+/// of the start runs on (PROPOSED D-117).
 struct Reseeded<E: Environment> {
     /// The first range's store, or the node's anchor where it hosts none (PROPOSED
     /// D-109).
     anchor: Arc<RaftStore<E>>,
     opened: Opened<E>,
     meta: Option<Vec<MetaDescriptor>>,
+    /// The fresh engine's configuration: the refused one's, in the directory the
+    /// re-seed built beside it.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    engine: EngineConfig,
 }
 
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the

@@ -77,7 +77,7 @@ use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::Message;
-use ananke_raft::store::{is_marked_lost, mark_store_lost};
+use ananke_raft::store::{STORE_MARKER, is_marked_lost, mark_store_lost};
 use ananke_shard::client::{RangedRequest, RangedResponse};
 use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::invariants::{Fold, Held};
@@ -1173,6 +1173,76 @@ fn audit(sim: &mut Sim, at: NodeId, dir: &Path) -> Option<DirAudit> {
     complete.then_some(taken)
 }
 
+/// Every entry under `dir` on the node's own disk, at any depth: a file by its path
+/// below `dir` against its length and checksum, as [`audit`] records one, and a
+/// directory by its path and a trailing `/` against `(0, 0)`.
+///
+/// [`audit`] reads `dir`'s own files and skips what is not one, so a directory created
+/// inside `dir` — a staging directory, a version directory — and every byte written into
+/// it are invisible to it. This descends. The simulated disk keeps a directory once made
+/// (nothing removes one), so a directory created and later emptied is still listed.
+fn audit_tree(sim: &mut Sim, at: NodeId, dir: &Path) -> Option<DirAudit> {
+    let found: Arc<Mutex<DirAudit>> = Arc::new(Mutex::new(DirAudit::new()));
+    let done: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let out = found.clone();
+    let finished = done.clone();
+    let env = sim.env(at);
+    let inner = env.clone();
+    let root = dir.to_path_buf();
+    env.spawn("audit", async move {
+        // Paths below `root`, the empty one being `root` itself.
+        let mut pending: Vec<PathBuf> = vec![PathBuf::new()];
+        while let Some(below) = pending.pop() {
+            let here = if below.as_os_str().is_empty() {
+                root.clone()
+            } else {
+                root.join(&below)
+            };
+            let Ok(listed) = inner.fs().read_dir(&here).await else {
+                return;
+            };
+            for entry in listed {
+                let Some(name) = entry.file_name() else {
+                    continue;
+                };
+                let child = below.join(name);
+                let path = root.join(&child);
+                let shown = child.to_string_lossy().into_owned();
+                match inner.fs().open(&path, OpenOptions::new().read(true)).await {
+                    Ok(file) => {
+                        let Ok(size) = file.size().await else {
+                            continue;
+                        };
+                        let bytes = file
+                            .read_at(0, usize::try_from(size).unwrap_or(usize::MAX))
+                            .await
+                            .unwrap_or_default();
+                        out.lock()
+                            .expect("the audit")
+                            .insert(shown, (size, checksum(&bytes)));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
+                        out.lock()
+                            .expect("the audit")
+                            .insert(format!("{shown}/"), (0, 0));
+                        pending.push(child);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        *finished.lock().expect("the audit") = true;
+    });
+    let mut waited = Duration::ZERO;
+    while waited < AUDIT_BUDGET && !*done.lock().expect("the audit") {
+        sim.run_for(AUDIT_STEP);
+        waited += AUDIT_STEP;
+    }
+    let complete = *done.lock().expect("the audit");
+    let taken = found.lock().expect("the audit").clone();
+    complete.then_some(taken)
+}
+
 /// Whether `dir`'s marker says the store there lost state, asked of the node's own
 /// disk after the run.
 fn marked_lost(sim: &mut Sim, at: NodeId, dir: &Path) -> bool {
@@ -1271,6 +1341,18 @@ pub struct AfterSplit {
     pub split: Option<(u64, u64)>,
     /// What the run could not build, if anything.
     pub unbuilt: Option<String>,
+    /// `x`'s engine directory, the one its restart refuses, as an audit found it with
+    /// `x` down just before that restart, or `None` if the audit did not finish.
+    pub refused_before: Option<DirAudit>,
+    /// The same directory at the run's end, `x` crashed so that nothing on it is
+    /// writing, or `None` if the audit did not finish.
+    pub refused_at_end: Option<DirAudit>,
+    /// Whether that directory's marker still says lost at the end.
+    pub still_lost: bool,
+    /// The directory `x`'s re-seed built and the rest of its start runs on, beside the
+    /// refused one, as an audit found it at the end with `x` crashed, or `None` if the
+    /// audit did not finish.
+    pub fresh_at_end: Option<DirAudit>,
 }
 
 impl AfterSplit {
@@ -1532,6 +1614,110 @@ impl AfterSplit {
         }
         Ok(())
     }
+
+    /// D-041 on a node that is re-seeded and runs on: `x`'s refused directory still says
+    /// lost at the end, and not one entry of it, at any depth, changed between the audit
+    /// before `x`'s restart and the one at the end, both with `x` down, other than the
+    /// marker itself, which the refusal writes (D-044).
+    ///
+    /// The re-seed shape's (e) asks the same of its refused directory, from the arm's
+    /// crash on; but the arm restarts the node within milliseconds of its re-seed, and
+    /// from that start on the node opens the new directory (D-066), so the start that
+    /// re-seeded never gets as far as a stream. Here `x` is not restarted after its
+    /// re-seed, and that start receives two streams, its re-seed's of P and its right
+    /// half's to its placeholder. Before PROPOSED D-117 both staged, synced and were
+    /// cleared in the refused directory, and this failed on every seed (#176).
+    ///
+    /// # Errors
+    ///
+    /// Naming every entry that changed, with the seed.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    pub fn refused_untouched(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        if !self.still_lost {
+            return Err(format!(
+                "seed {seed}: node {x}'s refused directory's marker no longer says lost"
+            ));
+        }
+        let Some(changed) = self.refused_changed() else {
+            return Err(format!(
+                "seed {seed}: node {x}'s refused directory could not be read within \
+                 {AUDIT_BUDGET:?}, so the run says nothing about whether it changed"
+            ));
+        };
+        if changed.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "seed {seed}: node {x}'s refused directory changed after its refusal: \
+             {changed:?}. A directory that held a store is marked lost and never written \
+             to again (D-041, D-044)"
+        ))
+    }
+
+    /// Every entry of `x`'s refused directory, at any depth, that differs between the audit
+    /// before its restart and the one at the end, other than the refusal's own marker; or
+    /// `None` if either audit did not finish.
+    // PROPOSED(D-117)
+    #[must_use]
+    pub fn refused_changed(&self) -> Option<BTreeSet<String>> {
+        let before = self.refused_before.as_ref()?;
+        let at_end = self.refused_at_end.as_ref()?;
+        Some(
+            at_end
+                .keys()
+                .chain(before.keys())
+                .filter(|name| name.as_str() != STORE_MARKER)
+                .filter(|name| at_end.get(*name) != before.get(*name))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Where the start that re-seeded staged its streams: the directory it runs on. For
+    /// P's re-seed and for the right half's install, the directory the re-seed built
+    /// holds a staging directory of that range, so [`Self::refused_untouched`] is
+    /// asserted of runs whose streams staged somewhere, and the somewhere is named.
+    ///
+    /// # Errors
+    ///
+    /// Naming the range with no staging directory there, with the seed.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    pub fn staged_where_it_runs(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        let fresh = fresh_dir();
+        let Some(at_end) = &self.fresh_at_end else {
+            return Err(format!(
+                "seed {seed}: node {x}'s directory {} could not be read within \
+                 {AUDIT_BUDGET:?}",
+                fresh.display()
+            ));
+        };
+        let Some((_, right)) = self.split else {
+            return Err(format!("seed {seed}: no split was traced"));
+        };
+        for range in [SPLIT_PARENT, right] {
+            let prefix = format!("staging-r{range}-s");
+            let staged = at_end
+                .keys()
+                .any(|name| name.starts_with(&prefix) && name.ends_with('/'));
+            if !staged {
+                return Err(format!(
+                    "seed {seed}: node {x} installed range {range} after its re-seed and \
+                     {} holds no staging directory of it, so its stream staged \
+                     somewhere other than the directory the node runs on: {:?}",
+                    fresh.display(),
+                    at_end
+                        .keys()
+                        .filter(|name| name.ends_with('/'))
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The run's writer: puts to P's left half's key, routed by the scenario's fixed map,
@@ -1662,7 +1848,7 @@ fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
     })
 }
 
-/// Runs the re-seed after a split for `seed` on the correct system.
+/// Runs the re-seed after a split for `seed`, the node carrying `node_variants`.
 ///
 /// The three servers of the re-seed shape and a writer on P's left half's key. P, the
 /// first user range, is split at [`SPLIT_KEY`] by an operator once every range has
@@ -1675,12 +1861,11 @@ fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
 /// told to stream (SHARD.md §5, Q22). `x` may have voted in R before its loss, and the
 /// replica its placeholder's install creates is quarantined (PROPOSED D-109 §2).
 #[must_use]
-pub fn run_after_split(seed: u64) -> AfterSplit {
+pub fn run_after_split(seed: u64, node_variants: NodeVariants) -> AfterSplit {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
     let variants = Variants::default();
-    let node_variants = NodeVariants::correct();
     for id in 1..=SERVERS {
         spawn(
             &sim,
@@ -1707,6 +1892,10 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
         x,
         split: None,
         unbuilt: None,
+        refused_before: None,
+        refused_at_end: None,
+        still_lost: false,
+        fresh_at_end: None,
     };
     {
         let env = sim.env(client);
@@ -1768,9 +1957,27 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
         }
         sim.run_for(SPLIT_SLICE);
     }
+    // D-041's baseline: the directory the restart refuses, read with `x` down. The
+    // refusal's own marker is written after it, and nothing else may be (PROPOSED D-117).
+    report.refused_before = audit_tree(&mut sim, at, Path::new(DIR));
     sim.restart(at);
     spawn(&sim, at, x, variants, node_variants, true);
     sim.run_for(SPLIT_AFTER);
+    // And the directories at the end, `x` crashed so that nothing on it is writing. `x`
+    // was never started again after its re-seed, so everything its re-seed's start did —
+    // both streams' staging, their installs' sweeps, any take — was done by the start
+    // that re-seeded, which is the start that held the wrong directory (#176).
+    sim.crash(at);
+    report.refused_at_end = audit_tree(&mut sim, at, Path::new(DIR));
+    report.still_lost = marked_lost(&mut sim, at, Path::new(DIR));
+    report.fresh_at_end = audit_tree(&mut sim, at, &fresh_dir());
     report.records = sim.trace();
     report
+}
+
+/// The directory a node of this shape's first re-seed builds: the generation after the
+/// configured one, beside it (D-066, D-077).
+#[must_use]
+pub fn fresh_dir() -> PathBuf {
+    ananke_shard::reseed::generation_dir(Path::new(DIR), ananke_shard::reseed::FIRST_GENERATION + 1)
 }
