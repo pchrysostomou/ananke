@@ -1774,3 +1774,615 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
     report.records = sim.trace();
     report
 }
+
+// A leader that can confirm no read (PROPOSED D-129): the pair on a run that holds one
+// there. `sim/shard.rs` found the state on seeds 128 and 643; this run builds it on every
+// seed from the same two re-seeds, on the scenario main already has.
+
+/// The range whose leader the run holds in the state.
+pub const READS_RANGE: u64 = FIRST_RANGE;
+/// The key the run's readers read: the range's first.
+const READS_KEY: &str = "k0";
+/// The run's readers. Each asks for a fresh get whenever its last one is answered or times
+/// out, as `sim/shard.rs`'s clients do after their operation timeout: the registrations
+/// that seed 128 counted were these, not retries (#125). Two at `READ_WAIT` are about
+/// twenty-four a second, about the rate of the clients of a sweep with four and several
+/// ranges, so a leader that keeps them passes the bound well inside [`READS_HOLD`].
+const READERS: u64 = 2;
+/// How long a reader waits for its answer before it goes on to a fresh get.
+const READ_WAIT: Duration = Duration::from_millis(80);
+/// How long the three run before the first loss: every range elects, and the writer takes
+/// the range's log over its threshold.
+const READS_SETTLE: Duration = Duration::from_secs(2);
+/// How long the first follower is gone at least, so that the leader designates it and
+/// compacts past it and its re-seed is a stream (D-037), as seed 128's were.
+const READS_GONE: Duration = Duration::from_secs(2);
+/// The longest the run waits for a re-seed to count: the leader's compaction, then the
+/// first rise of the follower's match under its new store.
+const READS_BUDGET: Duration = Duration::from_secs(8);
+/// How long the first follower is left after its re-seed before the second is crashed, so
+/// that it is caught up and can commit alone with the leader.
+const READS_MARGIN: Duration = Duration::from_millis(300);
+/// How long the second follower is gone. Short on purpose. This is the transient: a
+/// follower silent since it last confirmed counts as able, the reads wait on it, and the
+/// bound's measured figure covers them (D-076). Its first answer drops them (D-129 §3).
+const READS_DOWN: Duration = Duration::from_millis(300);
+/// How long the leader is held in the state, both its followers re-seeded and its clients
+/// reading: long enough for a leader that kept every read to pass the bound twice.
+pub const READS_HOLD: Duration = Duration::from_secs(4);
+/// The longest frame the leader's path to the second follower carries in the stalled run:
+/// under a chunk's `SNAPSHOT_CHUNK` alone and over a frame of an empty AppendEntries for
+/// each of the node's six ranges, about 400 bytes. A path-MTU black hole, as `sim/quorum.rs`
+/// blocks a stream (D-049).
+const READS_STALL_FRAME: usize = 500;
+/// The slice the run advances in while it waits.
+const READS_SLICE: Duration = Duration::from_millis(10);
+/// How long after the state shows the last read a round confirmed may still be served:
+/// past any lease a follower promised before it was lost, and past any acknowledgement
+/// still on its way back then. The leader's own heartbeats are ten times this close.
+const READS_SETTLED: Duration = Duration::from_secs(1);
+
+/// What the run's readers heard.
+// PROPOSED(D-129)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadersHeard {
+    /// A value: served.
+    pub served: u64,
+    /// `NotLeader`, naming nobody: a read the leader held and dropped. Counted whichever
+    /// get it answers, since a read that waited through the second follower's silence has
+    /// usually been given up on by the time its answer comes.
+    pub not_leader: u64,
+    /// Nothing, within `READ_WAIT`: on the node a read refused at the step is not
+    /// answered (D-076).
+    pub unanswered: u64,
+}
+
+/// One run of the leader held with both followers re-seeded and its clients reading
+/// ([`run_unconfirmable_reads`]).
+// PROPOSED(D-129)
+#[derive(Clone, Debug)]
+pub struct UnconfirmableReads {
+    /// The seed.
+    pub seed: u64,
+    /// The cores' variants: empty for the correct one, `UnconfirmableReadKept` for the pair.
+    pub variants: Variants,
+    /// The run's trace.
+    pub records: Vec<TraceRecord>,
+    /// The leader of [`READS_RANGE`] the run held, once it had one.
+    pub leader: u64,
+    /// The follower lost and re-seeded first, then the second.
+    pub lost: [u64; 2],
+    /// Whether the second follower's re-seed was stalled, so it stays refused for good
+    /// ([`run_unconfirmable_reads_stalled`]).
+    pub stalled: bool,
+    /// Where the hold starts in the trace: the second re-seed has counted.
+    pub hold_from: usize,
+    /// When the hold starts.
+    pub hold_at: Option<Instant>,
+    /// What the readers heard over the whole run.
+    pub readers: ReadersHeard,
+    /// Writes the writer saw committed, at the hold's start and at the run's end.
+    pub committed: (u64, u64),
+    /// What the run could not build, if anything.
+    pub unbuilt: Option<String>,
+}
+
+impl UnconfirmableReads {
+    /// Where the leader's state first shows in the trace.
+    #[must_use]
+    pub fn state_at(&self) -> Option<usize> {
+        self.records.iter().position(|record| {
+            matches!(record.event, TraceEvent::RaftReadsConfirmable {
+                server, range, confirmable: false, ..
+            } if server == self.leader && range == READS_RANGE)
+        })
+    }
+
+    /// The reads the leader refused at the step, from `at` in the trace on.
+    #[must_use]
+    pub fn refused_from(&self, at: usize) -> usize {
+        self.records[at.min(self.records.len())..]
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftReadRefused { server, range, .. }
+                    if server == self.leader && range == READS_RANGE)
+            })
+            .count()
+    }
+
+    /// The pending reads the leader dropped at answers that showed the state.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftReadsConfirmable {
+                    server,
+                    range,
+                    dropped,
+                    ..
+                } if server == self.leader && range == READS_RANGE => Some(dropped),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// The commits the leader traced from `at` in the trace on.
+    #[must_use]
+    pub fn commits_from(&self, at: usize) -> usize {
+        self.records[at.min(self.records.len())..]
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftCommit { server, range, .. }
+                    if server == self.leader && range == READS_RANGE)
+            })
+            .count()
+    }
+
+    /// The most reads any replica of the range held registered at once, as traced.
+    #[must_use]
+    pub fn outstanding(&self) -> u64 {
+        self.records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftReadsOutstanding {
+                    range, outstanding, ..
+                } if range == READS_RANGE => Some(outstanding),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The reads of the leader's a round confirmed, `READS_SETTLED` after the hold began.
+    /// None may be: nothing can confirm them there. A rule that counted a quarantined
+    /// acknowledgement for read-index, the one the owner did not take, would fill this.
+    #[must_use]
+    pub fn confirmed_in_the_hold(&self) -> usize {
+        let Some(from) = self.hold_at.map(|at| at + READS_SETTLED) else {
+            return 0;
+        };
+        self.records
+            .iter()
+            .filter(|record| {
+                record.at >= from
+                    && matches!(record.event, TraceEvent::RaftRead {
+                        server, range, lease: false, ..
+                    } if server == self.leader && range == READS_RANGE)
+            })
+            .count()
+    }
+
+    /// The first failure the bound reported of the leader's replica, if it did.
+    #[must_use]
+    pub fn over_the_bound(&self) -> Option<&str> {
+        let named = format!("range {READS_RANGE} holds");
+        self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RaftServerFailed { server, reason }
+                if *server == self.leader
+                    && reason.contains(&named)
+                    && reason.contains("registered reads") =>
+            {
+                Some(reason.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// The run's verdict: no node stopped, checks 1 to 4, the commit majority and the range
+    /// layer's folds.
+    ///
+    /// # Errors
+    ///
+    /// The first violation, with the seed.
+    pub fn check(&self) -> Result<(), String> {
+        let seed = self.seed;
+        if let Some((server, reason)) = self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RaftServerFailed { server, reason } => Some((*server, reason.clone())),
+            _ => None,
+        }) {
+            return Err(format!("seed {seed}: server {server} stopped: {reason}"));
+        }
+        if let Err(violation) = ananke_raft::invariants::all(crate::traced(&self.records)) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        if let Err(violation) = ananke_raft::invariants::commit_majority(
+            crate::traced(&self.records),
+            usize::try_from(SERVERS).expect("small"),
+        ) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        if let Err(violation) = ananke_shard::invariants::all(&self.records) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
+        Ok(())
+    }
+
+    /// The state, per seed. The leader led throughout, both followers were refused and
+    /// re-seeded quarantined with the log in them, so what holds the leader in office is
+    /// their answers; its trace says it can confirm nothing, first at an answer of the
+    /// second follower's, and still says so at the end; and it was the only leader the range
+    /// had from there on. A clause a run did not reach is a run that says nothing about the
+    /// rule, whichever half it is.
+    ///
+    /// # Errors
+    ///
+    /// What was not built or not reached, with the seed.
+    pub fn reached(&self) -> Result<(), String> {
+        let seed = self.seed;
+        if let Some(why) = &self.unbuilt {
+            return Err(format!("seed {seed}: the state was not built: {why}"));
+        }
+        for follower in self.lost {
+            let refused = self.records.iter().position(|record| {
+                matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == follower)
+            });
+            let Some(refused) = refused else {
+                return Err(format!("seed {seed}: node {follower} was never refused"));
+            };
+            let stated = self.records[refused..].iter().any(|record| {
+                matches!(record.event, TraceEvent::RaftReseeded { server, range }
+                    if server == follower && range == READS_RANGE)
+            });
+            let counted = self.records[refused..].iter().any(|record| {
+                matches!(record.event, TraceEvent::RaftMatchStarted { follower: f, range, .. }
+                    if f == follower && range == READS_RANGE)
+            });
+            if self.stalled && follower == self.lost[1] {
+                if counted {
+                    return Err(format!(
+                        "seed {seed}: node {follower}'s stream was meant to be stalled, and its \
+                         match rose: it did not stay refused"
+                    ));
+                }
+                continue;
+            }
+            if !stated || !counted {
+                return Err(format!(
+                    "seed {seed}: node {follower}'s replica of range {READS_RANGE} was not \
+                     re-seeded into counting: stated quarantined {stated}, its match rose \
+                     {counted}"
+                ));
+            }
+        }
+        let Some(state_at) = self.state_at() else {
+            return Err(format!(
+                "seed {seed}: leader {} never traced that it can confirm no read of range \
+                 {READS_RANGE}",
+                self.leader
+            ));
+        };
+        let last_side = self
+            .records
+            .iter()
+            .rev()
+            .find_map(|record| match record.event {
+                TraceEvent::RaftReadsConfirmable {
+                    server,
+                    range,
+                    confirmable,
+                    ..
+                } if server == self.leader && range == READS_RANGE => Some(confirmable),
+                _ => None,
+            });
+        if last_side != Some(false) {
+            return Err(format!(
+                "seed {seed}: the leader's last word on its reads is {last_side:?}, not that \
+                 it can confirm none"
+            ));
+        }
+        let left_office = self.records[state_at..]
+            .iter()
+            .find_map(|record| match &record.event {
+                TraceEvent::RaftQuorumLost { server, range, .. }
+                    if *server == self.leader && *range == READS_RANGE =>
+                {
+                    Some(format!("{:?}", record.event))
+                }
+                TraceEvent::RaftLeader { server, range, .. } if *range == READS_RANGE => {
+                    Some(format!("server {server} took office"))
+                }
+                _ => None,
+            });
+        if let Some(how) = left_office {
+            return Err(format!(
+                "seed {seed}: the leader did not stay in the state: {how}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// What the owner's ruling asks of the correct leader in the state, per seed: every read
+    /// it could not confirm refused or dropped, what it holds bounded, nothing confirmed
+    /// there, and writes committing the whole time. Each clause reads what it asserts off
+    /// the trace, or off what the clients heard, and none only that the run was green.
+    ///
+    /// # Errors
+    ///
+    /// The clause that does not hold, with the seed.
+    pub fn refused_and_committing(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let state_at = self.state_at().unwrap_or(self.records.len());
+        let refused = self.refused_from(self.hold_from);
+        // A reader waits `READ_WAIT` on a refused read and asks again, so the hold has at
+        // least this many in it even if half of it went on one reader.
+        let hold_reads = READS_HOLD.as_millis() / READ_WAIT.as_millis() / 2;
+        if (refused as u128) < hold_reads {
+            return Err(format!(
+                "seed {seed}: the leader refused {refused} reads in a hold of {READS_HOLD:?} \
+                 at {READERS} readers, under {hold_reads}"
+            ));
+        }
+        if self.dropped() == 0 {
+            return Err(format!(
+                "seed {seed}: the leader dropped no read at the answer that showed the state, \
+                 so the reads that waited on the second follower through {READS_DOWN:?} wait \
+                 still"
+            ));
+        }
+        if self.readers.not_leader == 0 {
+            return Err(format!(
+                "seed {seed}: no reader was told `NotLeader` of a dropped read: {:?}",
+                self.readers
+            ));
+        }
+        let outstanding = self.outstanding();
+        if outstanding > READS_HELD_AT_MOST {
+            return Err(format!(
+                "seed {seed}: the replica held {outstanding} reads at once, over the \
+                 {READS_HELD_AT_MOST} {READERS} readers through {READS_DOWN:?} can leave on it"
+            ));
+        }
+        let confirmed = self.confirmed_in_the_hold();
+        if confirmed != 0 {
+            return Err(format!(
+                "seed {seed}: {confirmed} reads were confirmed by a round in a state where \
+                 nothing can confirm one"
+            ));
+        }
+        let commits = self.commits_from(self.hold_from);
+        let written = self.committed.1.saturating_sub(self.committed.0);
+        if commits == 0 || written == 0 {
+            return Err(format!(
+                "seed {seed}: writes stopped in the state: {commits} commits traced, \
+                 {written} answered, from the hold on; {state_at} is where the state began"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The most reads the correct node holds on this run, and it is a figure about the run and
+/// not the bound: the two readers through the second follower's silence, and each reader's
+/// read in flight when an install's answer makes a follower able for a moment. Twice the
+/// worst measured over the binary's two hundred seeds in release, 11, by D-076's rule. The
+/// bound itself, 38, is asked by [`UnconfirmableReads::check`].
+// PROPOSED(D-129)
+pub const READS_HELD_AT_MOST: u64 = 22;
+
+/// A reader of [`READS_RANGE`]: a fresh get whenever the last is answered or times out,
+/// always at the one leader, recording what it hears.
+async fn reader<E: Environment>(env: E, client: u64, target: u64, heard: Arc<Mutex<ReadersHeard>>) {
+    let Ok(sock) = env.net().bind(client_addr(client)).await else {
+        return;
+    };
+    let mut seq = 0u64;
+    loop {
+        seq += 1;
+        let request = RangedRequest {
+            generation: FIRST_GENERATION,
+            range: RangeId(READS_RANGE),
+            request: Request {
+                client,
+                seq,
+                command: Command::Get {
+                    key: Bytes::from(READS_KEY),
+                },
+            },
+        };
+        let _ = sock.send(server_addr(target), request.encode()).await;
+        let deadline = env.clock().now() + READ_WAIT;
+        let reply = loop {
+            let recv = pin!(sock.recv());
+            let timer = pin!(env.clock().sleep_until(deadline));
+            let bytes = match race(&env, recv, timer).await {
+                Either::Left(Ok((_, bytes))) => bytes,
+                Either::Left(Err(_)) | Either::Right(()) => break None,
+            };
+            let Ok(response) = RangedResponse::decode(bytes) else {
+                continue;
+            };
+            if matches!(response.response.reply, Reply::NotLeader { leader: None }) {
+                heard.lock().expect("the readers' tally").not_leader += 1;
+            }
+            if response.response.seq == seq {
+                break Some(response.response.reply);
+            }
+        };
+        {
+            let mut heard = heard.lock().expect("the readers' tally");
+            match reply {
+                Some(Reply::Outcome(_)) => heard.served += 1,
+                Some(_) => {}
+                None => heard.unanswered += 1,
+            }
+        }
+        env.clock().sleep(Duration::from_millis(4)).await;
+    }
+}
+
+/// Advances `sim` until a record from now on satisfies `seen`, or `budget` is spent.
+fn until_traced(
+    sim: &mut Sim,
+    budget: Duration,
+    mut seen: impl FnMut(&TraceRecord) -> bool,
+) -> bool {
+    let deadline = sim.now() + budget;
+    let mut scanned = sim.trace_len();
+    loop {
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        if records.iter().any(&mut seen) {
+            return true;
+        }
+        if sim.now() >= deadline {
+            return false;
+        }
+        sim.run_for(READS_SLICE);
+    }
+}
+
+/// [`run_unconfirmable_reads`] with the second follower's re-seed stalled for good: its
+/// stream is lost to a path-MTU black hole, and its heartbeats and rejections pass. It never
+/// gets past refused, and the leader keeps its office on the first follower alone (D-049).
+/// This is the run that decides how a refused follower counts (PROPOSED D-129 §2): under
+/// "echo 0 and no refused mark" the follower counts as able to confirm for as long as its
+/// stream stalls, the reads wait on it, and the bound trips on the correct system.
+// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
+#[must_use]
+pub fn run_unconfirmable_reads_stalled(seed: u64) -> UnconfirmableReads {
+    unconfirmable_reads(seed, Variants::default(), true)
+}
+
+/// Holds a leader with both its followers re-seeded and its clients reading, for `seed`.
+///
+/// The three servers of the re-seed shape, a writer of [`READS_RANGE`] and, once the range
+/// has its leader, two readers of it at that leader. No message is dropped at random, as in
+/// `sim/quorum.rs` and for its reason: a leader that lost a whole window of answers from the
+/// one follower it has left would step down into a range that can elect nobody (D-035), and
+/// the state would be a matter of the draw. Duplicates, delays, reordering and the disk's
+/// latency stay.
+///
+/// The one follower is lost as the re-seed shape loses one: crashed, left down until the
+/// leader has compacted past it, and started again on a store marked lost. It is refused,
+/// the leader streams its re-seed, and it comes back quarantined with the log in it, so it
+/// commits and counts for check quorum. Then the other. The leader keeps its office on the
+/// first through the second's absence, which is the state's way in: a read waits on the
+/// silent follower, as D-076's transient may, until its first answer says it never will.
+/// That is a refused server's, and then a quarantined one's after its install, and the
+/// leader stays there for [`READS_HOLD`]. It is seeds 128 and 643 of `sim/shard.rs` with
+/// nothing else going on.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[must_use]
+pub fn run_unconfirmable_reads(seed: u64, variants: impl Into<Variants>) -> UnconfirmableReads {
+    unconfirmable_reads(seed, variants.into(), false)
+}
+
+fn unconfirmable_reads(seed: u64, variants: Variants, stall: bool) -> UnconfirmableReads {
+    let node_variants = NodeVariants::correct();
+    let mut config = config(seed);
+    config.net.p_drop = 0.0;
+    let mut sim = Sim::new(config);
+    let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
+    let client = sim.add_node();
+    let committed: Arc<Mutex<u64>> = Arc::default();
+    for id in 1..=SERVERS {
+        spawn(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            variants,
+            node_variants,
+            false,
+        );
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("writer", writer(inner, 1, READS_RANGE, committed.clone()));
+    }
+    sim.run_for(READS_SETTLE);
+
+    let leader = leader_of(&sim.trace(), READS_RANGE).unwrap_or(1);
+    let mut draw = moirae_sched::stream(seed, "reseed-unconfirmable-reads");
+    let followers: Vec<u64> = (1..=SERVERS).filter(|id| *id != leader).collect();
+    let first = followers[usize::try_from(draw.below(followers.len() as u64)).expect("small")];
+    let second = followers
+        .iter()
+        .copied()
+        .find(|id| *id != first)
+        .expect("three servers");
+    let heard: Arc<Mutex<ReadersHeard>> = Arc::default();
+    for n in 0..READERS {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("reader", reader(inner, 2 + n, leader, heard.clone()));
+    }
+    let mut report = UnconfirmableReads {
+        seed,
+        variants,
+        records: Vec::new(),
+        leader,
+        lost: [first, second],
+        stalled: stall,
+        hold_from: 0,
+        hold_at: None,
+        readers: ReadersHeard::default(),
+        committed: (0, 0),
+        unbuilt: None,
+    };
+    let unbuilt = |mut report: UnconfirmableReads, sim: &Sim, why: String| {
+        report.unbuilt = Some(why);
+        report.records = sim.trace();
+        report
+    };
+
+    // The first follower: gone until the leader has compacted past it.
+    let at = nodes[first as usize - 1];
+    sim.crash(at);
+    sim.run_for(READS_GONE);
+    let compacted = |record: &TraceRecord| {
+        matches!(record.event, TraceEvent::RaftCompacted { server, range, .. }
+            if server == leader && range == READS_RANGE)
+    };
+    if !sim.trace().iter().any(compacted) && !until_traced(&mut sim, READS_BUDGET, compacted) {
+        let why = format!("leader {leader} did not compact with node {first} gone");
+        return unbuilt(report, &sim, why);
+    }
+    sim.restart(at);
+    spawn(&sim, at, first, variants, node_variants, true);
+    let counted = |follower: u64| {
+        move |record: &TraceRecord| {
+            matches!(record.event, TraceEvent::RaftMatchStarted { follower: f, range, .. }
+                if f == follower && range == READS_RANGE)
+        }
+    };
+    if !until_traced(&mut sim, READS_BUDGET, counted(first)) {
+        let why = format!("node {first}'s re-seed never counted");
+        return unbuilt(report, &sim, why);
+    }
+    sim.run_for(READS_MARGIN);
+
+    // The second: the state's way in, through a silence D-076's bound covers.
+    let at = nodes[second as usize - 1];
+    sim.crash(at);
+    sim.run_for(READS_DOWN);
+    if stall {
+        sim.limit_frames(nodes[leader as usize - 1], at, READS_STALL_FRAME);
+    }
+    sim.restart(at);
+    spawn(&sim, at, second, variants, node_variants, true);
+    let second_counted = counted(second);
+    let shown = |record: &TraceRecord| matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == second);
+    let hold_begins = if stall {
+        // The stream never ends: the hold starts at the refusal, and the second follower's
+        // answers show the state just after.
+        until_traced(&mut sim, READS_BUDGET, shown)
+    } else {
+        until_traced(&mut sim, READS_BUDGET, second_counted)
+    };
+    if !hold_begins {
+        let why = format!("node {second}'s re-seed never counted or was never refused");
+        return unbuilt(report, &sim, why);
+    }
+
+    // The hold.
+    report.hold_from = sim.trace_len();
+    report.hold_at = Some(sim.now());
+    let before = *committed.lock().expect("the counter");
+    sim.run_for(READS_HOLD);
+    report.committed = (before, *committed.lock().expect("the counter"));
+    report.readers = *heard.lock().expect("the readers' tally");
+    report.records = sim.trace();
+    report
+}

@@ -159,6 +159,16 @@ pub enum Variant {
     /// without this variant nothing in the tree could make the assertion fire.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     FollowerNeverCompacts,
+    /// A leader keeps a read it can never confirm, and goes on registering more: the
+    /// core as built before D-129. With its followers' latest answers echoing 0 the
+    /// leader commits, keeps its office under check quorum, and no election can
+    /// succeed (D-035), so nothing ever answers those reads or deposes the leader
+    /// that holds them. The node's bound on a replica's registered reads
+    /// (`READS_OUTSTANDING`) is what catches it, on the directed run that holds a
+    /// leader there with clients reading (`reseed::run_unconfirmable_reads`). The
+    /// leader still traces the state: only the refusal and the drop are gone.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    UnconfirmableReadKept,
 }
 
 impl Variant {
@@ -184,6 +194,7 @@ impl Variant {
         Variant::RefusedCountsForQuorum,
         Variant::RefusedNeverCounts,
         Variant::FollowerNeverCompacts,
+        Variant::UnconfirmableReadKept,
     ];
 
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
@@ -210,6 +221,7 @@ impl Variant {
             Variant::RefusedCountsForQuorum => 1 << 14,
             Variant::RefusedNeverCounts => 1 << 15,
             Variant::FollowerNeverCompacts => 1 << 16,
+            Variant::UnconfirmableReadKept => 1 << 17,
         }
     }
 }
@@ -808,6 +820,17 @@ struct Progress {
     // PROPOSED(D-069): `RaftMatchStarted`, the first rise of `matched` under an
     // incarnation.
     match_started: bool,
+    /// Whether the follower's latest AppendEntries answer echoed 0: a quarantined
+    /// server's or a refused one's, neither of which ever confirms a read on the
+    /// store it answers from (RAFT.md §1, §3). Set on such an answer, cleared on an
+    /// answer with any other echo, and forgotten with the rest of what the leader
+    /// knew of the store at a new incarnation (D-042), so a store an operator
+    /// replaces can confirm again. It is about answers and nothing else: a crashed,
+    /// partitioned or silent follower keeps what it last said, and one that has said
+    /// nothing yet counts as able, since that transient is the one D-076's bound was
+    /// measured over.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    echoed_zero: bool,
 }
 
 /// One server's protocol state.
@@ -887,6 +910,13 @@ pub struct Raft {
     /// The index of the current term's first entry, the no-op, on a leader: a read
     /// waits for it to commit (thesis §6.4).
     first_of_term: Index,
+    /// Whether, at the leader's last look at an answer, it and the followers able to
+    /// confirm a read formed a majority of every voter set in force, so a change of
+    /// side is traced once ([`TraceEvent::RaftReadsConfirmable`]). `on_read` does not
+    /// read this: it asks the question afresh, since a configuration entry can change
+    /// the answer between two answers.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    reads_confirmable: bool,
     reads: Vec<PendingRead>,
     /// The follower a transfer waits to catch up before TimeoutNow is sent.
     transferee: Option<ServerId>,
@@ -1005,6 +1035,7 @@ impl Raft {
             leader_ticks: 0,
             quorum_elapsed: 0,
             first_of_term: 0,
+            reads_confirmable: true,
             reads: Vec::new(),
             transferee: None,
             transfer: false,
@@ -1271,6 +1302,16 @@ impl Raft {
     /// A linearizable read (thesis §6.4): served by the lease when it holds, else
     /// after a heartbeat round acknowledged by a majority; either way not before
     /// this term's no-op is committed and the read index is applied.
+    ///
+    /// A leader refuses a read no round can ever confirm: no lease holds, and it and
+    /// the followers able to confirm form no majority of some voter set in force
+    /// ([`Raft::can_confirm`]). It answers [`Output::Rejected`] with **no** leader, for
+    /// two reasons. It is not a pointer to anywhere: naming itself, as a follower names
+    /// the leader it knows, tells a client that follows hints to come straight back. And
+    /// with nobody named the one-group server answers `NotLeader { leader: None }`,
+    /// which a client takes as a reason to back off and try elsewhere. The node takes
+    /// the registration back at the same output (`Replica::refuse`, D-076).
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
     fn on_read(&mut self, id: u64, now: u64) {
         if self.role != Role::Leader {
             self.outputs.push(Output::Rejected {
@@ -1280,6 +1321,21 @@ impl Raft {
         }
         let index = self.commit.max(self.first_of_term);
         let lease = self.lease_holds(now);
+        if !lease
+            && !self.can_confirm(&[])
+            && !self
+                .config
+                .variants
+                .contains(Variant::UnconfirmableReadKept)
+        {
+            self.trace(TraceEvent::RaftReadRefused {
+                server: self.id.0,
+                range: self.config.range,
+                term: self.term,
+            });
+            self.outputs.push(Output::Rejected { leader: None });
+            return;
+        }
         self.reads.push(PendingRead {
             id,
             index,
@@ -1300,6 +1356,69 @@ impl Raft {
                 self.replicate(peer, true);
             }
         }
+    }
+
+    /// Whether a read with these acknowledgements can still be confirmed: whether they,
+    /// this server and the followers able to confirm form a majority of every voter set
+    /// in force, of the one set, or of each while a change is joint (thesis §4.3).
+    /// [`Configuration::has_majority`] only counts the members of each set, so a leader
+    /// outside `C_new` counts nothing there for itself, as in [`Raft::serve_reads`].
+    ///
+    /// A follower is able unless its latest AppendEntries answer echoed 0, which is the
+    /// one thing that says it never will: an echo of 0 is a promise not made, and a
+    /// store that answers so is re-seeded and quarantined for good, or refused and on
+    /// its way there (D-035). A follower gone silent has said nothing of the kind, so
+    /// it counts as able, and a read may wait on it for as long as it stays silent.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    fn can_confirm(&self, acks: &[ServerId]) -> bool {
+        let mut on: Vec<ServerId> = self
+            .progress
+            .iter()
+            .filter(|(_, progress)| !progress.echoed_zero)
+            .map(|(&follower, _)| follower)
+            .collect();
+        on.extend_from_slice(acks);
+        on.push(self.id);
+        self.membership.has_majority(&on)
+    }
+
+    /// What an answer from `follower` just showed about the reads: traces a change of
+    /// side, and drops every pending read no round can now confirm, so its client hears
+    /// `NotLeader` at once rather than never. A read the lease or a majority confirmed
+    /// stays, waiting only for its state; so does a read whose acknowledgements still
+    /// make a majority with those able, since they were sent while it was this leader's
+    /// to confirm, and only the no-op's commit stands between them and a confirmation.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    fn note_reads_confirmable(&mut self, follower: ServerId) {
+        let confirmable = self.can_confirm(&[]);
+        let mut dropped = 0u64;
+        if !confirmable
+            && !self
+                .config
+                .variants
+                .contains(Variant::UnconfirmableReadKept)
+        {
+            for read in std::mem::take(&mut self.reads) {
+                if read.confirmed || self.can_confirm(&read.acks) {
+                    self.reads.push(read);
+                } else {
+                    dropped += 1;
+                    self.outputs.push(Output::ReadDropped { id: read.id });
+                }
+            }
+        }
+        if confirmable == self.reads_confirmable && dropped == 0 {
+            return;
+        }
+        self.reads_confirmable = confirmable;
+        self.trace(TraceEvent::RaftReadsConfirmable {
+            server: self.id.0,
+            range: self.config.range,
+            term: self.term,
+            confirmable,
+            follower: follower.0,
+            dropped,
+        });
     }
 
     /// Confirms reads a majority has acknowledged since they arrived, and emits
@@ -1800,10 +1919,12 @@ impl Raft {
                         quiet_ticks: 0,
                         incarnation: None,
                         match_started: false,
+                        echoed_zero: false,
                     },
                 )
             })
             .collect();
+        self.reads_confirmable = true;
         self.trace(TraceEvent::RaftLeader {
             server: self.id.0,
             range: self.config.range,
@@ -1941,6 +2062,10 @@ impl Raft {
             // incarnation, whether or not the progress itself is reset — the
             // record is what SHARD.md §8's `RaftMatchStarted` is keyed on.
             progress.match_started = false;
+            // PROPOSED(D-129): whether the store can confirm a read is what the old
+            // store said, whether or not the progress itself is reset. The answer
+            // this one came with, if it is an AppendEntries answer, says it again.
+            progress.echoed_zero = false;
         }
         if !changed || self.config.variants.contains(Variant::IgnoreIncarnation) {
             return false;
@@ -2197,6 +2322,7 @@ impl Raft {
                             quiet_ticks: 0,
                             incarnation: None,
                             match_started: false,
+                            echoed_zero: false,
                         },
                     );
                     tracked.insert(
@@ -2859,7 +2985,9 @@ impl Raft {
         // timer on the request either way (moirae rule 5). An echo of zero is a
         // quarantined follower's (RAFT.md §3): a sign of life, never a promise and
         // never a read's confirmation, since it grants votes to nobody and a vote
-        // majority need not cross it. A rejection *carrying the refused mark* is a
+        // majority need not cross it: such a follower commits and keeps the leader in
+        // office, and cannot confirm a read for it, so the latest answer is kept
+        // (PROPOSED D-129). A rejection *carrying the refused mark* is a
         // refused server's, one that holds nothing of this log: a sign of life that
         // check quorum counts only beside re-seed progress in the same window. A
         // quarantined follower that holds the log answers without the mark and
@@ -2881,6 +3009,8 @@ impl Raft {
             progress.active = true;
         }
         progress.quiet_ticks = 0;
+        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        progress.echoed_zero = echo == 0;
         if echo != 0 {
             progress.promise = progress.promise.max(Some(echo));
             if let Some(moved) = progress.guard.observe(&self.config, now, echo, local) {
@@ -2899,6 +3029,9 @@ impl Raft {
                 }
             }
         }
+        // PROPOSED(D-129): after this answer's acknowledgement is on the reads it
+        // confirms, so a read it just made confirmable is not dropped.
+        self.note_reads_confirmable(from);
         let Some(progress) = self.progress.get_mut(&from) else {
             return;
         };

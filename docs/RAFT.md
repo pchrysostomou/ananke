@@ -99,6 +99,25 @@ sent after the read arrived, waits until its applied index reaches the read inde
 serves the read from the engine at that state. If it has not yet committed an entry of
 its term, it waits for the no-op.
 
+A leader refuses a read it can never confirm (the owner's ruling, 2026-11-06; PROPOSED
+D-129). It keeps, per follower, whether the follower's latest AppendEntries answer echoed
+zero (below, and §3): it sets that on such an answer, clears it on an answer with any
+other echo, and forgets it at a new store incarnation (D-042), so a store an operator
+replaces can confirm again. A follower that has not answered that way counts as able to
+confirm, a crashed, partitioned or silent one included, since a read waiting on it is the
+transient the node's bound on registered reads was measured over (§3, D-076). While the
+leader and the followers able to confirm form no majority of every voter set in force, of
+each set while a change is joint, a read no lease covers is refused at once with no
+leader named, and pending reads no round can confirm are dropped as soon as an answer
+shows it. The one-group server answers both `NotLeader` naming nobody: naming itself would
+send a client that follows hints straight back. The node takes a refused read's
+registration back at the step (D-076) and answers a dropped one the same `NotLeader`.
+A read the lease or a majority already confirmed still waits only for its state, and one
+whose acknowledgements still make a majority with those able stays. Writes are untouched:
+the same followers count for commits and for check quorum (§3, D-035), which is what keeps
+such a leader in office, and nothing but an operator's replacement or a change of
+membership gets it out of this state.
+
 *Lease reads* skip the heartbeat round while a lease holds. The lease is granted by
 followers, not assumed from the clock alone: every `AppendEntries` response says "I
 will not grant a vote or a pre-vote to anyone before my election timer next fires,
@@ -146,7 +165,8 @@ once without a pre-vote, and the sweep uses it to hand leadership to the server 
 the slowest clock, the only way such a server ever leads. A server on a re-seeded store
 makes no promise (D-035): its responses echo zero, and the leader counts such a
 response for nothing in the lease or a read-index round, since that server grants votes
-to nobody and a vote majority need not cross it.
+to nobody and a vote majority need not cross it. A leader whose followers' latest answers
+leave it no majority refuses the reads no lease covers (above, PROPOSED D-129).
 
 **Membership changes by joint consensus (thesis §4.3).** A change from C_old to C_new
 is two log entries: `C_old,new` and, once that is committed, `C_new`. While the joint
@@ -390,6 +410,8 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
+| `RaftReadsConfirmable` | an answer showed a leader's reads changing sides: it and the followers able to confirm stopped, or started again, to form a majority of every voter set in force, or the answer dropped reads with no change of side (PROPOSED D-129) | `term`, `confirmable`, `follower`: whose answer showed it, `dropped`: the pending reads it dropped |
+| `RaftReadRefused` | a leader refused a read no round can ever confirm (PROPOSED D-129) | `term` |
 | `RaftTransfer` | a leader sent TimeoutNow | `to` |
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
@@ -732,7 +754,8 @@ it neither votes nor serves until a snapshot rebuilds it. A refused server trace
 is before it adopts an install or opens its store, and it answers every AppendEntries,
 whatever its term and entries, with a rejection carrying the request's term and
 previous index, a hint of 1, an echo of zero, so no lease promise or read confirmation
-is measured from it, store incarnation 0, since it has no store (D-042), and **the
+is measured from it and a leader counts it as unable to confirm a read (§1, PROPOSED
+D-129), store incarnation 0, since it has no store (D-042), and **the
 refused mark** (PROPOSED D-087). That
 rejection is how a leader learns the server needs a re-seed. It is a sign of life and
 not of a log: check quorum counts it only in a window in which a chunk of the
@@ -764,7 +787,9 @@ the staged `CURRENT` is written leaves the lost mark, and the next start refuses
 On the rebuilt store the server is quarantined for good (D-035): it replicates, applies
 and counts for commit majorities, but grants no vote and no pre-vote, never campaigns
 and makes no lease promise, across any number of restarts and any later install on
-that history, since the state it lost may have included a vote.
+that history, since the state it lost may have included a vote. So it never confirms a
+read on that store, and with two of three quarantined the leader commits and refuses
+reads no lease covers until an operator replaces a store (§1, PROPOSED D-129).
 
 **The message codec.** `Message` is `PreVote`, `PreVoteResponse`, `RequestVote`,
 `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`, `InstallSnapshot`,
@@ -815,8 +840,9 @@ waits in the inbox for the next:
   snapshot action a core asks for while the `snapshot` task keyed by range and follower
   is another slice's, and a client request for a range this node does not host, are each
   traced as a failure of the server, and a replica's registered reads are bounded, so a
-  read the step refuses cannot leave its client's address behind
-  (`READS_OUTSTANDING`; PROPOSED D-076). The node's bound covers what it holds because
+  read the step refuses cannot leave its client's address behind and a leader cannot go
+  on holding reads it can never confirm
+  (`READS_OUTSTANDING`; PROPOSED D-076, D-129). The node's bound covers what it holds because
   the task drains its queue to empty on every wake, so a bound that asked only about
   the queue would bind nothing (D-074, proposed). What the hold does *not* bind is a
   message larger than the whole bound: no emptying could ever make room for one, so it
@@ -972,7 +998,7 @@ a hundred seeds, that the sweep reached the state its wedge is built on (D-042).
 test prints its catch rate. A variant the sweep does not catch is a hole in the sweep,
 not a variant to delete.
 
-The table's seventeen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
+The table's eighteen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
 own. The term and the vote durable before a vote is answered is `SendBeforePersist`'s
 rule, since that variant sends every message of a step, a vote's answer included, before
 the step's persist. The applied index written in the batch of its entry's writes (§3) has
@@ -999,6 +1025,7 @@ no known-buggy variant: its crash test,
 | `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
 | `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
 | `FollowerNeverCompacts` | §1 above: a replica that is not leading compacts to its own applied index once its log is more than `snapshot_threshold` entries past its prefix (D-065); the variant is the server as it was built before that, whose follower log shrinks only by truncation or install | the follower-log bound, `raft::FOLLOWER_LOG_BOUND`, 768 entries, asked of every replica on every seed: caught on 5 of the first 1 000 seeds (116, 429, 512, 577, 757), by that bound on all five, with 878 entries — 73 × the threshold — the largest, on seed 512. The rate is half a per cent, far under the gate's twenty seeds, so the pair is pinned at seed 512 rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound` | a replica that trails its leader and is never streamed a snapshot, over a run long enough for the lag to pass the bound's 768 entries |
+| `UnconfirmableReadKept` | §1: a leader refuses a read it can never confirm and drops the pending ones (the owner's ruling, PROPOSED D-129); the variant keeps them, the leader as built before it | the node's bound on registered reads, `READS_OUTSTANDING`, 38: a leader in the state commits, keeps its office and confirms nothing, and every fresh get adds a registration nothing will answer. Caught by the bound on every seed of the directed run, `reseed::run_unconfirmable_reads`, asserted at every tier (D-061) | a leader with both followers re-seeded and its clients reading, which the directed run builds on every seed. The one-group server holds no such bound, so the pair runs on the node. S10's sweep reaches the state on its own (seeds 128 and 643) |
 
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's
