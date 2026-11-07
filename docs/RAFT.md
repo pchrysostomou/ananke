@@ -105,7 +105,7 @@ zero (below, and §3): it sets that on such an answer, clears it on an answer wi
 other echo, and forgets it at a new store incarnation (D-042), so a store an operator
 replaces can confirm again. A follower that has not answered that way counts as able to
 confirm, a crashed, partitioned or silent one included, since a read waiting on it is the
-transient the node's bound on registered reads was measured over (§4, D-076). While the
+transient the node's bound on registered reads was measured over (§3, D-076). While the
 leader and the followers able to confirm form no majority of every voter set in force, of
 each set while a change is joint, a read no lease covers is refused at once with no
 leader named, and pending reads no round can confirm are dropped as soon as an answer

@@ -101,6 +101,14 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-refuse-unconfirmable-reads` (2026-11-06), off `main` at de9f4d7, PR #198,
+  PROPOSED **D-129**, the owner's ruling on S10's finding (b): a leader refuses reads it can never
+  confirm and drops the pending ones, and `READS_OUTSTANDING` stays 38. Per follower, the latest
+  answer echoed 0; a silent follower counts as able and a refused one as unable (D-129 says why). The
+  pair is `Variant::UnconfirmableReadKept` on `reseed::run_unconfirmable_reads`, caught by the bound on
+  every seed. No pinned hash moved; the one-group sweep's schedules moved on 13 % of seeds. Seeds 128
+  and 643 of S10's scenario clear the bound; 128 lands in S10's own finding (c). The relaxed read rule
+  and leader-side read expiry are left as questions.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

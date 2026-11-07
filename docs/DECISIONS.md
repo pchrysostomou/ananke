@@ -23521,7 +23521,8 @@ RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with 
 5. *The drop.* As soon as an answer shows the state, `note_reads_confirmable` drops every pending
    read no round can now confirm, `Output::ReadDropped`, which both servers answer `NotLeader`
    naming nobody. Otherwise the reads registered between the second follower's crash and its
-   first quarantined answer wait for ever (seed 128: about seven). Not every pending read goes
+   first quarantined answer wait for ever (seed 128: about seven by the verifiers' count; three
+   here, dropped at its first refused answer). Not every pending read goes
    (**PROPOSED**): a read a lease or a majority confirmed waits only for its state, and one whose
    acknowledgements still make a majority with those able was acknowledged while this leader
    could confirm it, and needs only the no-op's commit. So this is not `drop_reads`, which drops
@@ -23557,7 +23558,9 @@ under the rule taken it passes 20 of 20, holding at most 9. That run is now a te
 The seeds alone do not separate them: 128 and 643 clear the bound under both, since their re-seeds
 complete. Seed 128 goes through both states and shows the cost: under the rule taken the state
 shows at 3.322 s with 3 reads dropped and at most 3 held, and under the other at 3.493 s with 6 and
-6. Seed 643: 3 held at 5.611 s against 10 at 5.834 s (7 and 10 at most).
+6. On seed 643 the leader of range 19 shows it at 5.611 s against 5.834 s, holding at most 7 against
+10. Neither reading trips the bound over S10's thousand seeds (at most 12 held under each), and the
+verdicts are the same seeds' under each.
 
 A placeholder answers the same bytes (D-109), and it is the one such answer that can later confirm:
 an install on a node that was not re-seeded makes an ordinary replica. It is counted as unable until
@@ -23592,7 +23595,7 @@ failure above.
   quarantined follower and one that stays silent commits, keeps its office and registers reads for
   as long as the silence lasts. So the bound can still trip on a correct system if a silence outlasts
   what D-076 measured over: about four seconds at the rate seed 128's clients read. S10's sweep does not reach it on a thousand
-  seeds (below). That is what the read-expiry question would answer, and the bound stays the oracle for it.
+  seeds. That is what the read-expiry question would answer, and the bound stays the oracle for it.
 - *`refused` reads on the node are still not answered at the step* (D-076's "next slice's first job"),
   so the node's client waits out its timeout on each. It is not touched here: answering moves every
   schedule that reaches it.
@@ -23604,9 +23607,44 @@ through which reads wait on its silence. The run holds the state for four second
 not on `main` yet, so this is what reaches the state here. Asserted per seed: the state reached,
 its leader still leading at the end, and both followers re-seeded into counting; reads refused,
 reads dropped, what the replica holds within its figure, no read confirmed by a round in the hold,
-and writes committing throughout. The figures are owed by the next commit.
+and writes committing throughout. In release:
 
-**Phase 2 (the frozen one-group server shares this core).** Owed by the next commit.
+| seeds | the correct leader | `UnconfirmableReadKept` |
+|---|---|---|
+| 20 (gate) | passes 20; at most 9 held; 2 043 refused, at least 101 on a seed; 161 dropped | caught 20, by the bound; at most 113 held |
+| 100 (CI) | passes 100; at most 9 held; 10 201 refused, at least 100 on a seed; 788 dropped | caught 100, by the bound; at most 114 held |
+| 200 (`TIER_CAP`, the premerge and the nightly) | passes 200; at most 11 held; 20 402 refused, at least 99 on a seed; 1 582 dropped | caught 200, by the bound; at most 114 held |
+
+The state is built on every seed and the catch is 100 %, so both halves are asserted at every tier
+(D-061). The correct half sweeps the tier, capped as this binary is. The variant's test runs
+`HIGH_RATE_SHARE`, twenty seeds, at every tier, as the binary's other high-rate variants do. Its 100
+and 200 above were measured with the same test run over the tier, before it moved to the share.
+`READS_HELD_AT_MOST`, 22, is twice the correct half's worst. The stalled run passes its twenty, at most
+9 held, 1 923 refused, at least 94 on a seed.
+
+**Phase 2 (the frozen one-group server shares this core).** No pinned hash moved, and nothing was
+re-pinned: `SEED_42_BODY_HASH` holds, since seed 42 never reaches the state, and `sim/tests/echo.rs`'s
+golden runs no Raft. **Schedules did move, on 13 % of the one-group sweep's seeds.** Over the first
+thousand seeds in release:
+
+| scenario | the state reached | reads refused or dropped | fails |
+|---|---|---|---|
+| `raft::run`, one group | 132 | 131; 29 136 refused, 1 059 dropped | 0 |
+| `membership::run`, one group | 0 | 0 | 0 |
+| `quorum::run`, both halves | 0 | 0 | 0 |
+| `raft::run_on_the_node` | 0 | 0; at most 20 held | 0 |
+
+Why so many: that sweep's rot and crash arms often leave two of three servers refused or quarantined,
+the shape D-035's seed 60 named. Seed 60 of this tree is one: its leader shows the state at 15.504 s
+and refuses 277 reads to 20.993 s. Before, each of those reads sat at the leader until the client's
+deadline. Now it is answered `NotLeader` naming nobody, and the client sleeps 20 ms and tries the next
+server, which moves every later draw of the seed. One seed reached the state with nothing refused or
+dropped, so only its trace gained a record. Nothing is lost by it: on the one-group server a follower
+that echoes 0 never confirms again, since refused leads to quarantined, and no operator replaces a store
+there, so no read refused here would have been served. Of the sixteen seeds `sim/tests/raft.rs` pins, the
+correct server's trace reaches the state only on 158 (at 17.695 s, 108 refused). That pin asserts
+`RefusalNotDurable`'s mechanism and still passes. The gate's tier is green, and CI's and the
+nightly's are the check on the sweeps' rates, which the 13 % can move: nightly run 42300118372 on 988c575.
 
 **S10's seeds, on a scratch copy of `sim/shard.rs` at f3977a5.** Over a thousand seeds in release: the
 read bound trips on none, and the most any replica held is 12. The state is reached on 14 seeds, reads
@@ -23614,10 +23652,20 @@ refused on 12 and dropped on 9. Seed 643 passes. Seed 128 lands in S10's own fin
 client write completed after the last heal", beside (c)'s twelve, which are S10's to fix. The seven of
 finding (a), D-128's, stand as they were. Nothing new fails.
 
-**The plants.** Owed by the next commit.
+**The plants.** Sixteen one-place changes to the core, against `paper.rs` and `node.rs`, every one
+caught: no refusal; no drop; the refusal naming the leader; a non-zero echo not clearing; no reset at
+a new incarnation; every follower starting unable; one merged majority; the drop taking every read; the
+drop ignoring acknowledgements; the side not reset on taking office; a lease read refused; a refused
+follower counted as able; a silent follower counted as unable; the leader not counted; the variant still
+refusing; the state not looked at on an answer. Two survived the first pass (starting unable and ignoring
+acknowledgements), because the test's followers answered first and its read was confirmed by the very
+answer meant to show the state. Both tests were rewritten and now catch them. The runs' own clauses
+are direct: no refusal leaves `refused_from` under its floor, and no drop leaves `dropped` at 0.
 
-**The nightly's rows (D-064).** Three `reseed` rows at provisional weights, read off a twenty-seed run in
-release; weighed properly in the next commit.
+**The nightly's rows (D-064).** Three `reseed` rows, weighed on this tree from the built release binary,
+three runs each, the median, with other slices' builds beside them (load 360 to 530): the correct half
+106.3 cpu s at its cap of 200, into the lightest shard, shard 1 at 1977.1 -> 2083.4; the stalled run 6.6
+and the variant 6.3, each on its twenty, into shard 5 at 1981.0 -> 1993.9.
 
 ---
 

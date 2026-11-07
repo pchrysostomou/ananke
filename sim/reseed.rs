@@ -1823,6 +1823,7 @@ const READS_SLICE: Duration = Duration::from_millis(10);
 const READS_SETTLED: Duration = Duration::from_secs(1);
 
 /// What the run's readers heard.
+// PROPOSED(D-129)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadersHeard {
     /// A value: served.
@@ -1838,6 +1839,7 @@ pub struct ReadersHeard {
 
 /// One run of the leader held with both followers re-seeded and its clients reading
 /// ([`run_unconfirmable_reads`]).
+// PROPOSED(D-129)
 #[derive(Clone, Debug)]
 pub struct UnconfirmableReads {
     /// The seed.
@@ -2151,10 +2153,12 @@ impl UnconfirmableReads {
 }
 
 /// The most reads the correct node holds on this run, and it is a figure about the run and
-/// not the bound: `READERS` readers at most every `READ_WAIT` through `READS_DOWN` and
-/// the leader's reaction to it, plus each reader's read in flight in any flap at an install.
-/// Measured over two hundred seeds in release: see the entry.
-pub const READS_HELD_AT_MOST: u64 = 19;
+/// not the bound: the two readers through the second follower's silence, and each reader's
+/// read in flight when an install's answer makes a follower able for a moment. Twice the
+/// worst measured over the binary's two hundred seeds in release, 11, by D-076's rule. The
+/// bound itself, 38, is asked by [`UnconfirmableReads::check`].
+// PROPOSED(D-129)
+pub const READS_HELD_AT_MOST: u64 = 22;
 
 /// A reader of [`READS_RANGE`]: a fresh get whenever the last is answered or times out,
 /// always at the one leader, recording what it hears.
@@ -2234,6 +2238,7 @@ fn until_traced(
 /// This is the run that decides how a refused follower counts (PROPOSED D-129 §2): under
 /// "echo 0 and no refused mark" the follower counts as able to confirm for as long as its
 /// stream stalls, the reads wait on it, and the bound trips on the correct system.
+// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
 #[must_use]
 pub fn run_unconfirmable_reads_stalled(seed: u64) -> UnconfirmableReads {
     unconfirmable_reads(seed, Variants::default(), true)
@@ -2257,6 +2262,7 @@ pub fn run_unconfirmable_reads_stalled(seed: u64) -> UnconfirmableReads {
 /// That is a refused server's, and then a quarantined one's after its install, and the
 /// leader stays there for [`READS_HOLD`]. It is seeds 128 and 643 of `sim/shard.rs` with
 /// nothing else going on.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
 #[must_use]
 pub fn run_unconfirmable_reads(seed: u64, variants: impl Into<Variants>) -> UnconfirmableReads {
     unconfirmable_reads(seed, variants.into(), false)

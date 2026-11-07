@@ -1835,7 +1835,8 @@ fn a_leader_refuses_a_read_it_can_never_confirm_and_names_nobody() {
 /// measured its bound over, and a follower that has said nothing has not said it never
 /// will. The read waits on it. The moment its first answer says otherwise the read is
 /// dropped, which is what stops the reads registered between the second follower's crash
-/// and its first quarantined answer from waiting for ever (seed 128: about seven of them).
+/// and its first answer after it from waiting for ever (three of them on `sim/shard.rs`'s
+/// seed 128).
 // PROPOSED(D-129): a leader refuses a read it can never confirm.
 #[test]
 fn a_silent_follower_counts_as_able_until_an_answer_says_otherwise() {
