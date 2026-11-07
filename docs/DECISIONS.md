@@ -23332,6 +23332,138 @@ creation's own. The trace format is not changed for this.
 
 ---
 
+## PROPOSED D-113 — `sim/shard.rs`, Stage C's sharded sweep (S10): five nodes, a driver on stream `shard`, four clients over sixteen keys and Phase 2's faults; stopped at its first measurement on a correct-server failure, an install onto a re-seeded replica that deletes the right halves beside it
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for this
+slice (#162's S10); the footer moves past it, and the slices beside it (#185, S8 (c), #181)
+take D-114 and up. Every code site carries `// PROPOSED(D-113)`. **This entry is in
+progress**: it records what is built and why the slice stopped, and it grows as the slice
+resumes.
+
+### 1. What is built
+
+`sim/shard.rs` (SHARD.md §10; §12, Stage C; Q39):
+
+- **Five nodes, three of them bootstrap nodes.** Nodes 1 to 3 write ranges 0, 1 and 2,
+  range 2 over `[k, l)`, the whole user keyspace the clients write (§2). Nodes 4 and 5 join
+  and hold nothing: no leader of this stage sends them anything, so they never make even a
+  placeholder (Q22), and `Report::shape` asserts that on every seed, with the nine
+  bootstrap creations.
+- **The driver, on stream `shard`.** Four to eight actions a run, drawn before the run at
+  times spread over the faults and resolved against the trace when each fires, so the
+  stream's draws never depend on what the run did (D-031). Two in three are a split of a
+  current span: a user range whose latest descriptor holds at least two of the clients'
+  keys on each side of some key strictly inside it, split at one such key and asked of its
+  leader by an admin that follows `NotLeader` and retries after `NoRangeId` (D-092's A).
+  The rest are leadership transfers of any range, ranges 0 and 1 included, to another
+  voter. So halves split again, which the node sweep's split arms never draw (D-104).
+- **Four clients over sixteen keys**, `k00` to `k15`: the node sweep's client, routing by
+  its cache through ranges 0 and 1, starting by thirds stale, root-only or with the
+  bootstrap descriptor. `raft::client_on` is split so its keys and first cache are the
+  scenario's (`raft::client_over`, `ClientKeys`); every draw of the two clusters of
+  `sim/raft.rs` falls where it fell, so no schedule and no pinned hash moves.
+- **Phase 2's faults**: drops, duplicates, delays; every node's clock drawn as the raft
+  sweep draws its servers' (within the lease's bound on half the seeds, one bootstrap node
+  slow and the rest fast on the other half); four to seven of isolate a node with a
+  client, isolate a drawn range's leader, a one-way block, a crash and a drawn range's
+  leader crashed, each healed before the next; and the disk's bit rot at Phase 2's 0.02
+  with torn writes, `fsync` honoured.
+- **The checks**: the raft sweep's over this trace (`raft::Report::over_a_run`) —
+  checks 1 to 4 keyed by range, the range layer's folds in one incremental checker that
+  stops the run (D-046), linearizability of every key across every split, which with the
+  drifting clocks is check 6 as Phase 2 built it, pre-vote's property, and on uniform seeds
+  the timer check and the write bound — and the shape. Check 19 is S7's (D-093).
+- The sweep, `every_seed_passes_on_the_correct_sharded_sweep`, prints the driver's work
+  and the refusals by loss, and has its nightly row (D-064), shard 6.
+
+### 2. Why it stopped: what the first thousand seeds found
+
+At a thousand seeds in release (on this tree; about 81 s real):
+
+- 3 721 splits took effect, 1 726 of them of a range a split made; every seed but 9 split;
+  up to 8 user ranges at a run's end. The driver asked 3 899 splits: 3 484 done, 370
+  refused `key-outside-span` (a second split of a span drawn while the first was in
+  flight), **18 refused `NoRangeId` on 7 of 1 000 seeds**, 45 unanswered; 1 673 of 2 022
+  transfers done.
+- 340 store refusals on 293 of 1 000 seeds: 126 name a dropped table, and 214 are
+  reasons the loss classifier does not read yet (a missing log head, among others).
+- **21 seeds fail the correct system**, on three mechanisms:
+
+**(a) A correct-server failure: an install onto a re-seeded replica deletes the right
+halves beside it.** 7 seeds, all linearizability: 41, 119, 447, 466, 782, 793 and 865, each
+an answer only a replica that had lost the key's value could give. Seed 41, range 19 on node 2:
+1. Range 2 splits at `k11` (index 109; right half 19) and at `k08` (121; right half 20).
+2. Node 2 is refused at 3.869 s ("dropped tables [4]") and re-seeds configuration's
+   ranges, 0, 1 and 2 (Q15, D-077). The re-seeded range 2 holds no descriptor and is no
+   initialised replica in the host's map, but the `snapshot` task's plan hosts it at
+   configuration's span, `[k, l)`.
+3. Node 2's placeholder of 19 is installed at 4.112 s: `SpanInstalled` of `[k11, l)` into
+   table 2, `RangeCreated { range: 19, cause: snapshot }` at `[k11, l)`. The overlap rule
+   lets it in, since nothing initialised on node 2 overlaps it.
+4. Node 2's re-seeded range 2 is installed at 4.243 s: its switch replaces the plan's
+   hosted span, **`[k, l)`**, though the snapshot's descriptor is `[k, k08)` and that is
+   what its `RangeCreated` names. Table 2 is taken out and rewritten without its user keys:
+   range 19's data on node 2 is gone.
+5. Range 19 splits at `k13` (index 136) into 21, which node 2 creates from its emptied 19;
+   node 1, leading 21, is crashed, node 2 leads 21 at term 3 at 4.713 s and serves `k15`'s
+   get at index 138 as `None`, where 19's snapshot at 121 held a value.
+
+A probe over the same thousand seeds finds an install on a re-seeded node replacing keys of
+another replica initialised on that node on **151 of 1 000 seeds**; 15 of those fail the
+verdict, the rest lose data on a replica no client then reads. It is a server bug, not a
+check defect: the trace's own `SpanInstalled` shows the deletion. It is #172's case, a
+re-seed after a split, which no scenario reached before this one, and S8 (c)'s to fix. No
+fold sees it: every descriptor the trace names is right, and only the engine's switch is
+wrong. **Not fixed here; reported to the owner.**
+
+**(b) A bound the correct system trips: `READS_OUTSTANDING`.** 2 seeds, 128 and 643, "server
+1 failed: range 2 holds 39 registered reads, over the 38 its clients can have in flight with
+it". Seed 128: nodes 2 and 3 are both refused (2.548 s, 3.269 s), so two of range 2's three
+voters run quarantined (D-035). The leader, node 1, goes on committing writes at term 1
+(indices 112 to 146), since a quarantined follower counts for commits, and confirms no read
+after 3.048 s, since a quarantined follower's echo is 0 and never a read's confirmation
+(RAFT.md §3). Every get registered at it waits for good; the four clients retry, each retry
+a registration of its own (#125); the count passes 38 at 7.411 s and the node fails itself.
+No registration is lost: the bound, sized on two clients by D-076's rule, counts retries
+against a leader that cannot confirm a read. **Not widened; reported to the owner.**
+
+**(c) A check defect of this slice's own.** 12 seeds, 217, 248, 253, 260, 281, 309, 313,
+329, 457, 657, 945 and 952: "liveness: no client write completed after the last heal". Two nodes are refused, so range 2 has lost its majority, as (b)'s seeds have, and the
+check asks nothing of its keys; but a right half on a refused node traces no
+`RaftReplicaRefused` (#178), so it still counts as live, the live set is not empty, and the
+check's "no write was asked of a live range" arm fires. The fix is this slice's: §8 counts
+every replica on a refused node as refused, and the sweep's write bound is to be asked per
+range the run ended with, read that way. Not fixed before the owner's word on (a) and (b),
+since both move what this sweep's figures mean.
+
+### 3. What is left of S10
+
+- (c)'s fix: the write bound per final range, with §8's refusal reading.
+- The meta convergence bound, measured then asserted (§8).
+- #45's loss kinds read in full, and dropped tables by the ranges they touch.
+- D-092's `NoRangeId`: 18 refusals on 7 of 1 000 seeds at the block of eight and the
+  threshold of two; the choice of the pair, and D-092's per-seed assertion where it is
+  reached, wait on (a), which the same seeds' refusals sit beside.
+- The node scenarios in `sim/tests/parallel.rs`; the pair rule's variants on this sweep;
+  the first Phase 3 seeds pinned.
+
+### 4. PROPOSED, for the owner
+
+- **(a)'s fix**, S8 (c)'s: the install's switch replaces the snapshot descriptor's span
+  for a replica that holds none — a re-seeded one, as a placeholder's install already
+  does — or the re-seed hosts its replicas at their Raft interval alone until their
+  installs name their spans. Recommended: both, the second being what makes a re-seeded
+  replica what §5 says it is, a replica with no span until its install.
+- **(b)**: a leader that cannot confirm a read — fewer unquarantined voters than a
+  majority — refuses it at the step, as it refuses a read it is not the leader for, so no
+  registration waits on what cannot come; or `READS_OUTSTANDING` stays as it is and the
+  sweep counts such seeds apart. Recommended: the first; the bound then measures what it
+  was written to.
+- **The scenario's own choices**, all tunable and none measured yet: four clients, sixteen
+  keys, two keys a side, Phase 2's bit rot of 0.02, four to eight driver actions a run.
+
+---
+
 ## PROPOSED D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
 
 **The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for
