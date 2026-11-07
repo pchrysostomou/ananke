@@ -101,6 +101,12 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-quorum-root-hold` (2026-11-06), off `main` at de9f4d7, PROPOSED D-119
+  (footer D-120), **#143**: the sharded quorum scenario asks its hold of ranges 0 and 1 too, and
+  the keeper's commit there where the run gave it an entry. `Variant::ReseededRootReplicaVotes`
+  and `ReseededMetaReplicaVotes` are caught on 4 578 and 4 651 of 10 000, the correct node 0 of
+  10 000. The wait moves the cut on about a third of the seeds and seed 2994's pin to the vote
+  without its harm, with D-101's split now 3 338 / 6 662 / 0.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

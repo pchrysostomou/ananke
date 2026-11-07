@@ -35,13 +35,14 @@
 //! Duplicates, delays and reordering stay.
 //!
 //! [`node_run`] is the same scenario **sharded**, on the node of SHARD.md §4 (PROPOSED
-//! D-085): one `mark_store_lost` refuses a node and every one of the four replicas it
-//! holds (D-077), and check quorum is then asked separately of each range's own leader
-//! about that one node. It is not D-049's two halves. Those are about a *store-less*
-//! refused server, whose rejections are stamped incarnation 0, and about the re-seed
-//! stream whose acknowledgements make them count; the node produces neither, and
-//! [`NodeReport::check`] asserts both absences per seed, with the reason and with what
-//! would upgrade them.
+//! D-085): one `mark_store_lost` refuses a node and every replica it holds (D-077) — the
+//! four user ranges' and, since PROPOSED D-096, the root's and the meta range's — and
+//! check quorum is then asked separately of each range's own leader about that one
+//! node, the system ranges' included (PROPOSED D-119). It is not D-049's two halves.
+//! Those are about a *store-less* refused server, whose rejections are stamped
+//! incarnation 0, and about the re-seed stream whose acknowledgements make them count;
+//! the node produces neither, and [`NodeReport::check`] asserts both absences per seed,
+//! with the reason and with what would upgrade them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -270,14 +271,23 @@ fn run_until_record(
     None
 }
 
-/// How long the node's four ranges elect before the victim is refused.
+/// How long the node's ranges elect before the victim is refused.
 const NODE_WARMUP: Duration = Duration::from_millis(1200);
 
 /// How many puts of [`raft::SPREAD_VALUE_BYTES`] each the scenario drives into every
-/// range the keeper still leads once the cut is made, so that each of them has an
+/// user range the keeper still leads once the cut is made, so that each of them has an
 /// entry of the leader's term to commit past its commit index at the cut. Four is
 /// enough for the claim and small enough that the hold is not a load test.
 const HOLD_PUTS: u64 = 4;
+
+/// How late in the hold an entry of a system range still obliges the keeper to commit
+/// in the hold: half of it, the same seven and a half check-quorum windows on either
+/// side. The clause it serves (`NodeReport::check`) is about an entry nothing in the
+/// scenario drives, which could otherwise land the instant before the heal. Measured,
+/// not assumed (PROPOSED D-119): on the correct node the last such entry lands 303 ms
+/// into the hold and each commits within 30 ms of its entry, on seeds 0 to 999.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+pub const SYSTEM_ENTRY_DEADLINE: Duration = Duration::from_millis(750);
 
 /// How long the scenario gives the whole-node re-seed to land and the ranges the
 /// victim led to find leaders again, before it takes the cast and cuts the third node
@@ -294,22 +304,28 @@ const SETTLE: Duration = Duration::from_millis(1500);
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeCast {
-    /// The node refused for lost state, whose four replicas are re-seeded with it.
+    /// The node refused for lost state, whose replicas are re-seeded with it.
     pub victim: u64,
     /// The node that keeps its side of the cut: it leads at least two of the four
-    /// ranges, and for each of them its majority is itself and the refused node.
+    /// user ranges, and for each range it leads its majority is itself and the
+    /// refused node.
     pub keeper: u64,
     /// The node cut off for the hold. It leads the ranges the keeper does not.
     pub other: u64,
-    /// Each range's leader when the cut is made.
+    /// Each range's leader when the cut is made: every range the node hosts
+    /// ([`Cluster::hosted`]), the root and the meta range first. Until PROPOSED D-119
+    /// this held the four user ranges alone, and nothing the hold asks was asked of
+    /// ranges 0 and 1 (issue #143). The keeper and [`NodeReport::both_outcomes`] are
+    /// still read off the user ranges, the ones the scenario drives writes into.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
     pub leaders: BTreeMap<u64, u64>,
 }
 
 /// What one range of the node saw in the hold, read from the trace.
 ///
 /// [`Hold`] is the one-group scenario's and is about one leader and one refused
-/// follower; this is the same reading asked per range of four leaders and four
-/// refused replicas of one node.
+/// follower; this is the same reading asked per range of every range's leader and
+/// every refused replica of one node.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RangeHold {
@@ -325,7 +341,7 @@ pub struct RangeHold {
     pub reseeded: bool,
     /// The store incarnation the victim's re-seeded replica of this range restated
     /// at its first start (`RaftRecovered`). A re-seeded replica draws one of its own
-    /// from the **node's** generator (D-077, Q26), so the four ranges' are four
+    /// from the **node's** generator (D-077, Q26), so the six ranges' are six
     /// different numbers — which is a question only a node of several ranges has.
     pub incarnation: Option<u64>,
     /// The store incarnations that replica's answers of this range actually carried
@@ -409,9 +425,28 @@ pub struct RangeHold {
     /// The leader's first commit of its term past its commit index at the cut, in
     /// the hold.
     pub commit_after_cut: Option<Instant>,
+    /// Whether the leader's log held an entry of its term past its commit index at the
+    /// cut by [`SYSTEM_ENTRY_DEADLINE`] into the hold: something for it to commit there.
+    /// The scenario drives that on a user range and not on a system range, where only a
+    /// refill or a `MetaUpdate` the run sent of its own accord gives it one.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    pub entry_to_commit: bool,
     /// Servers that became leader of this range in the hold, keeper's side and
     /// other's alike.
     pub elected_in_hold: BTreeSet<u64>,
+    /// Vote and pre-vote requests of this range the victim answered **refused** in the
+    /// hold (`RaftVote { granted: false }`): on a range whose leader the cut left on
+    /// the far side, the keeper's campaign asking the one replica that could make it
+    /// a majority, and the quarantine (D-035) saying no. It is the situation the
+    /// "elected in the hold" clause decides, counted so a sweep can say it reached it.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    pub votes_refused: usize,
+    /// Votes of this range the victim **granted** in the hold, pre-votes not counted:
+    /// 0 on every seed of a node that keeps D-035, and the mechanism of the catch on one
+    /// that does not. Read by the sweep rather than asked by [`NodeReport::check`],
+    /// whose question is what the vote elected.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    pub votes_granted: usize,
     /// Snapshot streams opened toward the victim for this range: the wiring's path.
     pub streams: usize,
 }
@@ -439,10 +474,12 @@ pub struct NodeReport {
     /// D-085 designed this as a per-seed guarantee, and on the node it is not one
     /// without the receive cap: which of the two survivors leads which range is
     /// leadership's business and not the scenario's, and a seed on which one of them
-    /// leads all four carries one outcome. The victim is chosen to preserve the split
-    /// its two neighbours already have (`node_run`), which leaves the degenerate seeds
-    /// few; the share is measured and printed rather than assumed, and every range is
-    /// asked its own question on every seed either way.
+    /// leads all four user ranges carries one outcome. The victim is chosen to preserve
+    /// the split its two neighbours already have (`node_run`), which leaves the degenerate
+    /// seeds few; the share is measured and printed rather than assumed, and every range
+    /// is asked its own question on every seed either way. Read over the user ranges, as
+    /// D-085 measured it: the system ranges are asked the same two outcomes and do not
+    /// decide this one (PROPOSED D-119).
     pub both_outcomes: bool,
     /// Each node's clock rate error, in parts per million.
     pub drifts: Vec<i64>,
@@ -455,31 +492,33 @@ pub struct NodeReport {
 }
 
 /// The sharded check-quorum scenario on the node of SHARD.md §4 (PROPOSED D-085):
-/// three nodes, four ranges on every node, **one** `mark_store_lost` at the victim's
-/// restart, and check quorum asked of four leaders about the one refused node.
+/// three nodes, six ranges on every node — the root, the meta range (PROPOSED D-096)
+/// and four user ranges — **one** `mark_store_lost` at the victim's restart, and check
+/// quorum asked of every range's leader about the one refused node (PROPOSED D-119).
 ///
-/// What "sharded" means here is D-085's reading: not the scenario run four times, but
-/// one fault and four answers. Four things change in kind, and none of them can be
-/// said in a single-range world:
+/// What "sharded" means here is D-085's reading: not the scenario run once per range,
+/// but one fault and an answer per range. Four things change in kind, and none of them
+/// can be said in a single-range world:
 ///
-/// 1. **The refusal is the node's.** The one mark refuses four replicas and re-seeds
-///    four, each with a store incarnation of its own drawn from the node's generator
+/// 1. **The refusal is the node's.** The one mark refuses all six replicas and re-seeds
+///    all six, each with a store incarnation of its own drawn from the node's generator
 ///    (D-077). `NodeVariant::RefuseOneRangeOnly` refuses one, and this scenario
 ///    catches it on every seed.
-/// 2. **The leader is per range.** The four ranges need not agree on a leader, so the
+/// 2. **The leader is per range.** The ranges need not agree on a leader, so the
 ///    cast is a leader per range, each with its own term, its own commit index at the
 ///    cut and its own check-quorum window on its own clock.
-/// 3. **The cut is one partition and the answers are four.** Cutting the third node
+/// 3. **The cut is one partition and every range answers it.** Cutting the third node
 ///    off is one fault on one link — on the node, one socket carrying every range's
 ///    frames (Q10, D-072) — and it leaves the ranges the keeper leads with a majority
 ///    of the keeper and the refused node, and the ranges the other leads with no
 ///    majority on either side.
 /// 4. **Both outcomes at once, on one node, on every seed.** The keeper's ranges keep
-///    their leader through the hold and commit past their commit index at the cut,
-///    through the very replicas the refusal re-seeded; the other's ranges lose theirs
-///    within two windows of the cut and **stay leaderless**, because the re-seeded
-///    replicas are quarantined and neither vote nor campaign (D-035) and the keeper
-///    alone is no majority. A single range asserts one or the other and never both.
+///    their leader through the hold and commit what they are given past their commit
+///    index at the cut, through the very replicas the refusal re-seeded; the other's
+///    ranges lose theirs within two windows of the cut and **stay leaderless**, because
+///    the re-seeded replicas are quarantined and neither vote nor campaign (D-035) and
+///    the keeper alone is no majority. A single range asserts one or the other and never
+///    both.
 ///
 /// **What this is not.** It is not D-049's two halves. Those are about a *store-less*
 /// refused server, whose rejections are stamped incarnation 0, and about the re-seed
@@ -608,8 +647,11 @@ pub fn node_run(
     while settled < SETTLE {
         sim.run_for(step);
         settled += step;
+        // Every range the node hosts, the system ranges with the user ranges: a root
+        // or meta range the victim led must have elected again too, or its hold
+        // would be asked of a leader that is not there (PROPOSED D-119).
         leaders = cluster
-            .ranges()
+            .hosted()
             .into_iter()
             .map(|range| (range, raft::leader_of_range(&sim, range)))
             .collect();
@@ -624,10 +666,16 @@ pub fn node_run(
     if leaders.values().all(|&leader| leader != victim) {
         // The keeper is the node that leads most of what is left, so the ranges it
         // leads — at least two of four on two eligible nodes — are the ones whose
-        // majority the cut leaves as the keeper and the refused node.
+        // majority the cut leaves as the keeper and the refused node. Counted over
+        // the user ranges, which are the ones the hold drives a write into: the
+        // system ranges are asked the hold's questions of whichever survivor leads
+        // them, and do not choose it (PROPOSED D-119).
+        let user_ranges = cluster.ranges();
         let mut leading: BTreeMap<u64, usize> = BTreeMap::new();
-        for &leader in leaders.values() {
-            *leading.entry(leader).or_default() += 1;
+        for (range, &leader) in &leaders {
+            if user_ranges.contains(range) {
+                *leading.entry(leader).or_default() += 1;
+            }
         }
         let keeper = (1..=SERVERS)
             .filter(|&s| s != victim)
@@ -654,14 +702,16 @@ pub fn node_run(
         // in the hold, on a key of that range, so that "the leader committed past its
         // commit index at the cut" is a claim the scenario drives rather than one it
         // waits for the clients to happen to make. The ranges the cut-off node leads
-        // are given nothing: their leader is on the far side of the cut.
+        // are given nothing: their leader is on the far side of the cut. Nor are the
+        // system ranges: no client writes one (Q4), and `spread_on`'s keys are user
+        // keys.
         let keepers_ranges: Vec<u64> = report
             .cast
             .as_ref()
             .expect("the cast is set")
             .leaders
             .iter()
-            .filter(|&(_, &leader)| leader == keeper)
+            .filter(|&(range, &leader)| leader == keeper && user_ranges.contains(range))
             .map(|(&range, _)| range)
             .collect();
         for (i, range) in keepers_ranges.into_iter().enumerate() {
@@ -683,8 +733,16 @@ pub fn node_run(
         .iter()
         .filter(|r| matches!(r.event, TraceEvent::RaftRefused { server, .. } if server == victim))
         .count();
+    // Over the user ranges, as D-085 measured it: a system range on the keeper's side
+    // is asked to commit only what the run gave it (`NodeReport::check`), so it does
+    // not carry the keeper's whole outcome.
     report.both_outcomes = report.cast.as_ref().is_some_and(|cast| {
-        let sides: BTreeSet<u64> = cast.leaders.values().copied().collect();
+        let sides: BTreeSet<u64> = cast
+            .leaders
+            .iter()
+            .filter(|(range, _)| cluster.ranges().contains(range))
+            .map(|(_, &leader)| leader)
+            .collect();
         sides.contains(&cast.keeper) && sides.contains(&cast.other)
     });
     report.history = History::from_trace(&report.records);
@@ -818,6 +876,37 @@ impl NodeReport {
                     if let Some(hold) = holds.get_mut(range) {
                         hold.elected_in_hold.insert(*server);
                         let _ = term;
+                    }
+                }
+                // PROPOSED(D-119): the hold clauses ask the system ranges too.
+                TraceEvent::RaftVote {
+                    server,
+                    range,
+                    granted,
+                    pre,
+                    ..
+                } if *server == victim && in_hold(r.decided) => {
+                    if let Some(hold) = holds.get_mut(range) {
+                        if !*granted {
+                            hold.votes_refused += 1;
+                        } else if !*pre {
+                            hold.votes_granted += 1;
+                        }
+                    }
+                }
+                TraceEvent::RaftAppend {
+                    server,
+                    range,
+                    index,
+                    entry_term,
+                    ..
+                } if r.decided <= cut + SYSTEM_ENTRY_DEADLINE => {
+                    if let Some(hold) = holds.get_mut(range)
+                        && *server == hold.leader
+                        && *entry_term == hold.term
+                        && *index > hold.commit_at_cut
+                    {
+                        hold.entry_to_commit = true;
                     }
                 }
                 TraceEvent::RaftQuorumLost {
@@ -989,17 +1078,29 @@ impl NodeReport {
     ///    layer's checks — 7, 9, 10, 16, 17 and 18, folded over the whole trace as every
     ///    other node scenario folds them (issue #140) — and linearizability over the
     ///    trace.
-    /// 3. **The fan-out (D-077).** Every one of the node's four replicas was refused
+    /// 3. **The fan-out (D-077).** Every one of the node's six replicas — the four user
+    ///    ranges' and the root's and the meta range's (PROPOSED D-096) — was refused
     ///    with it and re-seeded, each stamping its answers with a store incarnation of
-    ///    its own, the four of them four different numbers.
-    /// 4. **Check quorum, per range.** A range the keeper leads keeps its leader
-    ///    through the hold and commits an entry of its term past its commit index at
-    ///    the cut — on a majority of the keeper and the node the refusal re-seeded. A
+    ///    its own, the six of them six different numbers.
+    /// 4. **Check quorum, per range, of every range the node hosts.** A range the
+    ///    keeper leads keeps its leader through the hold, on answers of the replica the
+    ///    refusal re-seeded, and a user range it leads commits an entry of its term past
+    ///    its commit index at the cut — on a majority of the keeper and that replica. A
     ///    range the cut-off node leads loses its leader within two windows and three
     ///    ticks of the cut, and **stays leaderless for the hold**, because a re-seeded
     ///    replica neither votes nor campaigns (D-035) and the keeper alone is no
     ///    majority. A range that reaches neither fails, naming the range: the scenario
     ///    must not pass by not asking.
+    ///
+    ///    The root and the meta range are asked every one of these (PROPOSED D-119,
+    ///    issue #143). Until then the hold asked the user ranges alone, and a re-seeded
+    ///    root replica that voted passed ten thousand seeds. The commit is asked of them
+    ///    where they have something to commit: the scenario writes nothing there, since
+    ///    no client writes a system range (Q4) and the hold's puts are user keys, so an
+    ///    entry of the keeper's term past its commit index at the cut is there only when
+    ///    the run's own refill or `MetaUpdate`, or the keeper's no-op, put it there. One
+    ///    there by [`SYSTEM_ENTRY_DEADLINE`] into the hold must commit in the hold, on the
+    ///    same majority; a system range with none is asked nothing about its commit.
     /// 5. **The mark tracks each range's own log, not the node's refusal** (PROPOSED
     ///    D-087), in **both** directions, which is the pair of clauses a single-range
     ///    world cannot state. No marked rejection of a range was *sent* after that
@@ -1031,7 +1132,7 @@ impl NodeReport {
     /// A message naming the seed, the range and the violation.
     #[expect(
         clippy::too_many_lines,
-        reason = "the verdict is four ranges' worth of one scenario, and splitting it \
+        reason = "the verdict is six ranges' worth of one scenario, and splitting it \
                   would hide the order the clauses are asked in"
     )]
     pub fn check(&self) -> Result<(), String> {
@@ -1084,7 +1185,8 @@ impl NodeReport {
                 record.event
             ));
         }
-        // The fan-out, and the four incarnations that are the sharded reading of it.
+        // The fan-out, and the six incarnations that are the sharded reading of it,
+        // the system ranges' with the user ranges' (PROPOSED D-119).
         let mut incarnations: BTreeMap<u64, u64> = BTreeMap::new();
         for hold in holds.values() {
             let range = hold.range;
@@ -1143,9 +1245,9 @@ impl NodeReport {
                      mark. One missing means the mark is being computed from something other \
                      than this range's own state — read once per **node** and stamped on every \
                      range, most likely, which is right for whichever replica it was read from \
-                     and wrong for the other three. The sweep-wide `refused_rejections > 0` \
-                     cannot see that: three quarters of the marks can go without it reaching \
-                     zero. One group cannot see it at all, having one replica",
+                     and wrong for the others. The sweep-wide `refused_rejections > 0` cannot \
+                     see that: most of the marks can go without it reaching zero. One group \
+                     cannot see it at all, having one replica",
                     hold.leader, hold.unmarked_before_fitted
                 ));
             }
@@ -1169,12 +1271,13 @@ impl NodeReport {
                 return fail(format!(
                     "ranges {twin} and {range}: node {victim}'s re-seeded replicas of them carry \
                      the same store incarnation {incarnation}, where each draws its own from the \
-                     node's generator (D-077, Q26). One number for four replicas is a mark read \
-                     per node where it is per (range, node)"
+                     node's generator (D-077, Q26). One number for several replicas is a mark \
+                     read per node where it is per (range, node)"
                 ));
             }
         }
-        // Check quorum, per range, of four leaders about the one refused node.
+        // Check quorum, per range, of every range's leader about the one refused node:
+        // the root's and the meta range's with the user ranges' (PROPOSED D-119).
         let mut kept = 0usize;
         let mut lost = 0usize;
         for hold in holds.values() {
@@ -1211,7 +1314,12 @@ impl NodeReport {
                         hold.answered_incarnations
                     ));
                 }
-                if hold.commit_after_cut.is_none() {
+                // Asked of every user range, which the hold drives a write into, and of
+                // a system range the run itself gave an entry to commit: nothing in this
+                // scenario writes one (Q4).
+                // PROPOSED(D-119): the hold clauses ask the system ranges too.
+                let owed = !system_range(range) || hold.entry_to_commit;
+                if owed && hold.commit_after_cut.is_none() {
                     return fail(format!(
                         "range {range}: keeper {keeper} of term {} committed nothing past index {} \
                          in the hold, through the replica its refusal re-seeded ({} answers \
@@ -1273,6 +1381,14 @@ impl NodeReport {
         }
         Ok(())
     }
+}
+
+/// Whether `range` is the root or the meta range (SHARD.md §1, Q4): the two whose
+/// keeper's commit the hold asks only where the run gave it an entry to commit, since
+/// nothing in this scenario writes them.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+fn system_range(range: u64) -> bool {
+    range == crate::ranges::ROOT_RANGE || range == crate::ranges::META_RANGE
 }
 
 /// Runs one half of the scenario on `seed` under `variants`, on the instant disk.

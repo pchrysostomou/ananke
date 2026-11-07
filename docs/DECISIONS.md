@@ -23463,4 +23463,187 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ---
 
-_Next entry: D-116. Add one before implementing anything not covered above._
+## PROPOSED D-119 — The sharded quorum scenario asks its hold of the root and the meta range: a re-seeded replica of either that votes is caught on nearly one seed in two, where it passed ten thousand (#143)
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-118 are held by
+other branches, and D-119 was reserved for this one. The footer moves to D-120. At a
+merge the entries are a union in numerical order with one footer, the highest plus one.
+Every code site carries `// PROPOSED(D-119)`. Closes #143.
+
+**Context.** #143, filed from D-101's plants. `NodeReport::holds` and every per-range clause
+of `NodeReport::check` iterated `Cluster::Node.ranges()`, the user ranges 2 to 5. Ranges 0
+and 1, which every bootstrap node has hosted since D-096, were asked only through the log
+invariants. So D-035 broken on the root alone passed ten thousand seeds on fdc5fc0, and
+passes a thousand on this entry's base, de9f4d7, with the same plant. A refused replica of
+the root or the meta range voting is D-035 broken where the cluster's routing lives.
+
+The issue leaves a fork: ask them, measuring the correct node at ten thousand first, or
+record why they are exempt. Measured, nothing exempts them but part of one clause, so they
+are asked.
+
+**What is built.**
+
+1. **The cast names every range.** `NodeCast::leaders` holds `Cluster::hosted()`, and the
+   wait before the cut runs until no hosted range is led by the victim. Without that, a
+   system range the victim led and had not yet re-elected would reach the cut with no one to
+   ask. The keeper and `both_outcomes` are still read off the user ranges, which are the
+   ones the hold drives writes into, so neither changes meaning.
+2. **Every clause of the hold runs over six ranges.** The fan-out, the re-seed, both
+   directions of the mark, the store-less and stream absences, the incarnations and their
+   twins; the keeper's office and the answers that carried it; the cut-off leader's
+   step-down inside its bound, no answer across the cut, and no one elected in the hold.
+   None of these needed a reason to differ on a system range, and none does.
+3. **The keeper's commit, where there is something to commit.** This is the one clause that
+   cannot be asked as it stands. The scenario drives four puts into each user range the
+   keeper leads, and writes nothing to a system range: no client writes one (Q4), and the
+   hold's keys are user keys. On the correct node 6 070 of the 9 985 keeper-led system ranges
+   of ten thousand seeds had no entry past their commit index, so an unconditional clause
+   fails correct code. The other 3 915 have one the run sent of its own accord: a `Refill`
+   on the root, a `MetaUpdate` on the meta range, or the keeper's no-op after an election
+   just before the cut. So `RangeHold::entry_to_commit` records that the leader's log held
+   an entry of its term past its commit index at the cut by `SYSTEM_ENTRY_DEADLINE`, half
+   the hold, and such a range must commit in the hold. All 3 915 do.
+
+   The deadline is new and measured, not a bound widened. Over seeds 0 to 999 the last such
+   entry lands 303 ms into the hold and each first commit comes within 30 ms of its entry, so
+   750 ms is far from both. Its only job is that an entry landing the instant before the heal
+   is not an obligation.
+
+   Driving a write into a system range was considered and not taken. It would be a `Refill`
+   under an invented run or a `MetaUpdate` restating a descriptor, neither of them a client's
+   write, and a new task on every seed moves every schedule in the scenario.
+4. **Two variants.** `Variant::ReseededRootReplicaVotes` and
+   `Variant::ReseededMetaReplicaVotes` are the core's: a re-seeded replica of that range, and
+   no other, grants votes and pre-votes past its quarantine (`Raft::quarantine_refuses_votes`).
+   It still never campaigns and makes no lease promise. They take bits 17 and 18, and RAFT.md's
+   table goes to nineteen rows. A server of one group runs range 2, so neither changes anything
+   there. Two, not one, because the two ranges' clauses can fail separately: a variant covering
+   both would pass with the clause gone from either.
+5. **The pair.** `a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario`
+   and its meta range twin assert at every tier that the election clause catches the variant,
+   on that range; that every catch is a seed whose leader the cut left on the far side and whose
+   victim granted a vote in the hold (`RangeHold::votes_granted`, the mechanism); and that nothing
+   else catches it. The vote could elect a candidate without an entry the range committed, but no
+   seed of ten thousand shows that here, so by D-101's rule it is not admitted: a verdict nobody
+   has read fails the test and gets read. The correct half is the existing sweep, renamed
+   `the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node`. It now also
+   asserts that the system ranges reached both outcomes, that a keeper's system range had an
+   entry to commit, that the keeper asked each system range's re-seeded replica for a vote and
+   was refused, and that the victim granted no vote at all.
+
+No fold is added: `holds` is this scenario's reading of its own trace, not one of
+`ananke_shard::invariants`' folds, so the per-fold equivalence test has nothing to run.
+
+### Measured before asserted (Q39, D-061)
+
+From the built release binary, an Apple M2 of 8 cores, with other slices' builds and sweeps
+beside it (load averages 360 to 850).
+
+| | 20 | 100 | 1 000 | 10 000 |
+|---:|---:|---:|---:|---:|
+| correct node, failed | 0 | 0 | 0 | **0** |
+| its seeds where the keeper asked the victim's root replica and was refused | 9 | 59 | 521 | 4 947 |
+| its seeds where the keeper asked the victim's meta replica and was refused | 8 | 51 | 497 | 5 068 |
+| its keeper-led system ranges with an entry to commit, all committed | 7 of 23 | 32 of 90 | 396 of 982 | 3 915 of 9 985 |
+| votes the victim granted in the hold | 0 | 0 | 0 | **0** |
+| `ReseededRootReplicaVotes` caught, every one by the election clause on range 0 | 11 | 56 | 491 | **4 578** |
+| … the cut left the root's leader on the far side | 11 | 60 | 523 | 4 945 |
+| … the victim's root replica granted a vote in the hold | 11 | 56 | 493 | 4 590 |
+| `ReseededMetaReplicaVotes` caught, every one by the election clause on range 1 | 8 | 48 | 466 | **4 651** |
+| … the cut left the meta range's leader on the far side | 9 | 51 | 495 | 5 043 |
+| … the victim's meta replica granted a vote in the hold | 8 | 48 | 466 | 4 660 |
+
+At 45.8 % and 46.5 % both catches are far above D-061's 5 %, so they are asserted at every
+tier. The difference between "far side" and "caught" was read off the trace, 20 seeds of the
+first 500 on the root, and it is a matter of timing, not of the log: all three logs are even at
+the cut on those seeds. A quarantined replica's election timer resets at its timeout instead of
+campaigning (`Raft::on_tick`), and a replica takes a vote only past the minimum election timeout
+since its timer last reset (`heard_from_leader`), so only part of each of its cycles can grant.
+On those seeds the keeper's requests kept landing outside that part through the hold: pre-votes
+refused and, where one was granted, the vote behind it refused. The variant is there, and that
+seed's hold does not exercise it. The correct node's 10 000 took 597.2 cpu s
+(540.89 + 56.33), the two variants' 535.8 and 533.1.
+
+The user ranges' figures on the correct node are D-101's to the number at ten thousand:
+25 871 ranges on the keeper's majority and every one committed through a re-seeded replica,
+14 129 cut-off, 9 607 seeds carrying both outcomes, and now 60 000 replicas refused and
+re-seeded.
+
+**One figure moved and has a reason.** `step_downs_naming_anyone_uncounted`, zero since D-087,
+is 5 at a thousand seeds and 126 at ten thousand. All five at the thousand are on a system
+range, a cut-off leader elected 8 to 12 ms before the cut, which is the wait's own exit (item
+1). In those few milliseconds all it had from the victim's replica was the first answer, a
+rejection carrying the refused mark, which D-049's rule does not count, so its first window
+ends in a step-down naming the victim, 79 to 90 ms after the cut. That is D-049's rule at work
+on a range nobody was reading, not a fault: the leader steps down inside the bound either way,
+and no clause depends on the list being empty. It is the one figure D-049's pair moves here:
+126 under `RefusedNeverCounts` as on the correct node, 0 under `RefusedCountsForQuorum`, which
+counts that rejection, and every other figure the same on all three.
+
+### The plants, before and after
+
+Each was applied to a scratch worktree, swept from the release binary, and never reached the
+branch. "Before" is `main` at de9f4d7 with the plant alone; "after" is this tree with the
+plant. Each plant is on the one range named. Before, 200 seeds, unless noted.
+
+| Plant | Before | After |
+|---|---|---|
+| a re-seeded replica grants votes, root (the variant) | 0 of 1 000 failed | **491 of 1 000**, the election clause |
+| the same, meta range (the variant) | 0 of 1 000 failed | **466 of 1 000**, the election clause |
+| check quorum never steps the leader down, root / meta | 0 / 0 of 200 | **106 / 103 of 200**, "kept its office" |
+| a quarantined follower's answers are no sign of life, root / meta | 0 / 0 | **94 / 97**, "keeper stepped down" |
+| a quarantined follower's acknowledgement counts for no commit, root / meta | 0 / 0 | **51 / 32**, "committed nothing past index", the conditional clause |
+| the refusal skips this replica, root | 139, all by the range-id check; 61 pass | **200**: the same 139, and 61 by the fan-out clause |
+| the refusal skips this replica, meta | 140, all by state machine safety; 60 pass | **200**: the same 140, and 60 by the fan-out clause |
+| the root and meta replicas share one store incarnation | 0 | **200**, the twin clause |
+| the refused mark is never set, root / meta | 0 / 0 | **200 / 199**, "carrying **no** refused mark" |
+
+And the shipped tests themselves: with the election clause switched off for ranges 0 and 1 (a
+scratch mutation), both variants' tests fail at the gate's twenty seeds, "the hold's election
+clause caught … on no seed". Nothing else catches either variant, so without that clause the
+scenario still passes a voting system replica, which is the issue. Seed 2994's new pin, run on the
+old wait, fails on its verdict with D-101's leader completeness.
+
+### What the wait moved
+
+The wait in item 1 is the one change to what a run does, and it moves the cut on every seed
+where the old cut found a system range still naming the victim: 1 102 of the first 3 000 on the
+correct node and 1 111 under `RefuseOneRangeOnly`, the victim and the keeper the same on every
+one. That share is why the other way, leaving the cut where it was and asking such a range
+nothing, was not taken: it exempts over a third of the seeds, and the check's own rule is that
+the scenario must not pass by not asking. No other scenario runs this code, no pinned trace hash
+is of this one, and the core's new variants are off on the correct path, so nothing else moves.
+
+Over those seeds the aggregate figures hold, since who leads the user ranges does not change in
+the extra wait. The correct node's are D-101's above. `RefuseOneRangeOnly` is caught on 10 000 of 10 000, by
+the fan-out clause on 3 338 as before, by state machine safety on the meta range on **6 662**
+against D-101's 6 661, and by leader completeness off group 0 on **0** against D-101's 1. Of the
+first 3 000 seeds, the kind of verdict changed on exactly one, seed 2994. D-049's pair is still
+not caught, by the test that fails the day it is: 0 of 10 000 under each of
+`RefusedCountsForQuorum` and `RefusedNeverCounts`, whose absence the new clauses could have
+ended, and did not.
+
+**Seed 2994, the one pin this touches.** On the old cut, at 1.32 s, server 3 had taken range 4 in
+term 2 only 8 ms before, and the root still named the victim. Server 2 was then elected in term 3
+by the victim's amnesiac vote at index 13, without the committed index 14, which is D-101's
+witness. The new cut waits for the root's leader, at 1.354 s, so it comes at 1.37 s; in those
+50 ms server 3 catches server 2 up. The vote is unchanged, the only one server 2 is given, but
+server 2 is elected at index 15 and loses nothing, and the verdict falls to state machine safety
+on the meta range. The correct node's run on that seed does not move. CLAUDE.md's rule is an
+upgrade to the seed that now reaches the situation, or the absence with its reason. Seeds 10 000
+to 19 999 were searched for a seed to move to and hold none, so it is the absence:
+`seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry` asserts the
+vote, the last index and the new verdict, and each of those fails if the harm comes back. D-101's
+witness stays admitted in the variant's attribution, since the vote that makes it is still there.
+
+### The nightly's rows (D-064)
+
+Two `node` rows, weighed from the built release binary at ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100, as user + sys, at load averages 400 to 540, so if anything high: the
+meta range's at 61.3 (54.34 + 6.91) and the root's at 60.4 (53.59 + 6.82). Longest-first into
+the lightest shard: shard 1 at 1977.1 -> 2038.4, then shard 5 at 1981.0 -> 2041.4. The correct
+node's row and seed 2994's are renamed in place. **PROPOSED.**
+
+---
+
+_Next entry: D-120. Add one before implementing anything not covered above._
