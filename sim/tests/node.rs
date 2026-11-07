@@ -3782,6 +3782,26 @@ struct QuorumNodeFigures {
     step_downs_naming_anyone_uncounted: usize,
     streams: usize,
     seeds_carrying_both_outcomes: u64,
+    /// The root and the meta range, asked the hold's clauses since PROPOSED D-119
+    /// (issue #143), counted apart from the user ranges so the figures above read as
+    /// D-085 and D-101 measured them: the system ranges on the keeper's majority, those
+    /// of them that had an entry of the keeper's term to commit — which nothing in the
+    /// scenario drives, and which `NodeReport::check` then requires committed — those
+    /// that committed in the hold, and those on the cut-off leader.
+    system_ranges_on_the_keepers_majority: usize,
+    system_ranges_with_an_entry_to_commit: usize,
+    system_commits_in_the_hold: usize,
+    system_ranges_on_the_cut_off_leader: usize,
+    /// Seeds on which the root, and seeds on which the meta range, had its leader left
+    /// on the far side of the cut and a vote or pre-vote of the keeper's campaign refused
+    /// by the victim's re-seeded replica in the hold: the situation the "elected in the
+    /// hold" clause decides on that range, and the one a re-seeded replica that votes
+    /// gets wrong.
+    seeds_a_cut_off_root_was_refused_a_vote: u64,
+    seeds_a_cut_off_meta_range_was_refused_a_vote: u64,
+    /// Votes the victim's re-seeded replicas granted in the hold, every range's: 0 on a
+    /// node that keeps D-035.
+    votes_granted_by_the_victim: usize,
 }
 
 impl QuorumNodeFigures {
@@ -3791,6 +3811,9 @@ impl QuorumNodeFigures {
         let (Some(cast), Some(holds)) = (report.cast.as_ref(), report.holds()) else {
             return;
         };
+        // The answers, the streams and the step-downs are every range's, the system
+        // ranges' with the user ranges' (PROPOSED D-119); the sides are counted apart.
+        let user_ranges = ranges();
         for hold in holds.values() {
             self.ranges_refused += usize::from(hold.replica_refused);
             self.ranges_reseeded += usize::from(hold.reseeded);
@@ -3801,12 +3824,26 @@ impl QuorumNodeFigures {
             self.store_rejections += hold.store_rejections;
             self.fitted += hold.fitted;
             self.streams += hold.streams;
-            if hold.leader == cast.keeper {
+            self.votes_granted_by_the_victim += hold.votes_granted;
+            let user = user_ranges.contains(&hold.range);
+            if hold.leader == cast.keeper && user {
                 self.ranges_on_the_keepers_majority += 1;
                 self.commits_through_a_reseeded_replica +=
                     usize::from(hold.commit_after_cut.is_some());
-            } else if hold.leader == cast.other {
+            } else if hold.leader == cast.keeper {
+                self.system_ranges_on_the_keepers_majority += 1;
+                self.system_ranges_with_an_entry_to_commit += usize::from(hold.entry_to_commit);
+                self.system_commits_in_the_hold += usize::from(hold.commit_after_cut.is_some());
+            } else if hold.leader == cast.other && user {
                 self.ranges_on_the_cut_off_leader += 1;
+            } else if hold.leader == cast.other {
+                self.system_ranges_on_the_cut_off_leader += 1;
+                let refused = u64::from(hold.votes_refused > 0);
+                if hold.range == ananke_sim::ranges::ROOT_RANGE {
+                    self.seeds_a_cut_off_root_was_refused_a_vote += refused;
+                } else {
+                    self.seeds_a_cut_off_meta_range_was_refused_a_vote += refused;
+                }
             }
             if let Some((_, uncounted)) = &hold.quorum_lost {
                 self.step_downs += 1;
@@ -3835,25 +3872,31 @@ fn quorum_node_sweep(
 }
 
 /// The sharded check-quorum scenario's positive control (PROPOSED D-085): **one
-/// fault, four answers**.
+/// fault, an answer per range**.
 ///
 /// One `mark_store_lost` at the victim's restart refuses the node and every replica
 /// it holds (D-077), each re-seeded with a store incarnation of its own; the third
-/// node is then cut off, and check quorum is asked separately of each of the four
-/// ranges' leaders about that one refused node. On every seed the run carries **both**
+/// node is then cut off, and check quorum is asked separately of each range's leader
+/// about that one refused node, the root's and the meta range's with the four user
+/// ranges' (PROPOSED D-119, issue #143). On nearly every seed the run carries **both**
 /// outcomes at once, which no single-range scenario can: the ranges the keeper leads
-/// keep their leader through the hold and commit past their commit index at the cut,
-/// on a majority of the keeper and the node the refusal re-seeded; the ranges the
-/// cut-off node leads lose theirs within two windows and three ticks and stay
-/// leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and the
-/// keeper alone is no majority.
+/// keep their leader through the hold and commit what they are given past their commit
+/// index at the cut, on a majority of the keeper and the node the refusal re-seeded;
+/// the ranges the cut-off node leads lose theirs within two windows and three ticks and
+/// stay leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and
+/// the keeper alone is no majority.
 ///
 /// The figures print what D-049's own halves need of the node;
 /// `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold` is
 /// where they are asserted.
+///
+/// Every counter asserted above zero here is well above D-061's 5 % at every tier: the
+/// per-range ones run about one seed in two (one in three for a system range with an
+/// entry to commit, PROPOSED D-119's table), so the gate's twenty asserts them too.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
 #[test]
-fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
+fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node() {
     let (violations, figures) = quorum_node_sweep(Variants::default(), NodeVariants::correct());
     eprintln!(
         "sharded quorum, correct: {} of {} seeds failed, {figures:?}, first: {}",
@@ -3862,10 +3905,11 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
         violations.first().map_or("", String::as_str)
     );
     assert!(violations.is_empty(), "{}", violations[0]);
-    // The shape the checks need, asserted rather than assumed: four replicas refused
-    // and re-seeded a seed, both outcomes reached on every seed, and the answers that
+    // The shape the checks need, asserted rather than assumed: every replica the node
+    // hosts refused and re-seeded a seed — six, the root's and the meta range's with
+    // the user ranges' (PROPOSED D-119) — both outcomes reached, and the answers that
     // carried the keeper's office actually delivered.
-    let ranges = u64::try_from(ranges().len()).expect("small");
+    let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     assert_eq!(
         figures.ranges_refused as u64,
         figures.seeds * ranges,
@@ -3885,6 +3929,130 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
         figures.fitted > 0,
         "no answer of a re-seeded replica fitted, so no keeper's office was kept on one"
     );
+    // The system ranges reached both outcomes too, so their clauses asked something.
+    assert!(
+        figures.system_ranges_on_the_keepers_majority > 0
+            && figures.system_ranges_on_the_cut_off_leader > 0,
+        "the system ranges reached only one of the scenario's two outcomes"
+    );
+    assert!(
+        figures.system_ranges_with_an_entry_to_commit > 0
+            && figures.system_commits_in_the_hold >= figures.system_ranges_with_an_entry_to_commit,
+        "no keeper's system range had an entry to commit, or fewer committed than had one, \
+         so the commit clause asked of them asked nothing"
+    );
+    // The situation D-035 decides, reached on each system range, and decided: the
+    // keeper asked and the re-seeded replica said no, on this half of the pair; its other
+    // half is `a_reseeded_system_replica_that_votes_is_caught`.
+    assert!(
+        figures.seeds_a_cut_off_root_was_refused_a_vote > 0,
+        "on no seed did the keeper ask the victim's root replica for a vote and get refused"
+    );
+    assert!(
+        figures.seeds_a_cut_off_meta_range_was_refused_a_vote > 0,
+        "on no seed did the keeper ask the victim's meta replica for a vote and get refused"
+    );
+    assert_eq!(
+        figures.votes_granted_by_the_victim, 0,
+        "a re-seeded replica granted a vote in the hold, which D-035 says it never does"
+    );
+}
+
+/// The system ranges' half of the pair (PROPOSED D-119, issue #143): a re-seeded replica
+/// of `range` that grants votes past its quarantine, and no other replica of the node
+/// doing so. D-035 broken where the cluster's routing lives, which until now passed ten
+/// thousand seeds: the hold's clauses iterated the four user ranges, and on none of those
+/// seeds does the vote break an invariant the run reaches.
+///
+/// **The catch.** On a seed where the cut leaves `range`'s leader on the far side, the
+/// keeper campaigns, the victim's replica grants the vote that is the second of three
+/// (the mechanism, asserted per seed), and the keeper is elected in the hold, where its
+/// office needed a majority it should not have had. The clause that names it is the one
+/// the user ranges have always had: "became leader of it in the hold".
+///
+/// Any other verdict fails this test: the variant is one range's, and every other replica
+/// still keeps D-035. The vote could elect a candidate without an entry the range committed
+/// before the crash, as `RefuseOneRangeOnly`'s amnesiac vote once did on seed 2994, but no
+/// seed of ten thousand shows it here, so that witness is not admitted: PROPOSED D-101's
+/// rule is to admit what is measured and to read the rest before admitting it.
+///
+/// Measured before it was asserted (Q39, D-061): see PROPOSED D-119's table. The range's
+/// leader is on the far side on about one seed in two and the catch is about as often,
+/// so the catch is asserted at every tier and the rate printed at every tier.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+fn a_reseeded_system_replica_that_votes_is_caught(variant: Variant, range: u64) {
+    let outcomes: Vec<(Option<String>, bool, bool)> = sweep(seeds(), |seed| {
+        let report = quorum::node_run(seed, variant, NodeVariants::correct());
+        let (cut_off, voted) =
+            report
+                .cast
+                .as_ref()
+                .zip(report.holds())
+                .map_or((false, false), |(cast, holds)| {
+                    let hold = &holds[&range];
+                    (hold.leader == cast.other, hold.votes_granted > 0)
+                });
+        (report.check().err(), cut_off, voted)
+    });
+    let elected_in_the_hold = format!(": range {range}: ");
+    let by_the_clause = |verdict: &str| {
+        verdict.contains(&elected_in_the_hold)
+            && verdict.contains("became leader of it in the hold")
+    };
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, ..)| v.as_ref()).collect();
+    let by_clause = caught.iter().filter(|v| by_the_clause(v)).count();
+    eprintln!(
+        "sharded quorum, {:?}: caught on {} of {} seeds ({by_clause} by the hold's election \
+         clause on range {range}); the cut left its leader on the far side on {} seeds and the \
+         victim's replica granted a vote in the hold on {}, first: {}",
+        Variants::from(variant),
+        caught.len(),
+        seeds(),
+        outcomes.iter().filter(|(_, cut_off, _)| *cut_off).count(),
+        outcomes.iter().filter(|(.., voted)| *voted).count(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert!(
+        by_clause > 0,
+        "the hold's election clause caught {variant:?} on no seed: {caught:?}"
+    );
+    assert_eq!(
+        by_clause,
+        caught.len(),
+        "{variant:?} was caught by something other than the hold's election clause on range \
+         {range}, where every other replica keeps D-035; read it before admitting it: \
+         {caught:?}"
+    );
+    // The mechanism, on every seed the clause caught: the vote that made the majority.
+    for (verdict, cut_off, voted) in &outcomes {
+        if verdict.as_deref().is_some_and(by_the_clause) {
+            assert!(
+                *cut_off && *voted,
+                "{verdict:?} named the clause, but the range's leader was on the far side: \
+                 {cut_off}, and the victim's replica granted a vote in the hold: {voted}"
+            );
+        }
+    }
+}
+
+/// `a_reseeded_system_replica_that_votes_is_caught` on the root.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+#[test]
+fn a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
+    a_reseeded_system_replica_that_votes_is_caught(
+        Variant::ReseededRootReplicaVotes,
+        ananke_sim::ranges::ROOT_RANGE,
+    );
+}
+
+/// `a_reseeded_system_replica_that_votes_is_caught` on the meta range.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+#[test]
+fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
+    a_reseeded_system_replica_that_votes_is_caught(
+        Variant::ReseededMetaReplicaVotes,
+        ananke_sim::ranges::META_RANGE,
+    );
 }
 
 /// The node's own variant beside the correct node (the pair rule, CLAUDE.md):
@@ -3896,8 +4064,8 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 /// catches it on its own scenario's shape. Here it is caught from this scenario's
 /// side, by the clause that asks the fan-out per range: the store that opens first is
 /// range 0's (PROPOSED D-096), so the variant refuses the root alone, and none of the
-/// four user ranges' replicas the clause asks about was refused, so none was re-seeded
-/// either.
+/// five other replicas the clause asks about — the meta range's first, since PROPOSED
+/// D-119 — was refused, so none was re-seeded either.
 ///
 /// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
 /// twenty, and the rate is printed at every tier.
@@ -3914,11 +4082,12 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 ///   system range, applies the first `MetaUpdate` over nothing and takes every span;
 /// - **leader completeness** on a range the variant left unrefused (PROPOSED D-101): the
 ///   empty replica votes again on state its node lost (D-035), and its vote elects a
-///   candidate missing an entry the range committed before the victim's crash. It is
-///   one seed in ten thousand (seed 2994), so its firing is asserted at no tier: seed
-///   2994's pin below asserts the mechanism instead. Group 0 is excluded: the variant
-///   refuses range 0 exactly as the correct node does, so a violation there is not
-///   this bug and fails the test.
+///   candidate missing an entry the range committed before the victim's crash. It was
+///   one seed in ten thousand (seed 2994), and since PROPOSED D-119 moved the cut it is
+///   none of seeds 0 to 19 999, so its firing is asserted at no tier. It stays admitted
+///   because the vote that makes it is still there: seed 2994's pin below asserts the vote
+///   and the harm's absence. Group 0 is excluded: the variant refuses range 0 exactly as
+///   the correct node does, so a violation there is not this bug and fails the test.
 ///
 /// The fan-out clause is asserted seen, every catch is one of the three, and each
 /// one's share is printed at every tier.
@@ -3926,9 +4095,10 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 /// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
 /// and before the history and the fan-out clause (PROPOSED D-106, issue #140). None of
 /// their seven folds is in violation under the variant on any of seeds 0 to 999, and at
-/// ten thousand the split is D-101's to the seed (3 338 / 6 661 / 1), so they name no
-/// catch the attribution does not admit; one that ever did would fail this test as
-/// "caught by something other than", and be read before it is admitted.
+/// ten thousand the split was D-101's to the seed (3 338 / 6 661 / 1; 3 338 / 6 662 / 0
+/// since PROPOSED D-119 moved seed 2994), so they name no catch the attribution does not
+/// admit; one that ever did would fail this test as "caught by something other than", and
+/// be read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 #[test]
@@ -4000,27 +4170,36 @@ fn leader_completeness_group(verdict: &str) -> Option<u64> {
     group.parse().ok()
 }
 
-/// **Seed 2994 is the variant's amnesiac vote** (PROPOSED D-101): the one seed of the
-/// nightly's ten thousand on fdc5fc0 (run 38082122222) that `RefuseOneRangeOnly` was
-/// caught on by leader completeness, which the pair's attribution did not then admit.
+/// **Seed 2994 is the variant's amnesiac vote, and since PROPOSED D-119 the vote without its
+/// harm.** It was the one seed of the nightly's ten thousand on fdc5fc0 (run 38082122222) that
+/// `RefuseOneRangeOnly` was caught on by leader completeness, which the pair's attribution did
+/// not then admit (PROPOSED D-101).
 ///
-/// The mechanism, asserted rather than the verdict alone. Before the victim's crash
-/// the leader of range 4's term 1 committed index 14 on a majority that held the
-/// victim and not server 2. The victim restarts on a store marked lost; the variant
-/// refuses range 0 alone, so the victim's replica of range 4 is re-created in the
-/// fresh engine as a first start creates it — term 0, nothing in its log, incarnation
-/// 1, neither refused nor quarantined. With server 3 cut off, server 2 asks for votes
-/// in term 3, and the victim's empty replica grants one: it is the only vote server 2
-/// is given, and with its own it is the majority of three that elects server 2 with
-/// index 13 as its last, without index 14. Leader completeness names it, ahead of the
-/// fan-out clause.
+/// The mechanism, asserted rather than the verdict alone. Before the victim's crash the leader
+/// of range 4's term 1 committed index 14 on a majority that held the victim and not server 2.
+/// The victim restarts on a store marked lost; the variant refuses range 0 alone, so the
+/// victim's replica of range 4 is re-created in the fresh engine as a first start creates it —
+/// term 0, nothing in its log, incarnation 1, neither refused nor quarantined. With server 3
+/// cut off, server 2 asks for votes in term 3, and the victim's empty replica grants one: it is
+/// the only vote server 2 is given, and with its own it is the majority of three that elects it.
 ///
-/// The correct node on the same seed is the other half: the same victim, its replica
-/// of range 4 refused with its node, restated refused, granting no vote after the
-/// refusal (D-035), and the seed green.
+/// **The harm is absent, asserted, with the reason.** Until D-119 the cut came at 1.32 s, 8 ms
+/// after server 3 took range 4 in term 2, with the root still naming the victim as its leader.
+/// Server 2 was then elected with index 13 as its last, without index 14, and leader
+/// completeness named it ahead of the fan-out clause. D-119's cut waits for the root's new
+/// leader, at 1.354 s, so it comes at 1.37 s; in those 50 ms server 3 catches server 2 up, server
+/// 2 is elected at index 15, and nothing is lost. The verdict is now the other witness, state
+/// machine safety on the meta range. No seed of 0 to 19 999 reaches the harm on this tree, so
+/// there is no seed to move this pin to. The day this one does, the verdict and the last index
+/// below both say so, and the pin can go back to asserting it.
+///
+/// The correct node on the same seed is the other half: the same victim, its replica of range 4
+/// refused with its node, restated refused, granting no vote after the refusal (D-035), and the
+/// seed green. Its cut does not move, since its root has a leader by 1.37 s either way.
 // PROPOSED(D-101): the amnesiac vote, pinned where the nightly found it.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
 #[test]
-fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry() {
+fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry() {
     let seed = 2994u64;
     let (group, index, candidate, term) = (4u64, 14u64, 2u64, 3u64);
     let report = quorum::node_run(
@@ -4034,16 +4213,20 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
     assert_eq!(
         violation,
         format!(
-            "seed {seed}: leader completeness: index {index} of group {group} (term 1) was \
-             committed in term 1 but server {candidate}, leader of term {term}, does not \
-             hold it"
+            "seed {seed}: state machine safety: index 2 of group 1 was applied to effect none \
+             on one server and took on server 1"
         ),
-        "seed {seed}'s schedule has moved off the amnesiac vote this pin asserts; assert \
-         the absence with its reason, and name the seed the pair's sweep counts by \
-         leader completeness instead"
+        "seed {seed}'s schedule has moved again. If this is leader completeness of group \
+         {group}, the amnesiac vote's harm is back: assert it here as D-101 did"
     );
-    assert_eq!(leader_completeness_group(&violation), Some(group));
-    let victim = report.cast.as_ref().expect("the cast was taken").victim;
+    assert_eq!(leader_completeness_group(&violation), None);
+    let cast = report.cast.as_ref().expect("the cast was taken");
+    let victim = cast.victim;
+    assert_ne!(
+        cast.leaders[&ananke_sim::ranges::ROOT_RANGE],
+        victim,
+        "seed {seed}: the cut left the root naming the victim, which is what D-119's wait stops"
+    );
     let records = &report.records;
     let refusal = records
         .iter()
@@ -4119,9 +4302,9 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
         unreachable!("found as a leader record")
     };
     assert!(
-        last_index < index,
+        last_index >= index,
         "seed {seed}: server {candidate} was elected with index {last_index} as its last, \
-         which holds index {index}"
+         without index {index}: the amnesiac vote's harm is back, so upgrade this pin"
     );
     let granted: BTreeSet<u64> = after[..elected]
         .iter()
@@ -4277,7 +4460,9 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
 // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
 #[test]
 fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold() {
-    let ranges = u64::try_from(ranges().len()).expect("small");
+    // Every replica the node hosts, the system ranges' with the user ranges' (PROPOSED
+    // D-119).
+    let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
         let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
         eprintln!(
