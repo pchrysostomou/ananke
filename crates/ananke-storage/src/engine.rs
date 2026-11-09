@@ -934,6 +934,8 @@ async fn open_tables<E: Environment>(
                         number: meta.number,
                         first_seq: meta.first_seq,
                         max_seq: meta.max_seq,
+                        first_key: meta.first_key.clone(),
+                        last_key: meta.last_key.clone(),
                         reason,
                     });
                 }

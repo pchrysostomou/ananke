@@ -384,6 +384,11 @@ pub enum TraceEvent {
         first_seq: u64,
         /// The highest sequence number it held.
         max_seq: u64,
+        /// The smallest key the manifest says it held: what attributes the loss to the
+        /// ranges whose keys it covers (#45; PROPOSED D-113).
+        first_key: Bytes,
+        /// The largest.
+        last_key: Bytes,
         /// What was wrong with it.
         reason: &'static str,
     },

@@ -101,6 +101,13 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-shard-sim-rest` (2026-11-09), on #198 and #200, PROPOSED D-113 §5 to
+  §11, **the rest of #162's S10**, after #188 merged at 08f0c62 unfinished: the write bound per
+  range the run ended with (not a widening, asserted per seed), the meta convergence bound (worst
+  587 ms against 2 s), refusals by loss (#45), D-092's measurement (eight and two kept), the node
+  scenarios in `sim/tests/parallel.rs`, the pairs on this sweep and the first Phase 3 pins. At
+  1 000 seeds, 0 fail. Check 8's right-half clause trips on 9 of them, each D-107's mechanism, read
+  against the engines: nothing lost.
 - Branch `phase-3-stage-c-refuse-unconfirmable-reads` (2026-11-06), off `main` at de9f4d7, PR #198,
   PROPOSED **D-129**, the owner's ruling on S10's finding (b): a leader refuses reads it can never
   confirm and drops the pending ones, and `READS_OUTSTANDING` stays 38. Per follower, the latest

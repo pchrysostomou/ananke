@@ -189,11 +189,9 @@ pub struct ServerConfig {
     // PROPOSED(D-075): the receive cap is a node setting with no default.
     pub snapshot_cap: usize,
     /// The block of range ids a refill grants, and the ids left in a node's block at
-    /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and a first
-    /// pair, unmeasured. D-092 has the pair chosen on a measurement in `sim/shard.rs`,
-    /// how often a split finds an empty block under Phase 2's network faults, printed
-    /// at every tier; that scenario does not exist yet, and D-099 deferred the choice
-    /// to it (PROPOSED D-099; D-104).
+    /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and chosen on
+    /// D-092's measurement in `sim/shard.rs`, how often a split finds an empty block,
+    /// printed at every tier there (PROPOSED D-099; PROPOSED D-113).
     // PROPOSED(D-099)
     pub id_block: u64,
     /// See `id_block`.

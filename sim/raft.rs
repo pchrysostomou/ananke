@@ -2107,6 +2107,17 @@ pub struct Report {
     pub splits: SplitStats,
 }
 
+/// A range's first client write after the last heal
+/// ([`Report::recoveries_by_final_range`]).
+// PROPOSED(D-113): the write bound per range the run ended with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    /// When the first of them was called.
+    pub first_call: Instant,
+    /// When the first of them completed, if one did.
+    pub first_completed: Option<Instant>,
+}
+
 /// What another scenario's run hands [`Report::over_a_run`].
 // PROPOSED(D-076): the node scenario is checked by the checks D-071 keyed.
 pub struct Run {
@@ -2987,12 +2998,23 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
 pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result<(), String> {
     // The ranges the run hosts: configuration's, and every right half a split's apply
-    // creates from then on (SHARD.md §5; PROPOSED D-100).
+    // creates (SHARD.md §5; PROPOSED D-100), named anywhere in the run and not only before
+    // the record. A node crashed with a split's batch durable and its `RangeSplit` not yet
+    // traced restates the right half at its next start, log first and descriptor last,
+    // before any node has traced the split: seed 88 of the sharded sweep under `NoPreVote`
+    // (PROPOSED D-113).
     let mut hosted: BTreeSet<u64> = hosted.iter().copied().collect();
     for record in records {
-        if let TraceEvent::RangeSplit { right, .. } = &record.event {
-            hosted.insert(*right);
+        match &record.event {
+            TraceEvent::RangeSplit { right: range, .. }
+            | TraceEvent::RangeCreated { range, .. }
+            | TraceEvent::RangeDescriptor { range, .. } => {
+                hosted.insert(*range);
+            }
+            _ => {}
         }
+    }
+    for record in records {
         let range = range_of(&record.event);
         if let Some(range) = range
             && !hosted.contains(&range)
@@ -3549,6 +3571,19 @@ impl Report {
     /// its range is `SINGLE_GROUP`, the only range of those runs, and it is marked down
     /// by its own per-replica event once the node traces one. Until a scenario runs the
     /// node, the sole reader of this is the node's own sweep.
+    ///
+    /// **A replica configuration never names is read from the node's own creations**
+    /// (PROPOSED D-113). The node's refusal names configuration's ranges, since those
+    /// are all it knows before it opens its store, so a right half on a refused node is
+    /// named by no `RaftReplicaRefused` (#178). §8 is plain about it: every replica on a
+    /// refused node counts as refused in this rule. So a `RaftRefused` takes down every
+    /// range outside configuration that its node traced a `RangeCreated` of since its
+    /// last refusal, until that replica's `RaftRecovered`; and a voter of such a range on
+    /// an engine a re-seed built, holding nothing of it, counts as impaired too, since a
+    /// placeholder grants no vote (Q22) and the install that ends it quarantines
+    /// (PROPOSED D-109). Configuration's ranges are read as they were, from the events
+    /// the node traces of them: `RefuseOneRangeOnly` is the node naming too few, which
+    /// this must not paper over.
     // PROPOSED(D-071): the checks about time are asked per range.
     // PROPOSED(D-077): a refusal marks down the ranges its node held, which its
     // per-replica refusal events name, and not every range in the run.
@@ -3557,6 +3592,16 @@ impl Report {
         let ranges = self.ranges();
         let mut down: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut configured: BTreeSet<u64> = BTreeSet::new();
+        let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut on_a_reseed: BTreeSet<u64> = BTreeSet::new();
+        let mut voters: BTreeMap<u64, (u64, Vec<u64>)> = BTreeMap::new();
+        let mut state = |range: u64, generation: u64, named: &[u64]| {
+            let latest = voters.entry(range).or_insert((generation, named.to_vec()));
+            if generation >= latest.0 {
+                *latest = (generation, named.to_vec());
+            }
+        };
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftReplicaRefused { server, range } => {
@@ -3568,7 +3613,57 @@ impl Report {
                 TraceEvent::RaftReseeded { server, range } => {
                     quarantined.insert((*range, *server));
                 }
+                // PROPOSED(D-113): the node's refusal, for the replicas no per-replica
+                // refusal can name (#178).
+                TraceEvent::RaftRefused { server, .. } => {
+                    let lost: Vec<u64> = held
+                        .iter()
+                        .filter(|(_, on)| on == server)
+                        .map(|&(range, _)| range)
+                        .collect();
+                    for range in lost {
+                        held.remove(&(range, *server));
+                        if !configured.contains(&range) {
+                            down.insert((range, *server));
+                        }
+                    }
+                    on_a_reseed.insert(*server);
+                }
+                TraceEvent::RangeCreated {
+                    range,
+                    cause,
+                    generation,
+                    voters: named,
+                    ..
+                } => {
+                    if *cause == ananke_env::RangeCause::Bootstrap {
+                        configured.insert(*range);
+                    }
+                    if let Some(node) = record.node {
+                        held.insert((*range, u64::from(node.get())));
+                    }
+                    state(*range, *generation, named);
+                }
+                TraceEvent::RangeDescriptor {
+                    range,
+                    generation,
+                    voters: named,
+                    ..
+                } => state(*range, *generation, named),
                 _ => {}
+            }
+        }
+        // A voter on an engine a re-seed built that holds nothing of a range configuration
+        // never named: it grants no vote from a placeholder, and the install that ends the
+        // placeholder quarantines it (PROPOSED D-109), so it helps elect nobody either way.
+        for (range, (_, named)) in &voters {
+            if configured.contains(range) {
+                continue;
+            }
+            for server in named {
+                if on_a_reseed.contains(server) && !held.contains(&(*range, *server)) {
+                    down.insert((*range, *server));
+                }
             }
         }
         ranges
@@ -3878,6 +3973,23 @@ impl Report {
     ///
     /// A message naming the seed and the violation.
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(Self::liveness)
+    }
+
+    /// [`Report::check`] for a run whose ranges are made by splits, its write bound asked
+    /// per range the run ended with ([`Report::liveness_by_final_range`]); every other
+    /// check is the same, in the same order.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the seed and the violation.
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    pub fn check_by_final_range(&self) -> Result<(), String> {
+        self.check_with(Self::liveness_by_final_range)
+    }
+
+    /// The checks, with `liveness` as the reading of the write bound.
+    fn check_with(&self, liveness: fn(&Self) -> Result<(), String>) -> Result<(), String> {
         let seed = self.seed;
         let fail = |what: String| Err(format!("seed {seed}: {what}"));
         if let Some(why) = &self.stopped {
@@ -3947,7 +4059,7 @@ impl Report {
         // Both are asked only of a range whose unimpaired replicas form a majority
         // (SHARD.md §8), which each reads for itself: with none, both pass.
         if self.uniform() {
-            if let Err(violation) = self.liveness() {
+            if let Err(violation) = liveness(self) {
                 return fail(violation);
             }
             if let Err(violation) = self.timers_fire() {
@@ -4074,6 +4186,133 @@ impl Report {
             }
         }
         if asked == 0 {
+            return Err(format!(
+                "liveness: no client write completed after the last heal at {:?}",
+                self.last_heal
+            ));
+        }
+        Ok(())
+    }
+
+    /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then every
+    /// split the trace took, read where the run stopped ([`Report::ended`]).
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    #[must_use]
+    pub fn final_range_of(&self, key: &Bytes) -> u64 {
+        self.serving_at(&self.splits_taken(), key, self.ended)
+    }
+
+    /// Per range the run ended with that some client wrote to after the last heal, when
+    /// the first of those writes was called and when the first of them completed.
+    /// The writes are the ones the per-key reading reads ([`Report::writes_after_heal_by_key`]).
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    #[must_use]
+    pub fn recoveries_by_final_range(&self) -> BTreeMap<u64, Recovery> {
+        let splits = self.splits_taken();
+        let mut by_range: BTreeMap<u64, Recovery> = BTreeMap::new();
+        for op in self.post_heal_writes() {
+            let range = self.serving_at(&splits, op.op.key(), self.ended);
+            let recovery = by_range.entry(range).or_insert(Recovery {
+                first_call: op.call,
+                first_completed: None,
+            });
+            recovery.first_call = recovery.first_call.min(op.call);
+            recovery.first_completed = match (recovery.first_completed, op.ret) {
+                (Some(one), Some(another)) => Some(one.min(another)),
+                (one, another) => one.or(another),
+            };
+        }
+        by_range
+    }
+
+    /// The write bound of [`Report::liveness`], asked per range the run ended with
+    /// (SHARD.md §8), for a run whose ranges are made by splits: [`Report::key_range`] is
+    /// the map the run started with, and on such a run it reads every key as one range's.
+    ///
+    /// - **Per key**, the same fold and the same bound: every key some client wrote after
+    ///   the heal, its slowest write from its own call, asked where the range serving the
+    ///   key at the run's end has a majority up ([`Report::ranges_with_a_majority_up`]).
+    /// - **Per range**, what [`Report::recoveries_by_final_range`] reads: a range whose
+    ///   post-heal writes all stayed pending is the wedge, and otherwise the first
+    ///   completion comes within the bound of the first call. It is measured from the
+    ///   range's first call and not from the heal because a range here is as few as two of
+    ///   sixteen keys: the time until a client happens to write one is the clients' draw,
+    ///   which D-076 took out of the per-key reading for the same reason.
+    /// - **The clients wrote nothing**, the arm [`Report::liveness`] ends with, is asked
+    ///   where every range the clients touched has a majority up. Where only some have, a
+    ///   live range of two keys that no client drew in the window is no evidence of
+    ///   anything.
+    ///
+    /// **Not a widening** (PROPOSED D-113 §5): the bound is the same constant. A voter
+    /// impaired on any final range is on a refused node, and a refused bootstrap node
+    /// impairs every range configuration names, so if the first range has a majority up
+    /// every final range has: every key [`Report::liveness`] asks of a run whose keys all
+    /// start in one range is asked here, and the per-range reading, one minimum over the
+    /// whole keyspace there, is one per log here. `sim/tests/shard.rs` asserts the
+    /// inclusion on every seed.
+    ///
+    /// # Errors
+    ///
+    /// The violation, naming the key or the range and the bound.
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    pub fn liveness_by_final_range(&self) -> Result<(), String> {
+        let live = self.ranges_with_a_majority_up();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        let splits = self.splits_taken();
+        let final_range = |key: &Bytes| self.serving_at(&splits, key, self.ended);
+        let mut asked = 0usize;
+        for (key, took) in self.writes_after_heal_by_key() {
+            if !live.contains(&final_range(&key)) {
+                continue;
+            }
+            asked += 1;
+            let key = String::from_utf8_lossy(&key).into_owned();
+            match took {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "liveness: the slowest client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to {key} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        for (range, recovery) in self.recoveries_by_final_range() {
+            if !live.contains(&range) {
+                continue;
+            }
+            match recovery.first_completed {
+                Some(completed) => {
+                    let took = completed.duration_since(recovery.first_call.max(self.last_heal));
+                    if took > bound {
+                        return Err(format!(
+                            "liveness: range {range} took {took:?} from its first client write after the last heal to complete one, over {bound:?}"
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to range {range} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        let touched: BTreeSet<u64> = self
+            .history
+            .ops
+            .iter()
+            .map(|op| final_range(op.op.key()))
+            .collect();
+        if asked == 0 && touched.iter().all(|range| live.contains(range)) {
             return Err(format!(
                 "liveness: no client write completed after the last heal at {:?}",
                 self.last_heal
@@ -9023,6 +9262,11 @@ pub fn run_on(
 pub(crate) struct Watch {
     slices: u32,
     pub(crate) stopped: Option<String>,
+    /// Whether the checkers fold at all, and so whether a violation can stop the run: off
+    /// for a run taken to its end, so that a check about time can be read of a variant
+    /// another check would have stopped first (`shard::run_to_the_end`).
+    // PROPOSED(D-113)
+    pub(crate) stops: bool,
     /// The safety checks, one checker for the whole run with the state of each
     /// check kept across looks, so a look costs only the records since the last
     /// one (D-046).
@@ -9040,6 +9284,7 @@ impl Default for Watch {
         Self {
             slices: 0,
             stopped: None,
+            stops: true,
             checker: invariants::Checker::new(SERVERS as usize),
             shard: ananke_shard::invariants::Checker::new(false),
             checked: 0,
@@ -9062,6 +9307,9 @@ impl Watch {
         let records = sim.trace_from(self.checked);
         self.checked += records.len();
         read(&records);
+        if !self.stops {
+            return;
+        }
         self.checker.extend(crate::traced(&records));
         if let Err(violation) = self.checker.verdict() {
             self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
@@ -11859,6 +12107,310 @@ mod tests {
     /// after it was called. With both keys in one range `k0` shows `k1`'s range live
     /// and the write is excused; with each key its own range, nothing shows `k1`'s
     /// range live and it is the wedge.
+    /// A right half restated before any node has traced its split: a node crashed with the
+    /// split's batch durable and its `RangeSplit` not yet traced restates it, log first and
+    /// descriptor last. Its range is the run's though nothing has named it yet, and a range
+    /// the run names nowhere is still a stamp from nowhere.
+    // PROPOSED(D-113)
+    #[test]
+    fn the_payload_oracle_takes_a_right_half_its_split_has_not_been_traced_for() {
+        const RIGHT: u64 = 28;
+        let truncate = |range| TraceEvent::RaftTruncate {
+            server: 1,
+            range,
+            from_index: 74,
+        };
+        let descriptor = TraceEvent::RangeDescriptor {
+            range: RIGHT,
+            index: 73,
+            applied: 73,
+            start: Bytes::new(),
+            end: Bytes::new(),
+            generation: 3,
+            voters: vec![1, 2, 3],
+            state: RangeState::Live,
+        };
+        let hosted = [SINGLE_GROUP];
+        payload_is_well_formed(
+            &[
+                record(ms(1), ms(1), Some(1), truncate(RIGHT)),
+                record(ms(1), ms(1), Some(1), descriptor),
+            ],
+            &hosted,
+        )
+        .expect("the restatement names it");
+        let named_nowhere =
+            payload_is_well_formed(&[record(ms(1), ms(1), Some(1), truncate(RIGHT))], &hosted);
+        assert!(
+            named_nowhere.is_err_and(|why| why.contains("carries range 28")),
+            "a range no record of the run names is a stamp from nowhere"
+        );
+    }
+
+    /// A replica's creation on `server`'s node, for the cases below.
+    // PROPOSED(D-113)
+    fn created_on(server: u64, at: u64, range: u64, cause: ananke_env::RangeCause) -> TraceRecord {
+        record(
+            ms(at),
+            ms(at),
+            Some(server),
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                parent: None,
+                start: Bytes::new(),
+                end: Bytes::new(),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                floor_index: 0,
+                floor_term: 0,
+                incarnation: 2,
+            },
+        )
+    }
+
+    /// SHARD.md §8: every replica on a refused node counts as refused in the per-range
+    /// majority rule. A right half is named by no `RaftReplicaRefused`, since configuration
+    /// never names it (#178), so it is read from the node's own creations; configuration's
+    /// ranges go on being read from the events the node traces of them, which a node that
+    /// names too few (`RefuseOneRangeOnly`) gets wrong and this must not paper over.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_refused_nodes_right_half_is_refused_though_no_event_names_it() {
+        use ananke_env::RangeCause::{Bootstrap, Snapshot, Split};
+        const RIGHT: u64 = 19;
+        let refusal = |server: u64, at: u64| record(ms(at), ms(at), Some(server), refused(server));
+        let live =
+            |records: Vec<TraceRecord>| report(records, Vec::new()).ranges_with_a_majority_up();
+        let on_all = || {
+            (1..=3)
+                .map(|server| created_on(server, 1, RIGHT, Split))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(live(on_all()), BTreeSet::from([RIGHT]), "whole");
+        // One node refused: one replica impaired, a majority left.
+        let mut records = on_all();
+        records.push(refusal(1, 2));
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "one refused node");
+        // Two: no majority, with no per-replica event naming either. This is what the
+        // reading of the per-replica events alone counted live (#178), and what the write
+        // bound then asked of a range that could not elect.
+        let mut records = on_all();
+        records.extend([refusal(1, 2), refusal(2, 3)]);
+        assert_eq!(live(records), BTreeSet::new(), "two refused nodes");
+        // A voter on a re-seeded engine that holds nothing of the range: a placeholder
+        // grants no vote (Q22), and the install that ends it quarantines (PROPOSED D-109).
+        let records = vec![
+            refusal(1, 1),
+            created_on(2, 2, RIGHT, Split),
+            created_on(3, 2, RIGHT, Split),
+            refusal(2, 3),
+        ];
+        assert_eq!(live(records), BTreeSet::new(), "refused, then never held");
+        // But one that made the range by its own apply after its refusal holds it, and
+        // no quarantine comes with a split (Q26).
+        let records = vec![
+            refusal(1, 1),
+            created_on(1, 2, RIGHT, Split),
+            created_on(2, 2, RIGHT, Split),
+            created_on(3, 2, RIGHT, Split),
+            refusal(2, 3),
+        ];
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "its own apply");
+        // A refused replica that comes back by an install is lifted, as any is, and stays
+        // impaired only by the quarantine that install states.
+        let back = |server: u64, at: u64| {
+            record(
+                ms(at),
+                ms(at),
+                Some(server),
+                TraceEvent::RaftRecovered {
+                    server,
+                    range: RIGHT,
+                    term: 1,
+                    applied: 1,
+                    last_index: 1,
+                    incarnation: 3,
+                    state: ananke_env::RecoveredAs::Neither,
+                },
+            )
+        };
+        let mut records = on_all();
+        records.extend([
+            refusal(1, 2),
+            refusal(2, 3),
+            created_on(1, 4, RIGHT, Snapshot),
+            back(1, 5),
+        ]);
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "one came back");
+        // Configuration's range is not read this way: refused without its per-replica
+        // events it is what `RefuseOneRangeOnly` traces, and it stays asked of.
+        let records = vec![
+            created_on(1, 1, SINGLE_GROUP, Bootstrap),
+            created_on(2, 1, SINGLE_GROUP, Bootstrap),
+            created_on(3, 1, SINGLE_GROUP, Bootstrap),
+            refusal(1, 2),
+            refusal(2, 3),
+        ];
+        assert_eq!(
+            live(records),
+            BTreeSet::from([SINGLE_GROUP]),
+            "configuration's range reads the node's own events"
+        );
+    }
+
+    /// The write bound per range the run ended with (SHARD.md §8).
+    // PROPOSED(D-113)
+    #[test]
+    fn the_write_bound_is_asked_of_the_range_serving_a_key_where_the_run_stopped() {
+        use ananke_env::RangeCause::{Bootstrap, Split};
+        const RIGHT: u64 = 19;
+        let split = record(
+            ms(1),
+            ms(1),
+            Some(1),
+            TraceEvent::RangeSplit {
+                range: SINGLE_GROUP,
+                right: RIGHT,
+                key: user_key(b"k5"),
+                index: 1,
+            },
+        );
+        let mut records = Vec::new();
+        for server in 1..=3 {
+            records.push(created_on(server, 0, SINGLE_GROUP, Bootstrap));
+            records.push(created_on(server, 1, RIGHT, Split));
+        }
+        records.push(split);
+        let with = |records: &Vec<TraceRecord>, ops| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ended: ms(9000),
+            ..report(records.clone(), Vec::new())
+        };
+        let run = with(
+            &records,
+            vec![put_at("k1", 100, Some(110)), put_at("k7", 100, Some(110))],
+        );
+        assert_eq!(run.final_range_of(&Bytes::from_static(b"k1")), SINGLE_GROUP);
+        assert_eq!(run.final_range_of(&Bytes::from_static(b"k7")), RIGHT);
+        run.liveness_by_final_range().expect("both halves answer");
+        // A wedged right half beside a live left half: every post-heal write to its key
+        // stays pending.
+        assert_eq!(
+            with(
+                &records,
+                vec![put_at("k1", 100, Some(110)), put_at("k7", 100, None)]
+            )
+            .liveness_by_final_range(),
+            Err(
+                "liveness: no client write to k7 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+        // The per-range reading sees what the per-key one reads past: a key with one quick
+        // write and one left pending, on a log that completed nothing for over the bound
+        // after that write was called.
+        let late = with(
+            &records,
+            vec![
+                put_at("k1", 100, Some(110)),
+                put_at("k7", 100, None),
+                put_at("k7", 2500, Some(2510)),
+            ],
+        );
+        assert_eq!(
+            late.writes_after_heal_by_key()[&Bytes::from_static(b"k7")],
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            late.liveness_by_final_range(),
+            Err(format!(
+                "liveness: range {RIGHT} took 2.41s from its first client write after the last \
+                 heal to complete one, over {:?}",
+                election_max() * LIVENESS_TIMEOUTS
+            ))
+        );
+        // And it is read from the range's first call, not from the heal: a right half no
+        // client wrote until 2.5 s after the heal answered at once.
+        with(
+            &records,
+            vec![put_at("k1", 100, Some(110)), put_at("k7", 2500, Some(2510))],
+        )
+        .liveness_by_final_range()
+        .expect("the time until a client draws the key is the client's");
+        // A range without a majority is asked nothing: two refused nodes hold it.
+        let refusal = |server: u64, at: u64| record(ms(at), ms(at), Some(server), refused(server));
+        let mut wedged = records.clone();
+        wedged.extend([refusal(1, 50), refusal(2, 60)]);
+        for server in [1, 2] {
+            wedged.push(record(
+                ms(60),
+                ms(60),
+                Some(server),
+                TraceEvent::RaftReseeded {
+                    server,
+                    range: SINGLE_GROUP,
+                },
+            ));
+        }
+        let none = with(
+            &wedged,
+            vec![put_at("k1", 100, None), put_at("k7", 100, None)],
+        );
+        assert_eq!(none.ranges_with_a_majority_up(), BTreeSet::new());
+        none.liveness_by_final_range()
+            .expect("the keys of a range with no majority are not asked of");
+        // Every range live and nothing written after the heal is the clients stopped.
+        let idle = with(&records, Vec::new());
+        assert_eq!(
+            idle.liveness_by_final_range(),
+            Err(
+                "liveness: no client write completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+        // Some live, none of their keys written: a live range of two keys no client drew in
+        // the window says nothing. The first range's replicas are gone; the right half,
+        // made by the nodes' own applies after their refusals, is whole.
+        let mut after = Vec::new();
+        for server in 1..=3 {
+            after.push(created_on(server, 0, SINGLE_GROUP, Bootstrap));
+        }
+        after.extend([refusal(1, 1), refusal(2, 1)]);
+        for server in [1, 2] {
+            after.push(record(
+                ms(1),
+                ms(1),
+                Some(server),
+                TraceEvent::RaftReseeded {
+                    server,
+                    range: SINGLE_GROUP,
+                },
+            ));
+        }
+        for server in 1..=3 {
+            after.push(created_on(server, 2, RIGHT, Split));
+        }
+        after.push(record(
+            ms(2),
+            ms(2),
+            Some(3),
+            TraceEvent::RangeSplit {
+                range: SINGLE_GROUP,
+                right: RIGHT,
+                key: user_key(b"k5"),
+                index: 1,
+            },
+        ));
+        let some = with(&after, vec![put_at("k1", 100, None)]);
+        assert_eq!(some.ranges_with_a_majority_up(), BTreeSet::from([RIGHT]));
+        some.liveness_by_final_range()
+            .expect("no key of a live range was written");
+    }
+
     // PROPOSED(D-102): the exemption asks for the range shown live.
     #[test]
     fn a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live() {

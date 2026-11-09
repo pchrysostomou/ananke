@@ -548,9 +548,30 @@
 # lightest shard: shard 1 at 1977.1 -> 2083.4, then shard 5 at 1981.0 -> 1987.6 -> 1993.9.
 # Merge note (D-129 onto D-128): every row stays in the shard its own side placed it in, and
 # every header is recomputed from the rows beneath it.
+# PROPOSED D-113's additions after #188 merged (§5 to §11) re-weighed the sweep in place at 203.5
+# cpu s (shard 1) and added 17 rows, weighed on this tree from the built release binaries at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores beside other
+# slices' runs (load averages 234 to 251), longest-first into the lightest shard:
+# a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_t 146.2 into shard 4, 2015.7 -> 2161.9.
+# a_node_that_resumes_another_runs_block_of_ids_is_caught_by_che 17.6 into shard 5, 2044.1 -> 2061.7.
+# a_node_that_refuses_only_one_range_is_caught_by_the_disks_rot_ 16.6 into shard 5, 2061.7 -> 2078.3.
+# a_server_that_resets_its_timer_on_any_message_is_caught_on_the 16.1 into shard 5, 2078.3 -> 2094.4.
+# a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the 16.1 into shard 5, 2094.4 -> 2110.5.
+# a_server_without_pre_vote_is_caught_by_the_isolations_on_the_s 15.9 into shard 5, 2110.5 -> 2126.4.
+# a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequenti 10.8 into shard 5, 2126.4 -> 2137.2.
+# a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_o 9.3 into shard 2, 2134.8 -> 2144.1.
+# a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_s 4.7 into shard 5, 2137.2 -> 2141.9.
+# a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_o 4.6 into shard 5, 2141.9 -> 2146.5.
+# a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_ 4.5 into shard 2, 2144.1 -> 2148.6.
+# a_server_that_sends_before_it_persists_is_caught_on_the_sharde 0.6 into shard 5, 2146.5 -> 2147.1.
+# seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_hal 0.3 into shard 5, 2147.1 -> 2147.4.
+# seeds_128_and_643_no_longer_reach_a_leader_that_cannot_confirm 0.3 into shard 5, 2147.4 -> 2147.7.
+# seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refi 0.2 into shard 5, 2147.7 -> 2147.9.
+# seed_986_a_leader_refuses_the_reads_it_can_never_confirm 0.2 into shard 5, 2147.9 -> 2148.1.
+# seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_s 0.1 into shard 5, 2148.1 -> 2148.2.
 # shard	binary	cpu_s	test
-# shard 1: 2313.0 cpu s
-1	shard	191.3	every_seed_passes_on_the_correct_sharded_sweep
+# shard 1: 2325.2 cpu s
+1	shard	203.5	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -576,7 +597,9 @@
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
 1	reseed	106.3	a_leader_that_can_confirm_no_read_refuses_it_and_goes_on_committing
 1	reseed	38.3	a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first
-# shard 2: 2134.8 cpu s
+# shard 2: 2148.6 cpu s
+2	shard	4.5	a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep
+2	shard	9.3	a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_sweep
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
@@ -621,7 +644,8 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2015.7 cpu s
+# shard 4: 2161.9 cpu s
+4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -655,7 +679,21 @@
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
-# shard 5: 2044.1 cpu s
+# shard 5: 2148.2 cpu s
+5	shard	0.1	seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split
+5	shard	0.2	seed_986_a_leader_refuses_the_reads_it_can_never_confirm
+5	shard	0.2	seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands
+5	shard	0.3	seeds_128_and_643_no_longer_reach_a_leader_that_cannot_confirm_a_read
+5	shard	0.3	seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it
+5	shard	0.6	a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep
+5	shard	4.6	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_sweep
+5	shard	4.7	a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep
+5	parallel	10.8	a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace
+5	shard	15.9	a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep
+5	shard	16.1	a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep
+5	shard	16.1	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep
+5	shard	16.6	a_node_that_refuses_only_one_range_is_caught_by_the_disks_rot_on_the_sharded_sweep
+5	shard	17.6	a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sharded_sweep
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused

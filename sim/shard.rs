@@ -49,11 +49,12 @@
 //! at its first violation and again over the whole trace (D-046); linearizability of
 //! every key across every split (§9), which with the drifting clocks is check 6, lease
 //! safety under drift, as Phase 2 built it; pre-vote's property per (range, server);
-//! and, on uniformly scheduled seeds, the timer check and the write bound per key —
-//! then this sweep's own: the write bound per range the run ended with, the meta
-//! convergence bound (§8), the shape (nodes 4 and 5 hold nothing; every bootstrap node
-//! created ranges 0, 1 and 2), and D-092's per-seed assertion wherever a split was
-//! refused for want of a range id. Check 19 is S7's, which waits on D-093.
+//! and, on uniformly scheduled seeds, the timer check and the write bound, per key and
+//! per range the run ended with (`raft::Report::liveness_by_final_range`), where a range
+//! whose replicas on refused nodes leave it no majority is asked nothing (§8) — then this
+//! sweep's own: the meta convergence bound (§8), the shape (nodes 4 and 5 hold nothing;
+//! every bootstrap node created ranges 0, 1 and 2), and D-092's per-seed assertion wherever
+//! a split was refused for want of a range id. Check 19 is S7's, which waits on D-093.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +72,7 @@ use ananke_raft::ServerId;
 use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
+use ananke_raft::store::KeyPrefix;
 use ananke_shard::client::{Cache, RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::range::RangeId;
@@ -124,6 +126,16 @@ const SPLIT_RETRY: Duration = Duration::from_millis(150);
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
 /// How long the run waits after the last fault for the driver's admins still asking.
 const DRIVER_DRAIN: Duration = Duration::from_secs(5);
+/// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
+/// correct system before it is asserted (Q39; D-113 §6).
+pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
+
+/// The meta convergence bound: how long past the last heal, or past a descriptor's first
+/// statement if that is later, meta may take to name a live range's descriptor.
+#[must_use]
+pub fn meta_convergence_bound() -> Duration {
+    election_max() * META_CONVERGENCE_TIMEOUTS
+}
 
 /// One fault of the schedule. Every fault heals before the next starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,6 +591,9 @@ pub struct DriverStats {
     pub refused: BTreeMap<&'static str, u64>,
     /// Every `NoRangeId` answer, as (the node that answered, when).
     pub no_range_id: Vec<(u64, Instant)>,
+    /// Every split a `NoRangeId` answered at least once: what its asker's retries came to
+    /// (PROPOSED D-092's per-seed assertion).
+    pub retried: Vec<Retried>,
     /// Splits asked of every node in turn and answered by none in time.
     pub splits_unanswered: u64,
     /// Split actions that found no span holding enough keys to split.
@@ -589,6 +604,40 @@ pub struct DriverStats {
     pub transfers_done: u64,
     /// Admins still asking.
     pub outstanding: u64,
+}
+
+/// One `NoRangeId` read against the trace: what emptied the node's block
+/// (PROPOSED D-092's figures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoRangeId {
+    /// The node that answered it.
+    pub node: u64,
+    /// When.
+    pub at: Instant,
+    /// The node's last restart before it, if it restarted.
+    pub restarted: Option<Instant>,
+    /// Whether a block was granted to the node since that restart. Where none was, the
+    /// block is empty because the run is new, whatever the block's size: a new run holds
+    /// no id until its refill lands (SHARD.md §5's second rule).
+    pub leased_since_restart: bool,
+    /// Whether a block was granted to the node within a minimum election timeout after
+    /// the answer: D-092's split of the figure.
+    pub leased_within: bool,
+    /// How many ids splits had taken from the latest block granted since that restart.
+    pub taken: usize,
+}
+
+/// A split `NoRangeId` answered at least once, and what its asker's retries came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retried {
+    /// The range asked of.
+    pub range: u64,
+    /// When the first `NoRangeId` came.
+    pub refused: Instant,
+    /// When the asker stopped asking.
+    pub ended: Instant,
+    /// Whether it stopped on an answer: done, or refused for a reason it does not retry.
+    pub answered: bool,
 }
 
 type Driver = Arc<Mutex<DriverStats>>;
@@ -617,6 +666,7 @@ async fn split_admin<E: Environment>(
     };
     let mut tries = BOOTSTRAP * 4;
     let mut done = false;
+    let mut first_refused: Option<Instant> = None;
     while tries > 0 && !done {
         tries -= 1;
         let request = RangedRequest {
@@ -664,6 +714,7 @@ async fn split_admin<E: Environment>(
                     }
                 }
                 if reason == SplitRefusal::NoRangeId {
+                    first_refused.get_or_insert(now);
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
                 }
@@ -681,9 +732,18 @@ async fn split_admin<E: Environment>(
             }
         }
     }
+    let ended = env.clock().now();
     let mut stats = lock(&stats);
     if !done {
         stats.splits_unanswered += 1;
+    }
+    if let Some(refused) = first_refused {
+        stats.retried.push(Retried {
+            range,
+            refused,
+            ended,
+            answered: done,
+        });
     }
     stats.outstanding -= 1;
 }
@@ -754,9 +814,12 @@ struct Watch {
 }
 
 impl Watch {
-    fn new() -> Self {
+    /// A watch whose checkers stop the run, or, for [`run_to_the_end`], fold nothing.
+    fn new(stops: bool) -> Self {
+        let mut checks = raft::Watch::of_descriptors();
+        checks.stops = stops;
         Self {
-            checks: raft::Watch::of_descriptors(),
+            checks,
             spans: Spans::default(),
         }
     }
@@ -856,6 +919,26 @@ pub fn run_of(
     )
 }
 
+/// [`run_of`] with no violation stopping it: the same run for as long as the sweep's
+/// would have lasted, and past that to its schedule's end, so a check about time can be read
+/// of a variant another check would have stopped first (PROPOSED D-113).
+#[must_use]
+pub fn run_to_the_end(
+    seed: u64,
+    variants: impl Into<Variants>,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+) -> Report {
+    run_watched(
+        seed,
+        Schedule::draw(seed),
+        variants.into(),
+        node_variants,
+        range_variants,
+        Watch::new(false),
+    )
+}
+
 /// Runs `schedule` on `seed`.
 #[must_use]
 pub fn run_with(
@@ -864,6 +947,24 @@ pub fn run_with(
     variants: Variants,
     node_variants: NodeVariants,
     range_variants: RangeVariants,
+) -> Report {
+    run_watched(
+        seed,
+        schedule,
+        variants,
+        node_variants,
+        range_variants,
+        Watch::new(true),
+    )
+}
+
+fn run_watched(
+    seed: u64,
+    schedule: Schedule,
+    variants: Variants,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+    mut watch: Watch,
 ) -> Report {
     let mut sim = Sim::new(config(seed, &schedule));
     let nodes: Vec<NodeId> = (0..NODES as usize)
@@ -894,7 +995,6 @@ pub fn run_with(
         );
     }
     let driver: Driver = Arc::default();
-    let mut watch = Watch::new();
     advance(&mut sim, schedule.warmup, &mut watch);
 
     // The timeline: each fault's beginning and heal, and each action of the driver,
@@ -1122,23 +1222,25 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
     }
 }
 
-/// The kinds of loss a refusal names (#45), read off its reason's words
-/// (`ananke_raft::store::LostState`'s display): one refusal may name several.
+/// The kinds of loss a refusal names (#45), read off its reason's words: the display of
+/// `ananke_raft::store::LostState`, `ananke_storage::wal::HeadGap` and
+/// `ananke_storage::engine::OpenRefused`. #45 asks three figures, dropped tables, lost log
+/// records and fallback manifests; the other two are what a sweep finds beside them. One
+/// refusal may name several.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Loss {
     /// A table the manifest listed could not be read.
     DroppedTable,
-    /// The manifest `CURRENT` named could not be read and an older one was used.
-    ManifestFallback,
-    /// A log head was discarded.
-    LogHead,
-    /// The log stopped short at a bad checksum or a gap: lost log records.
-    LogStop,
-    /// A corrupt record was skipped in a segment the tables cover.
-    LogSkipped,
-    /// The store was damaged before the engine opened.
+    /// Log records are gone: a missing or discarded head, a log stopped at a bad checksum
+    /// or a gap, or a corrupt record skipped in a segment the tables cover.
+    LostLogRecords,
+    /// The manifest in force could not be read, or `CURRENT` that names it: fallen back
+    /// from, or no intact one to fall back to.
+    Manifest,
+    /// The store's directory was damaged before the engine opened.
     Damaged,
-    /// None of the above words.
+    /// None of these words: a reason this list has not met, which the sweep fails on, so
+    /// a new way to lose state is read and named, never counted as nothing.
     Other,
 }
 
@@ -1149,13 +1251,18 @@ impl Loss {
         let mut kinds = Vec::new();
         for (words, kind) in [
             ("dropped tables", Self::DroppedTable),
-            ("fell back from manifest", Self::ManifestFallback),
-            ("discarded a log head", Self::LogHead),
-            ("stopped reading the log", Self::LogStop),
-            ("skipped the rest of log segment", Self::LogSkipped),
+            ("the log's head is missing", Self::LostLogRecords),
+            ("the log is damaged", Self::LostLogRecords),
+            ("discarded a log head", Self::LostLogRecords),
+            ("stopped reading the log", Self::LostLogRecords),
+            ("skipped the rest of log segment", Self::LostLogRecords),
+            ("fell back from manifest", Self::Manifest),
+            ("no manifest older than", Self::Manifest),
+            ("CURRENT", Self::Manifest),
+            ("MANIFEST-", Self::Manifest),
             ("the store is damaged", Self::Damaged),
         ] {
-            if reason.contains(words) {
+            if reason.contains(words) && !kinds.contains(&kind) {
                 kinds.push(kind);
             }
         }
@@ -1164,6 +1271,207 @@ impl Loss {
         }
         kinds
     }
+}
+
+/// One dropped table and the replicas it touches (#45): a table's bounds attribute its
+/// loss to the ranges whose keys lie inside them, which is what per-range refusal would
+/// need to be worth building.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedTable {
+    /// The node.
+    pub node: u64,
+    /// The table's number.
+    pub number: u64,
+    /// The replicas the node held when it was dropped.
+    pub held: usize,
+    /// How many of them have a key inside the table's bounds: in their Raft interval, or
+    /// in their user span.
+    pub touched: usize,
+}
+
+/// One final descriptor's wait for the meta range (SHARD.md §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaLag {
+    /// The range.
+    pub range: u64,
+    /// Its generation where the run stopped.
+    pub generation: u64,
+    /// When meta was owed it: the last heal, or the descriptor's first statement if later.
+    pub due: Instant,
+    /// When meta came to name it over its whole span and went on naming it; `None` if it
+    /// did not name it at the run's end.
+    pub named: Option<Instant>,
+}
+
+impl MetaLag {
+    /// How long meta took past when it was owed; zero where it named it by then.
+    #[must_use]
+    pub fn lag(&self) -> Option<Duration> {
+        self.named
+            .map(|named| named.checked_duration_since(self.due).unwrap_or_default())
+    }
+}
+
+/// What meta names, by the first apply of each meta index, as `MetaApplied`'s won
+/// sub-intervals say: keyed by end, each with its start, range and generation.
+#[derive(Clone, Debug, Default)]
+struct MetaNames {
+    highest: Option<u64>,
+    named: BTreeMap<Bytes, (Bytes, u64, u64)>,
+}
+
+impl MetaNames {
+    /// Folds one `MetaApplied`; whether it changed anything.
+    fn apply(&mut self, index: u64, descriptors: &[ananke_env::MetaDescriptor]) -> bool {
+        if self.highest.is_some_and(|highest| index <= highest) {
+            return false;
+        }
+        self.highest = Some(index);
+        for descriptor in descriptors {
+            for (start, end) in &descriptor.won {
+                self.name(start, end, descriptor.range, descriptor.generation);
+            }
+        }
+        true
+    }
+
+    fn name(&mut self, start: &Bytes, end: &Bytes, range: u64, generation: u64) {
+        let overlapped: Vec<Bytes> = self
+            .named
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(&start[..]),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(_, (from, ..))| from < end)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in overlapped {
+            let (from, was, at) = self.named.remove(&key).expect("listed");
+            if from < *start {
+                self.named.insert(start.clone(), (from.clone(), was, at));
+            }
+            if key > *end {
+                self.named.insert(key, (end.clone(), was, at));
+            }
+        }
+        self.named
+            .insert(end.clone(), (start.clone(), range, generation));
+    }
+
+    /// Whether meta names `[start, end)` wholly as `range` at `generation`.
+    fn names(&self, start: &Bytes, end: &Bytes, range: u64, generation: u64) -> bool {
+        let mut cursor = start.clone();
+        for (to, (from, of, at)) in self.named.range::<[u8], _>((
+            std::ops::Bound::Excluded(&start[..]),
+            std::ops::Bound::Unbounded,
+        )) {
+            if *from > cursor || *of != range || *at != generation {
+                return false;
+            }
+            cursor = to.clone();
+            if cursor >= *end {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Every dropped table in `records`, and how many of the replicas on its node it touches
+/// (#45), from the spans the node held when the table was dropped: its Raft interval, or
+/// its user span, lying within the table's bounds.
+#[must_use]
+pub fn dropped_tables_of(records: &[TraceRecord]) -> Vec<DroppedTable> {
+    let mut held: BTreeMap<u64, BTreeMap<u64, (Bytes, Bytes)>> = BTreeMap::new();
+    let mut tables = Vec::new();
+    for record in records {
+        let node = record.node.map_or(0, |node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RangeCreated {
+                range, start, end, ..
+            }
+            | TraceEvent::RangeDescriptor {
+                range, start, end, ..
+            } => {
+                held.entry(node)
+                    .or_default()
+                    .insert(*range, (start.clone(), end.clone()));
+            }
+            TraceEvent::SstDropped {
+                number,
+                first_key,
+                last_key,
+                ..
+            } => {
+                let on = held.get(&node);
+                let touched = on.map_or(0, |ranges| {
+                    ranges
+                        .iter()
+                        .filter(|(range, (start, end))| {
+                            let raft = KeyPrefix::group(**range).span();
+                            (raft.start <= *last_key && *first_key < raft.end)
+                                || (*start <= *last_key && *first_key < *end)
+                        })
+                        .count()
+                });
+                tables.push(DroppedTable {
+                    node,
+                    number: *number,
+                    held: on.map_or(0, BTreeMap::len),
+                    touched,
+                });
+            }
+            TraceEvent::RaftRefused { .. } => {
+                held.remove(&node);
+            }
+            _ => {}
+        }
+    }
+    tables
+}
+
+/// When the meta range came to name each user range's descriptor at the end of `records`
+/// (SHARD.md §8), by the first apply of each meta index, each owed from `last_heal` or from
+/// its descriptor's first statement if that is later. Meta names a descriptor from the apply
+/// after which it names it wholly and goes on naming it, so an update that overwrites it
+/// later ends what came before.
+#[must_use]
+pub fn meta_lags_of(records: &[TraceRecord], last_heal: Instant) -> Vec<MetaLag> {
+    let mut spans = Spans::default();
+    spans.extend(records);
+    let finals: Vec<(u64, Span)> = spans
+        .user()
+        .map(|(range, span)| (range, span.clone()))
+        .collect();
+    let mut names = MetaNames::default();
+    let mut since: BTreeMap<u64, Option<Instant>> =
+        finals.iter().map(|(range, _)| (*range, None)).collect();
+    for record in records {
+        let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+            continue;
+        };
+        if !names.apply(*index, descriptors) {
+            continue;
+        }
+        for (range, span) in &finals {
+            let named = names.names(&span.start, &span.end, *range, span.generation);
+            let at = since.get_mut(range).expect("listed");
+            match (named, *at) {
+                (true, None) => *at = Some(record.at),
+                (false, Some(_)) => *at = None,
+                _ => {}
+            }
+        }
+    }
+    finals
+        .into_iter()
+        .map(|(range, span)| MetaLag {
+            range,
+            generation: span.generation,
+            due: last_heal.max(span.since),
+            named: since.get(&range).copied().flatten(),
+        })
+        .collect()
 }
 
 impl Report {
@@ -1238,6 +1546,208 @@ impl Report {
         by
     }
 
+    /// Every dropped table the trace names ([`dropped_tables_of`]).
+    #[must_use]
+    pub fn dropped_tables(&self) -> Vec<DroppedTable> {
+        dropped_tables_of(self.records())
+    }
+
+    /// When the meta range came to name each user range's descriptor at the run's end
+    /// ([`meta_lags_of`]).
+    #[must_use]
+    pub fn meta_lags(&self) -> Vec<MetaLag> {
+        meta_lags_of(self.records(), self.checked.last_heal)
+    }
+
+    /// The lags the meta convergence bound is asked of: on a uniformly scheduled seed
+    /// (D-016), with the meta range's unimpaired replicas a majority and the range's too
+    /// (§8), since each needs a leader to send or take the update.
+    #[must_use]
+    pub fn meta_lags_asked(&self) -> Vec<MetaLag> {
+        if !self.checked.uniform() {
+            return Vec::new();
+        }
+        let live = self.checked.ranges_with_a_majority_up();
+        if !live.contains(&META_RANGE) {
+            return Vec::new();
+        }
+        self.meta_lags()
+            .into_iter()
+            .filter(|lag| live.contains(&lag.range))
+            .collect()
+    }
+
+    /// The meta convergence bound (SHARD.md §8): after the last heal, meta names every
+    /// key's current descriptor within [`meta_convergence_bound`].
+    ///
+    /// # Errors
+    ///
+    /// The first range meta names late or not at all.
+    pub fn meta_converges(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let bound = meta_convergence_bound();
+        for lag in self.meta_lags_asked() {
+            match lag.lag() {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "seed {seed}: meta convergence: meta came to name range {} at generation \
+                         {} {took:?} after it was owed at {:?}, over {bound:?}",
+                        lag.range, lag.generation, lag.due
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "seed {seed}: meta convergence: meta does not name range {} at \
+                         generation {} where the run stopped, owed since {:?}",
+                        lag.range, lag.generation, lag.due
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// D-092's assertion where a split was refused for want of a range id, per seed: on a
+    /// uniformly scheduled seed whose ranges 0 and the asked range have a majority, the
+    /// asker's retries end on an answer, and within the write bound of the last heal.
+    ///
+    /// # Errors
+    ///
+    /// The first asker left without an answer.
+    // PROPOSED(D-092): answer A; the asker retries.
+    pub fn retries_take_effect(&self) -> Result<(), String> {
+        if !self.checked.uniform() {
+            return Ok(());
+        }
+        let seed = self.seed;
+        let live = self.checked.ranges_with_a_majority_up();
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        for retried in &self.driver.retried {
+            if !live.contains(&ROOT_RANGE) || !live.contains(&retried.range) {
+                continue;
+            }
+            let since = retried.refused.max(self.checked.last_heal);
+            let late = retried
+                .ended
+                .checked_duration_since(since)
+                .unwrap_or_default();
+            if !retried.answered && late > bound {
+                return Err(format!(
+                    "seed {seed}: NoRangeId: the split of range {} refused at {:?} was still \
+                     unanswered {late:?} past the last heal, over {bound:?}",
+                    retried.range, retried.refused
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `NoRangeId` of the run, read against the trace (PROPOSED D-092's figures).
+    #[must_use]
+    pub fn no_range_ids(&self) -> Vec<NoRangeId> {
+        self.driver
+            .no_range_id
+            .iter()
+            .map(|&(node, at)| {
+                let mut restarted = None;
+                let mut leased_since_restart = false;
+                let mut leased_within = false;
+                let mut taken = 0usize;
+                let mut block: Option<(u64, u64)> = None;
+                let mut seen: BTreeSet<u64> = BTreeSet::new();
+                for record in self.records() {
+                    match &record.event {
+                        TraceEvent::NodeRestarted { node: of } if u64::from(of.get()) == node => {
+                            if record.at <= at {
+                                restarted = Some(record.at);
+                                leased_since_restart = false;
+                                taken = 0;
+                                block = None;
+                            }
+                        }
+                        TraceEvent::RangeIdsLeased {
+                            node: of,
+                            first,
+                            last,
+                            ..
+                        } if *of == node => {
+                            if record.at <= at {
+                                leased_since_restart = true;
+                                block = Some((*first, *last));
+                            } else if record.at.duration_since(at) <= raft::ELECTION_MIN {
+                                leased_within = true;
+                            }
+                        }
+                        TraceEvent::RangeSplit { right, .. }
+                            if record.at <= at
+                                && seen.insert(*right)
+                                && block.is_some_and(|(first, last)| {
+                                    first <= *right && *right <= last
+                                }) =>
+                        {
+                            taken += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                NoRangeId {
+                    node,
+                    at,
+                    restarted,
+                    leased_since_restart,
+                    leased_within,
+                    taken,
+                }
+            })
+            .collect()
+    }
+
+    /// The most range ids one block granted over the run gave to splits that took effect:
+    /// how near a run comes to spending a block ([`ID_BLOCK`]).
+    #[must_use]
+    pub fn most_ids_from_one_block(&self) -> usize {
+        let mut blocks: Vec<(u64, u64, usize)> = Vec::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        for record in self.records() {
+            match &record.event {
+                TraceEvent::RangeIdsLeased { first, last, .. }
+                    if !blocks.iter().any(|(f, ..)| f == first) =>
+                {
+                    blocks.push((*first, *last, 0));
+                }
+                TraceEvent::RangeSplit { right, .. } if seen.insert(*right) => {
+                    if let Some(block) = blocks
+                        .iter_mut()
+                        .find(|(first, last, _)| first <= right && right <= last)
+                    {
+                        block.2 += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks.iter().map(|(.., taken)| *taken).max().unwrap_or(0)
+    }
+
+    /// Every refusal's reason names a loss this file knows (#45): one that names none is a
+    /// new way to lose state, and is read and named rather than counted as nothing.
+    ///
+    /// # Errors
+    ///
+    /// The first reason [`Loss::of`] does not read.
+    pub fn losses_are_named(&self) -> Result<(), String> {
+        let seed = self.seed;
+        for (node, reason) in self.refusals() {
+            if Loss::of(&reason).contains(&Loss::Other) {
+                return Err(format!(
+                    "seed {seed}: node {node}'s refusal names a loss #45's kinds do not: {reason}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The shape, per seed: every bootstrap node created ranges 0, 1 and 2 at its first
     /// start, and nodes 4 and 5 created nothing, not even a placeholder (SHARD.md §2,
     /// §12's Stage C; Q22).
@@ -1284,14 +1794,246 @@ impl Report {
         Ok(())
     }
 
-    /// The run's verdict: the raft sweep's checks over this trace
-    /// (`raft::Report::check`), then the shape.
+    /// The run's verdict: the raft sweep's checks over this trace, its write bound per
+    /// range the run ended with (`raft::Report::check_by_final_range`), then the shape, the
+    /// meta convergence bound, D-092's retries and #45's kinds.
     ///
     /// # Errors
     ///
     /// The first violation, naming the seed.
     pub fn check(&self) -> Result<(), String> {
-        self.checked.check()?;
-        self.shape()
+        self.checked.check_by_final_range()?;
+        self.shape()?;
+        if self.checked.stopped.is_none() {
+            self.meta_converges()?;
+            self.retries_take_effect()?;
+        }
+        self.losses_are_named()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The readings' reasoning on records written by hand, one shape each.
+
+    use ananke_env::MetaDescriptor;
+
+    use super::*;
+
+    fn at(ms: u64) -> Instant {
+        Instant::from_nanos(ms * 1_000_000)
+    }
+
+    fn record(ms: u64, node: u32, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(ms),
+            decided: at(ms),
+            node: Some(NodeId::new(node)),
+            event,
+        }
+    }
+
+    fn descriptor(ms: u64, range: u64, span: (&str, &str), generation: u64) -> TraceRecord {
+        record(
+            ms,
+            1,
+            TraceEvent::RangeDescriptor {
+                range,
+                index: ms,
+                applied: ms,
+                start: Bytes::copy_from_slice(span.0.as_bytes()),
+                end: Bytes::copy_from_slice(span.1.as_bytes()),
+                generation,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        )
+    }
+
+    fn meta(ms: u64, index: u64, range: u64, span: (&str, &str), generation: u64) -> TraceRecord {
+        let (start, end) = (
+            Bytes::copy_from_slice(span.0.as_bytes()),
+            Bytes::copy_from_slice(span.1.as_bytes()),
+        );
+        record(
+            ms,
+            1,
+            TraceEvent::MetaApplied {
+                index,
+                descriptors: vec![MetaDescriptor {
+                    range,
+                    start: start.clone(),
+                    end: end.clone(),
+                    generation,
+                    voters: vec![1, 2, 3],
+                    won: vec![(start, end)],
+                }],
+            },
+        )
+    }
+
+    /// Range 2 over `[a, z)` split at `m`: 19 is `[m, z)`, both at generation 2.
+    fn split() -> Vec<TraceRecord> {
+        vec![
+            descriptor(1, 2, ("a", "z"), 1),
+            meta(1, 0, 2, ("a", "z"), 1),
+            descriptor(100, 2, ("a", "m"), 2),
+            descriptor(100, 19, ("m", "z"), 2),
+        ]
+    }
+
+    fn lag_of(lags: &[MetaLag], range: u64) -> Option<Duration> {
+        lags.iter()
+            .find(|lag| lag.range == range)
+            .expect("a lag")
+            .lag()
+    }
+
+    #[test]
+    fn meta_names_a_descriptor_from_the_apply_that_covers_its_whole_span() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(150, 2, 19, ("m", "z"), 2),
+        ]);
+        let lags = meta_lags_of(&records, at(120));
+        // Named before it was owed is no lag; named after it is the difference.
+        assert_eq!(lag_of(&lags, 2), Some(Duration::ZERO));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(30)));
+        // Owed from the descriptor's first statement where that is after the heal.
+        let lags = meta_lags_of(&records, at(50));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn meta_that_names_part_of_a_span_or_an_older_generation_does_not_name_it() {
+        let mut records = split();
+        records.push(meta(110, 1, 19, ("m", "t"), 2));
+        assert_eq!(
+            lag_of(&meta_lags_of(&records, at(100)), 19),
+            None,
+            "part of it"
+        );
+        let mut records = split();
+        records.push(meta(110, 1, 19, ("m", "z"), 1));
+        assert_eq!(lag_of(&meta_lags_of(&records, at(100)), 19), None, "older");
+    }
+
+    /// What `MetaOverwritesByArrival` does to meta: an update that wins a span a newer
+    /// record held ends the naming, so the descriptor reads as not named where the run stops.
+    #[test]
+    fn an_update_that_overwrites_a_named_descriptor_ends_its_naming() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(120, 2, 19, ("m", "z"), 2),
+            meta(130, 3, 2, ("a", "z"), 1),
+        ]);
+        let lags = meta_lags_of(&records, at(100));
+        assert_eq!(lag_of(&lags, 2), None);
+        assert_eq!(lag_of(&lags, 19), None);
+        // And a later resend of the right update names it from there.
+        records.push(meta(140, 4, 19, ("m", "z"), 2));
+        assert_eq!(
+            lag_of(&meta_lags_of(&records, at(100)), 19),
+            Some(Duration::from_millis(40))
+        );
+    }
+
+    /// A replica behind, applying an index already folded, moves nothing: first apply of
+    /// each index, as check 16's fold reads it.
+    #[test]
+    fn a_lagging_replicas_apply_of_an_index_already_folded_moves_nothing() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(120, 2, 19, ("m", "z"), 2),
+            meta(130, 0, 2, ("a", "z"), 1),
+        ]);
+        let lags = meta_lags_of(&records, at(100));
+        assert_eq!(lag_of(&lags, 2), Some(Duration::from_millis(10)));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn a_refusals_reason_is_read_for_every_loss_it_names() {
+        assert_eq!(
+            Loss::of("the engine's recovery lost state: dropped tables [4]"),
+            vec![Loss::DroppedTable]
+        );
+        assert_eq!(
+            Loss::of(
+                "the engine's recovery lost state: dropped tables [4] fell back from manifest 7"
+            ),
+            vec![Loss::DroppedTable, Loss::Manifest]
+        );
+        assert_eq!(
+            Loss::of("the log's head is missing: expected record 409, found 430"),
+            vec![Loss::LostLogRecords]
+        );
+        assert_eq!(
+            Loss::of(
+                "the log is damaged: a record at segment 1 offset 9307 (bad-checksum) was skipped \
+                 and the rest of the segment with it"
+            ),
+            vec![Loss::LostLogRecords]
+        );
+        assert_eq!(Loss::of("CURRENT cannot be read"), vec![Loss::Manifest]);
+        assert_eq!(
+            Loss::of("no manifest older than 9 has every table it lists on disk and intact"),
+            vec![Loss::Manifest]
+        );
+        assert_eq!(Loss::of("something new"), vec![Loss::Other]);
+    }
+
+    /// A table's bounds attribute its loss: the replicas whose Raft interval or user span
+    /// lie within them, and none past them.
+    #[test]
+    fn a_dropped_table_touches_the_replicas_within_its_bounds() {
+        let held = [
+            descriptor(1, 2, ("a", "m"), 2),
+            descriptor(1, 19, ("m", "z"), 2),
+        ];
+        let dropped = |first: &[u8], last: &[u8]| {
+            let mut records = held.to_vec();
+            records.push(record(
+                2,
+                1,
+                TraceEvent::SstDropped {
+                    number: 7,
+                    first_seq: 1,
+                    max_seq: 2,
+                    first_key: Bytes::copy_from_slice(first),
+                    last_key: Bytes::copy_from_slice(last),
+                    reason: "bad",
+                },
+            ));
+            dropped_tables_of(&records)[0].clone()
+        };
+        let table = dropped(b"b", b"c");
+        assert_eq!(
+            (table.touched, table.held),
+            (1, 2),
+            "the left half's keys alone"
+        );
+        let table = dropped(b"b", b"p");
+        assert_eq!(table.touched, 2, "across the two");
+        let raft = KeyPrefix::group(19).span();
+        let table = dropped(&raft.start, &raft.start);
+        assert_eq!(table.touched, 1, "the right half's Raft interval");
+    }
+
+    #[test]
+    fn a_split_leaves_at_least_the_fewest_keys_on_either_side() {
+        let span = |start: &[u8], end: &[u8]| Span {
+            start: user_key(start),
+            end: user_key(end),
+            generation: 1,
+            voters: vec![1, 2, 3],
+            since: at(0),
+        };
+        assert_eq!(split_keys(&span(b"k", b"l")), (2..=14).collect::<Vec<_>>());
+        assert_eq!(split_keys(&span(b"k04", b"k08")), vec![6]);
+        assert!(split_keys(&span(b"k04", b"k07")).is_empty());
     }
 }
