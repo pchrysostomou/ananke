@@ -23785,8 +23785,11 @@ though the host holds no descriptor, and check 8's two clauses over the same tra
 `an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of` holds
 `switched_spans` on its four inputs.
 
-**On S10's scenario.** `sim/shard.rs` is not on `main`, and is not in this PR. Applied from
-`phase-3-stage-c-shard-sim` (f3977a5) to a scratch copy of this tree, in release:
+**On S10's scenario.** When this section was written `sim/shard.rs` was on neither `main` nor
+this branch, and the figures below were taken by applying `phase-3-stage-c-shard-sim` (f3977a5)
+to a scratch copy of this tree, in release. #188 merged the sweep to `main` at 1d3f0a0 and the
+merge at 76c6490 brings it onto this branch, so they were re-measured on the merged tree itself,
+from its own built binary, and reproduce exactly — 21 fail on `main` at 8a4cdad, 11 here:
 
 | | the tree before this entry, as D-113 measured it at f3977a5 | this entry |
 |---|---|---|
@@ -23800,7 +23803,12 @@ The 11 are not this entry's. Seed 986 is D-113's (b), `READS_OUTSTANDING` on a l
 longer confirm a read. Seeds 217, 253, 281, 309, 329, 361, 376, 465, 657 and 769 are its (c),
 "no client write completed after the last heal", and each has two nodes refused. Which seeds show
 them moved, because the read-back and the narrower switch move every re-seeded seed's schedule:
-128 and 643 no longer show (b), for one. Neither mechanism is touched here.
+128 and 643 no longer show (b), for one. Neither mechanism is touched here, and each of the 11
+was re-confirmed on the merged tree: on 8 of the 10 (c) seeds every post-heal client write
+completed well inside the bound, and on the other two (217 and 329) no write was asked of a live
+range at all, so none of the 10 is a server that failed to make progress. So D-113 §2's "21 seeds
+fail the correct system", and its (a) recorded there as not fixed, are superseded by this section:
+(a) is fixed, and what remains of the verdict is (b) and (c) alone.
 
 Under the variant the install clause trips on all seven, so on this tree they still reach the order
 they were found on: the variant and the fix are one schedule up to the switch. S10's pin of seed 41
@@ -23834,13 +23842,24 @@ that moved shows.
 | the sharded quorum scenario | 0 to 99 | **0** |
 | `reseed::run`, the re-seed shape | 0 to 99 | **100**, every one still green |
 | `reseed::run_after_split` | every seed | every one, by the writer |
+| `sim/shard.rs`, S10's sharded sweep (after the merge) | 0 to 999 | **every seed that re-seeds** |
 
-The fix reaches only an install onto a replica with no descriptor, and of these only the re-seed's
-two runs make one, so nothing else moves. On the re-seed shape nothing has split, so the switch's
-spans and the plan's are what they were: what moves it is the read-back, D-083's engine reads, now
-made for these four installs too. Every pin on that shape is re-run by the gate on its new schedule, seed 1's
-among them. No schedule of the one-group server is touched, and seed 42's pinned body hash holds at
-the gate.
+The fix reaches only an install onto a replica with no descriptor, and of the scenarios above only
+the re-seed's two runs and S10's sweep make one, so nothing else moves. On the re-seed shape
+nothing has split, so the switch's spans and the plan's are what they were: what moves it is the
+read-back, D-083's engine reads, now made for these four installs too. Every pin on that shape is
+re-run by the gate on its new schedule, seed 1's among them. No schedule of the one-group server
+is touched, and seed 42's pinned body hash holds at the gate.
+
+**S10's sweep, which the merge brought in.** It owed this table a row, and its schedules do move:
+over the thousand, splits taking effect 3721 → 3718, seeds that never split 9 → 10,
+`key-outside-span` refusals 370 → 365, `no-range-id` 18 → 7 on 7 → 6 seeds, 45 → 47 unanswered,
+46 → 49 with no span to split, 1668 transfers done against 1673, and 339 store refusals against
+340. That is why the (b) and (c) seeds §5 names are a different set from `main`'s while both
+defects' rates are flat: the arm's shape on 24 seeds of the thousand against 22, and two nodes
+tracing a refusal on 37 against 32. `sim/tests/shard.rs` pins no seed today, so nothing on it is
+left stale by the move; D-113 §3's pins are due after this and D-129 both land, and by the rule on
+pinned seeds each must assert its mechanism rather than green.
 
 **What the thousand say of the clause on the correct system.** On the node sweep's thousand, and on
 S10's: **0** seeds in violation, so the window section 9 names is unreached. The correct node's sweep
