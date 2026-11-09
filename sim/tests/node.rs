@@ -2470,8 +2470,11 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// — `AnyFreshNodeBootstraps`, D-096's instrument, trips it on the membership scenario
 /// below.
 ///
-/// **Check 8** runs here and under every pair below too, its two clauses a fold each
-/// (PROPOSED D-107). Its right half's clause trips on the correct node itself — a voter
+/// **Check 8** runs here and under every pair below too, its clauses a fold each
+/// (PROPOSED D-107, D-128). Its install clause trips on no run of the correct node; its
+/// tripping variant is `InstallReplacesHostedSpan`, on the re-seed after a split
+/// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span`).
+/// Its right half's clause trips on the correct node itself — a voter
 /// installed past a split holds no right half until placeholders exist — so it is
 /// compared and printed and not asserted absent, and its seed 45
 /// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's

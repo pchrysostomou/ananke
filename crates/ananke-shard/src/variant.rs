@@ -819,9 +819,11 @@ mod tests {
         // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
         // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
-        // D-110's one is the overlap rule's fresh take never made.
+        // D-110's one is the overlap rule's fresh take never made, and D-128's one a
+        // replica with no descriptor whose install replaces what it is hosted at.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
+        // PROPOSED(D-128)
         assert_eq!(NodeVariant::BUGS.len(), 49);
         for variant in NodeVariant::SNAPSHOT
             .iter()

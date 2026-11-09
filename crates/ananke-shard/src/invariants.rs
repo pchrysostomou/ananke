@@ -1959,8 +1959,8 @@ impl Checker {
     }
 
     /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, and then
-    /// check 8's overlap clause, last so that no violation a fold before it reports
-    /// moves to it. This is what stops a run, and it names one fold where several may
+    /// check 8's overlap and install clauses, last so that no violation a fold before them
+    /// reports moves to them. This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
     /// right half's clause is folded and **not** in it: the correct node trips it on a
     /// voter installed past a split, which holds no placeholder for the right half

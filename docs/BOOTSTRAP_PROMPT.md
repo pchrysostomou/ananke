@@ -110,7 +110,9 @@ _Update this section at the end of every session._
   install clause, reading the engine's `SpanInstalled`, and `InstallReplacesHostedSpan` (node
   bit 49) keeps the bug beside the fix. `reseed::run_after_split` writes right-half keys and
   reads them back off the disk: 66 of 200 seeds lost them before, none now. S10's seven seeds
-  are green on a scratch copy of its scenario, which is not committed here.
+  are green on a scratch copy of its scenario, which is not committed here. #199, a re-seeded
+  range that came back by log replay and refuses its next split, is the same family and not
+  covered: it holds no descriptor whichever way this switch goes, 40 of 40 on its probe.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

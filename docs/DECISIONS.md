@@ -23592,10 +23592,11 @@ equivalence test compares it on the same run at every tier:
 
 ### 5. What says so
 
-**`reseed::run_after_split` reads the data.** Item 4 of what this entry was asked for. A second
-writer, `right_writer`, puts 100 keys of the right half's span, `k1-0001` onwards, each once, 40 ms
-apart, so they span the split and `x`'s crash and no later write can put one back. It asks P and
-follows `RangeMismatch` to the right half. When the run is over, with the trace already taken,
+**`reseed::run_after_split` reads the data.** Until now its right half held no user keys and the
+run checked no data, so the order it reached went unseen. A second writer, `right_writer`, puts
+100 keys of the right half's span, `k1-0001` onwards, each once, 40 ms apart, so they span the split
+and `x`'s crash and no later write can put one back. It asks P and follows `RangeMismatch` to the
+right half. When the run is over, with the trace already taken,
 `x` is crashed and its engine opened and scanned (`keys_on_disk`). `AfterSplit::right_keys_survive`
 holds every key a replica applied below the split or at or below `x`'s install's floor to be
 there, and fails a run whose install owed the span nothing. So the writer moves every schedule of
@@ -23607,7 +23608,8 @@ this run, and only this run; every other assertion on it holds.
 | the same, the cap's 200 | **fails on 66 of 200**: 3, 11, 14, 15, 17, 22, 25, 26, 29, 30, 31, 39, 40, 44, 46, 50, 52, 54, 55, 59, 61, 65, 66, 67, 69, 70, 71, 72, 73, 75, 80, 81, 83, 91, 96, 97, 98, 99, 101, 102, 103, 104, 106, 107, 109, 113, 123, 125, 129, 130, 132, 136, 143, 144, 150, 153, 158, 162, 170, 172, 174, 175, 180, 183, 189 and 194 | **passes on 200 of 200**; the right half's install lands first on those same 66 |
 | seed 3 | "node 3 lost 14 of the 14 keys its install of the right half owes its span (the right half installed before P), first `k1-0001`: its engine holds 5 keys of the span" | holds them |
 
-The writer's keys raised the order's rate from about a quarter to a third.
+Before the writer the run reached this order on about a quarter of seeds; with it, a third. The
+rate is the schedule's, and the assertions above do not depend on it beyond its being reached.
 
 **Directed, through the task** (`install.rs`):
 `an_install_onto_a_replica_with_no_descriptor_replaces_the_snapshots_span_alone`, on the correct
@@ -23634,7 +23636,9 @@ longer confirm a read. Seeds 217, 253, 281, 309, 329, 361, 376, 465, 657 and 769
 them moved, because the read-back and the narrower switch move every re-seeded seed's schedule:
 128 and 643 no longer show (b), for one. Neither mechanism is touched here.
 
-So S10's seed 41 pin is left for S10, which holds the shape's trace.
+Under the variant the install clause trips on all seven, so on this tree they still reach the order
+they were found on: the variant and the fix are one schedule up to the switch. S10's pin of seed 41
+is left for S10, on the scenario that makes it.
 
 ### 6. Not taken: hosting a span-less replica at its Raft interval alone
 
@@ -23649,13 +23653,52 @@ the pair. So it is not built. `run`'s comment says what the copy is still read f
 
 ### 7. What moves
 
-To come in this slice's next commit.
+One probe, a scratch test file never committed, built in release on de9f4d7 and on this tree,
+hashing FNV-1a over every record's time, node and event per run, `TaskPolled` kept, so a schedule
+that moved shows.
+
+| scenario, correct system | seeds | trace moved |
+|---|---|---|
+| the raft sweep's arms on the node | 0 to 199 | **0** |
+| `sim/ranges.rs` | 0 to 99 | **0** |
+| `sim/split.rs` (ii), (i) | 0 to 99 of each | **0** |
+| `sim/split.rs` (i)'s resplit | 0 to 49 | **0** |
+| `sim/install.rs`, and its joiner re-seed | 0 to 31 of each | **0** |
+| the membership scenario on the node | 0 to 99 | **0** |
+| the sharded quorum scenario | 0 to 99 | **0** |
+| `reseed::run`, the re-seed shape | 0 to 99 | **100**, every one still green |
+| `reseed::run_after_split` | every seed | every one, by the writer |
+
+The fix reaches only an install onto a replica with no descriptor, and of these only the re-seed's
+two runs make one, so nothing else moves. On the re-seed shape nothing has split, so the switch's
+spans and the plan's are what they were: what moves it is the read-back, D-083's engine reads, now
+made for these four installs too. Every pin on that shape is re-run by the gate on its new schedule, seed 1's
+among them. No schedule of the one-group server is touched, and seed 42's pinned body hash holds at
+the gate.
+
+**What the thousand say of the clause on the correct system.** On the node sweep's thousand, and on
+S10's: **0** seeds in violation, so the window section 9 names is unreached. The correct node's sweep
+asserts it of the checker's verdict at every tier.
 
 ### 8. Plants
 
 Each applied alone to this tree, at the gate's twenty seeds, in debug, and reverted:
 
-To come in this slice's next commit.
+| plant | caught by |
+|---|---|
+| the task does not re-host the replica at the switch | the directed test: the plan's spans |
+| the creation's read-back reads the host's descriptor alone, and finds none | the directed test, and `…_keeps_its_keys_…`: "node 3's install of range 2 traced no state read back", on 20 of 20 |
+| the read-back reads what the plan hosts, configuration's span | the directed test, two keys for one, and `…_keeps_its_keys_…` on seeds 3, 11, 14, 15 and 17: "read back 24 keys … and server 2's take there held 1 keys" |
+| the switch replaces what the plan hosts: the bug, with the variant's bit inverted | both directed tests; all four tests on `run_after_split`, on seeds 3, 11, 14, 15 and 17, by the install clause; and the pair test under the inverted bit, "the right half installed first: true, and check 8's install clause said Ok(()) and its keys Ok(())" |
+| the clause never latches | both of its unit tests and the directed test; the per-fold comparison under the variant, "did not trip"; and the pair test, the keys gone with the clause green |
+| the clause does not leave out the replica installed | its unit test, and all four tests on `run_after_split` on seed 0 onward, on the install's own span |
+| a refusal does not forget the node's spans | its unit test's refusal case |
+| the checker's verdict does not ask the clause | its verdict-order unit test |
+| the writer writes two keys over and over | the pair test: the clause trips and the keys are back, so a key written twice hides its loss |
+
+Dropping the `.or_else` in the host's comparison is not a plant: the re-host it did is the task's
+now, and putting it back pushes the spans the plan already holds, one more wake of the task and
+nothing else.
 
 ### 9. What is not here
 
@@ -23672,12 +23715,21 @@ To come in this slice's next commit.
   (section 7). Reading the span from the host's descriptors at the switch would close it. It
   is a change for an initialised replica, which this correction leaves alone, so it is a
   candidate for an issue of its own.
-- **A replica with no descriptor applying the log.** "One without is checked against nothing"
-  (the apply check, D-097), so a re-seeded user range that replays its log from index 1 with a
-  right half beside it would write that right half's keys, the overlap rule's first concern by
-  another road. Measured over S10's thousand: such a replica applies a keyed entry on **0** seeds,
-  since every user range re-seeded there is behind a compacted prefix. Not reached; beside #175,
-  and a candidate for the same issue.
+- **#199: a replica with no descriptor that came back by the log.** The same family, not the same
+  bug, and this correction does not cover it. A re-seeded user range whose leader has not compacted
+  replays its log and never installs, so nothing here gives it a descriptor, and a later split of it
+  is refused where the other replicas take it. #199's directed probe (the review of #192's, on
+  8fe74a6), with this entry's crate changes applied: range 3, which came back by replay, **fails
+  state machine safety on 40 of 40**, with the node installing it on 0 of 40, as without them; P's
+  left half, which came back by a stream, on **0 of 40**. So it is no better and no worse, and #199
+  stays open for its own PR.
+- **What such a replica's log does before that.** "One without is checked against nothing" (the
+  apply check, D-097), so one replaying below a split with a right half beside it would write that
+  right half's keys, the overlap rule's first concern by another road. Over S10's thousand a replica
+  with no descriptor applies a keyed entry on **0** seeds, so it is not reached there. And one that
+  replayed keys and is then streamed keeps those beyond the snapshot's span until a right half's
+  install replaces them, where configuration's span used to take them: no replica serves them, and
+  no run here shows it. Both belong with #199.
 
 ### 10. The nightly's rows (D-064)
 

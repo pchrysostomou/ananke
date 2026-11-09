@@ -1469,6 +1469,21 @@ impl AfterSplit {
         }
     }
 
+    /// The floor of `x`'s creation of `range` by an install: the snapshot's last index.
+    // PROPOSED(D-128)
+    #[must_use]
+    pub fn install_floor(&self, range: u64) -> Option<u64> {
+        self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RangeCreated {
+                range: r,
+                cause: RangeCause::Snapshot,
+                floor_index,
+                ..
+            } if *r == range && self.on_x(record) => Some(*floor_index),
+            _ => None,
+        })
+    }
+
     /// The keys `x`'s install of the right half owes its span: every key of the span a
     /// replica applied below the split, in P's log, or at or below the install's floor,
     /// in the right half's own. The snapshot carries each of them, so each is in the
@@ -1480,15 +1495,7 @@ impl AfterSplit {
         let Some((split, right)) = self.split else {
             return BTreeSet::new();
         };
-        let Some(floor) = self.records.iter().find_map(|record| match &record.event {
-            TraceEvent::RangeCreated {
-                range,
-                cause: RangeCause::Snapshot,
-                floor_index,
-                ..
-            } if *range == right && self.on_x(record) => Some(*floor_index),
-            _ => None,
-        }) else {
+        let Some(floor) = self.install_floor(right) else {
             return BTreeSet::new();
         };
         let span = SPLIT_KEY.as_bytes()..RIGHT_END.as_bytes();
@@ -1569,6 +1576,11 @@ impl AfterSplit {
     // PROPOSED(D-128)
     pub fn state_read_back_is_the_takes(&self, range: u64) -> Result<(), String> {
         let (seed, x) = (self.seed, self.x);
+        let Some(floor) = self.install_floor(range) else {
+            return Err(format!(
+                "seed {seed}: node {x} created no replica of range {range} by an install"
+            ));
+        };
         let state = |record: &TraceRecord| match record.event {
             TraceEvent::RaftSnapshotState {
                 server,
@@ -1581,13 +1593,13 @@ impl AfterSplit {
             } if r == range => Some((server, last_index, last_term, user_keys, user_digest)),
             _ => None,
         };
-        // The first state `x` traces of the range after its refusal is its install's: it
-        // holds nothing of the range to take from before that.
+        // The install's own state, by its last index: a later take of the range on `x`
+        // traces the same event, and would answer for an install that traced none.
         let refused = self.refused_at().unwrap_or(0);
         let Some((_, last_index, last_term, user_keys, user_digest)) = self.records[refused..]
             .iter()
             .filter_map(state)
-            .find(|(server, ..)| *server == x)
+            .find(|(server, index, ..)| *server == x && *index == floor)
         else {
             return Err(format!(
                 "seed {seed}: node {x}'s install of range {range} traced no state read back"
