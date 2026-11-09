@@ -21,6 +21,9 @@
 //!   (D-041, PROPOSED D-117);
 //! - `TasksOnTheRefusedDir`, the start that re-seeded handing its tasks the refused
 //!   directory, is caught there on every seed (PROPOSED D-117);
+//! - a node that leads a right half made after its re-seed takes and sweeps in the directory
+//!   it runs on, and the variant is caught there too (`reseed::run_split_after_reseed`,
+//!   PROPOSED D-117);
 //! - the same run's install of the parent is created at the split's generation, and
 //!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115).
 
@@ -70,8 +73,10 @@ fn shape_seeds() -> u64 {
 /// Under [`TIER_CAP`] this is **twenty at every tier**, and it is written as a constant
 /// rather than as a tenth of the tier so that it says so: a tenth of a capped tier is
 /// twenty from the gate to the nightly, and D-082's phrase "a tenth of the tier" would be
-/// false here above two hundred seeds. Both variants run on it are caught at 48 % and
-/// 77 %, at which twenty seeds miss with probability 4e-7 and 5e-13.
+/// false here above two hundred seeds. Four variants run on it. `ReseedMarkNotSynced` and
+/// `RecordNeverQueued` are caught at 48 % and 77 %, at which twenty seeds miss with
+/// probability 4e-7 and 5e-13. `ServeBeforeRefusedMark` and `TasksOnTheRefusedDir` are caught
+/// on every seed measured, 100 of 100 and 200 of 200.
 const HIGH_RATE_SHARE: u64 = 20;
 
 /// Prints what tier was asked for and what actually ran, once per test.
@@ -328,9 +333,10 @@ fn caught(variant: NodeVariant, run: u64) {
 ///   both streams, its re-seed's of P and the right half's to its placeholder. Not one
 ///   entry of the refused directory, at any depth, changes from the audit before the
 ///   restart to the one at the end, other than the refusal's own marker, and both
-///   streams staged in the directory the re-seed built. Before that fix the start's
-///   tasks were handed the refused directory and both streams staged, synced and were
-///   cleared there: this failed on 200 of 200 seeds (#176).
+///   streams staged in the directory the re-seed built and were cleared there, so no file
+///   is left in either staging directory. Before that fix the start's tasks were handed the
+///   refused directory and both streams staged, synced and were cleared there: this failed
+///   on 200 of 200 seeds (#176).
 #[test]
 fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
     let run = shape_seeds();
@@ -459,4 +465,69 @@ fn a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_
     });
     verdict(&verdicts)
         .expect("a re-seed after a split creates P at the split's generation on every seed");
+}
+
+/// A node that leads a right half made after its re-seed takes its checkpoints and sweeps
+/// them in the directory it runs on (D-041, PROPOSED D-117): `reseed::run_split_after_reseed`,
+/// on [`HIGH_RATE_SHARE`] seeds, correct and under `TasksOnTheRefusedDir`.
+///
+/// `run_after_split` reaches no take and no sweep: every replica of its re-seeded node is
+/// quarantined and never campaigns, so its `apply` task writes nothing and its `snapshot`
+/// task sweeps nothing. A right half the node makes after its re-seed may lead. Here P's left
+/// half is split, whichever other node leads the new right half is crashed until `x` does,
+/// and `x` is written to past the threshold several times over.
+///
+/// On the correct node, on every seed: every check of the trace passes, `x` leads and takes
+/// at least two checkpoints, each take's version directory is in the directory the re-seed
+/// built and none is in the refused one, a sweep has emptied an earlier one there, and the
+/// refused directory is untouched. Measured on 200 seeds: the split applied and every clause
+/// held on all 200, with 8 to 10 takes and 1 or 2 versions still holding files at the end.
+///
+/// Under the variant, on every seed: the same trace checks pass, the same takes are traced,
+/// and every version directory is in the refused directory and none in the fresh one.
+/// Measured on 200 of 200. It catches the two ways to leave a task behind that
+/// `run_after_split` cannot: the `apply` task's `engine_dir`, by where the versions are, and
+/// the `snapshot` task's, by the sweep that empties nothing (PROPOSED D-117 gives the table).
+///
+/// It splits P's left half and not a range the log rebuilt, whose split fails state machine
+/// safety on the re-seeded node, which is #199's.
+// PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+#[test]
+fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs() {
+    let run = HIGH_RATE_SHARE;
+    tier("the split after a re-seed", run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct());
+        report.check()?;
+        report.reached()?;
+        report.refused_untouched()?;
+        report.took_where_it_runs()
+    });
+    verdict(&verdicts).expect("the correct node takes and sweeps where it runs on every seed");
+
+    let variant = NodeVariant::TasksOnTheRefusedDir;
+    tier(&format!("the split after a re-seed, {variant}"), run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct().with(variant));
+        report.check()?;
+        report.reached()?;
+        let right = report
+            .second_right
+            .ok_or_else(|| format!("seed {seed}: {variant}: no split after the re-seed"))?;
+        let takes = report.takes_of(right);
+        let audit = |dir: &Option<reseed::DirAudit>| {
+            dir.as_ref()
+                .map(|audit| reseed::versions_of(audit, right).len())
+                .ok_or_else(|| format!("seed {seed}: {variant}: an audit did not finish"))
+        };
+        let (refused, fresh) = (audit(&report.refused_at_end)?, audit(&report.fresh_at_end)?);
+        if takes < 2 || refused < takes || fresh != 0 || report.took_where_it_runs().is_ok() {
+            return Err(format!(
+                "seed {seed}: {variant} should put every take of range {right} in the refused \
+                 directory: {takes} takes, {refused} versions there and {fresh} where it runs"
+            ));
+        }
+        Ok(())
+    });
+    verdict(&verdicts).expect("the variant's takes are all in the refused directory on every seed");
 }

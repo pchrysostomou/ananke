@@ -519,8 +519,15 @@
 # 1.17), shard 6 2202.8 -> 2205.2; the variant at 2.8 (2.61 + 0.16, 2.71 + 0.14), into the
 # lightest shard, shard 1 at 1977.1 -> 1979.9. D-115's row above runs the same scenario and
 # was not re-weighed: the audits this entry adds to the run are a small part of its 34.7.
+# #192's review (PROPOSED D-117, N2) added one `reseed` row, the directed run of a split after
+# the re-seed, correct and under the variant, twenty seeds each at every tier. Weighed on its
+# tree from the built release binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, two runs, on an Apple M2 of 8 cores with other slices'
+# runs beside it (load averages 381 to 415, so the figure is if anything high): 22.7 cpu s
+# (19.31 + 3.38, 18.89 + 3.86). Into the lightest shard, shard 1 at 1979.9 -> 2002.6. The right
+# half's test gained a clause and keeps its 30.2: one run on this tree under this load read 32.8.
 # shard	binary	cpu_s	test
-# shard 1: 1979.9 cpu s
+# shard 1: 2002.6 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -545,6 +552,7 @@
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
 1	reseed	2.8	a_node_whose_tasks_stay_on_the_refused_directory_is_caught
+1	reseed	22.7	a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed

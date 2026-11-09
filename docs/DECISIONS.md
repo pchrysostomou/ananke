@@ -23527,23 +23527,34 @@ temporary prints in each consumer, which were not committed.
   directory: the node sweep's refusals, about one seed in 10 000, and none in 1 000 probed
   here; `sim/quorum.rs`'s refused node; and `sim/install.rs`'s joiner.
 
-**Takes and sweeps: unreachable today, covered by the fix anyway.** A checkpoint take, and
-the sweep that follows it, need a replica on the node that leads.
+**Takes and sweeps: none observed in the scenarios, reached by a directed test, covered by
+the fix.** A checkpoint take, and the sweep that follows it, need a replica on the node that
+leads.
 - In the start that re-seeded, every replica the re-seed rebuilt is quarantined, and a
   quarantined core never campaigns (D-035; `core.rs` 1369-1371 and 1527-1529).
 - So is every replica a placeholder's install creates on that node (PROPOSED D-109 §2).
 - What is left is a split's right half created **after** the re-seed. The split writes no
-  quarantine for it (Q20, Q26), so it may lead. It would then take checkpoints into
-  `snap-r<id>-…` under whatever directory it was handed, and sweep its own versions there.
+  quarantine for it (Q20, Q26), so it may lead. It then takes checkpoints into
+  `snap-r<id>-…` under whatever directory it was handed, and sweeps its own versions there.
 - The worst case #176 named is not reachable on the correct server: a sweep emptying the
   refused store's *own old* checkpoints. A range's sweep matches only its own id, and an id
   leased after the re-seed is new.
 
-No scenario on `main` reaches even the split's right half. It needs a node refused,
+No scenario on `main` was observed to reach that right half. It needs a node refused,
 re-seeded and not restarted, which then applies a split of a range it holds and leads the
-right half. S10's sharded sweep (`sim/shard.rs`, #188) may reach it, if its schedule refuses
-a node and later splits a range on it within that start. Since the rebinding is the one
-directory every consumer reads, the take and both sweeps land in the fresh directory too.
+right half. That is unobserved, not excluded: the node sweep inserts two split arms on every
+seed (`sim/raft.rs`:1771 and 1779), and refuses a node about once in 10 000 seeds, none in
+the 1 000 probed here. S10's sharded sweep (`sim/shard.rs`, #188) may reach it too, if its
+schedule refuses a node and later splits a range on it within that start.
+
+#199 narrows "a range it holds": a re-seeded node that got a user range back by log replay
+holds no descriptor of it and refuses its split, and state machine safety trips. So today the
+split that makes such a right half is of a range that came back by a stream.
+
+`reseed::run_split_after_reseed` is the directed run for it, and its test is
+`a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs`. After
+`run_after_split` it splits P's left half at `k0a`, crashes whichever other node leads the new
+right half until `x` does, and writes to `x` past the threshold several times over.
 
 **Decision.**
 1. `reseed` returns the fresh engine's configuration, the refused one's in the new
@@ -23588,7 +23599,9 @@ directory every consumer reads, the take and both sweeps land in the fresh direc
     directory, at any depth and other than the marker, differs between the two audits;
   - `AfterSplit::staged_where_it_runs`: the fresh directory, `reseed::fresh_dir()`, holds a
     staging directory of P and one of the right half, so the first clause is asserted of
-    runs whose streams staged somewhere, and the somewhere is named.
+    runs whose streams staged somewhere, and the somewhere is named. Each of them is empty
+    at the end, since an install clears its own staging where the `snapshot` task was told
+    the node runs.
 
   `run_after_split` takes the node's variants.
 - **The variant's test** is `a_node_whose_tasks_stay_on_the_refused_directory_is_caught`, on
@@ -23600,6 +23613,39 @@ directory every consumer reads, the take and both sweeps land in the fresh direc
 
   #187 landed its D-115 clause as a test of its own, so `run_after_split`'s other test passes
   `NodeVariants::correct()` and is otherwise unchanged.
+- **The directed test,** on `HIGH_RATE_SHARE`'s twenty seeds at every tier, holds the other
+  two consumers. Correct: the trace checks pass, the run reaches its situation, the refused
+  directory is untouched, and `AfterSplit::took_where_it_runs` holds: `x` led the new right
+  half and took at least two checkpoints, each take's version directory is in the fresh
+  directory and none is in the refused one, and a version other than the newest was swept
+  empty there. The newest is left out because the crash that ends the run may cut its take
+  short, which leaves an empty directory no sweep emptied. Under `TasksOnTheRefusedDir`: the
+  trace checks pass, and at least as many versions as takes are in the refused directory and
+  none in the fresh one.
+
+**Each consumer is held by a clause that fails (#192's review, N2).** Each was planted alone
+in scratch, the one consumer left on the refused directory, and reverted. Twenty seeds each,
+release; the cells are the seeds that clause failed on, and every check of the trace passed
+in every cell.
+
+| Left on the refused directory | `run_after_split`: `refused_untouched` | `run_after_split`: `staged_where_it_runs` | Directed: `refused_untouched` | Directed: `took_where_it_runs` |
+|---|---|---|---|---|
+| `Snapshots::with_cores` | 20 | 20 | 20 | 0 |
+| `install::Task::new` | 0 | 20 | 0 | 20 |
+| `apply`'s `engine_dir` | 0 | 0 | 20 | 20 |
+| All three (`TasksOnTheRefusedDir`) | 20 | 20 | 20 | 20 |
+| None (correct) | 0 | 0 | 0 | 0 |
+
+Before these clauses the review measured 0 of 20 on `run_after_split` for
+`install::Task::new` and for `apply`'s `engine_dir`. Under each mutant the real tests agree
+on twenty seeds: `install::Task::new` fails both the right half's test and the directed test,
+`apply`'s `engine_dir` fails the directed test alone, and `Snapshots::with_cores` fails both.
+
+Leaving either of those two behind also inflates the takes, on the one seed read: seed 0 takes
+35 checkpoints with the `snapshot` task left behind and 32 with the `apply` task, where the
+correct node takes 8 to 10 on every seed measured. The reading, from the code and not traced,
+is that the two then disagree about where a version is, so `find_version` misses and asks for
+a retake. No check of the trace sees it.
 
 **Measured, release, on this tree, merged with `main` at de9f4d7.**
 - The correct node passes the right half's test at 200 of 200 seeds (`TIER_CAP`), with both
@@ -23607,10 +23653,20 @@ directory every consumer reads, the take and both sweeps land in the fresh direc
 - `TasksOnTheRefusedDir` is caught on 200 of 200. On each, the trace checks pass, what
   changed is staging alone and includes both streams, and the fresh directory holds neither.
 - At 100 %, the catch is asserted at every tier (D-061).
+- **The staging clause:** on 200 of 200 seeds the fresh directory holds exactly two staging
+  directories and not one file in either. No seed left files, so nothing here is weakened
+  for a stream cut short; if a schedule ever reaches one, the clause fails and says which
+  files.
+- **The directed run, correct node:** on 200 of 200 seeds `x` applied the split and every
+  clause held, with 8 takes on 14 seeds, 9 on 160 and 10 on 26, and 1 version still holding
+  files on 197 seeds and 2 on 3.
+- **The directed run, `TasksOnTheRefusedDir`:** on 200 of 200 the takes were all in the
+  refused directory (8 on 14 seeds, 9 on 158, 10 on 28) and no version in the fresh one.
 
 **The rows (D-064).**
 - The right half's test is re-weighed in place at 30.2 cpu s, from 27.8.
 - The variant's test is a new row at 2.8 cpu s, in the lightest shard, shard 1.
+- The directed test is a new row at 22.7 cpu s, then also in the lightest shard, shard 1.
 - `scripts/nightly-shards.txt` gives the measurements, and every header is recomputed from
   the rows beneath it.
 

@@ -109,8 +109,11 @@ _Update this section at the end of every session._
   the refused directory recursively before `x`'s restart and at the end, both with `x`
   down: before the fix it changed on 200 of 200 seeds, two staging directories staged,
   synced and cleared there; after, on none, and both streams staged in `/node-g1`. The pair is
-  `TasksOnTheRefusedDir` (bit 25, Q15's sixth), caught on 200 of 200. The re-seed shape's
-  own top-level-only audit is #190.
+  `TasksOnTheRefusedDir` (bit 25, Q15's sixth), caught on 200 of 200. #192's review added a
+  clause for each consumer that had none: the fresh staging directories are empty at the end
+  (the `snapshot` task), and `run_split_after_reseed`, a split of P's left half that `x` leads,
+  takes and sweeps in the fresh directory (the `apply` task). The re-seed shape's own
+  top-level-only audit is #190; a split of a range the log rebuilt fails on `main`, #199.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

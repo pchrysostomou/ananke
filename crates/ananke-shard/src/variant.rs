@@ -555,7 +555,7 @@ impl NodeVariant {
 
     /// The directed re-seed shape's own, outside §10's count of range-layer variants:
     /// D-067's [`ReseedMarkNotSynced`](Self::ReseedMarkNotSynced), the one way to get
-    /// Q15's *durability* wrong as against the five ways to get the refusal itself wrong
+    /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
     /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
     /// a refusal and the wiring first met on one tree — the applied index an install
     /// makes durable — no, that one is D-083's — the watermark a start begins at, a
