@@ -115,9 +115,24 @@ _Update this section at the end of every session._
   73 of 100, `IdBlockResumed` by check 18 on 44 of 100, `ClientIgnoresMismatch` by check 17 on 99 of
   100. Seed 707 was a defect of the log view (a replica's creation forgets the store it replaced),
   which moved seed 3870's variant catch to leader completeness; seed 992 a defect of the asker (asks
-  anew after a silence behind `NoRangeId`). **Seed 5620 is a correct-system data loss, unfixed and for
-  the owner: an install's switch replaced the span the plan hosted before a split applied (D-131).**
-  Owner questions in D-131. Not pushed.
+  anew after a silence behind `NoRangeId`). Seed 5620 was a correct-system data loss, an install's
+  switch replacing the span the plan hosted before a split applied: D-132 fixes it, merged here, and
+  the seed is pinned on the shaped schedule. Owner questions in D-131. Not pushed.
+- Branch `phase-3-stage-c-install-span-at-switch` (2026-11-09), off aa5e46c, PROPOSED **D-132**
+  (footer D-133), merged locally into S11's branch above, Closes #215: **a correct-server data loss, an install
+  replacing a span overlapping a right half the node already holds**, by two routes D-128 left
+  open, a second stream's copy of configuration's span and a split applied through the log while
+  a stream completes (seed 5620 of S11's sweep). An initialised replica's switch now replaces the
+  host's descriptor's span, read after `open_span_source`, where seed 5620's split had landed and
+  a read at the old place would have missed it, and the store is asked again there, so a snapshot
+  at or below an entry applied meanwhile answers installed and is not switched. `Install::spans` is
+  a copy the correct switch no longer reads, and `InstallWrongRangesSpans`'s doc says so. The pair
+  is `InstallReplacesCopiedSpan` (node bit 51), caught by check 8's install clause on the two directed
+  routes through the task and on seed 5620's pin, which fails under the variant with the original
+  words. On a scratch copy of S11's branch the fix passes its 10 000 seeds. Not closed, named in
+  D-132 §5: a split's apply landing after the install is numbered, reached on no seed from 0 to
+  9 999 but on seed 13283 of S11's sweep, with no issue of its own. #215's related window is
+  unchanged; driven by hand it ends in the same removal, and no run has reached it.
 - Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
   open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
   that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable

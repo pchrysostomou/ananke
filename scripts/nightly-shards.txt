@@ -687,6 +687,10 @@
 # 17.4 (17.09, 17.37, 17.70), shard 4 at 2186.4 -> 2203.8; ReadCheckAtReceiptOnly's check 9 13.8 (13.38, 13.81,
 # 14.14), shard 4 -> 2217.6; its fold-by-fold row in `node` 12.8 (12.20, 12.81, 12.89), shard 4 -> 2230.4; and the
 # pins on seeds 992 (0.13) and 707 (0.09), each 0.1, shard 4 -> 2230.6.
+# D-132's merge into S11's branch added no row of its own (its tests are in the crate's lib, in the `rest` job). The
+# merge added one `shard` row, seed 5620's pin on the shaped schedule, weighed the same way under load averages of 6
+# to 9: 0.2 (0.20 + 0.01, 0.17 + 0.00, 0.17 + 0.00, the median rounded up to a tenth), into the lightest shard, shard 4
+# at 2230.6 -> 2230.8. Every header is recomputed.
 # shard 1: 2689.1 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -766,7 +770,7 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2230.6 cpu s
+# shard 4: 2230.8 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -808,6 +812,7 @@
 4	node	12.8	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only
 4	shard	0.1	seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
 4	shard	0.1	seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view
+4	shard	0.2	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
 # shard 5: 2252.7 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound

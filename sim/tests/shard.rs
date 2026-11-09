@@ -954,7 +954,7 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 // the trace it was pinned on, which D-131 measured by the traces' hashes: a shape lands elsewhere in
 // the run, and no pin here would reach its situation on the shaped schedule. The rule's own case,
 // read: what these pins were pinned for is kept, by running the schedule that reaches it. Seeds
-// 707 and 992, at the end, are the first found on the shaped schedule, and run it.
+// 707, 992 and 5620, at the end, are the first found on the shaped schedule, and run it.
 
 /// A pin's correct run, on the schedule it was found on ([`shard::Schedule::plain`]).
 // PROPOSED(D-131)
@@ -2278,6 +2278,144 @@ fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_b
     assert!(
         retried.took(report.last_fault_healed) <= bound,
         "answered within D-092's bound: {retried:?}"
+    );
+}
+
+/// Seed 5620, the third shape-drawn seed the correct system failed on, and this one a defect of the
+/// system: a data loss D-132 fixes (PROPOSED D-131, D-132). The restart arm leaves node 3 behind on
+/// range 3, node 1 takes a snapshot at 113, the index of its split of range 3 at `k05`, and streams
+/// it to node 3; and node 3's apply of that split, which makes range 20, lands while the stream's
+/// switch is being prepared. The old switch replaced the copy of the span it took at the stream's
+/// last chunk, `[k03, k10)`, and range 20's keys went with it.
+///
+/// **A switch that replaces only the left half is not what this seed shows, and the pin does not
+/// claim it.** The fix has two halves and this seed reaches the first: the snapshot is at the
+/// split's own index, so at the switch the store holds everything the snapshot carries, and the
+/// install is answered installed and switches nothing (`Task::finish`'s second re-check). Replacing
+/// `[k03, k05)` is the case of a snapshot past the split, which `a_split_applied_through_the_log_...`
+/// in `install.rs` asserts. What stands for the mechanism on the trace, since an answer without a
+/// switch traces nothing of its own: the correct run and the variant's are one run, record for
+/// record, up to the variant's switch being spawned, and by then range 20 is made, so the correct
+/// node stood at that switch with the split landed and did not make it. Range 20's keys stay because
+/// nothing on node 3 replaces its span but range 20's own install, at 115.
+// PROPOSED(D-131)
+// PROPOSED(D-132)
+#[test]
+fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys() {
+    let (node, parent, right, index) = (3, 3, 20, 113);
+    let report = shard::run(5620);
+    report.check().unwrap();
+    assert!(
+        report.restart_arms.iter().any(|arm| arm.victim == node),
+        "the restart arm crashed node 3: {:?}",
+        report.restart_arms
+    );
+    let records = report.records();
+    let find = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records
+            .iter()
+            .position(want)
+            .unwrap_or_else(|| panic!("seed 5620 no longer reaches {what}: read its trace"))
+    };
+    let taken = find("node 1's snapshot of range 3 at the split", &|record| {
+        matches!(record.event, TraceEvent::RaftSnapshot {
+            server: 1, range: of, last_index, taken: true, ..
+        } if of == parent && last_index == index)
+    });
+    let streamed = find("node 1's stream of range 3 to node 3", &|record| {
+        matches!(record.event, TraceEvent::RaftSnapshotStreams {
+            server: 1, range: of, to, ..
+        } if of == parent && to == node && record.at >= records[taken].at)
+    });
+    let split = find("node 3's apply of the split", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeSplit {
+                range: of, right: made, index: at, ..
+            } if of == parent && made == right && at == index)
+    });
+    let created = find("node 3's replica of range 20", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeCreated {
+                range: of, cause: RangeCause::Split, ..
+            } if of == right)
+    });
+    assert!(
+        taken < streamed && streamed < split && split < created,
+        "the shape's order: taken {taken}, streamed {streamed}, split {split}, created {created}"
+    );
+    let variant = shard::run_of(
+        5620,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::InstallReplacesCopiedSpan]),
+        RangeVariants::correct(),
+    );
+    let first = records
+        .iter()
+        .zip(variant.records())
+        .position(|(correct, buggy)| correct != buggy)
+        .expect("the variant changes the run");
+    let switch = &variant.records()[first];
+    assert!(
+        created < first
+            && node_of(switch) == Some(node)
+            && matches!(switch.event, TraceEvent::TaskSpawned { name, .. } if name == "span-install"),
+        "the two runs are one until the variant's switch on node 3, with range 20 made \
+         (at {created}): they part at {first}, {switch:?}"
+    );
+
+    let (start, end) = match &records[created].event {
+        TraceEvent::RangeCreated { start, end, .. } => (start.clone(), end.clone()),
+        other => unreachable!("{other:?}"),
+    };
+    let own = |range: u64| {
+        let interval = ananke_raft::store::KeyPrefix::group(range).span();
+        (interval.start, interval.end)
+    };
+    let mut own_installs = 0;
+    for record in &records[created..] {
+        if node_of(record) != Some(node) {
+            continue;
+        }
+        match &record.event {
+            TraceEvent::SpanInstalled { spans, .. } => {
+                assert!(
+                    !spans.contains(&own(parent)),
+                    "seed 5620 switched range 3 on node 3 after the split: {spans:?}"
+                );
+                if spans.contains(&own(right)) {
+                    own_installs += 1;
+                } else {
+                    assert!(
+                        !spans.iter().any(|(from, to)| *from < end && start < *to),
+                        "a switch that was not range 20's replaced its keys: {spans:?}"
+                    );
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                assert_ne!(*range, right, "node 3 removed its replica of range 20");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(own_installs, 1, "range 20's own install on node 3, at 115");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftSnapshotStartOver { server, range: of, .. }
+                if server == node && of == parent
+        )),
+        "the stream was answered, not refused: an install answered installed starts nothing over"
+    );
+
+    let why = variant.check().expect_err("the variant fails seed 5620");
+    assert!(
+        why.contains("one owner per key")
+            && why.contains("an install of range 3 on node 3 replaced")
+            && why.contains("k03\", ")
+            && why.contains("k10\"), which overlaps its replica of range 20 over")
+            && why.contains("k05\", ")
+            && why.contains("and removes that replica's keys"),
+        "the violation seed 5620 is pinned for: {why}"
     );
 }
 
