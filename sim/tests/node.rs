@@ -2855,8 +2855,8 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_over
 
 /// Check 8's install clause against `InstallReplacesHostedSpan` (PROPOSED D-128), compared
 /// on `reseed::run_after_split`, where the right half's install lands before P's on about a
-/// third of seeds, so at every tier (D-061). The node sweep refuses no store (D-116), so
-/// it never makes a span-less replica. On every compared seed the folds agree fold by
+/// third of seeds, so at every tier (D-061). The node sweep refuses a store on about one
+/// seed in ten thousand, so it almost never makes a span-less replica. On every compared seed the folds agree fold by
 /// fold; on a seed the clause trips, every descriptor is right and it alone of the folds
 /// that stop a run is in violation. The correct node's run holds the clause green on the
 /// same seeds through its verdict (`sim/tests/reseed.rs`).

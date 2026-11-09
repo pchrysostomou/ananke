@@ -1259,8 +1259,8 @@ const SPLIT_SLICE: Duration = Duration::from_millis(50);
 /// How long the run goes on after `x` starts again on its lost store: its re-seed
 /// streams, and its right half's stream to its placeholder.
 const SPLIT_AFTER: Duration = Duration::from_secs(8);
-/// How many keys the right half's writer writes, each once: a key written twice would
-/// hide its own loss at its next write.
+/// How many keys the right half's writer writes, one put a key, resent until it is
+/// answered: a key a resend applies a second time can hide its own loss (D-128 §5).
 // PROPOSED(D-128)
 const RIGHT_KEYS: u64 = 100;
 /// The gap between two of its writes, so its keys span the split and `x`'s crash and the
@@ -1986,7 +1986,7 @@ fn split_of(records: &[TraceRecord]) -> Option<(u64, u64)> {
 /// told to stream (SHARD.md §5, Q22). `x` may have voted in R before its loss, and the
 /// replica its placeholder's install creates is quarantined (PROPOSED D-109 §2).
 ///
-/// A second writer puts keys of the right half's span, each once, through the split
+/// A second writer puts keys of the right half's span, one put a key, through the split
 /// and `x`'s loss. Which of `x`'s two installs lands first is the schedule's draw: when
 /// the right half's does, P's install finds a replica holding keys of the span
 /// configuration names for P, and when the run is over `x`'s engine is read off its disk

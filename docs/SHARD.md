@@ -810,8 +810,9 @@ interval and the snapshot's span, as a placeholder's does, and no key configurat
 names for it beyond that (D-128). A node's replica of P that already applied past a
 snapshot answers it installed without switching (RAFT.md:222-224), so a replica of P that applied `s` is never set
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
-R could have been installed on the node only if no replica of P covered its span, and
-then no replica of P is there to apply `s`. The apply asserts it.
+R could have been installed on the node only if no initialised replica of P covered its
+span, and then no initialised replica of P is there to apply `s`; a replica with no
+descriptor that replays to `s` refuses the split instead (#199). The apply asserts it.
 
 **What is atomic with what.**
 

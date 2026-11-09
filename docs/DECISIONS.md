@@ -23644,7 +23644,7 @@ its span is the snapshot's and unknown until the stream completes", with a switc
 replaces "the Raft interval and the descriptor's span". D-107 §4 records configuration's span
 for a replica without one, names this hazard for the *next* install, and fixes only that one.
 This entry amends D-107 §4: the *first* install of a replica with no descriptor is where the
-hazard is, and it is closed there.
+hazard is, and this entry closes it for one stream at a time (section 9 names what it leaves).
 
 **The bug, on a correct server.** S10's sweep found it (D-113, #188), and an independent
 verifier reproduced it. A bootstrap node whose engine is refused re-seeds configuration's
@@ -23721,8 +23721,10 @@ an install, and one-key spans of P's Raft state on a split's non-voter's step
 (`RaftStore::apply_removing`, D-107 §1), which removes the right span and is no other replica's
 business. A crash and a refusal forget the node's spans, as they do for the overlap clause.
 
-- **It reads the engine and not the plan**, so no error in how spans are chosen in the shard
-  crate can get past it.
+- **It reads the engine and not the plan**, so a span the plan or the host got wrong is caught
+  when the switch overlaps a replica the node holds. It does not catch every wrong choice: it
+  names the installed replica from the Raft keys among the spans, so an install carrying another
+  range's spans passes it (the review's probe, `InstallWrongRangesSpans`'s shape).
 - **In `Fold::ALL` and `Fold::VERDICT`, after the overlap clause.** No violation another fold
   reports moves to it. A `SnapshotOverlapsReplica` install trips it at `SpanInstalled` and the
   overlap clause at the `RangeCreated` after; the verdict still names the overlap clause.
@@ -23760,8 +23762,11 @@ equivalence test compares it on the same run at every tier:
 
 **`reseed::run_after_split` reads the data.** Until now its right half held no user keys and the
 run checked no data, so the order it reached went unseen. A second writer, `right_writer`, puts
-100 keys of the right half's span, `k1-0001` onwards, each once, 40 ms apart, so they span the split
-and `x`'s crash and no later write can put one back. It asks P and follows `RangeMismatch` to the
+100 keys of the right half's span, `k1-0001` onwards, 40 ms apart, so they span the split and `x`'s
+crash. Each key is one put, resent until it is answered, so a resend can apply it a second time: on
+this PR's first commit, 78 of 200 seeds had a key applied twice, 81 of 12 536 keys. A key applied at
+or below the floor and again above it hides its own loss, so the test is weaker for a loss of very
+few keys; the variant loses the rest and is still caught. It asks P and follows `RangeMismatch` to the
 right half. When the run is over, with the trace already taken,
 `x` is crashed and its engine opened and scanned (`keys_on_disk`). `AfterSplit::right_keys_survive`
 holds every key a replica applied below the split or at or below `x`'s install's floor to be
@@ -23900,6 +23905,12 @@ nothing else.
   (section 7). Reading the span from the host's descriptors at the switch would close it. It
   is a change for an initialised replica, which this correction leaves alone, so it is a
   candidate for an issue of its own.
+- **A second window, on the same re-seed shape (#215), reached by a directed test and by no run.**
+  Two senders' streams of a replica with no descriptor both complete before the first switch, so
+  both copies hold configuration's span. The second is stepped after the first's `Switched`, by
+  which time the replica counts as initialised, and it replaces its stale copy, R's keys with it.
+  Check 8's install clause names it. S10's seeds 0 to 1999 made about 600 installs onto a replica
+  with no descriptor and none met it.
 - **#199: a replica with no descriptor that came back by the log.** The same family, not the same
   bug, and this correction does not cover it. A re-seeded user range whose leader has not compacted
   replays its log and never installs, so nothing here gives it a descriptor, and a later split of it
