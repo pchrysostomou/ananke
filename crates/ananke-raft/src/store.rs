@@ -785,6 +785,13 @@ pub struct RaftStore<E: Environment> {
     /// only an install's repair writes it, and that builds a new store.
     // D-042: store incarnations.
     incarnation: u64,
+    /// Whether the store holds the re-seed quarantine flag (D-035), as it opened or as
+    /// [`mark_reseeded`](Self::mark_reseeded) set it. An install's repair writes the
+    /// flag too, and that builds a new store, so the field cannot go stale. A split's
+    /// apply reads it here and not from the engine, so that a seed with no quarantine
+    /// has the schedule it had before the rule that reads it (D-130).
+    // PROPOSED(D-130): a right half made on a quarantined parent takes the quarantine.
+    quarantined: bool,
 }
 
 impl<E: Environment> RaftStore<E> {
@@ -936,6 +943,7 @@ impl<E: Environment> RaftStore<E> {
                 last_index: AtomicU64::new(last_index),
                 applied: AtomicU64::new(applied),
                 incarnation,
+                quarantined,
             },
             Recovered {
                 log,
@@ -1201,7 +1209,16 @@ impl<E: Environment> RaftStore<E> {
         // that life is the re-seeded replica's: every message this store stamps must
         // carry the number now on the disk, not the 1 a fresh store opened at.
         self.incarnation = incarnation;
+        self.quarantined = true;
         Ok(())
+    }
+
+    /// Whether this replica is quarantined on this store (D-035): the flag as it opened
+    /// or as [`mark_reseeded`](Self::mark_reseeded) wrote it, with no read of the engine.
+    // PROPOSED(D-130)
+    #[must_use]
+    pub fn quarantined(&self) -> bool {
+        self.quarantined
     }
 
     /// Reads the snapshot record back, if the store holds one.
@@ -1439,17 +1456,25 @@ pub fn initial_state_into(prefix: &KeyPrefix, config: &Configuration, batch: &mu
 /// Q20, Q26): a hard state of current term 1 and no vote, an applied index of
 /// `index`, the split's, a snapshot record of last index `index`, last term 1 and
 /// `config`, the parent's plain configuration at the split, naming no checkpoint, the
-/// configuration key at `index`, and `incarnation`, drawn fresh for the replica, with
-/// no quarantine. Every replica of the parent writes the same state from the same
-/// entry, so the new group starts from one floor on each of them.
+/// configuration key at `index`, and `incarnation`, drawn fresh for the replica.
+/// Every replica of the parent writes the same state from the same entry, so the new
+/// group starts from one floor on each of them. `quarantined` is the parent's replica's
+/// on this store: where it is set the right half takes the quarantine flag in the same
+/// batch, since the split may be a replay of one the node applied before its loss, and
+/// the vote the right half's lost replica cast went with that loss (D-035, D-130).
 // PROPOSED(D-100)
+// PROPOSED(D-130): a right half made on a quarantined parent takes the quarantine.
 pub fn split_state_into(
     prefix: &KeyPrefix,
     config: &Configuration,
     index: Index,
     incarnation: u64,
+    quarantined: bool,
     batch: &mut WriteBatch,
 ) {
+    if quarantined {
+        batch.put(prefix.quarantine_key(), Bytes::from_static(&[1]));
+    }
     batch.put(prefix.hard_key(), encode_hard(1, None));
     batch.put(prefix.applied_key(), encode_applied(index));
     batch.put(

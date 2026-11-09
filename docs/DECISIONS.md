@@ -22300,7 +22300,11 @@ to R", no quarantine, though the R it lost may have voted. Q26 argues only for a
 quarantined replica of P takes P's quarantine. A replica is quarantined only by a re-seed
 (D-035), so this amends Q26 for re-seeded replicas alone. The cost is a right half
 quarantined that need not be: one whose split the node first applied after its re-seed.
-Nothing is built for it here.
+Nothing is built for it here. *Corrected after #173 merged:* the owner ruled on 2026-11-09
+that this recommendation is the fix, and D-130 builds it. Replicas that take a quarantine at
+a split's apply are `RaftReseeded` and `RaftRecovered { state: quarantined }` at their
+creation, as `created_by_install` states the ones it makes, and the two seeds of ten thousand
+that lost committed data this way, 3870 and 5303, pass.
 
 **For the owner (PROPOSED, #178): the re-seed's refused mark for replicas configuration
 does not name.** #174's review (B1) found that a re-seed refuses and marks only `hosted`,
@@ -23351,9 +23355,10 @@ resumes.
 **Corrected after #188 merged:** #188 merged at 08f0c62 with §1 to §4 as they stood, the slice
 unfinished. The branch `phase-3-stage-c-shard-sim-rest` finishes it on top of #198 and #200
 (D-128, D-129), and §5 to §11 below are additions made after that merge. The title's "stopped"
-is how #188 left it. Main's nightly was red on seed 41. These end that and do not make it green:
-at ten thousand seeds the correct system still fails seeds 3870 and 5303, #175's, whose fix lands in
-its own PR after the PRs now open (§11).
+is how #188 left it. Main's nightly was red on seed 41. These ended that and did not make it green:
+at ten thousand seeds the correct system still failed seeds 3870 and 5303, #175's, whose fix
+lands in its own PR after the PRs now open (§11). *Corrected after #175's fix:* D-130 is that PR
+and both pass.
 
 ### 1. What is built
 
@@ -23450,7 +23455,8 @@ against a leader that cannot confirm a read. **Not widened; reported to the owne
 can never confirm and drops the pending ones, and `READS_OUTSTANDING` stays 38: #198 (D-129).
 **(b) moved seeds.** #200 changes what a re-seeded node's engine holds, so seeds 128 and 643 no
 longer reach this: each has one store refused where it had two. On the merged tree the situation
-stands on seed 986. All three are pinned, 128 and 643 on the absence with that reason (§11).
+stood on seed 986. All three are pinned, 128 and 643 on the absence with that reason (§11).
+*Corrected after #175's fix:* D-130 moved seed 986 off it too, and seed 463 carries it now.
 
 **(c) A check defect of this slice's own.** 12 seeds, 217, 248, 253, 260, 281, 309, 313,
 329, 457, 657, 945 and 952: "liveness: no client write completed after the last heal". Two nodes are refused, so range 2 has lost its majority, as (b)'s seeds have, and the
@@ -23732,9 +23738,9 @@ Since the ruling no check fails them, and the sweep's printed line is what shows
 built here: a placeholder becoming a voter without a leader where its node's engine never held R. It must come after
 #175's.
 
-The same ten thousand also fails the correct system on seeds 3870 and 5303, by another check: #175, one refused node,
-a committed entry lost (§11). The owner ruled on 2026-11-09 that its fix lands in its own PR after the PRs now open. Until
-then 3870 and 5303 stay red.
+The same ten thousand also failed the correct system on seeds 3870 and 5303, by another check: #175, one refused node,
+a committed entry lost (§11). The owner ruled on 2026-11-09 that its fix lands in its own PR after the PRs now open. It
+did, as D-130, and 3870 and 5303 pass there.
 
 **The pair.** `MetaOverwritesByArrival`, on what this sweep's drops and resends do by themselves, each
 run taken to its end (`shard::run_to_the_end`, since check 16 would otherwise stop it first): check 16
@@ -23872,8 +23878,10 @@ the node sweep already has.
 
 At 1 000 seeds in release on #198 and #200 with this work: **0 fail**, and all 24 tests of the binary pass.
 
-**At 10 000 seeds the correct system still fails, on two seeds, 3870 and 5303** (#216's review; 3291 and 8934
-failed there too, and those two were check defects, §5). So this branch does not turn the nightly green.
+**At 10 000 seeds the correct system still failed, on two seeds, 3870 and 5303** (#216's review; 3291 and 8934
+failed there too, and those two were check defects, §5). So this branch did not turn the nightly green.
+*Corrected after #175's fix:* D-130 is the fix these two were waiting on. Both pass there, and the
+10 000-seed sweep reads 0 fail.
 
 - **Seeds 2272 and 7949: a right half with no possible majority**, one refused node and one placeholder,
   which grants no vote. It elects no one and meta is never told. Both pass: the owner's ruling of 2026-11-09
@@ -23890,13 +23898,13 @@ failed there too, and those two were check defects, §5). So this branch does no
   completeness. Both fail in the same words on the base, 2f223b1, and nothing on this branch changes what
   the correct server does there.
 
-**#175's fix lands in its own PR after the PRs now open**, the owner's ruling of 2026-11-09 on #175. It is not
-built here, and neither the live set nor the bound is changed for those two. Until it lands,
-`every_seed_passes_on_the_correct_sharded_sweep` fails seeds 3870 and 5303 at the nightly's tier.
+**#175's fix lands in its own PR after the PRs now open**, the owner's ruling of 2026-11-09 on #175. It was not
+built here, and neither the live set nor the bound is changed for those two. *Corrected after #175's fix:* it landed
+as D-130, which pins the two seeds on their mechanism, and the sweep no longer fails them.
 
 **The pins**, each asserting its mechanism: seed 41 on (a) (the right half's install first; under
 `InstallReplacesHostedSpan`, check 8's install clause at the switch); seeds 128 and 643 asserting (b)'s
-absence, with #200 as the reason; seed 986 on (b) as it stands now (reads refused and dropped; under
+absence, with #200 as the reason; seed 986 on (b) as it stood then, and seed 463 on it since D-130 (reads refused and dropped; under
 `UnconfirmableReadKept`, the bound); seed 286 on a new run's empty block and seed 368 on a grant whose
 answer has not landed, neither of which refuses a store; seeds 2272 and 7949 on the wedge the owner excused, each
 condition of the ruling and what the bound would have said (§6).
@@ -24593,6 +24601,10 @@ leads.
 - What is left is a split's right half created **after** the re-seed. The split writes no
   quarantine for it (Q20, Q26), so it may lead. It then takes checkpoints into
   `snap-r<id>-…` under whatever directory it was handed, and sweeps its own versions there.
+  *Corrected after #175's fix:* D-130 quarantines that right half too, so on the correct
+  node nothing on a re-seeded node leads or takes. The directed test below runs under
+  `SplitLeavesQuarantineBehind`, where the right half may still lead, and asks the tasks'
+  directories of that; a second test asserts the correct node's absence (D-130).
 - The worst case #176 named is not reachable on the correct server: a sweep emptying the
   refused store's *own old* checkpoints. A range's sweep matches only its own id, and an id
   leased after the re-seed is new.
@@ -24660,7 +24672,7 @@ right half until `x` does, and writes to `x` past the threshold several times ov
     at the end, since an install clears its own staging where the `snapshot` task was told
     the node runs.
 
-  `run_after_split` takes the node's variants.
+  `run_after_split_under` takes the node's variants.
 - **The variant's test** is `a_node_whose_tasks_stay_on_the_refused_directory_is_caught`, on
   `HIGH_RATE_SHARE`'s twenty seeds at every tier. On every seed it asserts that:
   - the run passes every check of the trace and reaches its situation;
@@ -25849,4 +25861,170 @@ and the variant 6.3, each on its twenty, into shard 5 at 1981.0 -> 1993.9.
 
 ---
 
-_Next entry: D-130. Add one before implementing anything not covered above._
+## D-130 — A right half a split's apply makes on a quarantined replica of its parent takes the quarantine (#175); Q26 amended
+
+**The number.** Off 91a1946, the merge of the eight open Stage C PRs, whose footer reads D-130.
+The footer here moves to D-131. Every code site carries `// PROPOSED(D-130)`.
+
+**The owner's ruling (2026-11-09, #175).** A replica of a right half R that a split's apply
+creates on a quarantined replica of its parent P takes P's quarantine, in its own PR after the
+open PRs have merged. It is the recommendation of D-109 §2 and of #175, built as written, and it
+amends Q26 for that case. The owner chose the cost knowingly: a wedge can be repaired later and
+acknowledged data lost cannot. Everything below marked PROPOSED is how this slice carried it out.
+
+**The problem.** Q26 and SHARD.md §5 say a split does not copy P's quarantine to R, because no
+store held a vote of R's before the split's apply, so a re-seed of P *before* the split lost
+nothing of R's. That covers a re-seed before the split. It does not cover this one:
+
+1. Node `n` is a voter of P, applies P's split at `s` and creates R. R's terms start at 1 at `s`
+   and `n`'s replica of R votes in R's elections.
+2. `n` loses its engine and is refused whole (Q15). The re-seed rebuilds configuration's
+   replicas, P among them, each marked and quarantined (D-035, D-077). R is not among them.
+3. P's leader re-seeds `n`'s P from a checkpoint below `s`, so `n`'s P replays `s` from the log.
+4. That apply creates R again, at current term 1, with no vote and, by Q26, no quarantine. The
+   replica `n` lost may have voted, and this one can vote again in a term its predecessor voted
+   in. That is the double vote D-035's quarantine exists to prevent (Raft's `votedFor` must
+   survive restarts; Ongaro and Ousterhout, Figure 2). `n` cannot tell the replay from a first
+   apply: what would tell them apart was in the engine it lost.
+
+**What was measured, on this tree.** The sharded sweep at 10 000 seeds in release, the correct
+server and `SplitLeavesQuarantineBehind`, which is the server as it stood before this entry.
+
+- The variant fails seeds 3870 and 5303 and no other, as the correct system did on main (D-113
+  §11). *Seed 3870, range 19, parent 11, split 106:* entries 107 to 115 of term 2 are committed on
+  nodes 2 and 3, node 3 is refused, its range 11 is re-seeded at 103, it replays the split at
+  106 and re-creates 19 with no quarantine, and with node 1's vote it leads term 4 from last
+  index 106 and applies a 107 of its own: "state machine safety: index 107 of group 19 was
+  applied as term 2 ... and term 4 ... on server 3". *Seed 5303, range 44, parent 43, split 87:*
+  node 3 is refused, re-seeded at 83, replays the split and re-creates 44, and grants node 1
+  term 5 with last index 88 against a committed 89: "leader completeness: index 89 of group 44
+  (term 2) was committed in term 2 but server 1, leader of term 5, does not hold it".
+- The correct server fails none of the 10 000 (this entry's own tree, before the pins it adds).
+  It makes 4 883 replicas of right halves on a quarantined replica of their parent, and states
+  every one of them quarantined at its creation. Grants from a replica with no quarantine on a
+  node that has been refused: 0, where the variant has 9 676.
+
+**Decision.** PROPOSED: how the ruling is carried out.
+
+1. *The store.* `RaftStore` keeps a `quarantined` flag in memory, set from the disk at the open and
+   by `mark_reseeded`, read through `RaftStore::quarantined()` with no I/O. An install's repair
+   writes the flag too and builds a new store, so the field cannot go stale. Reading it costs the
+   engine nothing, so a seed with no quarantine has the schedule it had.
+2. *The split's apply.* `split_state_into` takes `quarantined` and writes R's quarantine key in the
+   split's own batch when P's replica here is quarantined. It is durable with everything else in
+   the batch, or none of it is.
+3. *The statement.* Where the store R opens on is quarantined, the apply traces `RaftReseeded` and
+   `RaftRecovered { state: quarantined }` at R's creation, as `created_by_install` does (D-109 §2).
+   Without them, on this tree, seed 41 fails the timers check: "server 2's replica of range 21
+   heard from no leader of its term and granted no vote since 4.432 s and had not campaigned by
+   4.750 s". `impaired_voters`, the majority rule's reading, takes its quarantined set from the
+   same `RaftReseeded`, so it would count the replica as able too.
+4. *A restart.* The key is what the disk says, and the restart's `restate` traces it, per replica,
+   as any quarantined replica's: `RaftReseeded`, then `RaftRecovered { state: quarantined }`.
+   `seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split` pins that.
+
+**The pair.** `NodeVariant::SplitLeavesQuarantineBehind`, bit 50, restores the server as it stood:
+the split's apply copies no quarantine. Two seeds in ten thousand is far below D-061's 5 %, so the
+pair lives on its pins, at every tier
+(`seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries`). On
+the correct server each seed reaches the mechanism: node 3 lost a replica that had voted, its
+parent was re-seeded below the split, it replays the split, the replica it makes states its
+quarantine, grants no vote and leads nothing, what it had committed before its loss is on the
+next leader, no replica applies one of those entries at another term, and the third node applies
+them at theirs. Under the variant each fails for the named reason: state machine safety on 3870,
+leader completeness on 5303, with the replica having voted and never stated quarantined. Seed
+2097 is the pair for the restart: the correct restart states the replica quarantined, and under
+the variant the replica votes and the restart states it with none.
+`a_right_half_takes_its_parents_quarantine_in_the_splits_batch` is the store's own round trip.
+
+**What the fix moved, and what each pin now says.**
+
+- *Seed 41:* two stores refused where it had one, node 1's after node 2's, since a right half made
+  on a quarantined parent no longer votes and the schedule moved. Its mechanism (the right half's
+  install before its parent's on the refused node, and check 8's install clause under
+  `InstallReplacesHostedSpan`) still holds, and node 2's refusal, the first, is the one pinned.
+- *Seed 986:* it no longer reaches a leader unable to confirm a read: one store refused where it
+  had two, no read refused, none traced unconfirmable, and `UnconfirmableReadKept` passes it.
+  `seed_463_a_leader_refuses_the_reads_it_can_never_confirm` carries the situation now, on two
+  stores refused and 84 reads refused, where the variant fails at "range 4 holds 39 registered
+  reads". Seed 986 joins 128 and 643 in the test that asserts the absence with its reason.
+- *`reseed::run_split_after_reseed`, D-117's directed run:* `x` no longer leads the right half made
+  after its re-seed, because that replica now takes the quarantine, so the correct node reaches
+  neither a take nor a sweep on a re-seeded node. Asked of the correct node, D-117's test failed
+  on all twenty seeds with "led ...: false, and took 0 checkpoints". What it holds is the tasks'
+  directories, so it now runs under `SplitLeavesQuarantineBehind`, where a replica of a re-seeded
+  node may still lead, and asks each of its clauses as before, under that variant alone and with
+  `TasksOnTheRefusedDir`. The absence on the correct node is asserted beside it
+  (`a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes`), so
+  the day a re-seeded node can lead again that test says so.
+- *Everything else* (286, 368, 2272, 3291, 7949, 8934 and the other binaries' pins) is unchanged.
+
+**The cost, re-measured on this tree against the base,** 10 000 seeds of the sharded sweep. A
+replica is *needed* where its node had created that right half before its latest refusal (a
+replay), and *not needed* where the split's apply is the node's first of it. A right half has no
+possible majority at the run's end where fewer than two of its voters hold it and are neither
+impaired nor quarantined.
+
+| | base (`SplitLeavesQuarantineBehind`) | D-130 |
+|---|---|---|
+| seeds failing | 2 (3870, 5303) | 0 |
+| replicas made by a split's apply on a quarantined parent | 3 645 | 4 883 |
+| of which needed: a replay of a split the node had applied | 202, none quarantined | 207, all quarantined |
+| of which not needed: the node's first apply | 3 443, none quarantined | 4 676 (95.8 %), all quarantined |
+| grants from a replica with no quarantine on a refused node | 9 676 | 0 |
+| right halves with no possible majority at the end | 425 of 37 470 | 909 of 37 303 |
+| of those, attributable to the quarantine a split's apply took | | 464 |
+
+D-130's count of replicas is the higher because a right half that now takes the quarantine passes
+it on: a replica made by a later split of that right half is made on a quarantined parent too, and
+the base's right half is not. *Attributable* is a right half with no possible majority that would
+have two voters able to vote if the replicas that took a quarantine at a split's apply counted as
+able.
+
+**The meta convergence bound (SHARD.md §8, #220) is not changed and asks these ranges as before.**
+Condition three of the owner's exception is literal, so a right half that wedges with one
+quarantined replica is held in `others` and stays asked. At 10 000 seeds that bound fails no
+correct seed: 18 descriptors excused and the bound without the exception failing the same two
+seeds, 2272 and 7949, on both trees. **Item for the owner:** nothing here widens the exception, and
+were a future seed to fail it that way the sweep would report it.
+
+**The narrowing, not built or measured.** A leader could carry a bound: a split entry of its own
+term above its last index when the stream began cannot have been applied before the loss, so the
+replica it makes on the re-seeded node need not be quarantined. Of the 4 676 not needed here, the
+split was applied on no node before the refusal on 4 537 (97.0 %). That is an estimate of what the
+bound could spare, not a measurement of a bound. Not built here.
+
+**The crash inside `reseed()`'s marking loop: unforced.** Each mark is its own synced batch, so a
+crash inside the loop restarts with the later replicas unmarked. That is by reading the code, and
+no scenario aims at it. At 10 000 seeds of this tree no crash landed between a node's refusal and
+that start's `RangesRestated`, the window the marks are written in, so no replica came back
+unmarked that way and none granted a vote. It is D-077's window and not this entry's, and nothing
+is built for it here.
+
+**The narrow exception's tests and §5's clause (#223).** Three cases in `sim/shard.rs` for the three
+inputs of `right_halves` no test could fail: that it reads the last fault's heal and not the
+liveness window's start (the one of the three that widens the exception), that it passes the
+majority rule's impaired voters, and that `RaftRecovered { state: quarantined }` counts as
+quarantined. SHARD.md §5's "excuses exactly it" now names the clause it left out, a voter that
+holds no replica of P.
+
+**Stale phrases left by the merge, each one line.** D-117's "`run_after_split` takes the node's
+variants" is `run_after_split_under`; `variant.rs`'s comment beside D-117's bit no longer counts
+the free bits, which the last taken bit says; and `Fold::Overlap`, whose doc said it was asked
+last, and `check_8s_overlap_clause_is_third_from_last_and_its_right_half_clause_is_not_in_it`, the
+renamed test, say third from last. That test lives in `ananke-shard`'s unit tests and has no row in
+the nightly's table.
+
+**The nightly's rows (D-064).** Weighed from the built release binaries (`<binary>-<hash> <test>
+--exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the median, on an
+Apple M2 of 8 cores under load averages of 16 to 23. Two pins renamed in place in shard 5, seed
+986's row to seed 463's at 0.1 and the absence's row at 0.3 -> 0.6, for a third seed and the
+variant's runs. New rows longest-first into the lightest shard:
+`a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes` at 9.6,
+shard 4 at 2176.8 -> 2186.4; the pair of 3870 and 5303 at 0.3, shard 6 at 2179.9 -> 2180.2; seed
+2097's at 0.2, shard 6, -> 2180.4. D-117's directed test keeps its 22.7: it runs the runs it ran,
+and one weighing here read 23.9.
+
+---
+
+_Next entry: D-131. Add one before implementing anything not covered above._

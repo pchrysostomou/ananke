@@ -678,7 +678,8 @@ nothing. Otherwise one synced batch on each replica holds:
   and no vote (Q20); an applied index of `s`; a snapshot record of last index `s`, last
   term 1 and P's configuration at `s`, naming no checkpoint; the configuration key; and
   an incarnation drawn fresh for R's replica, with no quarantine flag, since a split does
-  not copy P's quarantine to R (Q26);
+  not copy P's quarantine to R (Q26) except where this replica of P is quarantined, when
+  the batch carries R's flag too (D-130);
 - no user key: with one engine per node R's data is already where it is (Q2).
 
 R's Raft state is written only on a node that is a voter of P's configuration at `s`. A
@@ -713,13 +714,19 @@ apply is (RAFT.md §3); a crash after it restarts both replicas from their keys.
 | snapshot record | P's last take, which covers P's whole span | the floor at `s`, with no checkpoint behind it: the first stream asks for a take (node.rs:1759-1766) |
 | proposals remembered (node.rs:952-957, 2031) | P's; entries above `s` for right-half keys apply as nothing (§3) | none |
 | pending reads | right-half keys refused at serving | none |
-| store incarnation (D-042), quarantine (D-035) | P's replica's | an incarnation drawn fresh; no quarantine: P's replica's is not copied (Q26) |
+| store incarnation (D-042), quarantine (D-035) | P's replica's | an incarnation drawn fresh; no quarantine, P's replica's not being copied (Q26), except that a replica of R made on a quarantined replica of P takes its quarantine (D-130) |
 | meta record | P's until the leader's update | none until then; P's record still names R's span at generation g, so meta has no gap (§1) |
 
-The quarantine is not copied (Q26). A replica is quarantined because its store may have
-lost a vote in some term of its group (D-035). R is a new group whose terms start at 1
-at the split's apply, and no store held a vote of R's before that apply, so a re-seed of
-P's replica before the split lost nothing of R's. Q15 refuses a whole node at a loss and
+The quarantine is not copied (Q26), except where P's replica is quarantined (D-130). A
+replica is quarantined because its store may have lost a vote in some term of its group
+(D-035). R is a new group whose terms start at 1 at the split's apply, and no store held a
+vote of R's before that apply, so a re-seed of P's replica before the split lost nothing
+of R's. A re-seed after it can have: P's replica goes back to a checkpoint below `s`,
+replays `s` and makes R a second time, and the replica of R the node lost may have voted.
+The apply cannot tell that replay from a first apply, since what would tell them apart was
+in the engine the node lost, so a replica of R made by the apply of `s` on a quarantined
+replica of P takes the quarantine, in the same batch, and is stated quarantined at its
+creation (D-130). Q15 refuses a whole node at a loss and
 re-seeds each of its replicas from its own leader, so each re-seeded replica draws its
 own incarnation and carries its own quarantine flag; that is why both are per replica
 (Q26). Kept per node store, a node that lost one table would be quarantined in every
@@ -788,7 +795,8 @@ and each of them applies `s`. There are two exceptions. The first is a
 replica of P removed before it applied `s`: its node's R is then initialised only by a
 snapshot, after the stale P is collected (Q27). The second (PROPOSED D-113, #220) is a
 replica of P installed past `s`, which never applies `s`, so that its R is a placeholder
-only R's leader can end. Where R's other voters are one that was refused and one that is
+only R's leader can end, or a voter that holds no P at all, which has nothing to apply `s`.
+Where R's other voters are one that was refused and one that is
 initialised, R has no leader and can get none: the initialised voter stays a pre-candidate
 for good, and no data is lost. Nothing built today ends that shape. §8's meta convergence
 bound excuses exactly it, by the owner's ruling of 2026-11-09 recorded in #220 and D-113
@@ -2498,7 +2506,7 @@ per-replica incarnation and quarantine (Q26), the re-seed shape and its variant
   Q23's rules for a split, refused at proposal while a change is catching up and at apply
   while the configuration at or below `s` is joint, and, on a replica that is not a voter
   of P at `s`, no R and a range delete of the right span (Stage A); P's quarantine not
-  copied (Q26).
+  copied (Q26) except to a replica of R made on a quarantined replica of P (D-130).
 - Placeholders (§5, Q22; §11, raft 7, 17): no vote or pre-vote and no acknowledgement;
   AppendEntries answered as a refused server answers, hint 1, echo 0, incarnation 0,
   counted for check quorum only as D-049 counts a refused server.
@@ -2607,7 +2615,8 @@ as an index of the range-local authority (Q3, Q36). Range ids leased in blocks (
 with §5's three rules marked as SHARD.md's and not Q17's, and the exhausted block's answer
 (question 1). Split (Q18 to Q21; Q23's rules for a split; Q27's overlap rule and
 `Overlaps`), keeping SPEC's "term 1" with no superseding entry (Q20), and Q26's rule that
-a split does not copy P's quarantine to R, which differs from the draft. The range
+a split does not copy P's quarantine to R, which differs from the draft and which D-130
+amends for a quarantined P. The range
 layer's variant set beside `ananke-raft`'s unchanged `Variants(u32)`, Phase 2's variants
 keeping their bits (Q37), and both `TrustStaleDescriptor` and `ClientIgnoresMismatch`
 shipped (Q38). Check 19's variant as question 2 settles it.
@@ -3159,8 +3168,8 @@ Reason: SPEC is silent and the balance criterion needs no merge.
 **Q26. Replica identity and per-replica state.** _Load-bearing._ A replica is (range,
 node); `ServerId` stays the node; a replica must be collected before its range is added
 back to that node; incarnation (drawn fresh at every creation) and quarantine are per
-replica; **a split does not copy P's quarantine to R** (differs from the draft); a merge
-does not take R's. **The "wrong if" is a named sweep assertion**, not prose: on every
+replica; **a split does not copy P's quarantine to R** (differs from the draft), **except
+where P's replica is quarantined** (D-130); a merge does not take R's. **The "wrong if" is a named sweep assertion**, not prose: on every
 sweep seed, no leader's `matched` for a re-added replica is ever set from an answer
 stamped with the collected replica's incarnation (D-042's one-message window on a
 re-add), asserted and pinned when a seed reaches the shape (§8, the re-add window). The
@@ -3168,6 +3177,9 @@ entry states the vote argument for re-added replicas. Reason: in Phase 3 removin
 re-adding a replica on one node is a normal move, and Q15 re-seeds each replica of a
 refused node from its own leader, so incarnation and quarantine must be per replica; R
 is a new group, none of whose votes a re-seed of P before the split can have lost (§5).
+A re-seed after the split can have lost them, and the apply that replays the split cannot
+tell, so a replica of R made on a quarantined replica of P takes its quarantine (D-130, the
+owner's ruling of 2026-11-09 on #175).
 
 **Q27. Collecting removed replicas, and the overlap rule.** _Load-bearing._ A replica
 collects itself only on a descriptor at a higher generation that excludes its node; an

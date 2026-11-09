@@ -2365,16 +2365,18 @@ pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSpl
 }
 
 /// [`run_after_split`], and then a split of P's left half with `x` still in the start that
-/// re-seeded: the one way a replica of a re-seeded node may lead in that start.
+/// re-seeded.
 ///
 /// Every replica the re-seed rebuilt and every replica a placeholder's install created is
-/// quarantined and never campaigns (D-035, PROPOSED D-109 §2). A split's right half is
-/// neither: the split writes it no quarantine (Q20, Q26), and `x` never voted in a range
-/// that did not exist. So `x` can lead it. The run makes it: whichever other node leads
+/// quarantined and never campaigns (D-035, PROPOSED D-109 §2), and since D-130 so is a right
+/// half a split's apply makes on one of them, this one included: the correct node does not
+/// lead it, and nothing on a re-seeded node takes a checkpoint. Under
+/// `NodeVariant::SplitLeavesQuarantineBehind` the split writes it no quarantine, as it did
+/// when this run was built, and `x` can lead it. The run tries: whichever other node leads
 /// that right half is crashed and the last one restarted, until `x` is elected. Then `x`
-/// is written to past the threshold several times over, so it takes checkpoints and
-/// sweeps the earlier ones, which is the `apply` task's and the `snapshot` task's use of
-/// the directory no other run reaches (PROPOSED D-117; #176).
+/// is written to past the threshold several times over, so under that variant it takes
+/// checkpoints and sweeps the earlier ones, which is the `apply` task's and the `snapshot`
+/// task's use of the directory no other run reaches (PROPOSED D-117; #176).
 ///
 /// P's left half, which came back to `x` by a stream, and not a range the log rebuilt,
 /// whose split fails state machine safety on `x` (#199).

@@ -2663,6 +2663,109 @@ mod tests {
         assert!(!half.excused());
     }
 
+    /// A replica stated quarantined by `RaftRecovered` alone counts as quarantined, as one
+    /// `RaftReseeded` names does: a restart states it that way, and with the arm gone it read
+    /// as able to vote. The state the arm reads is the point, so a replica recovered with none
+    /// stays able (#223).
+    #[test]
+    fn a_right_half_stated_quarantined_at_a_recovery_cannot_vote() {
+        let recovered = |state| {
+            record(
+                31,
+                1,
+                TraceEvent::RaftRecovered {
+                    server: 1,
+                    range: RIGHT,
+                    term: 1,
+                    applied: SPLIT_AT,
+                    last_index: SPLIT_AT,
+                    incarnation: 2,
+                    state,
+                },
+            )
+        };
+        let mut records = wedged();
+        records.extend([created(30, 1, RIGHT), recovered(RecoveredAs::Neither)]);
+        assert_eq!(read(&records).able, BTreeSet::from([1, 2]), "no quarantine");
+
+        let mut records = wedged();
+        records.extend([created(30, 1, RIGHT), recovered(RecoveredAs::Quarantined)]);
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]), "quarantined, and not able");
+        assert_eq!(half.others, BTreeSet::from([1]), "and it holds the range");
+        assert!(!half.excused());
+    }
+
+    /// A run's report with its trace replaced by `records`: the last fault healed at [`HEAL`],
+    /// and the liveness window opening `later` ms past it, as the driver's drain leaves it.
+    fn report_over(records: Vec<TraceRecord>, later: u64) -> Report {
+        let mut report = run(0);
+        report.last_fault_healed = at(HEAL);
+        report.checked.last_heal = at(HEAL + later);
+        report.checked.records = records;
+        report
+    }
+
+    /// `right_halves` reads the last fault's heal and not the liveness window's start, which
+    /// the driver's drain leaves later: a leader traced in between counts against the
+    /// exception, and reading the window's start instead would have excused it (#223).
+    #[test]
+    fn right_halves_read_the_last_faults_heal_and_not_the_liveness_windows_start() {
+        let mut records = wedged();
+        records.extend([led(HEAL + 100, 2), stepped_down(HEAL + 200, 2)]);
+        let report = report_over(records, 500);
+        let halves = report.right_halves();
+        let half = &halves[&RIGHT];
+        assert_eq!(half.led_since_heal, 1, "led in the drain, past the heal");
+        assert!(!half.excused());
+        let impaired = report.checked.impaired_voters();
+        let from_the_window =
+            right_halves_of(report.records(), report.checked.last_heal, &impaired);
+        assert_eq!(from_the_window[&RIGHT].led_since_heal, 0);
+        assert!(
+            from_the_window[&RIGHT].excused(),
+            "the wider reading excuses what this one does not"
+        );
+    }
+
+    /// `right_halves` hands the fold the majority rule's own impaired voters: a replica the run
+    /// refused holds the range and is not able to vote, and with an empty map it read as able
+    /// (#223).
+    #[test]
+    fn right_halves_read_the_majority_rules_impaired_voters() {
+        let mut records = wedged();
+        records.extend([
+            created(30, 1, RIGHT),
+            record(
+                31,
+                1,
+                TraceEvent::RaftReplicaRefused {
+                    server: 1,
+                    range: RIGHT,
+                },
+            ),
+        ]);
+        let report = report_over(records, 0);
+        assert_eq!(
+            report.checked.impaired_voters()[&RIGHT],
+            BTreeSet::from([1]),
+            "the rule reads node 1 as impaired"
+        );
+        let halves = report.right_halves();
+        assert_eq!(halves[&RIGHT].able, BTreeSet::from([2]), "not able to vote");
+        assert_eq!(
+            halves[&RIGHT].others,
+            BTreeSet::from([1]),
+            "impaired, holding it"
+        );
+        assert!(
+            right_halves_of(report.records(), at(HEAL), &BTreeMap::new())[&RIGHT]
+                .able
+                .contains(&1),
+            "the fold with an empty map reads it as able"
+        );
+    }
+
     /// A refusal ends what its node held, so it is its later history that counts. Node 1 loses
     /// its replicas and with them the install: it then holds no parent until one is made.
     #[test]

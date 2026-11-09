@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{NodeId, TraceEvent};
+use ananke_env::{NodeId, RangeCause, RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::message::Message;
 use ananke_shard::invariants::{self, Fold};
@@ -172,9 +172,9 @@ fn seen_of(seed: u64) -> Seen {
     }
 }
 
-/// The correct system, under every check, at every tier. At the nightly's ten thousand it fails
-/// two seeds and this test says so: 3870 and 5303, #175's committed entry lost, whose fix the
-/// owner ruled lands in its own PR after the PRs now open. Nothing here is narrowed for them.
+/// The correct system, under every check, at every tier. Seeds 3870 and 5303, the two the nightly
+/// failed on with a committed entry lost (#175), pass since a right half made on a quarantined
+/// parent takes the quarantine (D-130), and are pinned below on that mechanism.
 /// Seeds 2272 and 7949, a right half with no possible majority, pass under the owner's ruling
 /// of 2026-11-09, which excuses exactly that shape from the meta convergence bound and from
 /// nothing else, and which this prints (#220; PROPOSED D-113 §6, §11).
@@ -839,14 +839,17 @@ fn seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split() {
 /// configuration's `[k, l)` and took 19's keys with it, so node 2 later led 19's right half and
 /// answered `k15` with nothing. Since #200 the switch replaces the snapshot's span and the run
 /// is green; under `InstallReplacesHostedSpan` check 8's install clause names that switch
-/// (PROPOSED D-128).
+/// (PROPOSED D-128). Since D-130 a right half made on a quarantined parent is quarantined, which
+/// moved this seed's schedule: a second store, node 1's, is refused after node 2's, and node 2's
+/// is the first and the one this pins.
 #[test]
 fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
     let report = shard::run(41);
     report.check().unwrap();
     let refused = report.refusals();
-    assert_eq!(refused.len(), 1, "one store refused: {refused:?}");
+    assert_eq!(refused.len(), 2, "two stores refused: {refused:?}");
     let node = refused[0].0;
+    assert_eq!(node, 2, "node 2's is the first: {refused:?}");
     let created = |of: u64| {
         report.records().iter().position(|record| {
             record.node.map(|at| u64::from(at.get())) == Some(node)
@@ -876,14 +879,16 @@ fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
     );
 }
 
-/// Seeds 128 and 643, where the sweep first found D-113's (b): a leader whose followers were
+/// Seeds 128, 643 and 986, where the sweep found D-113's (b): a leader whose followers were
 /// both quarantined, reads no round could confirm, and each client's retry a registration, until
-/// `READS_OUTSTANDING`. #200 moved their schedules: with no right half's keys taken, each has one
-/// store refused where it had two, so no leader is left unable to confirm a read. The situation
-/// is absent, asserted, with that reason; seed 986 carries it now.
+/// `READS_OUTSTANDING`. #200 moved 128 and 643 off it, and D-130 moved 986 off it: with a right
+/// half made on a quarantined parent now quarantined, each of the three has one store refused
+/// where it had two, so no leader is left unable to confirm a read, and `UnconfirmableReadKept`
+/// has nothing to keep. The situation is absent, asserted, with that reason; seed 463 carries it
+/// now.
 #[test]
-fn seeds_128_and_643_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
-    for seed in [128, 643] {
+fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
+    for seed in [128, 643, 986] {
         let report = shard::run(seed);
         report.check().unwrap();
         assert_eq!(
@@ -893,22 +898,34 @@ fn seeds_128_and_643_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
             report.refusals()
         );
         assert!(
-            !report
-                .records()
-                .iter()
-                .any(|record| matches!(record.event, TraceEvent::RaftReadRefused { .. })),
+            !report.records().iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftReadRefused { .. }
+                    | TraceEvent::RaftReadsConfirmable {
+                        confirmable: false,
+                        ..
+                    }
+            )),
             "seed {seed} reaches a read no round can confirm again: pin it on its mechanism"
         );
+        shard::run_of(
+            seed,
+            Variant::UnconfirmableReadKept,
+            NodeVariants::correct(),
+            RangeVariants::correct(),
+        )
+        .check()
+        .unwrap_or_else(|why| panic!("seed {seed} has a read to keep again: {why}"));
     }
 }
 
-/// Seed 986, D-113's (b) where it stands since #200 moved seeds 128 and 643 off it: two stores
-/// refused and a leader left unable to confirm a read, which it refuses at the step and drops
-/// (PROPOSED D-129). Under `UnconfirmableReadKept` nothing answers them, the clients' retries
-/// pile up and the node fails itself at `READS_OUTSTANDING`.
+/// Seed 463, D-113's (b) where it stands since D-130 moved seed 986 off it, as #200 moved seeds
+/// 128 and 643: two stores refused and a leader left unable to confirm a read, which it refuses
+/// at the step and drops (PROPOSED D-129). Under `UnconfirmableReadKept` nothing answers them,
+/// the clients' retries pile up and the node fails itself at `READS_OUTSTANDING`.
 #[test]
-fn seed_986_a_leader_refuses_the_reads_it_can_never_confirm() {
-    let report = shard::run(986);
+fn seed_463_a_leader_refuses_the_reads_it_can_never_confirm() {
+    let report = shard::run(463);
     report.check().unwrap();
     assert_eq!(report.refusals().len(), 2, "two stores refused");
     let refused = report
@@ -928,16 +945,16 @@ fn seed_986_a_leader_refuses_the_reads_it_can_never_confirm() {
         "no leader was traced unable to confirm a read"
     );
     let why = shard::run_of(
-        986,
+        463,
         Variant::UnconfirmableReadKept,
         NodeVariants::correct(),
         RangeVariants::correct(),
     )
     .check()
-    .expect_err("the variant fails seed 986");
+    .expect_err("the variant fails seed 463");
     assert!(
         why.contains("registered reads"),
-        "the violation seed 986 is pinned for: {why}"
+        "the violation seed 463 is pinned for: {why}"
     );
 }
 
@@ -1154,6 +1171,370 @@ fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracki
              incarnation {store}"
         )),
         "the violation the old reading made of it: {old_reading}"
+    );
+}
+
+/// Seeds 3870 and 5303, #175's two, on which the correct system lost committed entries at the
+/// nightly's ten thousand until D-130. Node 3 applied the split and voted in the right half; it
+/// is refused, its parent is re-seeded from a checkpoint below the split, and it replays the
+/// split and makes the right half a second time, knowing nothing of the votes the first one
+/// cast. That replica takes the parent's quarantine: it is stated quarantined at its creation,
+/// grants no vote, leads nothing, and the entries committed on node 3 before its loss are on
+/// the next leader and applied at their own term. Under `SplitLeavesQuarantineBehind` it makes
+/// the right half with no quarantine, and votes. On 3870 it leads term 4 from last index 106
+/// and applies a 107 of its own: state machine safety. On 5303 it grants node 1 term 5 with
+/// last index 88 against a committed 89: leader completeness. Two seeds of ten thousand are far
+/// below D-061's 5 %, so the pair lives on these pins, at every tier.
+// PROPOSED(D-130)
+#[test]
+fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries() {
+    type Row<'a> = (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        std::ops::RangeInclusive<u64>,
+        std::ops::RangeInclusive<u64>,
+        &'a str,
+    );
+    let pins: [Row<'_>; 2] = [
+        (
+            3870,
+            11,
+            19,
+            106,
+            103,
+            107..=115,
+            108..=115,
+            "state machine safety: index 107 of group 19 was applied as term 2",
+        ),
+        (
+            5303,
+            43,
+            44,
+            87,
+            83,
+            88..=89,
+            89..=89,
+            "leader completeness: index 89 of group 44 (term 2) was committed in term 2 but \
+             server 1, leader of term 5, does not hold it",
+        ),
+    ];
+    let node = 3;
+    for (seed, parent, right, split, below, committed, reapplied, named) in pins {
+        let report = shard::run(seed);
+        report.check().unwrap();
+        let records = report.records();
+        let on_node = |record: &TraceRecord| node_of(record) == Some(node);
+        let at = |from: usize, what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+            records[from..]
+                .iter()
+                .position(want)
+                .map(|found| from + found)
+                .unwrap_or_else(|| panic!("seed {seed} no longer reaches {what}: read its trace"))
+        };
+        // The loss, and what it lost: node 3 had made the right half and voted in it.
+        let refused = at(
+            0,
+            "node 3's refusal",
+            &|record| matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == node),
+        );
+        let first_made = at(0, "node 3's first creation of the right half", &|record| {
+            on_node(record)
+                && matches!(record.event, TraceEvent::RangeCreated {
+                    range,
+                    cause: RangeCause::Split,
+                    ..
+                } if range == right)
+        });
+        assert!(first_made < refused, "seed {seed}: made before its loss");
+        assert!(
+            records[first_made..refused].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftVote { server, range, granted: true, .. }
+                    if server == node && range == right
+            )),
+            "seed {seed}: node 3's lost replica granted no vote: nothing was lost"
+        );
+        // The re-seed below the split, the replay, and the second creation, stated quarantined.
+        let installed = at(
+            refused,
+            "node 3's parent installed below the split",
+            &|record| {
+                matches!(record.event, TraceEvent::RaftSnapshot {
+                server,
+                range,
+                last_index,
+                taken: false,
+                ..
+            } if server == node && range == parent && last_index == below && below < split)
+            },
+        );
+        let replayed = at(installed, "node 3's replay of the split", &|record| {
+            on_node(record)
+                && matches!(record.event, TraceEvent::RangeSplit {
+                    range,
+                    right: of,
+                    index,
+                    ..
+                } if range == parent && of == right && index == split)
+        });
+        let remade = at(replayed, "node 3's second creation", &|record| {
+            on_node(record)
+                && matches!(record.event, TraceEvent::RangeCreated {
+                    range,
+                    cause: RangeCause::Split,
+                    floor_index,
+                    ..
+                } if range == right && floor_index == split)
+        });
+        let marked = at(remade, "the replica's quarantine", &|record| {
+            matches!(record.event, TraceEvent::RaftReseeded { server, range }
+                if server == node && range == right)
+        });
+        let stated = at(remade, "the replica's restatement", &|record| {
+            matches!(record.event, TraceEvent::RaftRecovered {
+                server,
+                range,
+                applied,
+                state: RecoveredAs::Quarantined,
+                ..
+            } if server == node && range == right && applied == split)
+        });
+        assert!(
+            remade < marked && marked < stated,
+            "seed {seed}: the creation, the mark and the statement in order"
+        );
+        // It grants no vote and leads nothing, for the rest of its life on that store.
+        assert!(
+            !records[remade..].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftVote { server, range, granted: true, .. }
+                    | TraceEvent::RaftLeader { server, range, .. }
+                    if server == node && range == right
+            )),
+            "seed {seed}: the quarantined replica granted a vote or led"
+        );
+        // The committed entries survive: node 3 had them committed before its loss, the first
+        // leader elected after the second creation holds them, no replica applies one at
+        // another term, and the third node applies the rest at their own.
+        let highest = records[..refused]
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftCommit {
+                    server,
+                    range,
+                    index,
+                    ..
+                } if server == node && range == right => Some(index),
+                _ => None,
+            })
+            .max();
+        assert_eq!(
+            highest,
+            Some(*committed.end()),
+            "seed {seed}: what node 3 had committed before its loss"
+        );
+        let next = at(
+            remade,
+            "the next leader of the right half",
+            &|record| matches!(record.event, TraceEvent::RaftLeader { range, .. } if range == right),
+        );
+        assert!(
+            matches!(records[next].event, TraceEvent::RaftLeader { server, last_index, .. }
+                if server != node && last_index >= *committed.end()),
+            "seed {seed}: the next leader does not hold them: {:?}",
+            records[next].event
+        );
+        for record in records {
+            if let TraceEvent::RaftApply {
+                range,
+                index,
+                entry_term,
+                ..
+            } = record.event
+                && range == right
+                && committed.contains(&index)
+            {
+                assert_eq!(entry_term, 2, "seed {seed}: index {index} changed its term");
+            }
+        }
+        for index in reapplied {
+            assert!(
+                records[remade..].iter().any(|record| matches!(
+                    record.event,
+                    TraceEvent::RaftApply {
+                        server,
+                        range,
+                        index: of,
+                        entry_term: 2,
+                        ..
+                    } if server != node && range == right && of == index
+                )),
+                "seed {seed}: no other node applied index {index} after the second creation"
+            );
+        }
+
+        // The buggy half: the seed's named failure, and the vote that made it.
+        let variant = shard::run_of(
+            seed,
+            Variants::default(),
+            NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
+            RangeVariants::correct(),
+        );
+        let why = variant
+            .check()
+            .expect_err("the variant fails the seed #175 was found on");
+        assert!(
+            why.contains(named),
+            "seed {seed}: the violation the seed is pinned for: {why}"
+        );
+        let records = variant.records();
+        let remade = records
+            .iter()
+            .rposition(|record| {
+                node_of(record) == Some(node)
+                    && matches!(record.event, TraceEvent::RangeCreated {
+                        range,
+                        cause: RangeCause::Split,
+                        ..
+                    } if range == right)
+            })
+            .expect("the variant replays the split");
+        assert!(
+            records[remade..].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftVote { server, range, granted: true, .. }
+                    if server == node && range == right
+            )),
+            "seed {seed}: the replica with no quarantine granted no vote under the variant"
+        );
+        assert!(
+            !records[remade..].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftRecovered { server, range, state: RecoveredAs::Quarantined, .. }
+                    if server == node && range == right
+            )),
+            "seed {seed}: the variant quarantined the replica after all"
+        );
+    }
+}
+
+/// Seed 2097: a quarantine a right half took at its split's apply is durable and a restart
+/// restates it. Node 2 is refused and re-seeded, applies a split of range 2 on its quarantined
+/// replica of it, and range 27 takes the quarantine in the split's batch and states it. Node 2
+/// then crashes and restarts on the same store, which says quarantined, and the restart says
+/// so. Under `SplitLeavesQuarantineBehind` the same restart states range 27 with no quarantine,
+/// and the replica has already voted (PROPOSED D-130).
+// PROPOSED(D-130)
+#[test]
+fn seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() {
+    let (node, parent, right, split) = (2, 2, 27, 143);
+    let correct = shard::run(2097);
+    correct.check().unwrap();
+    let records = correct.records();
+    assert_eq!(correct.refusals().len(), 1, "one store refused");
+    assert_eq!(correct.refusals()[0].0, node, "node 2's");
+    let at = |from: usize, what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records[from..]
+            .iter()
+            .position(want)
+            .map(|found| from + found)
+            .unwrap_or_else(|| panic!("seed 2097 no longer reaches {what}: read its trace"))
+    };
+    let refused = at(
+        0,
+        "node 2's refusal",
+        &|record| matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == node),
+    );
+    let made = at(refused, "the split's apply on node 2", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Split,
+                parent: Some(of),
+                floor_index,
+                ..
+            } if range == right && of == parent && floor_index == split)
+    });
+    let stated = at(made, "the quarantine stated at the creation", &|record| {
+        matches!(record.event, TraceEvent::RaftRecovered {
+            server,
+            range,
+            applied,
+            state: RecoveredAs::Quarantined,
+            ..
+        } if server == node && range == right && applied == split)
+    });
+    let crashed = at(stated, "node 2's crash", &|record| {
+        matches!(record.event, TraceEvent::NodeCrashed { node: gone }
+            if u64::from(gone.get()) == node)
+    });
+    let restarted = at(crashed, "node 2's restart", &|record| {
+        matches!(record.event, TraceEvent::NodeRestarted { node: back }
+            if u64::from(back.get()) == node)
+    });
+    let marked = at(restarted, "the restart's mark", &|record| {
+        matches!(record.event, TraceEvent::RaftReseeded { server, range }
+            if server == node && range == right)
+    });
+    let restated = at(restarted, "the restart's statement", &|record| {
+        matches!(record.event, TraceEvent::RaftRecovered { server, range, .. }
+            if server == node && range == right)
+    });
+    assert!(marked < restated, "the mark, then the statement");
+    assert!(
+        matches!(
+            records[restated].event,
+            TraceEvent::RaftRecovered {
+                state: RecoveredAs::Quarantined,
+                ..
+            }
+        ),
+        "the restart states the replica as: {:?}",
+        records[restated].event
+    );
+    assert!(
+        !records[made..].iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftVote { server, range, granted: true, .. }
+                if server == node && range == right
+        )),
+        "the quarantined replica granted a vote"
+    );
+
+    let variant = shard::run_of(
+        2097,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
+        RangeVariants::correct(),
+    );
+    variant
+        .check()
+        .expect("the variant's named failures are 3870's and 5303's");
+    let on_variant = variant.records();
+    let granted = on_variant.iter().any(|record| {
+        matches!(record.event, TraceEvent::RaftVote { server, range, granted: true, .. }
+            if server == node && range == right)
+    });
+    let states: Vec<RecoveredAs> = on_variant
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                state,
+                ..
+            } if server == node && range == right => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert!(granted, "under the variant the replica votes");
+    assert_eq!(
+        states,
+        [RecoveredAs::Neither],
+        "under the variant the restart states no quarantine"
     );
 }
 

@@ -101,6 +101,20 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
+  open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
+  that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable
+  in the split's batch and stated `RaftReseeded` and `RaftRecovered { quarantined }` at its creation,
+  and a restart restates it. Seeds 3870 and 5303, which lost committed entries, pass, and are pinned
+  on the mechanism against `SplitLeavesQuarantineBehind` (bit 50) at every tier. At 10 000 seeds on
+  the correct server: 0 fail, 4 883 replicas quarantined at a split's apply, 207 of them needed
+  and 4 676 (95.8 %) not; right halves with no possible majority 909 against the base's 425, 464
+  of them attributable. Seed 41 has two stores refused; seed 463 carries D-113's (b) where 986 did;
+  D-117's directed run now reaches a take only under the variant, and the correct node's absence
+  is asserted beside it. The meta convergence bound's exception is unchanged, and no correct seed
+  fails it. Not built: a leader-carried bound as the possible narrowing, and the crash inside
+  `reseed()`'s marking loop, unforced. Local, not pushed: the owner wants no new PR until the
+  open ones have merged.
 - Branch `phase-3-stage-c-shard-sim-rest` (2026-11-09), on #198 and #200, PROPOSED D-113 §5 to
   §11, **the rest of #162's S10**, after #188 merged at 08f0c62 unfinished: the write bound per
   range the run ended with (the same constant and every key still asked, asserted per seed; each
@@ -108,9 +122,9 @@ _Update this section at the end of every session._
   beside it, worst 994 ms at 10 000 seeds against 2 s; it reads the history, so #197 and #158 stand),
   the meta convergence bound (worst 1.099 s against 2 s at 10 000 seeds), refusals by loss (#45), D-092's measurement (eight and two kept), the node
   scenarios in `sim/tests/parallel.rs`, the pairs on this sweep and the first Phase 3 pins. At
-  1 000 seeds, 0 fail. **At 10 000 the correct system still fails two seeds, 3870 and 5303 (D-113 §11),**
+  1 000 seeds, 0 fail. **At 10 000 the correct system still failed two seeds, 3870 and 5303 (D-113 §11),**
   #175 (one refused node, a committed entry lost), whose fix the owner ruled lands in its own PR after
-  the PRs now open. 2272 and 7949, a right half with no possible majority (one refused node and one
+  the PRs now open, and D-130 is that PR. 2272 and 7949, a right half with no possible majority (one refused node and one
   placeholder, which grants no vote), pass: the owner's ruling of 2026-11-09 (#220, D-113 §6) excuses
   exactly that shape from the meta convergence bound and from nothing else, 18 of 23 283
   descriptors, and the sweep prints which. The bound's constant and the majority rule are unchanged. Check 8's
