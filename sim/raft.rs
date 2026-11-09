@@ -986,9 +986,9 @@ pub enum Fault {
     /// draws a fresh block for the second split; the variant resumes its record's
     /// block from the first id, the one the first split took, and check 18 sees the
     /// right half named before. Drawn after the split. If no split is done by then, the
-    /// arm is a wait of `settle` and nothing else: it injects no fault, so the run's
-    /// `last_heal` stays at the last fault's heal, and no gap follows it
-    /// (PROPOSED D-120).
+    /// arm is a wait of `settle` and nothing else: it asks nothing of the cluster, so it
+    /// leaves the run's `last_heal` where the arm before it left it — which is that arm's
+    /// end, a heal or not — and no gap follows it (PROPOSED D-120).
     // PROPOSED(D-120): with no split done the arm is its settle alone.
     SplitFromRestarted {
         /// How long the proposer stays down.
@@ -1489,10 +1489,12 @@ pub struct Schedule {
     pub trials: Vec<Trial>,
     /// The faults, each healed before the next, with `gaps[i]` of quiet after it.
     pub faults: Vec<Fault>,
-    /// The quiet after each fault. An arm that injects nothing spends none: its own
-    /// wait is the quiet ([`Fault::SplitFromRestarted`] with no split done,
-    /// PROPOSED D-120).
-    // PROPOSED(D-120): an arm that injects nothing spends no gap.
+    /// The quiet after each fault. One arm spends none: [`Fault::SplitFromRestarted`]
+    /// with no split done, whose own wait is that quiet (PROPOSED D-120). It is the
+    /// only one, and not because it injects nothing — a [`Fault::Split`] whose ask goes
+    /// unanswered or refused injects nothing either, and spends its gap at the loop's
+    /// foot like every other arm.
+    // PROPOSED(D-120): that one arm spends no gap; no general rule is claimed.
     pub gaps: Vec<Duration>,
     /// The quiet after the last fault: the liveness window.
     pub settle: Duration,
@@ -2004,10 +2006,17 @@ pub struct Report {
     /// [`Report::jsonl`] writes the trace from the two when it is asked for.
     // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
     pub run: RunHeader,
-    /// When the last fault healed or the last crashed server restarted. An arm that
-    /// injects nothing, [`Fault::SplitFromRestarted`] with no split done, leaves it
-    /// where it was (PROPOSED D-120).
-    // PROPOSED(D-120): the no-split arm heals nothing, so it does not move this.
+    /// When the last fault healed or the last crashed server restarted — or, where the
+    /// last arm healed nothing, when it finished. Every arm but one sets this at its own
+    /// end at the fault loop's foot, whether or not it injected anything:
+    /// [`Fault::Split`] sets it at its end with its split done, refused or unanswered,
+    /// and a split is no heal and crashes no one. The one exception is
+    /// [`Fault::SplitFromRestarted`] with no split done, which asks nothing of the
+    /// cluster at all and so has no moment of its own to date this from; it leaves the
+    /// field where the arm before it left it, which is as near the last real heal as the
+    /// run can say and never further from it than the arm's own end would be
+    /// (PROPOSED D-120).
+    // PROPOSED(D-120): the no-split arm asks nothing, so it does not move this.
     pub last_heal: Instant,
     /// Where the simulation stopped: the virtual time once the run's last advance
     /// returned, read off the simulator and not worked out from the schedule.
@@ -8785,16 +8794,33 @@ pub fn run_on(
                     // resume from: the arm is a wait, counted as not reached.
                     //
                     // The `continue` skips `last_heal` and the gap **deliberately**
-                    // (PROPOSED D-120, issue #147). The arm heals nothing and crashes
-                    // no server, so `last_heal` stays at the last real heal, which is
-                    // what the field says it is; a gap is the quiet after a fault, and
-                    // this settle was that quiet. Setting `last_heal` here, as the arms
-                    // that ask something of the cluster do below, would start the
-                    // liveness readings' clock late, with no fault to answer for it,
-                    // and leave the first of the recovery from that real heal unread:
-                    // D-102 measured 47 of `SharedSnapshotDir`'s uniform liveness
-                    // catches lost that way and no verdict of the correct node moved.
-                    // It is a looser reading, not a fix.
+                    // (PROPOSED D-120, issue #147). The arm asks nothing of the cluster
+                    // — no split, no crash, no transfer — so it has no moment of its own
+                    // to date `last_heal` from, and a gap is the quiet after a fault,
+                    // which this settle already was.
+                    //
+                    // What it is *not* is a return to the last real heal, and the reason
+                    // for the `continue` must not pretend otherwise (#196's review, B2).
+                    // `Schedule::draw_on_the_node` inserts `Fault::Split` at `at` and
+                    // this arm at `after >= at + 1`, so every node schedule carries a
+                    // split arm before this one and the loop reaches this one only by
+                    // having run it; on 377 of the first thousand node schedules that
+                    // split arm is the one immediately before: `last_heal` is then its
+                    // end, set at the loop's foot whether its split was done, refused or
+                    // unanswered, and a split is no heal. That imprecision is the split
+                    // arm's, it is not #147's question, and nothing here changes it.
+                    //
+                    // What this `continue` keeps out is only this arm's own gap and
+                    // settle *on top of* that. Setting `last_heal` here, as the arms
+                    // that ask something of the cluster do below, can only start the
+                    // liveness readings' clock later than the arm before it already
+                    // starts it, with no fault of this arm's to answer for the
+                    // allowance, leaving the first of the recovery unread. So the kept
+                    // reading is the nearer of the two to the last real heal, never the
+                    // further. D-102 measured the move at ten thousand node seeds as
+                    // losing 47 of `SharedSnapshotDir`'s uniform liveness catches and
+                    // winning 2 — it is not a superset either way — and moving no verdict
+                    // of the correct node. A looser reading, not a fix.
                     // PROPOSED(D-120): the no-split branch is the arm's settle alone.
                     advance(&mut sim, *settle, &mut watch);
                     continue;
@@ -11755,46 +11781,62 @@ mod tests {
     }
 
     /// [`Fault::SplitFromRestarted`] with no split done is a wait of its settle and
-    /// nothing else, **by design** (PROPOSED D-120, issue #147). The arm injects no fault
-    /// and crashes no server, so `last_heal` stays where the arm before it healed — the
-    /// field's own definition, "when the last fault healed or the last crashed server
-    /// restarted" — and no gap follows it, because a gap is "the quiet after a fault"
-    /// and the arm's settle, longer than any gap the node schedule draws, was that quiet
-    /// already. The other half of the pair is the same arm after a split done, on the
-    /// same seed: there it crashes the proposer, and `last_heal` is the arm's end with
-    /// its gap after it, as every arm that asks something of the cluster sets it.
+    /// nothing else, **by design** (PROPOSED D-120, issue #147). The arm asks nothing of
+    /// the cluster, so it has no moment of its own to date `last_heal` from and leaves the
+    /// field where the arm before it left it; and no gap follows it, because a gap is "the
+    /// quiet after a fault" and the arm's settle, longer than any gap the node schedule
+    /// draws, was that quiet already. The other end of the pair is the same arm after a
+    /// split done: there it crashes the proposer, and `last_heal` is the arm's end with its
+    /// gap after it, as every arm that asks something of the cluster sets it.
     ///
-    /// What the first half guards is a reading, not a schedule. `last_heal` moved to the
-    /// no-split arm's end would start the liveness readings' clock late, with no fault to
-    /// answer for it, and leave the first of the recovery from the real heal unread: D-102
-    /// measured that at ten thousand node seeds as moving no verdict of the correct node
-    /// and turning 47 of `SharedSnapshotDir`'s uniform liveness catches into passes.
-    /// Spending the gap would redraw every node run that takes the branch before another
-    /// arm, for nothing anything reads.
+    /// What the no-split parts guard is a reading, not a schedule, and the reading they
+    /// keep is not "the last real heal": [`Fault::Split`] sets `last_heal` at its own end
+    /// whether its split was done, refused or unanswered, and the node draw puts that arm
+    /// immediately before this one on 377 of the first thousand schedules (#196's review,
+    /// B2). The field is the arm-before's end either way. Moving it to *this* arm's end
+    /// would add this arm's gap and settle on top, starting the liveness readings' clock
+    /// later still with no fault of its own to answer for it and leaving the first of the
+    /// recovery unread: D-102 measured that at ten thousand node seeds as moving no verdict
+    /// of the correct node, turning 47 of `SharedSnapshotDir`'s uniform liveness catches
+    /// into passes and 2 passes into catches. Spending the gap would redraw every node run
+    /// that takes the branch before another arm, for nothing anything reads.
     ///
     /// The schedule is built by hand: a 1.2 s warmup, no lease trial, the arms with a gap
-    /// of 200 ms each and the liveness window, every clock true. The first half's arm
-    /// follows a 500 ms isolation, the second half's a split. Seed 5 is pinned for the
-    /// second half because its split is done; the first split of seed 0 on the same
-    /// schedule goes unanswered within the admin's round, an ordinary outcome of a split
-    /// asked (361 of 1 941 at D-100's thousand), and leaves its arm the wait again. Should
-    /// a change redraw seed 5 that way, the second half's first assertion says so, and
-    /// another seed is to be pinned.
+    /// of 200 ms each and the liveness window, every clock true. Three parts, each
+    /// asserting `uniform()` so the liveness fold is known to be asked of it (#196's
+    /// review, N3):
+    ///
+    /// 1. After a 500 ms **isolation**, seed 5: no split asked at all. The plainest
+    ///    reading of "injects nothing", but not a shape the sweep can produce.
+    /// 2. After a **`Split` not done**, seed 0: the sweep's own shape, and the only one it
+    ///    reaches the branch with, since [`Schedule::draw_on_the_node`] inserts
+    ///    `Fault::Split` at `at` and this arm at `after >= at + 1` on every seed. Part 1
+    ///    cannot tell a `last_heal` keyed on the split *asked* from one keyed on the split
+    ///    *done*; this part can (#196's review, B3). Seed 0's split goes unanswered within
+    ///    the admin's round, an ordinary outcome of a split asked (361 of 1 941 at D-100's
+    ///    thousand).
+    /// 3. After a **`Split` done**, seed 5: the arm fires.
+    ///
+    /// Seed 5 is pinned for part 3 because its split is done and seed 0 for part 2 because
+    /// its is not. Should a change redraw either the other way, that part's first assertion
+    /// says so and another seed is to be pinned.
     // PROPOSED(D-120): the no-split branch is the arm's settle alone, by design.
     #[test]
     fn a_split_from_restarted_with_no_split_done_is_its_settle_alone() {
         const SEED: u64 = 5;
+        const UNANSWERED: u64 = 0;
         let origin = Instant::default();
         let warmup = Duration::from_millis(1200);
         let quiet = election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200);
         let gap = Duration::from_millis(200);
         let isolated = Duration::from_millis(500);
         let settle = Duration::from_millis(1000);
+        let asked_for = Duration::from_millis(600);
         let arm = Fault::SplitFromRestarted {
             down: Duration::from_millis(300),
             settle,
         };
-        let run = |faults: Vec<Fault>| {
+        let run = |seed: u64, faults: Vec<Fault>| {
             let arms = faults.len();
             let schedule = Schedule {
                 warmup,
@@ -11808,7 +11850,7 @@ mod tests {
             };
             run_on(
                 Cluster::Node,
-                SEED,
+                seed,
                 schedule,
                 Variants::default(),
                 NodeVariants::correct(),
@@ -11823,15 +11865,20 @@ mod tests {
                 .count()
         };
 
-        // No split done before it: the arm is its settle alone, and counted unreached.
-        let waited = run(vec![
-            Fault::Isolate {
-                server: 1,
-                client: 1,
-                for_: isolated,
-            },
-            arm.clone(),
-        ]);
+        // No split asked before it at all: the arm is its settle alone, and counted
+        // unreached. Not the sweep's shape — the sweep always asks a split before the
+        // arm (below) — but the plainest reading of "injects nothing".
+        let waited = run(
+            SEED,
+            vec![
+                Fault::Isolate {
+                    server: 1,
+                    client: 1,
+                    for_: isolated,
+                },
+                arm.clone(),
+            ],
+        );
         assert_eq!(waited.stopped, None, "the correct node stopped early");
         assert!(
             waited.uniform(),
@@ -11865,15 +11912,63 @@ mod tests {
             "the correct node fails the isolation and the wait"
         );
 
+        // A split asked and not done before it: the sweep's own shape, the only one it
+        // can reach the branch with, because `Schedule::draw_on_the_node` inserts
+        // `Fault::Split` at `at` and this arm at `after >= at + 1` on every seed. Part 1
+        // above cannot tell a `last_heal` keyed on the split *asked* from one keyed on
+        // the split *done*; this part can, and the sweep's ~59 seeds in a thousand are
+        // all of this kind.
+        let unanswered = run(
+            UNANSWERED,
+            vec![Fault::Split { settle: asked_for }, arm.clone()],
+        );
+        assert_eq!(unanswered.stopped, None, "the correct node stopped early");
+        assert!(
+            unanswered.uniform(),
+            "seed {UNANSWERED} is a uniform run, so liveness is asked"
+        );
+        assert_eq!(
+            (
+                unanswered.splits.asked,
+                unanswered.splits.done,
+                unanswered.splits.from_restarted,
+                crashes(&unanswered)
+            ),
+            (1, 0, 0, 0),
+            "seed {UNANSWERED}'s split before the arm was answered done, or the arm fired: \
+             the sweep's shape for the branch is a split asked and not done, and another \
+             seed is to be pinned: {:?}",
+            unanswered.splits
+        );
+        let asked = origin + warmup + asked_for;
+        assert_eq!(
+            unanswered.last_heal, asked,
+            "the no-split arm moved last_heal off the end of the split arm before it: the arm \
+             heals nothing and crashes no one, and moving the field here can only start the \
+             liveness readings' clock later than the split arm already starts it, dropping the \
+             first of the recovery with no fault to answer for the allowance (PROPOSED D-120)"
+        );
+        assert_eq!(
+            unanswered.ended,
+            asked + gap + settle + quiet,
+            "the no-split arm did not spend its settle alone, the split arm's gap before it: \
+             a gap is the quiet after a fault, and it injected none (PROPOSED D-120)"
+        );
+        assert_eq!(
+            unanswered.check().err(),
+            None,
+            "the correct node fails the unanswered split and the wait"
+        );
+
         // After a split done: the arm crashes the proposer and asks again, and last_heal
         // is its end, with its gap and the settle after it.
-        let after = run(vec![
-            Fault::Split {
-                settle: Duration::from_millis(600),
-            },
-            arm,
-        ]);
+        let after = run(SEED, vec![Fault::Split { settle: asked_for }, arm]);
         assert_eq!(after.stopped, None, "the correct node stopped early");
+        assert!(
+            after.uniform(),
+            "seed {SEED} is a uniform run on this shape, so liveness is asked: without it \
+             `check()` folds no liveness and this part would pass on nothing"
+        );
         assert_eq!(
             (after.splits.from_restarted, crashes(&after)),
             (1, 1),
