@@ -1379,10 +1379,10 @@ impl AfterSplit {
     /// 7 made it. That check 7 judges an install's creation is held by its own unit test,
     /// `an_install_must_agree_with_the_descriptor_in_force_at_its_index`, in `ananke-shard`'s
     /// `invariants.rs`, and [`check`](Self::check) runs check 7 on this trace first. The
-    /// comparison adds the voters, which [`reached`](Self::reached) does not read, and a
-    /// fault check 7 would miss. In this run a value of P always lies under the floor, P's
-    /// bootstrap at index 0, so the case where check 7 leaves a creation waiting for a
-    /// value does not arise here.
+    /// comparison adds the voters, which [`reached`](Self::reached) does not read and only
+    /// check 7 reads of this creation, and a fault check 7 would miss. In this run the
+    /// split's value of P, at generation 2, lies at or below the floor on every seed
+    /// (measured 200 of 200), so neither of check 7's waits arises here.
     ///
     /// An install's creation names the descriptor its snapshot put in place (PROPOSED
     /// D-107 §2). With the first generation put back, whatever the snapshot held, check 7

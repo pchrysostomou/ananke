@@ -101,6 +101,14 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-reseed-after-split-review` (2026-11-06), off `main` at de9f4d7,
+  **#187's review fixes** (PROPOSED D-115). #187 merged at 2d9e8ad before them and closed
+  #172: a re-seed after a split creates P by an install at the split's generation over its
+  left half, check 7 holds it at its floor, and the creation's generation put back fails the
+  run on 200 of 200 at the cap. These fixes ask that clause inside D-109's test on the same
+  runs, drop the duplicate sweep and its row, re-weigh D-109's row, and rest the run's cap on
+  its own figures (0.17 to 0.21 cpu s a seed; a whole nightly shard at ten thousand), which
+  is PROPOSED and the owner's. D-115 is corrected in place, each correction marked.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

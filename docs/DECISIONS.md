@@ -23420,11 +23420,15 @@ install P at generation 2 with P's left half's end.
 *Corrected after #187 merged* (#187's review, B1 and N1). This first said two things were
 missing: check 7 holding the creation, and a run that fails on the revert. Neither stands as
 written. `reached` alone fails the revert on every seed, so the revert already failed a
-standing test on `main`, and only the measurement was missing. In this run a value of P
-always lies under the creation's floor, P's bootstrap at index 0, so check 7 judges the
-creation on every seed and the case in which it waits unjudged does not arise here. What
-was missing was the measurement, and an ask of the creation whole: its start and its voters
-are read by neither `reached` nor anything else apart from check 7.
+standing test on `main`, and only the measurement was missing. In this run the split's value
+of P, at generation 2, lies at or below the creation's floor on every seed (measured 200 of
+200), so neither of check 7's waits arises here and it judges the creation. P's bootstrap
+value would not do that alone: a creation of a later generation than the value under it
+waits (#195's review, N1, which measured the creation still waiting, 200 of 200, with every
+generation-2 descriptor of P removed from the trace). What was missing was the measurement,
+and an ask of the creation whole. `reached` reads neither its start nor its voters. Check 8
+reads the start (`OneOwnerPerKey::push`) and asks only that it overlap nothing; the voters
+of this creation are read by check 7 alone (#195's review, N2).
 
 **What is added.**
 1. `AfterSplit::created_by_install_after_refusal` (`sim/reseed.rs`): `x`'s first install
@@ -23456,9 +23460,10 @@ are read by neither `reached` nor anything else apart from check 7.
 4. The unit test of `created_from` (`server.rs`) no longer says no scenario reaches its
    call site. It names this run as the one that does.
 
-**The revert, measured.** A scratch plant, reverted before the gate, gave the call site
-in `created_by_install` no descriptor: `created_from(None, config)`. That is the first
-generation and the configuration's voters, whatever the snapshot held, as before D-107.
+**The revert, measured.** A scratch plant, reverted before the gate, gave the call site in
+`installed` no descriptor: `created_from(None, config)` (*corrected after #187 merged*,
+#195's review, N3: this first named `created_by_install`, which never calls it). That is the
+first generation and the configuration's voters, whatever the snapshot held, as before D-107.
 *Re-measured after #187 merged*, on the test as it now stands:
 
 | | the plant | the correct tree |
@@ -23486,7 +23491,8 @@ review, N2): this first cited D-081 for the cap, and D-081's case is `run`'s cos
 Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the nightly's ten
 thousand some 1 700 to 2 100, about a whole nightly shard (shards carry 1 977 to 2 237,
 D-064), for clauses that hold or fail on every seed at twenty. So the run stays under the
-binary's `TIER_CAP`, and that cap is put to the owner with D-081's. The cap samples the run's
+binary's `TIER_CAP`, and that cap is put to the owner with D-081's. The line the run prints
+names this entry, where it named D-081 (#195's review, N5). The cap samples the run's
 rarer schedules thinly: 5 of 200 seeds install P at floor 192, after a second compaction,
 against 127 to 129 on the rest (counted by the review, and again here), and nothing asserted
 reads that schedule apart. **PROPOSED.**

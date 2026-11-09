@@ -81,9 +81,15 @@ const HIGH_RATE_SHARE: u64 = 20;
 
 /// Prints what tier was asked for and what actually ran, once per test.
 fn tier(what: &str, run: u64) {
+    tier_under(what, run, "D-081");
+}
+
+/// [`tier`], naming the entry whose figures the cap stands on for this run.
+// PROPOSED(D-115)
+fn tier_under(what: &str, run: u64, entry: &str) {
     println!(
         "reseed shape, {what}: ANANKE_SEEDS={} ran {run} seeds (TIER_CAP={TIER_CAP}, \
-         PROPOSED — see D-081)",
+         PROPOSED — see {entry})",
         seeds()
     );
 }
@@ -341,7 +347,7 @@ fn caught(variant: NodeVariant, run: u64) {
 #[test]
 fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
     let run = shape_seeds();
-    tier("the re-seed after a split", run);
+    tier_under("the re-seed after a split", run, "D-115");
     let verdicts = sweep(run, |seed| {
         let report = reseed::run_after_split(seed);
         report.check()?;
@@ -369,5 +375,8 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
             )),
         }
     });
-    verdict(&verdicts).expect("a re-seeded node's right half comes back quarantined on every seed");
+    verdict(&verdicts).expect(
+        "a re-seed after a split creates P at the split's generation and brings the right half \
+         back quarantined, on every seed",
+    );
 }
