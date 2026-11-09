@@ -110,11 +110,14 @@ _Update this section at the end of every session._
   a read at the old place would have missed it, and the store is asked again there, so a snapshot
   at or below an entry applied meanwhile answers installed and is not switched. `Install::spans` is
   a copy the correct switch no longer reads, and `InstallWrongRangesSpans`'s doc says so. The pair
-  is `InstallReplacesCopiedSpan` (node bit 51), caught by check 8's install clause on three directed
+  is `InstallReplacesCopiedSpan` (node bit 51), caught by check 8's install clause on two directed
   tests through the task. On a scratch copy of S11's branch the fix passes its 10 000 seeds and
   seed 5620 fails under the variant with the original words. Not closed, named in D-132 §5 and
-  reached on no seed: a split's apply landing after the install is numbered. #215's related window
-  is unchanged, read and not run.
+  tracked by #225: a split's apply landing after the install is numbered, which seed 13283 of S11's
+  sweep reaches, past the nightly's range, with and without this fix; the switch removes the right
+  half's keys and the store goes back from 168 to the snapshot's 167. #215's related window is
+  unchanged and also #225's: a directed run removes the right half's key, and no sweep has reached
+  this order.
 - Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
   open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
   that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable
