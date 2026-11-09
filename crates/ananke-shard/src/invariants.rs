@@ -76,6 +76,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use ananke_env::sim::TraceRecord;
 use ananke_env::{ApplyEffect, ClientOp, RangeCause, RangeState, TraceEvent};
 use ananke_raft::apply::user_key;
+use ananke_raft::store::RAFT_TENANT;
 use bytes::Bytes;
 
 use crate::system::{META_RANGE, ROOT_RANGE};
@@ -418,9 +419,21 @@ impl Descriptors {
 /// that is not a voter there, that it traces no creation of R, is Stage D's (SHARD.md
 /// §12).
 ///
+/// **The install clause** (PROPOSED D-128): the spans an engine's install replaced,
+/// from its `SpanInstalled`, overlap no span the node holds of a replica other than the
+/// one installed. A descriptor says what a replica claims and a switch what it removes,
+/// so the overlap clause, which folds descriptors, holds with every descriptor right and
+/// another replica's keys gone: a span-less replica's switch that replaced
+/// configuration's span. The replica installed is the one whose Raft interval, or a key
+/// of it, is among the spans: the install's own, and a split's non-voter's step
+/// (`RaftStore::apply_removing`), which removes the right span with P's own keys and is
+/// no other replica's business.
+///
 /// Each clause keeps its own verdict ([`OneOwnerPerKey::overlap_verdict`],
-/// [`OneOwnerPerKey::right_half_verdict`]), so a scenario can read them apart.
+/// [`OneOwnerPerKey::right_half_verdict`], [`OneOwnerPerKey::install_verdict`]), so a
+/// scenario can read them apart.
 // PROPOSED(D-107): check 8's two Stage C clauses.
+// PROPOSED(D-128): and what a switch replaced.
 #[derive(Clone, Debug, Default)]
 pub struct OneOwnerPerKey {
     /// Per node, the span of every initialised replica it holds.
@@ -449,6 +462,20 @@ pub struct OneOwnerPerKey {
     owed: BTreeMap<u64, BTreeMap<u64, (u64, u64)>>,
     overlap: Option<String>,
     right_half: Option<String>,
+    // PROPOSED(D-128)
+    install: Option<String>,
+}
+
+/// The group whose Raft state `key` is, by the layout of `KeyPrefix::group`: `None` for a
+/// key of any other tenant.
+// PROPOSED(D-128)
+fn raft_group_of(key: &[u8]) -> Option<u64> {
+    let (tenant, rest) = key.split_first_chunk::<8>()?;
+    if u64::from_be_bytes(*tenant) != RAFT_TENANT {
+        return None;
+    }
+    let (group, _) = rest.split_first_chunk::<8>()?;
+    Some(u64::from_be_bytes(*group))
 }
 
 impl OneOwnerPerKey {
@@ -555,6 +582,44 @@ impl OneOwnerPerKey {
         }
     }
 
+    /// An install on `node` replaced `spans`: none of its keyspace spans may overlap a
+    /// span the node holds of a replica other than the one installed. The replica is
+    /// named by the Raft keys among the spans (`raft_group_of`).
+    // PROPOSED(D-128)
+    fn replaced(&mut self, node: u64, spans: &[(Bytes, Bytes)]) {
+        if self.install.is_some() {
+            return;
+        }
+        let Some(held) = self.spans.get(&node) else {
+            return;
+        };
+        let installed: BTreeSet<u64> = spans
+            .iter()
+            .filter_map(|(start, _)| raft_group_of(start))
+            .collect();
+        self.install = spans
+            .iter()
+            .filter(|(start, _)| raft_group_of(start).is_none())
+            .find_map(|(start, end)| {
+                held.iter()
+                    .find(|(other, (from, to))| {
+                        !installed.contains(other) && from < end && start < to
+                    })
+                    .map(|(other, (from, to))| {
+                        let of = installed.first().map_or_else(
+                            || "no range".to_owned(),
+                            |range| format!("range {range}"),
+                        );
+                        format!(
+                            "one owner per key: an install of {of} on node {node} replaced \
+                             [{start:?}, {end:?}), which overlaps its replica of range {other} \
+                             over [{from:?}, {to:?}) and removes that replica's keys (SHARD.md \
+                             §5, §8; §11, storage 5: an install replaces its own span's keys)"
+                        )
+                    })
+            });
+    }
+
     /// The first right half `node` owes and does not hold, as a violation.
     fn owed_and_missing(&self, node: u64, at: &str) -> Option<String> {
         let held = self.spans.get(&node);
@@ -647,6 +712,8 @@ impl OneOwnerPerKey {
                         self.owed_and_missing(node, &format!("at its apply of {index}"));
                 }
             }
+            // PROPOSED(D-128)
+            TraceEvent::SpanInstalled { spans, .. } => self.replaced(node, spans),
             TraceEvent::RangeRemoved { range, .. } => {
                 if let Some(held) = self.spans.get_mut(&node) {
                     held.remove(range);
@@ -702,14 +769,26 @@ impl OneOwnerPerKey {
         self.right_half.clone().map_or(Ok(()), Err)
     }
 
-    /// Both clauses' first violation, the overlap clause's first.
+    /// The install clause's first violation.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    // PROPOSED(D-128)
+    pub fn install_verdict(&self) -> Result<(), String> {
+        self.install.clone().map_or(Ok(()), Err)
+    }
+
+    /// The clauses' first violation, the overlap clause's first and the install clause's
+    /// after the right half's.
     ///
     /// # Errors
     ///
     /// The violation, in words naming it.
     pub fn verdict(&self) -> Result<(), String> {
         self.overlap_verdict()?;
-        self.right_half_verdict()
+        self.right_half_verdict()?;
+        self.install_verdict()
     }
 }
 
@@ -1688,6 +1767,11 @@ pub enum Fold {
     /// trips it until placeholders exist.
     // PROPOSED(D-107)
     RightHalf,
+    /// Check 8's install clause ([`OneOwnerPerKey::install_verdict`]): asked after the
+    /// overlap clause by [`Checker::verdict`], so a switch that overlaps and the creation
+    /// the overlap clause reads after it stay the overlap clause's.
+    // PROPOSED(D-128)
+    InstallSpan,
     /// Check 20, a placeholder grants nothing ([`PlaceholderGrantsNothing`]).
     // PROPOSED(D-109)
     PlaceholderGrants,
@@ -1695,9 +1779,9 @@ pub enum Fold {
 
 impl Fold {
     /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20
-    /// and check 8's overlap clause — and then check 8's right half's clause, which it
-    /// does not ask ([`Fold::VERDICT`]).
-    pub const ALL: [Self; 10] = [
+    /// and check 8's overlap and install clauses — and then check 8's right half's clause,
+    /// which it does not ask ([`Fold::VERDICT`]).
+    pub const ALL: [Self; 11] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1707,14 +1791,15 @@ impl Fold {
         Self::SplitLineage,
         Self::PlaceholderGrants,
         Self::Overlap,
+        Self::InstallSpan,
         Self::RightHalf,
     ];
 
-    /// The folds [`Checker::verdict`] asks, in its order: check 8's overlap clause
-    /// last, so that no violation a fold before it reports moves to it, and check 8's
-    /// right half's clause not at all (PROPOSED D-107).
+    /// The folds [`Checker::verdict`] asks, in its order: check 8's overlap clause and
+    /// then its install clause last, so that no violation a fold before them reports moves
+    /// to them, and check 8's right half's clause not at all (PROPOSED D-107, D-128).
     // PROPOSED(D-107)
-    pub const VERDICT: [Self; 9] = [
+    pub const VERDICT: [Self; 10] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1724,6 +1809,7 @@ impl Fold {
         Self::SplitLineage,
         Self::PlaceholderGrants,
         Self::Overlap,
+        Self::InstallSpan,
     ];
 
     /// The check of SHARD.md §8 the fold is; checks 8 and 18 are two folds each.
@@ -1731,7 +1817,7 @@ impl Fold {
     pub const fn check(self) -> u32 {
         match self {
             Self::DescriptorAgreement => 7,
-            Self::Overlap | Self::RightHalf => 8,
+            Self::Overlap | Self::RightHalf | Self::InstallSpan => 8,
             Self::ServingWithinSpan => 9,
             Self::GenerationsRise => 10,
             Self::MetaNeverGoesBack => 16,
@@ -1753,7 +1839,7 @@ impl Fold {
             Self::ClientRefreshes => "client refreshes:",
             Self::RangeIds => "range ids:",
             Self::SplitLineage => "descriptor lineage:",
-            Self::Overlap | Self::RightHalf => "one owner per key:",
+            Self::Overlap | Self::RightHalf | Self::InstallSpan => "one owner per key:",
             Self::PlaceholderGrants => "placeholder grants nothing:",
         }
     }
@@ -1765,6 +1851,7 @@ impl std::fmt::Display for Fold {
         let clause = match self {
             Self::Overlap => ", the overlap clause",
             Self::RightHalf => ", the right half's clause",
+            Self::InstallSpan => ", the install clause",
             _ => "",
         };
         write!(
@@ -1860,19 +1947,20 @@ impl Checker {
             Fold::SplitLineage => self.lineage.verdict(),
             Fold::Overlap => self.owners.overlap_verdict(),
             Fold::RightHalf => self.owners.right_half_verdict(),
+            Fold::InstallSpan => self.owners.install_verdict(),
             Fold::PlaceholderGrants => self.placeholders.verdict(),
         }
     }
 
     /// Every fold's own verdict, in [`Fold::ALL`]'s order.
     // PROPOSED(D-106): a verdict per fold.
-    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 10] {
+    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 11] {
         Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
     }
 
     /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, and then
-    /// check 8's overlap clause, last so that no violation a fold before it reports
-    /// moves to it. This is what stops a run, and it names one fold where several may
+    /// check 8's overlap and install clauses, last so that no violation a fold before them
+    /// reports moves to them. This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
     /// right half's clause is folded and **not** in it: the correct node trips it on a
     /// voter installed past a split, which holds no placeholder for the right half
@@ -2642,6 +2730,162 @@ mod tests {
         assert!(apart.verdict().is_ok(), "{:?}", apart.verdict());
     }
 
+    /// An engine's install, as `SpanInstalled` traces it: only `spans` is read.
+    // PROPOSED(D-128)
+    fn switched(node: u64, spans: Vec<(Bytes, Bytes)>) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::SpanInstalled {
+                manifest: 9,
+                spans,
+                seq: 9,
+                removed: Vec::new(),
+                rewritten: Vec::new(),
+                added: Vec::new(),
+                repair: None,
+            },
+        )
+    }
+
+    /// `range`'s Raft interval, as a span of an install.
+    // PROPOSED(D-128)
+    fn raft_span(range: u64) -> (Bytes, Bytes) {
+        let span = ananke_raft::store::KeyPrefix::group(range).span();
+        (span.start, span.end)
+    }
+
+    /// A key span of an install.
+    // PROPOSED(D-128)
+    fn keys(start: &[u8], end: &[u8]) -> (Bytes, Bytes) {
+        (user_key(start), user_key(end))
+    }
+
+    /// Check 8's install clause, on its shapes (PROPOSED D-128). Node 3 holds right half 6
+    /// over `[m, z)` and has no descriptor of range 2, a re-seeded user range: an install
+    /// of range 2 that replaces configuration's `[a, z)` is the data loss, with the
+    /// overlap clause green, since no descriptor of 2 is traced and the descriptor it
+    /// would trace, `[a, m)`, overlaps nothing. The snapshot's own span is not; nor is the
+    /// install of the same span on another node, one on a node whose spans a crash or a
+    /// refusal forgot, a range replacing its own span, nor a split's non-voter's step,
+    /// whose spans are one-key spans of P's Raft state and the right span.
+    // PROPOSED(D-128)
+    #[test]
+    fn check_8s_install_clause_sees_a_switch_that_replaces_another_replicas_keys() {
+        let held = created(3, 6, b"m", b"z", 2, &[1, 2, 3]);
+        let wide = vec![raft_span(2), keys(b"a", b"z")];
+        let mut caught = OneOwnerPerKey::default();
+        caught.push(&held);
+        caught.push(&switched(3, wide.clone()));
+        let why = caught.install_verdict().unwrap_err();
+        assert!(why.starts_with("one owner per key:"), "{why}");
+        assert!(why.contains("on node 3"), "{why}");
+        assert!(why.contains("its replica of range 6"), "{why}");
+        assert_eq!(caught.overlap_verdict(), Ok(()));
+        // Latched: a later switch that overlaps again keeps the first words.
+        caught.push(&switched(3, vec![raft_span(4), keys(b"n", b"o")]));
+        assert_eq!(caught.install_verdict(), Err(why));
+
+        let one = |events: Vec<TraceRecord>| {
+            let mut owners = OneOwnerPerKey::default();
+            for event in &events {
+                owners.push(event);
+            }
+            owners.install_verdict()
+        };
+        // The snapshot's own span.
+        assert_eq!(
+            one(vec![
+                held.clone(),
+                switched(3, vec![raft_span(2), keys(b"a", b"m")]),
+            ]),
+            Ok(())
+        );
+        // Another node's.
+        assert_eq!(one(vec![held.clone(), switched(4, wide.clone())]), Ok(()));
+        // Forgotten by a crash, and by a refusal.
+        let crashed = record(
+            3,
+            TraceEvent::NodeCrashed {
+                node: NodeId::new(3),
+            },
+        );
+        assert_eq!(
+            one(vec![held.clone(), crashed, switched(3, wide.clone())]),
+            Ok(())
+        );
+        let refused = record(
+            3,
+            TraceEvent::RaftRefused {
+                server: 3,
+                reason: "lost".to_owned(),
+            },
+        );
+        assert_eq!(
+            one(vec![held.clone(), refused, switched(3, wide.clone())]),
+            Ok(())
+        );
+        // A range's own span, however wide: P's post-split snapshot onto a lagging P.
+        assert_eq!(
+            one(vec![
+                created(3, 2, b"a", b"z", 1, &[1, 2, 3]),
+                switched(3, wide),
+            ]),
+            Ok(())
+        );
+        // A split's non-voter's step: P's Raft keys, one key each, and the right span.
+        let prefix = ananke_raft::store::KeyPrefix::group(2);
+        let one_key = |key: Bytes| {
+            let mut past = key.to_vec();
+            past.push(0);
+            (key, Bytes::from(past))
+        };
+        assert_eq!(
+            one(vec![
+                created(3, 2, b"a", b"z", 1, &[1, 2, 3]),
+                switched(
+                    3,
+                    vec![
+                        one_key(prefix.descriptor_key()),
+                        one_key(prefix.key(9, b"applied")),
+                        keys(b"m", b"z"),
+                    ]
+                ),
+            ]),
+            Ok(())
+        );
+    }
+
+    /// The clause in the checker (PROPOSED D-128): it stops a run, after the overlap
+    /// clause, so a run in which both hold names the overlap clause as before.
+    // PROPOSED(D-128)
+    #[test]
+    fn check_8s_install_clause_is_asked_after_its_overlap_clause() {
+        let wide = vec![raft_span(2), keys(b"a", b"z")];
+        let mut alone = Checker::new(true);
+        alone.push(&created(3, 6, b"m", b"z", 2, &[1, 2, 3]));
+        alone.push(&switched(3, wide.clone()));
+        let words = alone.verdict_of(Fold::InstallSpan).unwrap_err();
+        assert!(words.starts_with(Fold::InstallSpan.words()), "{words}");
+        assert_eq!(alone.verdict(), Err(words.clone()));
+        for (fold, verdict) in alone.verdicts() {
+            if fold != Fold::InstallSpan {
+                assert_eq!(verdict, Ok(()), "{fold}");
+            }
+        }
+        // `SnapshotOverlapsReplica`'s shape: the switch and then the creation that overlaps.
+        let mut both = Checker::new(true);
+        both.push(&created(3, 2, b"a", b"z", 1, &[1, 2, 3]));
+        both.push(&switched(3, vec![raft_span(6), keys(b"m", b"z")]));
+        both.push(&created(3, 6, b"m", b"z", 2, &[1, 2, 3]));
+        let overlap = both.verdict_of(Fold::Overlap).unwrap_err();
+        assert!(both.verdict_of(Fold::InstallSpan).is_err());
+        assert_eq!(both.verdict(), Err(overlap));
+        assert_eq!(
+            Fold::InstallSpan.to_string(),
+            "check 8 (one owner per key, the install clause)"
+        );
+    }
+
     #[test]
     fn a_voter_that_applied_a_split_restates_its_right_half_or_check_8_says_so() {
         let mut owners = OneOwnerPerKey::default();
@@ -3304,12 +3548,12 @@ mod tests {
         }
         assert_eq!(
             Fold::VERDICT.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8],
             "the order the checker's verdict asks the folds in"
         );
         assert_eq!(
             Fold::ALL.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8],
             "every fold, the verdict's first and check 8's right half's clause last"
         );
         assert_eq!(

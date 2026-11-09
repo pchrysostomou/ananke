@@ -19,11 +19,15 @@
 //!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2);
 //! - the same run's install of the parent is created at the split's generation, and
 //!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115);
+//! - the same run's right half keeps its keys, whichever of the node's two installs lands
+//!   first, off the node's disk, and `InstallReplacesHostedSpan` loses them exactly where
+//!   the right half's lands first (PROPOSED D-128);
 //! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
 //!   on committing, and the leader as it was is caught by the read bound
 //!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
 
 use ananke_raft::core::{Variant, Variants};
+use ananke_shard::invariants::Fold;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::reseed::{self, Report};
 use ananke_sim::{seeds, sweep, verdict};
@@ -525,4 +529,123 @@ fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {
     unconfirmable_figures("a stalled refused follower", run, &figures);
     let verdicts: Vec<Result<(), String>> = results.into_iter().map(|(v, _)| v).collect();
     verdict(&verdicts).expect("a refused follower that stays refused counts as unable");
+}
+
+/// A re-seeded node's right half keeps its keys, whichever of its two installs lands first
+/// (SHARD.md §5, §11 storage 5; PROPOSED D-128): `reseed::run_after_split`, on every seed
+/// of the tier.
+///
+/// The re-seed hosts P, which has no descriptor in the fresh engine, at configuration's
+/// span, and the right half comes back through its placeholder at its own. Which stream
+/// completes first is the schedule's draw. Where the right half's does, P's install finds
+/// a replica holding keys of the span configuration names for P: it may replace the
+/// snapshot's span alone, and the right half's keys must still be in the node's engine
+/// when the run is over, read off its disk. The run writes each key once, so nothing
+/// puts one back. Every traced descriptor is right whichever span the switch replaced,
+/// so only the keys, and check 8's install clause, can say.
+// PROPOSED(D-128)
+#[test]
+fn a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first() {
+    let run = shape_seeds();
+    tier("the re-seed after a split, the right half's keys", run);
+    let outcomes = sweep(run, |seed| {
+        let report = reseed::run_after_split(seed);
+        report.check()?;
+        report.reached()?;
+        report.right_keys_survive()?;
+        report.state_read_back_is_the_takes(reseed::SPLIT_PARENT)?;
+        let (_, right) = report.split.expect("`reached` names the split");
+        report.state_read_back_is_the_takes(right)?;
+        Ok::<bool, String>(report.right_installed_first())
+    });
+    let first: Vec<u64> = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| matches!(outcome, Ok(true)))
+        .map(|(seed, _)| seed as u64)
+        .collect();
+    println!(
+        "reseed: the right half's install landed before P's on {} of {run} seeds: {first:?}",
+        first.len()
+    );
+    let verdicts: Vec<Result<(), String>> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.map(|_| ()))
+        .collect();
+    verdict(&verdicts).expect("a re-seeded node's right half keeps its keys on every seed");
+    assert!(
+        !first.is_empty(),
+        "the right half's install landed before P's on no seed of {run}: this test saw only \
+         the order that loses nothing"
+    );
+}
+
+/// The pair's buggy half (CLAUDE.md; PROPOSED D-128): `InstallReplacesHostedSpan` on
+/// `reseed::run_after_split`, the same seeds as the correct node's test above.
+///
+/// On every seed where the right half's install lands before P's the switch of P replaces
+/// configuration's span. The right half's keys go from `x`'s engine, every descriptor
+/// traced is as it was, and check 8's install clause is the fold that sees it; the overlap
+/// clause and check 7 stay green. On a seed where P's lands first the variant is the
+/// correct node, and all of them hold. Measured on the tier's seeds, about a third, so
+/// asserted at every tier (D-061).
+// PROPOSED(D-128)
+#[test]
+fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so() {
+    let run = shape_seeds();
+    tier("the re-seed after a split, InstallReplacesHostedSpan", run);
+    let variant = NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]);
+    let outcomes = sweep(run, |seed| {
+        let report = reseed::run_after_split_under(seed, variant);
+        report.reached()?;
+        let checker = ananke_shard::invariants::folded(&report.records);
+        let clause = checker.verdict_of(Fold::InstallSpan);
+        let keys = report.right_keys_survive();
+        if let Err(words) = checker.verdict_of(Fold::Overlap) {
+            return Err(format!(
+                "seed {seed}: the overlap clause tripped, on a variant no descriptor shows: \
+                 {words}"
+            ));
+        }
+        if let Err(words) = checker.verdict_of(Fold::DescriptorAgreement) {
+            return Err(format!("seed {seed}: check 7 tripped: {words}"));
+        }
+        let first = report.right_installed_first();
+        match (first, clause, keys) {
+            (true, Err(words), Err(lost)) => {
+                if words.starts_with(Fold::InstallSpan.words())
+                    && lost.contains("before P")
+                    && lost.contains("lost")
+                {
+                    Ok(true)
+                } else {
+                    Err(format!(
+                        "seed {seed}: caught in other words: {words}; {lost}"
+                    ))
+                }
+            }
+            (false, Ok(()), Ok(())) => Ok(false),
+            (first, clause, keys) => Err(format!(
+                "seed {seed}: the right half installed first: {first}, and check 8's install \
+                 clause said {clause:?} and its keys {keys:?}"
+            )),
+        }
+    });
+    let caught = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(true)))
+        .count();
+    println!(
+        "reseed: InstallReplacesHostedSpan lost the right half's keys and tripped check 8's \
+         install clause on {caught} of {run} seeds, and on the others neither"
+    );
+    let verdicts: Vec<Result<(), String>> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.map(|_| ()))
+        .collect();
+    verdict(&verdicts).expect("the variant is caught exactly where the order reaches it");
+    assert!(
+        caught > 0,
+        "InstallReplacesHostedSpan was caught on no seed of {run}"
+    );
 }

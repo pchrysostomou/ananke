@@ -410,6 +410,17 @@ pub enum NodeVariant {
     /// it by its liveness: the node never makes R (PROPOSED D-110, #185's review, NB2).
     // PROPOSED(D-110): the fresh take's variant.
     RetakeNeverAfterOverlap,
+    /// An install onto a replica with no descriptor replaces every span its plan hosts it
+    /// at, configuration's, where SHARD.md §11 (storage 5) has an install remove "the
+    /// span's keys" and a span-less replica's span is the snapshot's, as a placeholder's
+    /// is (D-109 §2). The overlap rule lets the install in: it compares the snapshot's
+    /// span with the node's initialised replicas, and the snapshot's span overlaps none.
+    /// Then the switch removes the keys of a right half the node got back through its
+    /// placeholder first, and nothing traced says so, since every descriptor is right.
+    /// Check 8's install clause sees the switch's spans, and `reseed::run_after_split`
+    /// the keys gone from the engine (PROPOSED D-128).
+    // PROPOSED(D-128)
+    InstallReplacesHostedSpan,
 }
 
 impl NodeVariant {
@@ -463,6 +474,7 @@ impl NodeVariant {
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
         NodeVariant::RetakeNeverAfterOverlap,
+        NodeVariant::InstallReplacesHostedSpan,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the five ways to get a node's
@@ -653,6 +665,10 @@ impl NodeVariant {
             // PROPOSED(D-110): the overlap rule's fresh take never made. Bits 25 and 49
             // to 53 are free, and sixteen bits are left.
             NodeVariant::RetakeNeverAfterOverlap => 1 << 48,
+            // PROPOSED(D-128): a span-less replica's install replacing what it is hosted
+            // at. Bit 25 is free on `main`, and an open slice proposes it for its own;
+            // bits 50 to 53 are free, and fourteen bits are left.
+            NodeVariant::InstallReplacesHostedSpan => 1 << 49,
         }
     }
 
@@ -708,6 +724,7 @@ impl NodeVariant {
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
             NodeVariant::RetakeNeverAfterOverlap => "RetakeNeverAfterOverlap",
+            NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
         }
     }
 }
@@ -802,10 +819,12 @@ mod tests {
         // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
         // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
-        // D-110's one is the overlap rule's fresh take never made.
+        // D-110's one is the overlap rule's fresh take never made, and D-128's one a
+        // replica with no descriptor whose install replaces what it is hosted at.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
-        assert_eq!(NodeVariant::BUGS.len(), 48);
+        // PROPOSED(D-128)
+        assert_eq!(NodeVariant::BUGS.len(), 49);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

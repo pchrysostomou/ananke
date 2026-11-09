@@ -465,8 +465,9 @@ fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDe
 /// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
 /// node whose initialised replicas' descriptors are `held`.
 // PROPOSED(D-110): one decision for both install paths, failing closed.
+// PROPOSED(D-114): read by the split's test in `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+pub(crate) enum Admission {
     /// Install it.
     Install,
     /// Refuse it with `Overlaps`: its span overlaps another initialised replica on the
@@ -493,7 +494,9 @@ enum Admission {
 /// node meanwhile, which is the same replica made twice rather than an overlap, and it
 /// keeps the refusal of a snapshot that names no span.
 // PROPOSED(D-110): one decision for both install paths, failing closed.
-fn admission(
+// PROPOSED(D-114): read by the split's test in `server.rs`, which holds what a reader of
+// the host's table sees at a split against this rule.
+pub(crate) fn admission(
     range: RangeId,
     streamed: Option<&RangeDescriptor>,
     held: &BTreeMap<RangeId, RangeDescriptor>,
@@ -519,6 +522,42 @@ fn admission(
     } else {
         Admission::Install
     }
+}
+
+/// The spans the switch of an install onto a store of `prefix` replaces, where the plan
+/// hosted the range at `hosted` when its stream completed and the snapshot's descriptor
+/// is `streamed`.
+///
+/// **A replica the node holds a descriptor of** (`initialised`) replaces what the plan
+/// hosts it at, which is that descriptor's span: P's post-split snapshot onto a P that
+/// never applied the split takes the right half's keys out with the rest, since no
+/// replica on the node owns them (the overlap rule keeps it so, SHARD.md §5, Q27).
+///
+/// **A replica with none** holds no key the node can call its own: a re-seeded user
+/// range, or a joining node's replica, hosted at configuration's span only because
+/// nothing else names one (`run`). Its span is the snapshot's, and the keys configuration
+/// names beyond it may be another replica's: a right half the node got back through its
+/// placeholder before this stream completed, which the overlap rule lets in because a
+/// replica with no descriptor is not initialised. So its switch replaces the Raft
+/// interval and the snapshot's span and nothing else, as a placeholder's does (D-109 §2;
+/// SHARD.md §11, storage 5: an install removes "the span's keys").
+/// [`NodeVariant::InstallReplacesHostedSpan`] replaces what the plan hosts it at.
+///
+/// A free function for the reason [`admission`] is: inside `finish` this was one field
+/// of the install read at one call, and no run of the tree told the two apart until the
+/// sharded sweep linearized a key that span had removed.
+// PROPOSED(D-128): a span-less replica's install replaces the snapshot's span alone.
+fn switched_spans(
+    prefix: &KeyPrefix,
+    hosted: &[KeyRange<Bytes>],
+    initialised: bool,
+    streamed: &RangeDescriptor,
+    variants: NodeVariants,
+) -> Vec<KeyRange<Bytes>> {
+    if initialised || variants.contains(NodeVariant::InstallReplacesHostedSpan) {
+        return hosted.to_vec();
+    }
+    vec![prefix.span(), streamed.start.clone()..streamed.end.clone()]
 }
 
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
@@ -1344,6 +1383,21 @@ impl<E: Environment> Task<E> {
             .await;
             return self.release(range);
         }
+        // Admitted, so the descriptor names a span (`admission`): the snapshot's, which a
+        // replica with no descriptor is made of, and what its switch replaces.
+        // PROPOSED(D-128)
+        let Some(streamed) = streamed else {
+            return self.restart(range, from, &install, &store).await;
+        };
+        let span = streamed.start.clone()..streamed.end.clone();
+        let initialised = lock(&self.descriptors).contains_key(&range);
+        let spans = switched_spans(
+            store.prefix(),
+            &install.spans,
+            initialised,
+            &streamed,
+            self.variants,
+        );
         let source = match store.engine().open_span_source(&install.source).await {
             Ok(source) => source,
             // The staged directory is short — a crash inside the stream, a table left
@@ -1386,7 +1440,7 @@ impl<E: Environment> Task<E> {
         let switched = if with_repair {
             store
                 .engine()
-                .install_spans(install.spans.clone(), source, batch)
+                .install_spans(spans.clone(), source, batch)
                 .await
         } else {
             // The variant: the switch is made without the range's repair carried in it
@@ -1394,11 +1448,7 @@ impl<E: Environment> Task<E> {
             // term, its vote, its log — under this replica's prefix.
             store
                 .engine()
-                .install_spans(
-                    install.spans.clone(),
-                    source,
-                    ananke_storage::WriteBatch::new(),
-                )
+                .install_spans(spans.clone(), source, ananke_storage::WriteBatch::new())
                 .await
         };
         if switched.is_err() {
@@ -1425,6 +1475,16 @@ impl<E: Environment> Task<E> {
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
+        // A replica that had no descriptor has one now, whose span is the snapshot's: its
+        // next install replaces that, here and now, as a placeholder's install hosts its
+        // replica. The host's comparison at `Switched` is for a replica it holds a
+        // descriptor of; waiting for it left the plan at configuration's span for as long
+        // as the raft task took to step.
+        // PROPOSED(D-128): the re-host in this task.
+        if !initialised {
+            self.plan
+                .host(range, vec![store.prefix().span(), span.clone()]);
+        }
         // What actually landed, read back from the engine before this range is let go
         // again, so a check can compare it with what the take that fed it put in.
         // Counting events says a stream flowed; it says nothing about what is in the
@@ -1451,7 +1511,12 @@ impl<E: Environment> Task<E> {
             .flatten()
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok())
             .map(Box::new);
-        self.state_of(range, install.at, &store).await;
+        // The state, over the span the replica's descriptor names or, on a replica the
+        // host holds none of yet, the snapshot's: the host puts it in place at `Switched`,
+        // after this (D-083).
+        // PROPOSED(D-128): the creation's read-back reads the streamed span.
+        let read = self.user_span(range).unwrap_or(span);
+        self.state_of(range, install.at, &store, read).await;
         self.env.trace_decided(
             installing,
             TraceEvent::RaftSnapshot {
@@ -1659,15 +1724,20 @@ impl<E: Environment> Task<E> {
         // range is initialised on the node, so the host drops its messages rather than
         // answer them as its placeholder's, and a chunk of it is no placeholder's either
         // (SHARD.md §5: the placeholder becomes a replica at the install). It is what the
-        // state read back below takes the span from, and what the host's receipt check
-        // reads from here on.
+        // host's receipt check reads from here on.
         // PROPOSED(D-109)
         lock(&self.descriptors).insert(range, descriptor.clone());
         // What landed, read back out of the engine before the store is opened on it
         // (`read_back`): counting events says a stream flowed, and nothing about what is
         // in the store (D-083). It is traced once the store is open, with the applied
         // index the store reports (`trace_state`).
-        let read = self.read_back(range, beside.engine(), &prefix).await;
+        let read = self
+            .read_back(
+                descriptor.start.clone()..descriptor.end.clone(),
+                beside.engine(),
+                &prefix,
+            )
+            .await;
         self.env.trace_decided(
             installing,
             TraceEvent::RaftSnapshot {
@@ -1893,9 +1963,15 @@ impl<E: Environment> Task<E> {
     /// by `(range, last_index, last_term)` is what lets a check say the bytes that
     /// landed are the bytes that were taken — which no count of events can say.
     // PROPOSED(D-083): what an install installed is read back and traced.
-    async fn state_of(&self, range: RangeId, at: Identity, store: &RaftStore<E>) {
+    async fn state_of(
+        &self,
+        range: RangeId,
+        at: Identity,
+        store: &RaftStore<E>,
+        span: KeyRange<Bytes>,
+    ) {
         let applied = store.applied();
-        if let Some(read) = self.read_back(range, store.engine(), store.prefix()).await {
+        if let Some(read) = self.read_back(span, store.engine(), store.prefix()).await {
             self.trace_state(range, at, applied, read);
         }
     }
@@ -1907,15 +1983,16 @@ impl<E: Environment> Task<E> {
     /// back already tidied (`TakeStreamsTheLogToo`; PROPOSED D-109). What it reads there
     /// is therefore the state the switch left, which no opened store serves: the log
     /// keys at or below the snapshot's index it counts are gone once the open runs, and
-    /// everything else it reads the open leaves as it is. `None` where the range has no
-    /// descriptor or the scan of its user keys fails, and nothing is traced.
+    /// everything else it reads the open leaves as it is. `span` is the range's: the
+    /// caller's to say, since a creation's descriptor is not yet the host's when this
+    /// reads it (PROPOSED D-128). `None` where the scan of its user keys fails, and
+    /// nothing is traced.
     async fn read_back(
         &self,
-        range: RangeId,
+        spans: KeyRange<Bytes>,
         engine: &ananke_storage::Engine<E>,
         prefix: &KeyPrefix,
     ) -> Option<ReadBack> {
-        let spans = self.user_span(range)?;
         let version = engine.snapshot();
         let user = engine
             .scan(&spans.start[..]..&spans.end[..], &version)
@@ -3136,6 +3213,20 @@ mod tests {
         descriptor: Option<&RangeDescriptor>,
         dir: &Path,
     ) {
+        checkpoint_with(env, range, index, descriptor, &[], dir).await;
+    }
+
+    /// [`checkpoint_of`], over the descriptor's span too where `user` names keys to put
+    /// in it: what a take of a range holding those keys leaves.
+    // PROPOSED(D-128)
+    async fn checkpoint_with<E: Environment>(
+        env: &E,
+        range: RangeId,
+        index: Index,
+        descriptor: Option<&RangeDescriptor>,
+        user: &[&str],
+        dir: &Path,
+    ) {
         let prefix = KeyPrefix::group(range.get());
         let (leader, _) = RaftStore::open_dir(
             env.clone(),
@@ -3149,6 +3240,9 @@ mod tests {
             batch.put(prefix.descriptor_key(), descriptor.encode());
         } else {
             batch.delete(prefix.descriptor_key());
+        }
+        for name in user {
+            batch.put(key(name), Bytes::from_static(b"v"));
         }
         leader
             .engine()
@@ -3167,9 +3261,13 @@ mod tests {
             .await
             .expect("the record");
         let span = prefix.span();
+        let mut spans = vec![&span.start[..]..&span.end[..]];
+        if let (false, Some(descriptor)) = (user.is_empty(), descriptor) {
+            spans.push(&descriptor.start[..]..&descriptor.end[..]);
+        }
         leader
             .engine()
-            .checkpoint_spans(&[&span.start[..]..&span.end[..]], dir)
+            .checkpoint_spans(&spans, dir)
             .await
             .expect("the checkpoint");
     }
@@ -3365,6 +3463,202 @@ mod tests {
                 expected,
                 "case {case}: P's pre-split snapshot where R is held, a snapshot naming no \
                  span, and P's post-split snapshot"
+            );
+        }
+    }
+
+    /// What the switch of an install replaces, read off the three things that decide it
+    /// (PROPOSED D-128): a replica the node holds a descriptor of replaces what the plan
+    /// hosts it at, and one with none the snapshot's span, however wide configuration's,
+    /// unless the variant says what it hosts it at.
+    // PROPOSED(D-128)
+    #[test]
+    fn an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of() {
+        let prefix = KeyPrefix::group(R2.get());
+        let hosted = vec![prefix.span(), key("k0")..key("k2")];
+        let left = described(R2, "k0", "k1", 2);
+        let variant = NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]);
+        let correct = NodeVariants::correct();
+        let snapshots = vec![prefix.span(), key("k0")..key("k1")];
+        assert_eq!(
+            switched_spans(&prefix, &hosted, true, &left, correct),
+            hosted
+        );
+        assert_eq!(
+            switched_spans(&prefix, &hosted, false, &left, correct),
+            snapshots
+        );
+        assert_eq!(
+            switched_spans(&prefix, &hosted, false, &left, variant),
+            hosted
+        );
+        assert_eq!(
+            switched_spans(&prefix, &hosted, true, &left, variant),
+            hosted
+        );
+    }
+
+    /// An install onto a replica with no descriptor, through the task (PROPOSED D-128):
+    /// node `/n1` hosts R2 at configuration's `[k0, k9)` with no descriptor of it, as a
+    /// re-seed leaves a user range, and holds R9 over `[k1, k2)`, as R9's placeholder's
+    /// install left it, with a key. R2's post-split snapshot names `[k0, k1)`, which
+    /// overlaps nothing, so the overlap rule lets it in.
+    ///
+    /// On the correct node the switch replaces `[k0, k1)`: R9's key is there after it, the
+    /// plan hosts R2 at the snapshot's span from the switch, and the state read back is
+    /// traced, over the snapshot's span, though the host holds no descriptor of R2 until
+    /// `Switched`. Under the variant the switch replaces what the plan hosts and R9's key
+    /// is gone, with every descriptor as it was; check 8's install clause reads the
+    /// switch's spans off the same trace.
+    // PROPOSED(D-128)
+    #[test]
+    fn an_install_onto_a_replica_with_no_descriptor_replaces_the_snapshots_span_alone() {
+        struct Case {
+            variants: NodeVariants,
+            switched_end: &'static str,
+            right_key_kept: bool,
+            clause_green: bool,
+        }
+        let cases = [
+            Case {
+                variants: NodeVariants::correct(),
+                switched_end: "k1",
+                right_key_kept: true,
+                clause_green: true,
+            },
+            Case {
+                variants: NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]),
+                switched_end: "k9",
+                right_key_kept: false,
+                clause_green: false,
+            },
+        ];
+        for case in cases {
+            let variants = case.variants;
+            let ((right_key, left_key, hosted, switched), trace) =
+                on_a_node(move |env| async move {
+                    let right = described(R9, "k1", "k2", 2);
+                    let left = described(R2, "k0", "k1", 2);
+                    let (mut task, store, local, _follower) =
+                        task_on(&env, R2, std::slice::from_ref(&right)).await;
+                    task.variants = variants;
+                    let mut batch = ananke_storage::WriteBatch::new();
+                    batch.put(key("k1x"), Bytes::from_static(b"R9's"));
+                    store.engine().write(batch, true).await.expect("R9's key");
+                    let source = PathBuf::from("/n1/staging-r2-s3");
+                    checkpoint_with(&env, R2, 30, Some(&left), &["k0x"], &source).await;
+                    let from = FOLLOWER;
+                    let install = Install {
+                        range: R2,
+                        from,
+                        at: Identity {
+                            term: 2,
+                            last_index: 30,
+                            last_term: 2,
+                        },
+                        source,
+                        spans: vec![KeyPrefix::group(R2.get()).span(), key("k0")..key("k9")],
+                        repair_in_switch: true,
+                        reopens_engine: false,
+                        adopted: false,
+                    };
+                    task.receiving.entry((R2, from)).or_default().pending = Some(Box::new(install));
+                    let repair = Repair {
+                        term: 2,
+                        vote: None,
+                        tail: Vec::new(),
+                        quarantined: false,
+                        incarnation: 7,
+                    };
+                    task.finish(R2, from, repair, env.decision()).await;
+                    let switched = matches!(
+                        local.remove_first(|_| true),
+                        Some(crate::server::Local::Snapshot(SnapAnswer::Switched { .. }))
+                    );
+                    let hosted = task.plan.hosted_at(R2).map(<[KeyRange<Bytes>]>::to_vec);
+                    let right_key = store.engine().get(&key("k1x")).await.expect("a read");
+                    let left_key = store.engine().get(&key("k0x")).await.expect("a read");
+                    (right_key, left_key, hosted, switched)
+                });
+            assert!(switched, "the install switched");
+            assert!(left_key.is_some(), "the snapshot's key is installed");
+            assert_eq!(right_key.is_some(), case.right_key_kept, "R9's key");
+            assert_eq!(
+                hosted,
+                Some(vec![
+                    KeyPrefix::group(R2.get()).span(),
+                    key("k0")..key("k1")
+                ]),
+                "the plan hosts R2 at the snapshot's span from the switch"
+            );
+            let replaced: Vec<&Vec<(Bytes, Bytes)>> = trace
+                .iter()
+                .filter_map(|record| match &record.event {
+                    TraceEvent::SpanInstalled { spans, .. } => Some(spans),
+                    _ => None,
+                })
+                .collect();
+            let raft = KeyPrefix::group(R2.get()).span();
+            assert_eq!(
+                replaced,
+                vec![&vec![
+                    (raft.start, raft.end),
+                    (key("k0"), key(case.switched_end)),
+                ]],
+                "what the switch replaced"
+            );
+            // The read-back, with no descriptor of R2 in the host's table: R2's one key, and
+            // on the variant too, since it reads the snapshot's span.
+            let read: Vec<(u64, u64)> = trace
+                .iter()
+                .filter_map(|record| match &record.event {
+                    TraceEvent::RaftSnapshotState {
+                        range,
+                        last_index,
+                        user_keys,
+                        ..
+                    } if *range == R2.get() => Some((*last_index, *user_keys)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(read, vec![(30, 1)], "the state read back at the switch");
+            // Check 8's install clause over the task's own trace, with the node's holding
+            // of R9 stated before it.
+            let node = trace
+                .iter()
+                .find_map(|record| record.node)
+                .expect("a record on the node");
+            let mut checker = crate::invariants::Checker::new(true);
+            let right = described(R9, "k1", "k2", 2);
+            checker.push(&ananke_env::sim::TraceRecord {
+                at: ananke_env::Instant::from_nanos(0),
+                decided: ananke_env::Instant::from_nanos(0),
+                node: Some(node),
+                event: TraceEvent::RangeCreated {
+                    range: R9.get(),
+                    cause: ananke_env::RangeCause::Snapshot,
+                    parent: None,
+                    start: right.start,
+                    end: right.end,
+                    generation: 2,
+                    voters: vec![1, 2, 3],
+                    floor_index: 9,
+                    floor_term: 1,
+                    incarnation: 3,
+                },
+            });
+            checker.extend(&trace);
+            assert_eq!(
+                checker
+                    .verdict_of(crate::invariants::Fold::InstallSpan)
+                    .is_ok(),
+                case.clause_green,
+                "check 8's install clause"
+            );
+            assert_eq!(
+                checker.verdict_of(crate::invariants::Fold::Overlap),
+                Ok(()),
+                "no descriptor overlaps, whichever span the switch replaced"
             );
         }
     }
