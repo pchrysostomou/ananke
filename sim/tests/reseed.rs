@@ -16,9 +16,16 @@
 //! - (c)'s second half — a replica answering *after its own install* — is shown not to be
 //!   a constant, which is what it was when it was keyed on the mark alone;
 //! - a re-seeded node's right half, which configuration never names, comes back through
-//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2);
-//! - the same run's install of the parent is created at the split's generation, and
-//!   check 7 holds it (issue #172; PROPOSED D-107 §2, D-115);
+//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2), and the
+//!   node, re-seeded and not restarted, writes nothing into the directory it refused
+//!   (D-041, PROPOSED D-117);
+//! - `TasksOnTheRefusedDir`, the start that re-seeded handing its tasks the refused
+//!   directory, is caught there on every seed (PROPOSED D-117);
+//! - a node that leads a right half made after its re-seed takes and sweeps in the directory
+//!   it runs on, and the variant is caught there too (`reseed::run_split_after_reseed`,
+//!   PROPOSED D-117);
+//! - the same run's install of the parent is created at the split's generation and agrees
+//!   with check 7's map at its floor (issue #172; PROPOSED D-107 §2, D-115);
 //! - the same run's right half keeps its keys, whichever of the node's two installs lands
 //!   first, off the node's disk, and `InstallReplacesHostedSpan` loses them exactly where
 //!   the right half's lands first (PROPOSED D-128);
@@ -61,6 +68,15 @@ fn with(seed: u64, variant: NodeVariant) -> Report {
 /// hundred run in full; the premerge and the nightly run two hundred. Every test here
 /// prints the tier it was asked for and the number it ran, so a capped run never reads
 /// as a full one.
+///
+/// The binary's other shape, the re-seed after a split (`reseed::run_after_split`), runs
+/// under this cap on its own figures, not this shape's: about 98 000 trace records and
+/// 0.17 to 0.21 CPU seconds a seed in release, measured at load averages from 86 to 541.
+/// Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the
+/// nightly's ten thousand some 1 700 to 2 100, a whole nightly shard (D-064), for clauses
+/// that hold or fail on every seed at twenty. Like this shape's, that cap is the owner's
+/// to rule on (PROPOSED D-115).
+// PROPOSED(D-115): the second shape's cap, on its own figures.
 const TIER_CAP: u64 = 200;
 
 /// The seeds this binary's sweeps run: the tier's, capped.
@@ -73,15 +89,23 @@ fn shape_seeds() -> u64 {
 /// Under [`TIER_CAP`] this is **twenty at every tier**, and it is written as a constant
 /// rather than as a tenth of the tier so that it says so: a tenth of a capped tier is
 /// twenty from the gate to the nightly, and D-082's phrase "a tenth of the tier" would be
-/// false here above two hundred seeds. Both variants run on it are caught at 48 % and
-/// 77 %, at which twenty seeds miss with probability 4e-7 and 5e-13.
+/// false here above two hundred seeds. Four variants run on it. `ReseedMarkNotSynced` and
+/// `RecordNeverQueued` are caught at 48 % and 77 %, at which twenty seeds miss with
+/// probability 4e-7 and 5e-13. `ServeBeforeRefusedMark` and `TasksOnTheRefusedDir` are caught
+/// on every seed measured, 100 of 100 and 200 of 200.
 const HIGH_RATE_SHARE: u64 = 20;
 
 /// Prints what tier was asked for and what actually ran, once per test.
 fn tier(what: &str, run: u64) {
+    tier_under(what, run, "D-081");
+}
+
+/// [`tier`], naming the entry whose figures the cap stands on for this run.
+// PROPOSED(D-115)
+fn tier_under(what: &str, run: u64, entry: &str) {
     println!(
         "reseed shape, {what}: ANANKE_SEEDS={} ran {run} seeds (TIER_CAP={TIER_CAP}, \
-         PROPOSED — see D-081)",
+         PROPOSED — see {entry})",
         seeds()
     );
 }
@@ -313,23 +337,54 @@ fn caught(variant: NodeVariant, run: u64) {
 }
 
 /// A re-seeded node's right half comes back through its placeholder, quarantined
-/// (PROPOSED D-109 §2): `reseed::run_after_split`, on every seed of the tier.
+/// (PROPOSED D-109 §2), the node writes nothing into the directory it refused (PROPOSED
+/// D-117), and P's install is created at the split's generation (PROPOSED D-115):
+/// `reseed::run_after_split`, on every seed of the tier.
 ///
-/// The node held the right half before its loss: its own apply of the split created it,
-/// and it may have voted in it. The re-seed rebuilds configuration's replicas, and
-/// configuration never names a right half, so the right half is not among them; the
-/// fresh engine holds no key of it. So it comes back only by its placeholder's install,
-/// and the replica that install creates is quarantined — stated so, `RaftReseeded` and
-/// `RaftRecovered { state: quarantined }` — and grants the right half nothing. Before the
-/// fix it was installed unquarantined, and this failed on every seed.
+/// What it holds, per seed, on the correct node:
+///
+/// - **the quarantine** (PROPOSED D-109 §2). The node held the right half before its
+///   loss: its own apply of the split created it, and it may have voted in it. The
+///   re-seed rebuilds configuration's replicas, and configuration never names a right
+///   half, so the right half is not among them; the fresh engine holds no key of it. So
+///   it comes back only by its placeholder's install, and the replica that install
+///   creates is quarantined — stated so, `RaftReseeded` and `RaftRecovered { state:
+///   quarantined }` — and grants the right half nothing. Before that fix it was
+///   installed unquarantined, and this failed on every seed;
+/// - **the refused directory untouched** (D-041, PROPOSED D-117). The node is not
+///   restarted after its re-seed, so the start that re-seeded is the one that receives
+///   both streams, its re-seed's of P and the right half's to its placeholder. Not one
+///   entry of the refused directory, at any depth, changes from the audit before the
+///   restart to the one at the end, other than the refusal's own marker, and both
+///   streams staged in the directory the re-seed built and were cleared there, so no file
+///   is left in either staging directory. Before that fix the start's tasks were handed the
+///   refused directory and both streams staged, synced and were cleared there: this failed
+///   on 200 of 200 seeds (#176);
+/// - **an install creation's generation** (issue #172; PROPOSED D-107 §2, D-115). `x`
+///   applied the split before its loss, and P's leader compacted past it while `x` was
+///   down, so the install that creates P on `x`'s fresh engine puts P's left half in place,
+///   `[k0, k1)` at generation 2. Its `RangeCreated { cause: snapshot }` must name that
+///   descriptor (SHARD.md §8) and equal check 7's value for P at its floor
+///   (`AfterSplit::parent_created_at_the_splits_generation`). Reverting the creation's
+///   reading to the first generation, whatever the snapshot held, fails this on every seed
+///   by check 7. The revert gives the call site of `created_from` in `ananke-shard`'s
+///   `server.rs` no descriptor. Seed 0 then fails with "descriptor agreement: node
+///   Some(3)'s replica of range 2 was installed at index 128 with Held { …, generation: 1,
+///   … }, where the range's descriptor there is Held { …, generation: 2, … }". The unit
+///   test of `created_from` passes that revert, so this run is what holds the call site.
+// PROPOSED(D-115): the parent's install creation, asked on the same run.
 #[test]
 fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
     let run = shape_seeds();
-    tier("the re-seed after a split", run);
+    tier_under("the re-seed after a split", run, "D-115");
     let verdicts = sweep(run, |seed| {
         let report = reseed::run_after_split(seed);
         report.check()?;
         report.reached()?;
+        // PROPOSED(D-117)
+        report.refused_untouched()?;
+        report.staged_where_it_runs()?;
+        report.parent_created_at_the_splits_generation()?;
         let (_, right) = report.split.expect("`reached` names the split");
         let (at, ..) = report
             .installed_after_refusal(right)
@@ -352,40 +407,68 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
             )),
         }
     });
-    verdict(&verdicts).expect("a re-seeded node's right half comes back quarantined on every seed");
+    verdict(&verdicts).expect(
+        "a re-seed after a split creates P at the split's generation, brings the right half \
+         back quarantined and leaves the directory it refused untouched, on every seed",
+    );
 }
 
-/// A re-seed after a split creates the parent by an install at the split's generation,
-/// and check 7 holds it (issue #172; PROPOSED D-107 §2, D-115): `reseed::run_after_split`,
-/// on every seed of the tier.
+/// D-117's variant: the start that re-seeded hands its tasks the refused directory, the
+/// node as it stood before #176. `reseed::run_after_split` on the variant, on
+/// [`HIGH_RATE_SHARE`] seeds.
 ///
-/// `x` applied the split before its loss, and P's leader compacted past it while `x` was
-/// down. So the re-seed's stream of P carries a checkpoint past the split, and the
-/// install that creates P on `x`'s fresh engine puts P's left half in place, `[k0, k1)`
-/// at generation 2. Its `RangeCreated { cause: snapshot }` must name that descriptor
-/// (SHARD.md §8), and check 7 must hold it at its floor: equal to the value check 7's
-/// map holds for P there, not waiting for one.
+/// Caught on every seed, and by the clauses it breaks: the refused directory changed, what
+/// changed is staging and nothing else, and it includes the two streams this start received,
+/// the re-seed's own of P and the right half's to its placeholder; and the directory the
+/// node runs on holds no staging of either. Asking for a stream of each rather than for
+/// exactly two names leaves room for a leader's change during a stream, which would stage
+/// under a second sender. Measured on 200 of 200 seeds, so the catch is asserted at every
+/// tier (D-061 gates only what is caught on under 5 %).
 ///
-/// Reverting the creation's reading to the first generation, whatever the snapshot held,
-/// fails this on every seed by check 7. The revert gives the call site of `created_from`
-/// in `ananke-shard`'s `server.rs` no descriptor. Measured: 20 of 20 seeds in debug and
-/// 200 of 200 at the cap in release. Seed 0 fails with "descriptor agreement: node
-/// Some(3)'s replica of range 2 was installed at index 128 with Held { …, generation: 1,
-/// … }, where the range's descriptor there is Held { …, generation: 2, … }". The unit test
-/// of `created_from` passes that revert, so this run is what holds the call site
-/// (PROPOSED D-115).
+/// The run is otherwise the correct one, and the test asks that too: every check of the
+/// trace passes the variant, so the audit is what catches it.
+// PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
 #[test]
-fn a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it() {
-    let run = shape_seeds();
-    tier("the re-seed after a split, P's install creation", run);
+fn a_node_whose_tasks_stay_on_the_refused_directory_is_caught() {
+    let run = HIGH_RATE_SHARE;
+    let variant = NodeVariant::TasksOnTheRefusedDir;
+    tier(&format!("{variant}"), run);
     let verdicts = sweep(run, |seed| {
-        let report = reseed::run_after_split(seed);
+        let report = reseed::run_after_split_under(seed, NodeVariants::correct().with(variant));
         report.check()?;
         report.reached()?;
-        report.parent_created_at_the_splits_generation()
+        let (_, right) = report.split.expect("`reached` names the split");
+        if report.refused_untouched().is_ok() {
+            return Err(format!(
+                "seed {seed}: {variant} left the refused directory untouched"
+            ));
+        }
+        let changed = report.refused_changed().ok_or_else(|| {
+            format!("seed {seed}: {variant}: an audit of the refused directory did not finish")
+        })?;
+        let staged = |range: u64| {
+            let prefix = format!("staging-r{range}-s");
+            changed.iter().any(|name| name.starts_with(&prefix))
+        };
+        if !staged(reseed::SPLIT_PARENT)
+            || !staged(right)
+            || !changed.iter().all(|name| name.starts_with("staging-"))
+        {
+            return Err(format!(
+                "seed {seed}: {variant} should change the staging of ranges {} and {right} in \
+                 the refused directory, and nothing else: {changed:?}",
+                reseed::SPLIT_PARENT
+            ));
+        }
+        if report.staged_where_it_runs().is_ok() {
+            return Err(format!(
+                "seed {seed}: {variant}'s streams staged in the directory the node runs on"
+            ));
+        }
+        Ok(())
     });
-    verdict(&verdicts)
-        .expect("a re-seed after a split creates P at the split's generation on every seed");
+    verdict(&verdicts).expect("the variant is caught on every seed, by the staging it moved");
+    println!("{variant}: caught on {run} of {run} seeds, by its staging in the refused directory");
 }
 
 /// The figures the two halves of D-129's pair print.
@@ -648,4 +731,69 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
         caught > 0,
         "InstallReplacesHostedSpan was caught on no seed of {run}"
     );
+}
+
+/// A node that leads a right half made after its re-seed takes its checkpoints and sweeps
+/// them in the directory it runs on (D-041, PROPOSED D-117): `reseed::run_split_after_reseed`,
+/// on [`HIGH_RATE_SHARE`] seeds, correct and under `TasksOnTheRefusedDir`.
+///
+/// `run_after_split` reaches no take and no sweep: every replica of its re-seeded node is
+/// quarantined and never campaigns, so its `apply` task writes nothing and its `snapshot`
+/// task sweeps nothing. A right half the node makes after its re-seed may lead. Here P's left
+/// half is split, whichever other node leads the new right half is crashed until `x` does,
+/// and `x` is written to past the threshold several times over.
+///
+/// On the correct node, on every seed: every check of the trace passes, `x` leads and takes
+/// at least two checkpoints, each take's version directory is in the directory the re-seed
+/// built and none is in the refused one, a sweep has emptied an earlier one there, and the
+/// refused directory is untouched. Measured on 200 seeds: the split applied and every clause
+/// held on all 200, with 8 to 10 takes and 1 or 2 versions still holding files at the end.
+///
+/// Under the variant, on every seed: the same trace checks pass, the same takes are traced,
+/// and every version directory is in the refused directory and none in the fresh one.
+/// Measured on 200 of 200. It catches the two ways to leave a task behind that
+/// `run_after_split` cannot: the `apply` task's `engine_dir`, by where the versions are, and
+/// the `snapshot` task's, by the sweep that empties nothing (PROPOSED D-117 gives the table).
+///
+/// It splits P's left half and not a range the log rebuilt, whose split fails state machine
+/// safety on the re-seeded node, which is #199's.
+// PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+#[test]
+fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs() {
+    let run = HIGH_RATE_SHARE;
+    tier("the split after a re-seed", run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct());
+        report.check()?;
+        report.reached()?;
+        report.refused_untouched()?;
+        report.took_where_it_runs()
+    });
+    verdict(&verdicts).expect("the correct node takes and sweeps where it runs on every seed");
+
+    let variant = NodeVariant::TasksOnTheRefusedDir;
+    tier(&format!("the split after a re-seed, {variant}"), run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct().with(variant));
+        report.check()?;
+        report.reached()?;
+        let right = report
+            .second_right
+            .ok_or_else(|| format!("seed {seed}: {variant}: no split after the re-seed"))?;
+        let takes = report.takes_of(right);
+        let audit = |dir: &Option<reseed::DirAudit>| {
+            dir.as_ref()
+                .map(|audit| reseed::versions_of(audit, right).len())
+                .ok_or_else(|| format!("seed {seed}: {variant}: an audit did not finish"))
+        };
+        let (refused, fresh) = (audit(&report.refused_at_end)?, audit(&report.fresh_at_end)?);
+        if takes < 2 || refused < takes || fresh != 0 || report.took_where_it_runs().is_ok() {
+            return Err(format!(
+                "seed {seed}: {variant} should put every take of range {right} in the refused \
+                 directory: {takes} takes, {refused} versions there and {fresh} where it runs"
+            ));
+        }
+        Ok(())
+    });
+    verdict(&verdicts).expect("the variant's takes are all in the refused directory on every seed");
 }

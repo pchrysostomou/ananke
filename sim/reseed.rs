@@ -77,14 +77,15 @@ use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::Message;
-use ananke_raft::store::{is_marked_lost, mark_store_lost};
+use ananke_raft::store::{STORE_MARKER, is_marked_lost, mark_store_lost};
 use ananke_shard::client::{RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::generation_dir;
-use ananke_shard::invariants::{Fold, Held};
+use ananke_shard::invariants::Held;
 use ananke_shard::range::RangeId;
 use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::server::ServerConfig;
+use ananke_shard::snapshot::parse_version;
 use ananke_shard::variant::NodeVariants;
 use ananke_storage::{Engine, EngineConfig};
 use bytes::Bytes;
@@ -1174,6 +1175,76 @@ fn audit(sim: &mut Sim, at: NodeId, dir: &Path) -> Option<DirAudit> {
     complete.then_some(taken)
 }
 
+/// Every entry under `dir` on the node's own disk, at any depth: a file by its path
+/// below `dir` against its length and checksum, as [`audit`] records one, and a
+/// directory by its path and a trailing `/` against `(0, 0)`.
+///
+/// [`audit`] reads `dir`'s own files and skips what is not one, so a directory created
+/// inside `dir` — a staging directory, a version directory — and every byte written into
+/// it are invisible to it. This descends. The simulated disk keeps a directory once made
+/// (nothing removes one), so a directory created and later emptied is still listed.
+fn audit_tree(sim: &mut Sim, at: NodeId, dir: &Path) -> Option<DirAudit> {
+    let found: Arc<Mutex<DirAudit>> = Arc::new(Mutex::new(DirAudit::new()));
+    let done: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let out = found.clone();
+    let finished = done.clone();
+    let env = sim.env(at);
+    let inner = env.clone();
+    let root = dir.to_path_buf();
+    env.spawn("audit", async move {
+        // Paths below `root`, the empty one being `root` itself.
+        let mut pending: Vec<PathBuf> = vec![PathBuf::new()];
+        while let Some(below) = pending.pop() {
+            let here = if below.as_os_str().is_empty() {
+                root.clone()
+            } else {
+                root.join(&below)
+            };
+            let Ok(listed) = inner.fs().read_dir(&here).await else {
+                return;
+            };
+            for entry in listed {
+                let Some(name) = entry.file_name() else {
+                    continue;
+                };
+                let child = below.join(name);
+                let path = root.join(&child);
+                let shown = child.to_string_lossy().into_owned();
+                match inner.fs().open(&path, OpenOptions::new().read(true)).await {
+                    Ok(file) => {
+                        let Ok(size) = file.size().await else {
+                            continue;
+                        };
+                        let bytes = file
+                            .read_at(0, usize::try_from(size).unwrap_or(usize::MAX))
+                            .await
+                            .unwrap_or_default();
+                        out.lock()
+                            .expect("the audit")
+                            .insert(shown, (size, checksum(&bytes)));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
+                        out.lock()
+                            .expect("the audit")
+                            .insert(format!("{shown}/"), (0, 0));
+                        pending.push(child);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        *finished.lock().expect("the audit") = true;
+    });
+    let mut waited = Duration::ZERO;
+    while waited < AUDIT_BUDGET && !*done.lock().expect("the audit") {
+        sim.run_for(AUDIT_STEP);
+        waited += AUDIT_STEP;
+    }
+    let complete = *done.lock().expect("the audit");
+    let taken = found.lock().expect("the audit").clone();
+    complete.then_some(taken)
+}
+
 /// Whether `dir`'s marker says the store there lost state, asked of the node's own
 /// disk after the run.
 fn marked_lost(sim: &mut Sim, at: NodeId, dir: &Path) -> bool {
@@ -1267,6 +1338,31 @@ const RIGHT_KEYS: u64 = 100;
 /// right half's snapshot stays a few dozen chunks ([`SNAPSHOT_CHUNK`]).
 // PROPOSED(D-128)
 const RIGHT_EVERY: Duration = Duration::from_millis(40);
+/// The key the split after the re-seed splits P's left half at: its right half is
+/// `[k0a, k1)`. P's left half and not another range because `x` got it back by a stream,
+/// which carries its descriptor; a range the log rebuilt holds none, and its next split
+/// fails state machine safety on `x` (#199).
+// PROPOSED(D-117)
+const LEFT_SPLIT_KEY: &str = "k0a";
+/// The key the writer of that right half writes.
+// PROPOSED(D-117)
+const LEFT_RIGHT_KEY: &str = "k0b";
+/// The longest the run waits for `x` to apply the split after its re-seed.
+// PROPOSED(D-117)
+const SECOND_SPLIT_BUDGET: Duration = Duration::from_secs(4);
+/// How long the new right half is given to elect before the run asks who leads it.
+// PROPOSED(D-117)
+const SECOND_SPLIT_SETTLE: Duration = Duration::from_millis(600);
+/// How often the run crashes that right half's leader, if it is not `x`, and how long it
+/// gives the next election.
+// PROPOSED(D-117)
+const LEADER_TRIES: usize = 12;
+// PROPOSED(D-117)
+const LEADER_TRY: Duration = Duration::from_millis(1200);
+/// How long `x` is written to as that right half's leader: past its threshold several
+/// times over, so that it takes several checkpoints and sweeps the earlier ones.
+// PROPOSED(D-117)
+const TAKES_FOR: Duration = Duration::from_secs(5);
 
 /// What one run of the re-seed after a split built and traced
 /// ([`run_after_split`]).
@@ -1287,6 +1383,21 @@ pub struct AfterSplit {
     /// was not built or the read did not finish.
     // PROPOSED(D-128)
     pub right_keys_on_x: Option<BTreeSet<Bytes>>,
+    /// `x`'s engine directory, the one its restart refuses, as an audit found it with
+    /// `x` down just before that restart, or `None` if the audit did not finish.
+    pub refused_before: Option<DirAudit>,
+    /// The same directory at the run's end, `x` crashed so that nothing on it is
+    /// writing, or `None` if the audit did not finish.
+    pub refused_at_end: Option<DirAudit>,
+    /// Whether that directory's marker still says lost at the end.
+    pub still_lost: bool,
+    /// The directory `x`'s re-seed built and the rest of its start runs on, beside the
+    /// refused one, as an audit found it at the end with `x` crashed, or `None` if the
+    /// audit did not finish.
+    pub fresh_at_end: Option<DirAudit>,
+    /// The right half of the split after the re-seed, where this run asked for one and
+    /// `x` applied it ([`run_split_after_reseed`]).
+    pub second_right: Option<u64>,
 }
 
 impl AfterSplit {
@@ -1328,8 +1439,19 @@ impl AfterSplit {
 
     /// `x`'s creation of `range` by an install after its refusal: where it stands, and the
     /// generation and span it names.
+    // PROPOSED(D-115): reads the one search below.
     #[must_use]
     pub fn installed_after_refusal(&self, range: u64) -> Option<(usize, u64, Bytes, Bytes)> {
+        self.created_by_install_after_refusal(range)
+            .map(|(at, _, held)| (at, held.generation, held.start, held.end))
+    }
+
+    /// `x`'s first creation of `range` by an install after its refusal, its `RangeCreated
+    /// { cause: snapshot }`: where it stands, its floor index, and the descriptor it names,
+    /// as check 7 holds a creation's.
+    // PROPOSED(D-115)
+    #[must_use]
+    pub fn created_by_install_after_refusal(&self, range: u64) -> Option<(usize, u64, Held)> {
         let refused = self.refused_at()?;
         self.records
             .iter()
@@ -1339,13 +1461,23 @@ impl AfterSplit {
                 TraceEvent::RangeCreated {
                     range: r,
                     cause: RangeCause::Snapshot,
-                    generation,
                     start,
                     end,
+                    generation,
+                    voters,
+                    floor_index,
                     ..
-                } if *r == range && self.on_x(record) => {
-                    Some((at, *generation, start.clone(), end.clone()))
-                }
+                } if *r == range && self.on_x(record) => Some((
+                    at,
+                    *floor_index,
+                    Held {
+                        start: start.clone(),
+                        end: end.clone(),
+                        generation: *generation,
+                        voters: voters.clone(),
+                        state: RangeState::Live,
+                    },
+                )),
                 _ => None,
             })
     }
@@ -1366,47 +1498,22 @@ impl AfterSplit {
         marked && stated
     }
 
-    /// `x`'s creation of P by its re-seed's install: the first `RangeCreated { cause:
-    /// snapshot }` of [`SPLIT_PARENT`] on `x` after its refusal, with its floor index and
-    /// the descriptor it names, as check 7 holds a creation.
-    // PROPOSED(D-115)
-    #[must_use]
-    pub fn parent_created_after_refusal(&self) -> Option<(u64, Held)> {
-        let refused = self.refused_at()?;
-        self.records[refused..]
-            .iter()
-            .find_map(|record| match &record.event {
-                TraceEvent::RangeCreated {
-                    range,
-                    cause: RangeCause::Snapshot,
-                    start,
-                    end,
-                    generation,
-                    voters,
-                    floor_index,
-                    ..
-                } if *range == SPLIT_PARENT && self.on_x(record) => Some((
-                    *floor_index,
-                    Held {
-                        start: start.clone(),
-                        end: end.clone(),
-                        generation: *generation,
-                        voters: voters.clone(),
-                        state: RangeState::Live,
-                    },
-                )),
-                _ => None,
-            })
-    }
-
-    /// Issue #172's clause, per seed: `x`'s re-seed creates P by an install at the
-    /// split's generation over P's left half, `[k0, k1)`, and check 7 holds that
-    /// creation. Holding it means check 7's map has a value for P at or below the
-    /// creation's floor and the creation equals it, so the creation was judged and
-    /// agreed, not left waiting for a value. An install's creation names the descriptor
-    /// its snapshot put in place (PROPOSED D-107 §2). Before D-107 it named the first
-    /// generation whatever the snapshot held, and with that reading put back check 7
-    /// fails this run (PROPOSED D-115).
+    /// Issue #172's clause, per seed, asked after [`check`](Self::check): `x`'s re-seed
+    /// creates P by an install at the split's generation over P's left half, `[k0, k1)`,
+    /// and the creation equals the value check 7's map holds for P at or below its floor.
+    ///
+    /// The second half makes check 7's comparison again here; it does not show that check
+    /// 7 made it. That check 7 judges an install's creation is held by its own unit test,
+    /// `an_install_must_agree_with_the_descriptor_in_force_at_its_index`, in `ananke-shard`'s
+    /// `invariants.rs`, and [`check`](Self::check) runs check 7 on this trace first. The
+    /// comparison adds the voters, which [`reached`](Self::reached) does not read and only
+    /// check 7 reads of this creation, and a fault check 7 would miss. In this run the
+    /// split's value of P, at generation 2, lies at or below the floor on every seed
+    /// (measured 200 of 200), so neither of check 7's waits arises here.
+    ///
+    /// An install's creation names the descriptor its snapshot put in place (PROPOSED
+    /// D-107 §2). With the first generation put back, whatever the snapshot held, check 7
+    /// fails this run on every seed (PROPOSED D-115).
     ///
     /// # Errors
     ///
@@ -1414,7 +1521,7 @@ impl AfterSplit {
     // PROPOSED(D-115)
     pub fn parent_created_at_the_splits_generation(&self) -> Result<(), String> {
         let (seed, x) = (self.seed, self.x);
-        let Some((floor, created)) = self.parent_created_after_refusal() else {
+        let Some((_, floor, created)) = self.created_by_install_after_refusal(SPLIT_PARENT) else {
             return Err(format!(
                 "seed {seed}: node {x}'s re-seed created no replica of range {SPLIT_PARENT} \
                  by an install"
@@ -1437,15 +1544,11 @@ impl AfterSplit {
             ));
         }
         let checker = ananke_shard::invariants::folded(&self.records);
-        if let Err(violation) = checker.verdict_of(Fold::DescriptorAgreement) {
-            return Err(format!("seed {seed}: {violation}"));
-        }
         match checker.descriptors().at(SPLIT_PARENT, floor) {
             Some(value) if *value == created => Ok(()),
             value => Err(format!(
-                "seed {seed}: check 7 does not hold node {x}'s install creation of range \
-                 {SPLIT_PARENT} at its floor {floor}: it names {created:?}, and check 7's \
-                 value there is {value:?}"
+                "seed {seed}: node {x}'s install creation of range {SPLIT_PARENT} at its floor \
+                 {floor} names {created:?}, and check 7's value there is {value:?}"
             )),
         }
     }
@@ -1724,6 +1827,231 @@ impl AfterSplit {
         }
         Ok(())
     }
+
+    /// D-041 on a node that is re-seeded and runs on: `x`'s refused directory still says
+    /// lost at the end, and not one entry of it, at any depth, changed between the audit
+    /// before `x`'s restart and the one at the end, both with `x` down, other than the
+    /// marker itself, which the refusal writes (D-044).
+    ///
+    /// The re-seed shape's (e) asks the same of its refused directory, from the arm's
+    /// crash on; but the arm restarts the node within milliseconds of its re-seed, and
+    /// from that start on the node opens the new directory (D-066), so the start that
+    /// re-seeded never gets as far as a stream. Here `x` is not restarted after its
+    /// re-seed, and that start receives two streams, its re-seed's of P and its right
+    /// half's to its placeholder. Before PROPOSED D-117 both staged, synced and were
+    /// cleared in the refused directory, and this failed on every seed (#176).
+    ///
+    /// # Errors
+    ///
+    /// Naming every entry that changed, with the seed.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    pub fn refused_untouched(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        if !self.still_lost {
+            return Err(format!(
+                "seed {seed}: node {x}'s refused directory's marker no longer says lost"
+            ));
+        }
+        let Some(changed) = self.refused_changed() else {
+            return Err(format!(
+                "seed {seed}: node {x}'s refused directory could not be read within \
+                 {AUDIT_BUDGET:?}, so the run says nothing about whether it changed"
+            ));
+        };
+        if changed.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "seed {seed}: node {x}'s refused directory changed after its refusal: \
+             {changed:?}. A directory that held a store is marked lost and never written \
+             to again (D-041, D-044)"
+        ))
+    }
+
+    /// Every entry of `x`'s refused directory, at any depth, that differs between the audit
+    /// before its restart and the one at the end, other than the refusal's own marker; or
+    /// `None` if either audit did not finish.
+    // PROPOSED(D-117)
+    #[must_use]
+    pub fn refused_changed(&self) -> Option<BTreeSet<String>> {
+        let before = self.refused_before.as_ref()?;
+        let at_end = self.refused_at_end.as_ref()?;
+        Some(
+            at_end
+                .keys()
+                .chain(before.keys())
+                .filter(|name| name.as_str() != STORE_MARKER)
+                .filter(|name| at_end.get(*name) != before.get(*name))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Where the start that re-seeded staged its streams and cleared them: the directory
+    /// it runs on. For P's re-seed and for the right half's install, the directory the
+    /// re-seed built holds a staging directory of that range, so
+    /// [`Self::refused_untouched`] is asserted of runs whose streams staged somewhere,
+    /// and the somewhere is named. And that directory is empty: the `snapshot` task's
+    /// `clear_staging` lists the directory it was handed and clears the install's staging
+    /// there, so a task left on the refused directory finds nothing to clear and leaves
+    /// every file here.
+    ///
+    /// Measured on the 200 seeds this runs at the cap: two staging directories and not
+    /// one file in either, on every seed. A stream the run's end cut short, or the
+    /// assembly of a sender its range superseded, would leave files without any bug; if a
+    /// schedule ever reaches that, this says so here and the clause needs to read which
+    /// assembly the install came from.
+    ///
+    /// # Errors
+    ///
+    /// Naming the range with no staging directory there, or the files left in one, with
+    /// the seed.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    pub fn staged_where_it_runs(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        let fresh = fresh_dir();
+        let Some(at_end) = &self.fresh_at_end else {
+            return Err(format!(
+                "seed {seed}: node {x}'s directory {} could not be read within \
+                 {AUDIT_BUDGET:?}",
+                fresh.display()
+            ));
+        };
+        let Some((_, right)) = self.split else {
+            return Err(format!("seed {seed}: no split was traced"));
+        };
+        for range in [SPLIT_PARENT, right] {
+            let prefix = format!("staging-r{range}-s");
+            let staged = at_end
+                .keys()
+                .any(|name| name.starts_with(&prefix) && name.ends_with('/'));
+            if !staged {
+                return Err(format!(
+                    "seed {seed}: node {x} installed range {range} after its re-seed and \
+                     {} holds no staging directory of it, so its stream staged \
+                     somewhere other than the directory the node runs on: {:?}",
+                    fresh.display(),
+                    at_end
+                        .keys()
+                        .filter(|name| name.ends_with('/'))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            let left: Vec<&String> = at_end
+                .keys()
+                .filter(|name| name.starts_with(&prefix) && !name.ends_with('/'))
+                .collect();
+            if !left.is_empty() {
+                return Err(format!(
+                    "seed {seed}: node {x} installed range {range} after its re-seed and left \
+                     {left:?} in {}: an install clears its own staging there",
+                    fresh.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `x`'s takes and sweeps after a split of P's left half that followed its re-seed
+    /// ([`run_split_after_reseed`]), in the directory it runs on: `x` led the new right
+    /// half and took at least two checkpoints of it; each take's version directory is in
+    /// the directory the re-seed built, and none is in the refused one; and a sweep has
+    /// emptied an earlier version there.
+    ///
+    /// # Errors
+    ///
+    /// What the run did not reach, or where the versions went, with the seed.
+    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    pub fn took_where_it_runs(&self) -> Result<(), String> {
+        let (seed, x) = (self.seed, self.x);
+        let Some(right) = self.second_right else {
+            return Err(format!(
+                "seed {seed}: node {x} did not apply a split of P's left half after its re-seed"
+            ));
+        };
+        let led = self.records.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftLeader { server, range, .. }
+                if server == x && range == right)
+        });
+        let takes = self.takes_of(right);
+        if !led || takes < 2 {
+            return Err(format!(
+                "seed {seed}: node {x} led the right half {right} made after its re-seed: {led}, \
+                 and took {takes} checkpoints of it, where this asks for two so that a sweep \
+                 has an earlier one to empty"
+            ));
+        }
+        let (Some(fresh), Some(refused)) = (&self.fresh_at_end, &self.refused_at_end) else {
+            return Err(format!(
+                "seed {seed}: node {x}'s directories could not be read within {AUDIT_BUDGET:?}"
+            ));
+        };
+        let versions = versions_of(fresh, right);
+        let elsewhere = versions_of(refused, right);
+        if versions.len() < takes || !elsewhere.is_empty() {
+            return Err(format!(
+                "seed {seed}: node {x} took {takes} checkpoints of range {right}, and the \
+                 directory it runs on holds {} version directories of it where the one it \
+                 refused holds {elsewhere:?}: a take writes where the node runs (D-041)",
+                versions.len()
+            ));
+        }
+        // The newest is left out: the crash that ends the run may have cut its take short,
+        // which leaves an empty directory no sweep emptied. A task left on the refused
+        // directory passes on 3 seeds of 20 without this.
+        let newest = versions.iter().filter_map(|version| take_in(version)).max();
+        let swept = versions
+            .iter()
+            .filter(|version| take_in(version) != newest)
+            .filter(|version| {
+                !fresh
+                    .keys()
+                    .any(|name| name.len() > version.len() && name.starts_with(version.as_str()))
+            })
+            .count();
+        if swept == 0 {
+            return Err(format!(
+                "seed {seed}: node {x} took {takes} checkpoints of range {right} and none of \
+                 its {} version directories but the newest was swept empty in the directory \
+                 it runs on",
+                versions.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The checkpoints `x` took of `range`, by their trace.
+    // PROPOSED(D-117)
+    #[must_use]
+    pub fn takes_of(&self, range: u64) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftSnapshot { server, range: r, taken: true, .. }
+                    if server == self.x && r == range)
+            })
+            .count()
+    }
+}
+
+/// The take a version directory's name carries, as an audit lists it.
+// PROPOSED(D-117)
+fn take_in(version: &str) -> Option<u64> {
+    parse_version(version.trim_end_matches('/')).map(|(_, _, take)| take)
+}
+
+/// The version directories of `range` an audit found, by their names.
+// PROPOSED(D-117)
+#[must_use]
+pub fn versions_of(audit: &DirAudit, range: u64) -> BTreeSet<String> {
+    let prefix = format!("snap-r{range}-");
+    audit
+        .keys()
+        .filter(|name| name.starts_with(&prefix) && name.ends_with('/'))
+        .cloned()
+        .collect()
 }
 
 /// The run's writer: puts to P's left half's key, routed by the scenario's fixed map,
@@ -1897,10 +2225,14 @@ fn keys_on_disk(
     found.lock().expect("the read").take()
 }
 
-/// The operator's split of P at [`SPLIT_KEY`], asked of `target` and following
-/// `NotLeader`; it records nothing, since the trace says whether the split took effect.
-async fn split_operator<E: Environment>(env: E, mut target: u64) {
-    let Ok(sock) = env.net().bind(crate::raft::admin_addr(1)).await else {
+/// The operator's split of P at `key`, asked of `target` and following `NotLeader`; it
+/// records nothing, since the trace says whether the split took effect.
+///
+/// `operator` says which: each split is asked on an address of its own and by a client of
+/// its own, since a replica does not propose a copy of a request it proposed, by client and
+/// sequence number (`Replica::proposed`).
+async fn split_operator<E: Environment>(env: E, mut target: u64, operator: u64, key: &'static str) {
+    let Ok(sock) = env.net().bind(crate::raft::admin_addr(operator)).await else {
         return;
     };
     for _ in 0..SERVERS * 4 {
@@ -1908,10 +2240,10 @@ async fn split_operator<E: Environment>(env: E, mut target: u64) {
             generation: FIRST_GENERATION,
             range: RangeId(SPLIT_PARENT),
             request: Request {
-                client: u64::MAX >> 2,
+                client: (u64::MAX >> 2) - (operator - 1),
                 seq: 1,
                 command: Command::Split {
-                    key: Bytes::from(SPLIT_KEY),
+                    key: Bytes::from(key),
                     right: 0,
                 },
             },
@@ -1940,6 +2272,34 @@ async fn split_operator<E: Environment>(env: E, mut target: u64) {
             }
             Reply::Outcome(_) | Reply::RangeMismatch { .. } => return,
         }
+    }
+}
+
+/// A writer of one key of `range`, sent straight to `to` and never read back: it exists
+/// to grow that replica's log while it leads. Client 3, on its own address: client 2 is
+/// [`right_writer`], which may still be retrying its last key.
+// PROPOSED(D-117)
+async fn second_right_writer<E: Environment>(env: E, range: u64, to: u64, key: &'static str) {
+    let Ok(sock) = env.net().bind(client_addr(3)).await else {
+        return;
+    };
+    let mut seq = 0u64;
+    loop {
+        seq += 1;
+        let request = RangedRequest {
+            generation: FIRST_GENERATION,
+            range: RangeId(range),
+            request: Request {
+                client: 3,
+                seq,
+                command: Command::Put {
+                    key: Bytes::from(key),
+                    value: Bytes::from(format!("v{seq}")),
+                },
+            },
+        };
+        let _ = sock.send(server_addr(to), request.encode()).await;
+        env.clock().sleep(Duration::from_millis(4)).await;
     }
 }
 
@@ -2001,6 +2361,31 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
 // PROPOSED(D-128)
 #[must_use]
 pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSplit {
+    after_split(seed, node_variants, false)
+}
+
+/// [`run_after_split`], and then a split of P's left half with `x` still in the start that
+/// re-seeded: the one way a replica of a re-seeded node may lead in that start.
+///
+/// Every replica the re-seed rebuilt and every replica a placeholder's install created is
+/// quarantined and never campaigns (D-035, PROPOSED D-109 §2). A split's right half is
+/// neither: the split writes it no quarantine (Q20, Q26), and `x` never voted in a range
+/// that did not exist. So `x` can lead it. The run makes it: whichever other node leads
+/// that right half is crashed and the last one restarted, until `x` is elected. Then `x`
+/// is written to past the threshold several times over, so it takes checkpoints and
+/// sweeps the earlier ones, which is the `apply` task's and the `snapshot` task's use of
+/// the directory no other run reaches (PROPOSED D-117; #176).
+///
+/// P's left half, which came back to `x` by a stream, and not a range the log rebuilt,
+/// whose split fails state machine safety on `x` (#199).
+// PROPOSED(D-117)
+#[must_use]
+pub fn run_split_after_reseed(seed: u64, node_variants: NodeVariants) -> AfterSplit {
+    after_split(seed, node_variants, true)
+}
+
+/// The runs above; `split_again` is [`run_split_after_reseed`]'s.
+fn after_split(seed: u64, node_variants: NodeVariants, split_again: bool) -> AfterSplit {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
@@ -2034,11 +2419,16 @@ pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSpl
         split: None,
         unbuilt: None,
         right_keys_on_x: None,
+        refused_before: None,
+        refused_at_end: None,
+        still_lost: false,
+        fresh_at_end: None,
+        second_right: None,
     };
     {
         let env = sim.env(client);
         let inner = env.clone();
-        env.spawn("split", split_operator(inner, leader));
+        env.spawn("split", split_operator(inner, leader, 1, SPLIT_KEY));
     }
     let deadline = sim.now() + SPLIT_BUDGET;
     let applied_by_x = |records: &[TraceRecord]| {
@@ -2095,9 +2485,65 @@ pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSpl
         }
         sim.run_for(SPLIT_SLICE);
     }
+    // D-041's baseline: the directory the restart refuses, read with `x` down. The
+    // refusal's own marker is written after it, and nothing else may be (PROPOSED D-117).
+    report.refused_before = audit_tree(&mut sim, at, Path::new(DIR));
     sim.restart(at);
     spawn(&sim, at, x, variants, node_variants, true);
     sim.run_for(SPLIT_AFTER);
+    if split_again {
+        // PROPOSED(D-117): a right half made after the re-seed, led by `x`, written past
+        // its threshold.
+        let before = rights_on(&sim.trace(), x).len();
+        let target = leader_of(&sim.trace(), SPLIT_PARENT).unwrap_or(1);
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn(
+            "split-again",
+            split_operator(inner, target, 2, LEFT_SPLIT_KEY),
+        );
+        let deadline = sim.now() + SECOND_SPLIT_BUDGET;
+        while sim.now() < deadline && report.second_right.is_none() {
+            sim.run_for(SPLIT_SLICE);
+            report.second_right = rights_on(&sim.trace(), x).get(before).copied();
+        }
+        if let Some(right) = report.second_right {
+            sim.run_for(SECOND_SPLIT_SETTLE);
+            let mut down = None;
+            for _ in 0..LEADER_TRIES {
+                let leader = leader_of(&sim.trace(), right);
+                if leader == Some(x) {
+                    break;
+                }
+                if let Some(id) = down.take() {
+                    bring_back(&mut sim, &nodes, id, variants, node_variants);
+                }
+                if let Some(id) = leader {
+                    sim.crash(nodes[id as usize - 1]);
+                    down = Some(id);
+                }
+                sim.run_for(LEADER_TRY);
+            }
+            if let Some(id) = down.take() {
+                bring_back(&mut sim, &nodes, id, variants, node_variants);
+            }
+            let env = sim.env(client);
+            let inner = env.clone();
+            env.spawn(
+                "second-right-writer",
+                second_right_writer(inner, right, x, LEFT_RIGHT_KEY),
+            );
+            sim.run_for(TAKES_FOR);
+        }
+    }
+    // And the directories at the end, `x` crashed so that nothing on it is writing. `x`
+    // was never started again after its re-seed, so everything its re-seed's start did —
+    // both streams' staging, their installs' sweeps, any take — was done by the start
+    // that re-seeded, which is the start that held the wrong directory (#176).
+    sim.crash(at);
+    report.refused_at_end = audit_tree(&mut sim, at, Path::new(DIR));
+    report.still_lost = marked_lost(&mut sim, at, Path::new(DIR));
+    report.fresh_at_end = audit_tree(&mut sim, at, &fresh_dir());
     report.records = sim.trace();
     // What `x`'s engine holds, read with the run's trace already taken, so the read moves
     // nothing the run's checks see. The engine a re-seed built is the first generation
@@ -2725,4 +3171,42 @@ fn unconfirmable_reads(seed: u64, variants: Variants, stall: bool) -> Unconfirma
     report.readers = *heard.lock().expect("the readers' tally");
     report.records = sim.trace();
     report
+}
+
+/// The right halves of P's splits node `x` applied, in the order it applied them.
+// PROPOSED(D-117)
+fn rights_on(records: &[TraceRecord], x: u64) -> Vec<u64> {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::RangeSplit { range, right, .. }
+                if *range == SPLIT_PARENT
+                    && record.node.map(|node| u64::from(node.get())) == Some(x) =>
+            {
+                Some(*right)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Starts node `id` again on its own store, after a crash the run aimed at it.
+// PROPOSED(D-117)
+fn bring_back(
+    sim: &mut Sim,
+    nodes: &[NodeId],
+    id: u64,
+    variants: Variants,
+    node_variants: NodeVariants,
+) {
+    let node = nodes[id as usize - 1];
+    sim.restart(node);
+    spawn(sim, node, id, variants, node_variants, false);
+}
+
+/// The directory a node of this shape's first re-seed builds: the generation after the
+/// configured one, beside it (D-066, D-077).
+#[must_use]
+pub fn fresh_dir() -> PathBuf {
+    ananke_shard::reseed::generation_dir(Path::new(DIR), ananke_shard::reseed::FIRST_GENERATION + 1)
 }

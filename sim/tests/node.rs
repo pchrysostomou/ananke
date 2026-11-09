@@ -2209,7 +2209,7 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     // first on 129 of the 628 seeds the variant is caught on — state machine safety on
     // 90, check 9 on 16, log matching on 11, commit by current term on 8, check 7 on 3,
     // check 16 on 1 — and check 18's clause trips beneath every one of them, read fold by
-    // fold (`the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed`).
+    // fold (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
     // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
@@ -2259,6 +2259,181 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
          record's block and ask for no refill, so range 0 should grant them fewer blocks \
          ({variant_grants}) than the correct node's ({correct_grants})"
     );
+}
+
+/// One right half a split created on a voter of its parent, read off its
+/// `RangeCreated { cause: split }`, against the draws of its node's stream for it.
+struct RightHalfDraw {
+    /// The node that created it.
+    node: ananke_env::NodeId,
+    /// The right half.
+    range: u64,
+    /// The incarnation it was created with.
+    incarnation: u64,
+    /// Which of the stream's draws the incarnation is, counting from 1, among the draws
+    /// the creation could have taken (see [`right_half_draws`]); `None` for none of them.
+    position: Option<usize>,
+}
+
+/// Every right half a split created over `records`, each matched against the draws
+/// that its node's stream for it, `n{id}/r{range}/protocol` (`Environment::range_rng`),
+/// gives under `seed`.
+///
+/// The stream is read off a fresh simulation of the same seed, through the call the
+/// node makes, and a fresh one for each creation since `range_rng` hands back one shared
+/// stream: a range's stream is made from the seed and its name the first time it is
+/// asked for and draws from no other stream (D-017, PROPOSED D-057), so its values are
+/// the run's whatever else the run drew.
+///
+/// Under `IncarnationPerRangeStream` the split's draw is the stream's first on the
+/// node. The right half's id is fresh from a block (Q17), and nothing on a node draws
+/// from its stream before that node's apply of the split: a placeholder draws nothing,
+/// and a placeholder's install, which does, is refused while the node's parent still
+/// covers the right half (Q27). In the apply the incarnation is drawn before the core's
+/// seed (`ServerApplier::split`). The one way past it is an apply that drew and never
+/// reached its synced batch, which only a crash of the node interrupts: the restarted
+/// node applies the split again and draws again, and only the second is traced. So a
+/// creation is matched against the stream's first `1 + c` draws, `c` the crashes of its
+/// node the trace holds before it.
+fn right_half_draws(seed: u64, records: &[TraceRecord]) -> Vec<RightHalfDraw> {
+    use ananke_env::{Environment, Rng};
+    let mut crashes: BTreeMap<ananke_env::NodeId, usize> = BTreeMap::new();
+    let mut out = Vec::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::NodeCrashed { node } => *crashes.entry(*node).or_default() += 1,
+            TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Split,
+                incarnation,
+                ..
+            } => {
+                let Some(node) = record.node else {
+                    continue;
+                };
+                let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(seed));
+                let mut at = sim.add_node();
+                while at < node {
+                    at = sim.add_node();
+                }
+                let stream = sim.env(at).range_rng(*range);
+                // The floor the apply puts under every draw (Q26).
+                let draws: Vec<u64> = (0..=crashes.get(&node).copied().unwrap_or(0))
+                    .map(|_| {
+                        stream
+                            .next_u64()
+                            .max(ananke_raft::store::FIRST_INCARNATION + 1)
+                    })
+                    .collect();
+                out.push(RightHalfDraw {
+                    node,
+                    range: *range,
+                    incarnation: *incarnation,
+                    position: draws
+                        .iter()
+                        .position(|draw| draw == incarnation)
+                        .map(|at| at + 1),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `IncarnationPerRangeStream` at a split's right half: every right half a split
+/// creates on a voter of its parent restates the incarnation its node's stream for it,
+/// `n{id}/r{range}/protocol`, draws first, and the correct node's restates a number no
+/// such draw gives, the node generator's (SHARD.md §8, Q26; issue #160).
+///
+/// The variant is read at three sites of a creation. The directed refusal scenario
+/// asserts the first, Q15's re-seed (`sim/tests/ranges.rs`). This is the second, a
+/// split's apply (`ServerApplier::split`, PROPOSED D-100), which only a scenario that
+/// splits reaches and which no test ran until now: D-108's M6, the split's draw reading
+/// the correct set, failed nothing. The third, a placeholder's install (PROPOSED
+/// D-109), this test does not read (PROPOSED D-123). Nothing downstream can see what the
+/// variant draws at a split: `range_rng` continues across draws, handles and restarts,
+/// so it repeats no incarnation, and a right half is new on every node anyway. So what
+/// is asserted is the draw itself, as the refusal test asserts the re-seed's, on both
+/// systems: the variant's draw is the stream's, and the correct node's is not.
+///
+/// Measured before asserted (D-061), in release over seeds 0 to 999 on both systems: a
+/// split creates a right half on 20 of the first twenty seeds, 100 of the first hundred
+/// and 999 of the thousand (seed 680 lands no split). That is far above D-061's 5 %, so
+/// the reach is asserted at every tier, over [`high_rate_share`] as every instrument on
+/// the node caught at a high rate runs. The draws are asserted of every creation, at no
+/// rate: every one of the variant's 4 871 creations is its stream's first draw, 2 442 of
+/// them on a node that had crashed before it, and none of the correct node's 4 854 is a
+/// draw of that stream. So no seed of the thousand needs [`right_half_draws`]'s allowance
+/// for a crash: it is reasoned from the apply, for the schedule that lands a crash there.
+// PROPOSED(D-108): the instrument at its second site.
+// PROPOSED(D-123)
+#[test]
+fn a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument() {
+    let seeds = high_rate_share();
+    let instrument = RangeVariants::of(&[RangeVariant::IncarnationPerRangeStream]);
+    let runs: Vec<(Vec<RightHalfDraw>, Vec<RightHalfDraw>)> = sweep(seeds, |seed| {
+        let report = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            instrument,
+        );
+        (
+            right_half_draws(seed, &report.records),
+            right_half_draws(seed, &correct(seed).records),
+        )
+    });
+    let variant_seeds = runs.iter().filter(|(of, _)| !of.is_empty()).count();
+    let correct_seeds = runs.iter().filter(|(_, of)| !of.is_empty()).count();
+    let mut positions: BTreeMap<Option<usize>, usize> = BTreeMap::new();
+    for draw in runs.iter().flat_map(|(of, _)| of) {
+        *positions.entry(draw.position).or_default() += 1;
+    }
+    let correct_created = runs.iter().map(|(_, of)| of.len()).sum::<usize>();
+    let correct_on_the_stream = runs
+        .iter()
+        .flat_map(|(_, of)| of)
+        .filter(|draw| draw.position.is_some())
+        .count();
+    println!(
+        "node: IncarnationPerRangeStream: right halves created by a split on {variant_seeds}/\
+         {seeds} seeds, {} in all, by which draw of their node's stream for them {positions:?}; \
+         the correct node's on {correct_seeds}/{seeds} seeds, {correct_created} in all, \
+         {correct_on_the_stream} of them a draw of that stream",
+        positions.values().sum::<usize>(),
+    );
+    assert!(
+        variant_seeds > 0 && correct_seeds > 0,
+        "no split created a right half on a voter on any of {seeds} seeds (the variant's on \
+         {variant_seeds}, the correct node's on {correct_seeds}), so the split's draw was not \
+         reached and this test asserts nothing"
+    );
+    for (seed, (variant, correct)) in (0u64..).zip(&runs) {
+        for draw in variant {
+            assert!(
+                draw.position.is_some(),
+                "seed {seed}: under IncarnationPerRangeStream node {} created right half {} with \
+                 incarnation {}, which no draw of its stream for the range gives: the split's \
+                 draw does not read the variant (issue #160)",
+                draw.node,
+                draw.range,
+                draw.incarnation
+            );
+        }
+        for draw in correct {
+            assert!(
+                draw.position.is_none(),
+                "seed {seed}: the correct node {} created right half {} with incarnation {}, its \
+                 stream's draw {:?} for the range, where SHARD.md §8 draws it from the node's \
+                 generator (Q26)",
+                draw.node,
+                draw.range,
+                draw.incarnation,
+                draw.position
+            );
+        }
+    }
 }
 
 #[test]
@@ -2471,9 +2646,13 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// below.
 ///
 /// **Check 8** runs here and under every pair below too, its clauses a fold each
-/// (PROPOSED D-107, D-128). Its install clause trips on no run of the correct node; its
+/// (PROPOSED D-107, D-116, D-128). Its install clause trips on no run of the correct node; its
 /// tripping variant is `InstallReplacesHostedSpan`, on the re-seed after a split
 /// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span`).
+/// Its created-twice clause stops a run and is asserted absent
+/// here with the others ([`Fold::VERDICT`]), and its comparison in violation comes with
+/// `IdBlockResumed`
+/// (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
 /// Its right half's clause trips on the correct node itself — a voter
 /// installed past a split holds no right half until placeholders exist — so it is
 /// compared and printed and not asserted absent, and its seed 45
@@ -2960,28 +3139,93 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// variant is caught on: the run's own verdict names another check first on 129 of the
 /// 628 (state machine safety, check 9, log matching and others, D-105's table), and the
 /// fold shows check 18 tripped beneath each. Asserted at every tier.
+///
+/// **Check 8's created-twice clause** against the same variant (PROPOSED D-116): a voter
+/// of the second split that holds the right half the first made, created there or
+/// restated there after the restart the variant needs, creates it again at its apply,
+/// which is SHARD.md §5's "R already initialised here". Measured fold by fold over seeds 0
+/// to 999 of this tree in release: in violation on 630 of the thousand, 71 of the first
+/// hundred and 14 of the first twenty, on exactly the seeds check 18's range-id clause
+/// trips on there, each a `RangeCreated { cause: split }` of a range its node held,
+/// restated after a restart on 605 and created by the first split on 25. Asserted at
+/// every tier (D-061: 70 %), each trip a split's creation on a seed check 18's range-id
+/// clause trips on too, so that what the clause sees here is the reused id. It is the
+/// clause's tripping variant because no other variant reaches it at a rate a tier can
+/// assert: `SnapshotOverlapsReplica`, whose harm §5 names, creates a range twice on one
+/// seed of the node sweep's thousand (seed 219, pinned:
+/// `seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`)
+/// and on none of `sim/split.rs` (i)'s. The run's own verdict names check 18 or an
+/// earlier check on every one of the 630, since the clause is asked last.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-116): and check 8's created-twice clause, its tripping variant.
 #[test]
-fn the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed() {
+fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed() {
     let seeds = range_folds_compared();
     let found = range_folds_under("IdBlockResumed", seeds, |seed| {
         node_records(seed, &[RangeVariant::IdBlockResumed])
     });
-    let by_clause = found
-        .iter()
-        .filter(|seed| {
-            [Fold::RangeIds, Fold::SplitLineage].iter().any(|fold| {
-                seed.tripped
-                    .get(fold)
-                    .is_some_and(|words| by_the_range_id_clause(words))
-            })
+    let reused = |seed: &FoldsFound| {
+        [Fold::RangeIds, Fold::SplitLineage].iter().any(|fold| {
+            seed.tripped
+                .get(fold)
+                .is_some_and(|words| by_the_range_id_clause(words))
         })
-        .count();
+    };
+    let by_clause = found.iter().filter(|seed| reused(seed)).count();
     println!("range folds: IdBlockResumed: check 18's range-id clause on {by_clause}/{seeds}");
     assert!(
         by_clause > 0,
         "check 18's range-id clause tripped on no compared seed of IdBlockResumed's {seeds}"
     );
+    // PROPOSED(D-116)
+    let twice: Vec<(usize, &str)> = found
+        .iter()
+        .enumerate()
+        .filter_map(|(seed, outcome)| {
+            outcome
+                .tripped
+                .get(&Fold::CreatedTwice)
+                .map(|words| (seed, words.as_str()))
+        })
+        .collect();
+    println!(
+        "range folds: IdBlockResumed: check 8's created-twice clause on {}/{seeds}",
+        twice.len()
+    );
+    assert!(
+        !twice.is_empty(),
+        "check 8's created-twice clause tripped on no compared seed of IdBlockResumed's \
+         {seeds}: no voter created again the right half whose id the second split took"
+    );
+    // What the node held the range by: on most seeds the restatement after the restart
+    // the variant needs, so the clause's holding is seen to include a restatement on a
+    // real trace (605 of the 630 trips of the thousand; the rest, the first split's
+    // creation).
+    let over_a_restatement = twice
+        .iter()
+        .filter(|(_, words)| words.contains("initialised, stated at applied index"))
+        .count();
+    println!(
+        "range folds: IdBlockResumed: check 8's created-twice clause over a restatement on \
+         {over_a_restatement} of those"
+    );
+    assert!(
+        over_a_restatement > 0,
+        "check 8's created-twice clause tripped under IdBlockResumed over no restatement on \
+         {seeds} compared seeds: a range a restarted node restated is not held"
+    );
+    for (seed, words) in twice {
+        assert!(
+            words.contains("traced a `RangeCreated { cause: split }`"),
+            "seed {seed}: check 8's created-twice clause tripped under IdBlockResumed at a \
+             creation that is not a split's: {words}"
+        );
+        assert!(
+            reused(&found[seed]),
+            "seed {seed}: check 8's created-twice clause tripped under IdBlockResumed where \
+             check 18's range-id clause did not, so what it saw is not the reused id: {words}"
+        );
+    }
 }
 
 /// Check 7 against `AnyFreshNodeBootstraps` on the membership scenario's five nodes,
@@ -3249,6 +3493,194 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         report.records[placeholder].at,
         report.records[created].at,
         report.records[crashed].at
+    );
+}
+
+/// **Seed 219 under `SnapshotOverlapsReplica`: one range created twice on one node, by
+/// a split's apply and then an install, and check 8's created-twice clause sees the
+/// second creation** (PROPOSED D-116, #181; found by D-110 §4). Node 3 made a placeholder
+/// of range 62 at 17.653 s, before its replica of range 5 applied the split at index 346
+/// that makes 62. A stream of 62 reached the placeholder, and the variant let its install
+/// past the overlap check while node 3's 5 still covered 62's span. Node 3's apply of the
+/// split then created 62 at 18.211 s (`RangeCreated { cause: split }`, floor 346), and the
+/// install's switch, landing after it, created 62 again at 18.289 s (`RangeCreated {
+/// cause: snapshot }`, floor 347). Node 3 then applied 347 again at 18.305 s, which is
+/// what the run's own verdict names: Raft's state machine safety, the raft checker being
+/// asked before the range layer's at every look. No two of node 3's spans overlapped when
+/// the install was traced, since the split had shrunk 5 first, so check 8's overlap clause
+/// is green; before this clause no check of the range layer saw the run. On the correct
+/// node node 3 refuses 62's install for overlap at 18.192 s, while its 5 still covers 62,
+/// and its apply of the split creates 62 once.
+///
+/// What is asserted: under the variant, the two creations on node 3 in that order with
+/// nothing between that lets node 3 drop 62, the placeholder before both; the clause,
+/// fed one record at a time, first in violation at the install's creation, in its own
+/// words; the overlap clause green; and the raft checker, fed the same way, first in
+/// violation after that record. On the correct node: green, the refusal for overlap
+/// before the split's apply, and 62 created on node 3 once. The day a schedule moves
+/// the seed off either, this says which, and the pin is re-audited (CLAUDE.md).
+// PROPOSED(D-116)
+#[test]
+fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second() {
+    let (seed, node, parent, index, right) = (219u64, 3u32, 5u64, 346u64, 62u64);
+    let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
+    let variant = raft::run_on_the_node(
+        seed,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]),
+    );
+    let records = &variant.records;
+    let find = |what: &str, from: usize, matches: &dyn Fn(&TraceEvent) -> bool| {
+        from + records[from..]
+            .iter()
+            .position(|record| on(record) && matches(&record.event))
+            .unwrap_or_else(|| {
+                panic!(
+                    "seed {seed} under SnapshotOverlapsReplica: node {node} never traced {what}; \
+                     the schedule has moved off the pin's shape, so re-audit it (CLAUDE.md)"
+                )
+            })
+    };
+    let placeholder = find(
+        "a placeholder of the right half",
+        0,
+        &|event| matches!(event, TraceEvent::RangeReplicaCreated { range } if *range == right),
+    );
+    let by_split = find(
+        "the right half's creation by the split",
+        placeholder,
+        &|event| {
+            matches!(event, TraceEvent::RangeCreated {
+            range, cause: ananke_env::RangeCause::Split, parent: Some(p), floor_index, ..
+        } if (*range, *p, *floor_index) == (right, parent, index))
+        },
+    );
+    let by_install = find(
+        "a second creation of the right half",
+        by_split + 1,
+        &|event| matches!(event, TraceEvent::RangeCreated { range, .. } if *range == right),
+    );
+    let floor = match &records[by_install].event {
+        TraceEvent::RangeCreated {
+            cause: ananke_env::RangeCause::Snapshot,
+            floor_index,
+            ..
+        } => *floor_index,
+        other => panic!(
+            "seed {seed}: node {node}'s second creation of {right} is not an install's: {other:?}"
+        ),
+    };
+    assert!(
+        !records[..by_split].iter().any(|record| on(record)
+            && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
+        "seed {seed}: node {node} created {right} before its split's apply did"
+    );
+    let dropped = records[by_split + 1..by_install].iter().find(|record| {
+        matches!(&record.event, TraceEvent::NodeCrashed { node: n } if n.get() == node)
+            || (on(record)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RaftRefused { .. } | TraceEvent::RangeRemoved { .. }
+                ))
+    });
+    assert!(
+        dropped.is_none(),
+        "seed {seed}: between node {node}'s two creations of {right} it let it go: {dropped:?}"
+    );
+    // The clause, one record at a time: first in violation at the install's creation.
+    let mut owners = invariants::OneOwnerPerKey::default();
+    let tripped = records.iter().position(|record| {
+        owners.push(record);
+        owners.created_twice_verdict().is_err()
+    });
+    assert_eq!(
+        tripped,
+        Some(by_install),
+        "seed {seed}: check 8's created-twice clause did not first trip at node {node}'s \
+         second creation of {right}"
+    );
+    let checker = invariants::folded(records);
+    assert_eq!(
+        checker.verdict_of(Fold::CreatedTwice),
+        Err(format!(
+            "one owner per key: node {node} traced a `RangeCreated {{ cause: snapshot }}` of \
+             range {right} at floor index {floor} while it holds range {right} initialised, \
+             created by a split at floor index {index}, with no `RangeRemoved` of it, crash or \
+             refusal of the node between: a replica created twice on one node (SHARD.md §5, \
+             the apply's \"R already initialised here\"; §8, check 8)"
+        )),
+        "seed {seed}: check 8's created-twice clause"
+    );
+    assert_eq!(
+        checker.verdict_of(Fold::Overlap),
+        Ok(()),
+        "seed {seed}: check 8's overlap clause, which the split's shrinking of {parent} keeps \
+         green here"
+    );
+    // Raft's state machine safety sees the harm later, at the re-apply.
+    let mut log = ananke_raft::invariants::Checker::new(raft::SERVERS as usize);
+    let raft_tripped = records
+        .iter()
+        .position(|record| {
+            log.extend(ananke_sim::traced(std::slice::from_ref(record)));
+            log.verdict().is_err()
+        })
+        .unwrap_or_else(|| panic!("seed {seed}: the raft checker never tripped"));
+    assert!(
+        by_install < raft_tripped,
+        "seed {seed}: the raft checker tripped at record {raft_tripped}, not after node \
+         {node}'s second creation of {right} at {by_install}"
+    );
+    let why = variant
+        .check()
+        .expect_err("seed 219 fails under SnapshotOverlapsReplica");
+    assert!(
+        why.contains("state machine safety"),
+        "seed {seed}: the run's verdict under SnapshotOverlapsReplica: {why}"
+    );
+    // The correct node: the install refused for overlap, and one creation.
+    let report = correct(seed);
+    checked(&report)
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let refused = report.records.iter().position(|record| {
+        on(record)
+            && matches!(&record.event, TraceEvent::RaftSnapshotStartOver {
+                range, reason: ananke_env::StartOver::Overlaps, ..
+            } if *range == right)
+    });
+    let created: Vec<usize> = report
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            on(record)
+                && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        matches!(&created[..], [one] if matches!(&report.records[*one].event,
+            TraceEvent::RangeCreated { cause: ananke_env::RangeCause::Split, floor_index, .. }
+                if *floor_index == index)),
+        "seed {seed}: the correct node 3 did not create {right} once, by the split at {index}: \
+         {created:?}"
+    );
+    assert!(
+        refused.is_some_and(|refused| refused < created[0]),
+        "seed {seed}: the correct node {node} did not refuse {right}'s install for overlap \
+         before its split's apply created it ({refused:?})"
+    );
+    println!(
+        "seed {seed}: under SnapshotOverlapsReplica node {node} made a placeholder of {right} at \
+         {:?}, created it by the split at {:?} and by the install at {:?}, which check 8's \
+         created-twice clause trips at; the raft checker trips at {:?}; the correct node refused \
+         the install for overlap at {:?} and created {right} once",
+        records[placeholder].at,
+        records[by_split].at,
+        records[by_install].at,
+        records[raft_tripped].at,
+        refused.map(|at| report.records[at].at)
     );
 }
 
@@ -3827,6 +4259,26 @@ struct QuorumNodeFigures {
     step_downs_naming_anyone_uncounted: usize,
     streams: usize,
     seeds_carrying_both_outcomes: u64,
+    /// The root and the meta range, asked the hold's clauses since PROPOSED D-119
+    /// (issue #143), counted apart from the user ranges so the figures above read as
+    /// D-085 and D-101 measured them: the system ranges on the keeper's majority, those
+    /// of them that had an entry of the keeper's term to commit — which nothing in the
+    /// scenario drives, and which `NodeReport::check` then requires committed — those
+    /// that committed in the hold, and those on the cut-off leader.
+    system_ranges_on_the_keepers_majority: usize,
+    system_ranges_with_an_entry_to_commit: usize,
+    system_commits_in_the_hold: usize,
+    system_ranges_on_the_cut_off_leader: usize,
+    /// Seeds on which the root, and seeds on which the meta range, had its leader left
+    /// on the far side of the cut and a vote or pre-vote of the keeper's campaign refused
+    /// by the victim's re-seeded replica in the hold: the situation the "elected in the
+    /// hold" clause decides on that range, and the one a re-seeded replica that votes
+    /// gets wrong.
+    seeds_a_cut_off_root_was_refused_a_vote: u64,
+    seeds_a_cut_off_meta_range_was_refused_a_vote: u64,
+    /// Votes the victim's re-seeded replicas granted in the hold, every range's: 0 on a
+    /// node that keeps D-035.
+    votes_granted_by_the_victim: usize,
 }
 
 impl QuorumNodeFigures {
@@ -3836,6 +4288,9 @@ impl QuorumNodeFigures {
         let (Some(cast), Some(holds)) = (report.cast.as_ref(), report.holds()) else {
             return;
         };
+        // The answers, the streams and the step-downs are every range's, the system
+        // ranges' with the user ranges' (PROPOSED D-119); the sides are counted apart.
+        let user_ranges = ranges();
         for hold in holds.values() {
             self.ranges_refused += usize::from(hold.replica_refused);
             self.ranges_reseeded += usize::from(hold.reseeded);
@@ -3846,12 +4301,26 @@ impl QuorumNodeFigures {
             self.store_rejections += hold.store_rejections;
             self.fitted += hold.fitted;
             self.streams += hold.streams;
-            if hold.leader == cast.keeper {
+            self.votes_granted_by_the_victim += hold.votes_granted;
+            let user = user_ranges.contains(&hold.range);
+            if hold.leader == cast.keeper && user {
                 self.ranges_on_the_keepers_majority += 1;
                 self.commits_through_a_reseeded_replica +=
                     usize::from(hold.commit_after_cut.is_some());
-            } else if hold.leader == cast.other {
+            } else if hold.leader == cast.keeper {
+                self.system_ranges_on_the_keepers_majority += 1;
+                self.system_ranges_with_an_entry_to_commit += usize::from(hold.entry_to_commit);
+                self.system_commits_in_the_hold += usize::from(hold.commit_after_cut.is_some());
+            } else if hold.leader == cast.other && user {
                 self.ranges_on_the_cut_off_leader += 1;
+            } else if hold.leader == cast.other {
+                self.system_ranges_on_the_cut_off_leader += 1;
+                let refused = u64::from(hold.votes_refused > 0);
+                if hold.range == ananke_sim::ranges::ROOT_RANGE {
+                    self.seeds_a_cut_off_root_was_refused_a_vote += refused;
+                } else {
+                    self.seeds_a_cut_off_meta_range_was_refused_a_vote += refused;
+                }
             }
             if let Some((_, uncounted)) = &hold.quorum_lost {
                 self.step_downs += 1;
@@ -3880,25 +4349,31 @@ fn quorum_node_sweep(
 }
 
 /// The sharded check-quorum scenario's positive control (PROPOSED D-085): **one
-/// fault, four answers**.
+/// fault, an answer per range**.
 ///
 /// One `mark_store_lost` at the victim's restart refuses the node and every replica
 /// it holds (D-077), each re-seeded with a store incarnation of its own; the third
-/// node is then cut off, and check quorum is asked separately of each of the four
-/// ranges' leaders about that one refused node. On every seed the run carries **both**
+/// node is then cut off, and check quorum is asked separately of each range's leader
+/// about that one refused node, the root's and the meta range's with the four user
+/// ranges' (PROPOSED D-119, issue #143). On nearly every seed the run carries **both**
 /// outcomes at once, which no single-range scenario can: the ranges the keeper leads
-/// keep their leader through the hold and commit past their commit index at the cut,
-/// on a majority of the keeper and the node the refusal re-seeded; the ranges the
-/// cut-off node leads lose theirs within two windows and three ticks and stay
-/// leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and the
-/// keeper alone is no majority.
+/// keep their leader through the hold and commit what they are given past their commit
+/// index at the cut, on a majority of the keeper and the node the refusal re-seeded;
+/// the ranges the cut-off node leads lose theirs within two windows and three ticks and
+/// stay leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and
+/// the keeper alone is no majority.
 ///
 /// The figures print what D-049's own halves need of the node;
 /// `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold` is
 /// where they are asserted.
+///
+/// Every counter asserted above zero here is well above D-061's 5 % at every tier: the
+/// per-range ones run about one seed in two (one in three for a system range with an
+/// entry to commit, PROPOSED D-119's table), so the gate's twenty asserts them too.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
 #[test]
-fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
+fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node() {
     let (violations, figures) = quorum_node_sweep(Variants::default(), NodeVariants::correct());
     eprintln!(
         "sharded quorum, correct: {} of {} seeds failed, {figures:?}, first: {}",
@@ -3907,10 +4382,11 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
         violations.first().map_or("", String::as_str)
     );
     assert!(violations.is_empty(), "{}", violations[0]);
-    // The shape the checks need, asserted rather than assumed: four replicas refused
-    // and re-seeded a seed, both outcomes reached on every seed, and the answers that
+    // The shape the checks need, asserted rather than assumed: every replica the node
+    // hosts refused and re-seeded a seed — six, the root's and the meta range's with
+    // the user ranges' (PROPOSED D-119) — both outcomes reached, and the answers that
     // carried the keeper's office actually delivered.
-    let ranges = u64::try_from(ranges().len()).expect("small");
+    let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     assert_eq!(
         figures.ranges_refused as u64,
         figures.seeds * ranges,
@@ -3930,6 +4406,130 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
         figures.fitted > 0,
         "no answer of a re-seeded replica fitted, so no keeper's office was kept on one"
     );
+    // The system ranges reached both outcomes too, so their clauses asked something.
+    assert!(
+        figures.system_ranges_on_the_keepers_majority > 0
+            && figures.system_ranges_on_the_cut_off_leader > 0,
+        "the system ranges reached only one of the scenario's two outcomes"
+    );
+    assert!(
+        figures.system_ranges_with_an_entry_to_commit > 0
+            && figures.system_commits_in_the_hold >= figures.system_ranges_with_an_entry_to_commit,
+        "no keeper's system range had an entry to commit, or fewer committed than had one, \
+         so the commit clause asked of them asked nothing"
+    );
+    // The situation D-035 decides, reached on each system range, and decided: the
+    // keeper asked and the re-seeded replica said no, on this half of the pair; its other
+    // half is `a_reseeded_system_replica_that_votes_is_caught`.
+    assert!(
+        figures.seeds_a_cut_off_root_was_refused_a_vote > 0,
+        "on no seed did the keeper ask the victim's root replica for a vote and get refused"
+    );
+    assert!(
+        figures.seeds_a_cut_off_meta_range_was_refused_a_vote > 0,
+        "on no seed did the keeper ask the victim's meta replica for a vote and get refused"
+    );
+    assert_eq!(
+        figures.votes_granted_by_the_victim, 0,
+        "a re-seeded replica granted a vote in the hold, which D-035 says it never does"
+    );
+}
+
+/// The system ranges' half of the pair (PROPOSED D-119, issue #143): a re-seeded replica
+/// of `range` that grants votes past its quarantine, and no other replica of the node
+/// doing so. D-035 broken where the cluster's routing lives, which until now passed ten
+/// thousand seeds: the hold's clauses iterated the four user ranges, and on none of those
+/// seeds does the vote break an invariant the run reaches.
+///
+/// **The catch.** On a seed where the cut leaves `range`'s leader on the far side, the
+/// keeper campaigns, the victim's replica grants the vote that is the second of three
+/// (the mechanism, asserted per seed), and the keeper is elected in the hold, where its
+/// office needed a majority it should not have had. The clause that names it is the one
+/// the user ranges have always had: "became leader of it in the hold".
+///
+/// Any other verdict fails this test: the variant is one range's, and every other replica
+/// still keeps D-035. The vote could elect a candidate without an entry the range committed
+/// before the crash, as `RefuseOneRangeOnly`'s amnesiac vote once did on seed 2994, but no
+/// seed of ten thousand shows it here, so that witness is not admitted: PROPOSED D-101's
+/// rule is to admit what is measured and to read the rest before admitting it.
+///
+/// Measured before it was asserted (Q39, D-061): see PROPOSED D-119's table. The range's
+/// leader is on the far side on about one seed in two and the catch is about as often,
+/// so the catch is asserted at every tier and the rate printed at every tier.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+fn a_reseeded_system_replica_that_votes_is_caught(variant: Variant, range: u64) {
+    let outcomes: Vec<(Option<String>, bool, bool)> = sweep(seeds(), |seed| {
+        let report = quorum::node_run(seed, variant, NodeVariants::correct());
+        let (cut_off, voted) =
+            report
+                .cast
+                .as_ref()
+                .zip(report.holds())
+                .map_or((false, false), |(cast, holds)| {
+                    let hold = &holds[&range];
+                    (hold.leader == cast.other, hold.votes_granted > 0)
+                });
+        (report.check().err(), cut_off, voted)
+    });
+    let elected_in_the_hold = format!(": range {range}: ");
+    let by_the_clause = |verdict: &str| {
+        verdict.contains(&elected_in_the_hold)
+            && verdict.contains("became leader of it in the hold")
+    };
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, ..)| v.as_ref()).collect();
+    let by_clause = caught.iter().filter(|v| by_the_clause(v)).count();
+    eprintln!(
+        "sharded quorum, {:?}: caught on {} of {} seeds ({by_clause} by the hold's election \
+         clause on range {range}); the cut left its leader on the far side on {} seeds and the \
+         victim's replica granted a vote in the hold on {}, first: {}",
+        Variants::from(variant),
+        caught.len(),
+        seeds(),
+        outcomes.iter().filter(|(_, cut_off, _)| *cut_off).count(),
+        outcomes.iter().filter(|(.., voted)| *voted).count(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert!(
+        by_clause > 0,
+        "the hold's election clause caught {variant:?} on no seed: {caught:?}"
+    );
+    assert_eq!(
+        by_clause,
+        caught.len(),
+        "{variant:?} was caught by something other than the hold's election clause on range \
+         {range}, where every other replica keeps D-035; read it before admitting it: \
+         {caught:?}"
+    );
+    // The mechanism, on every seed the clause caught: the vote that made the majority.
+    for (verdict, cut_off, voted) in &outcomes {
+        if verdict.as_deref().is_some_and(by_the_clause) {
+            assert!(
+                *cut_off && *voted,
+                "{verdict:?} named the clause, but the range's leader was on the far side: \
+                 {cut_off}, and the victim's replica granted a vote in the hold: {voted}"
+            );
+        }
+    }
+}
+
+/// `a_reseeded_system_replica_that_votes_is_caught` on the root.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+#[test]
+fn a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
+    a_reseeded_system_replica_that_votes_is_caught(
+        Variant::ReseededRootReplicaVotes,
+        ananke_sim::ranges::ROOT_RANGE,
+    );
+}
+
+/// `a_reseeded_system_replica_that_votes_is_caught` on the meta range.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
+#[test]
+fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
+    a_reseeded_system_replica_that_votes_is_caught(
+        Variant::ReseededMetaReplicaVotes,
+        ananke_sim::ranges::META_RANGE,
+    );
 }
 
 /// The node's own variant beside the correct node (the pair rule, CLAUDE.md):
@@ -3941,8 +4541,8 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 /// catches it on its own scenario's shape. Here it is caught from this scenario's
 /// side, by the clause that asks the fan-out per range: the store that opens first is
 /// range 0's (PROPOSED D-096), so the variant refuses the root alone, and none of the
-/// four user ranges' replicas the clause asks about was refused, so none was re-seeded
-/// either.
+/// five other replicas the clause asks about — the meta range's first, since PROPOSED
+/// D-119 — was refused, so none was re-seeded either.
 ///
 /// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
 /// twenty, and the rate is printed at every tier.
@@ -3959,11 +4559,12 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 ///   system range, applies the first `MetaUpdate` over nothing and takes every span;
 /// - **leader completeness** on a range the variant left unrefused (PROPOSED D-101): the
 ///   empty replica votes again on state its node lost (D-035), and its vote elects a
-///   candidate missing an entry the range committed before the victim's crash. It is
-///   one seed in ten thousand (seed 2994), so its firing is asserted at no tier: seed
-///   2994's pin below asserts the mechanism instead. Group 0 is excluded: the variant
-///   refuses range 0 exactly as the correct node does, so a violation there is not
-///   this bug and fails the test.
+///   candidate missing an entry the range committed before the victim's crash. It was
+///   one seed in ten thousand (seed 2994), and since PROPOSED D-119 moved the cut it is
+///   none of seeds 0 to 19 999, so its firing is asserted at no tier. It stays admitted
+///   because the vote that makes it is still there: seed 2994's pin below asserts the vote
+///   and the harm's absence. Group 0 is excluded: the variant refuses range 0 exactly as
+///   the correct node does, so a violation there is not this bug and fails the test.
 ///
 /// The fan-out clause is asserted seen, every catch is one of the three, and each
 /// one's share is printed at every tier.
@@ -3971,9 +4572,10 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 /// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
 /// and before the history and the fan-out clause (PROPOSED D-106, issue #140). None of
 /// their seven folds is in violation under the variant on any of seeds 0 to 999, and at
-/// ten thousand the split is D-101's to the seed (3 338 / 6 661 / 1), so they name no
-/// catch the attribution does not admit; one that ever did would fail this test as
-/// "caught by something other than", and be read before it is admitted.
+/// ten thousand the split was D-101's to the seed (3 338 / 6 661 / 1; 3 338 / 6 662 / 0
+/// since PROPOSED D-119 moved seed 2994), so they name no catch the attribution does not
+/// admit; one that ever did would fail this test as "caught by something other than", and
+/// be read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 #[test]
@@ -4045,27 +4647,36 @@ fn leader_completeness_group(verdict: &str) -> Option<u64> {
     group.parse().ok()
 }
 
-/// **Seed 2994 is the variant's amnesiac vote** (PROPOSED D-101): the one seed of the
-/// nightly's ten thousand on fdc5fc0 (run 38082122222) that `RefuseOneRangeOnly` was
-/// caught on by leader completeness, which the pair's attribution did not then admit.
+/// **Seed 2994 is the variant's amnesiac vote, and since PROPOSED D-119 the vote without its
+/// harm.** It was the one seed of the nightly's ten thousand on fdc5fc0 (run 38082122222) that
+/// `RefuseOneRangeOnly` was caught on by leader completeness, which the pair's attribution did
+/// not then admit (PROPOSED D-101).
 ///
-/// The mechanism, asserted rather than the verdict alone. Before the victim's crash
-/// the leader of range 4's term 1 committed index 14 on a majority that held the
-/// victim and not server 2. The victim restarts on a store marked lost; the variant
-/// refuses range 0 alone, so the victim's replica of range 4 is re-created in the
-/// fresh engine as a first start creates it — term 0, nothing in its log, incarnation
-/// 1, neither refused nor quarantined. With server 3 cut off, server 2 asks for votes
-/// in term 3, and the victim's empty replica grants one: it is the only vote server 2
-/// is given, and with its own it is the majority of three that elects server 2 with
-/// index 13 as its last, without index 14. Leader completeness names it, ahead of the
-/// fan-out clause.
+/// The mechanism, asserted rather than the verdict alone. Before the victim's crash the leader
+/// of range 4's term 1 committed index 14 on a majority that held the victim and not server 2.
+/// The victim restarts on a store marked lost; the variant refuses range 0 alone, so the
+/// victim's replica of range 4 is re-created in the fresh engine as a first start creates it —
+/// term 0, nothing in its log, incarnation 1, neither refused nor quarantined. With server 3
+/// cut off, server 2 asks for votes in term 3, and the victim's empty replica grants one: it is
+/// the only vote server 2 is given, and with its own it is the majority of three that elects it.
 ///
-/// The correct node on the same seed is the other half: the same victim, its replica
-/// of range 4 refused with its node, restated refused, granting no vote after the
-/// refusal (D-035), and the seed green.
+/// **The harm is absent, asserted, with the reason.** Until D-119 the cut came at 1.32 s, 8 ms
+/// after server 3 took range 4 in term 2, with the root still naming the victim as its leader.
+/// Server 2 was then elected with index 13 as its last, without index 14, and leader
+/// completeness named it ahead of the fan-out clause. D-119's cut waits for the root's new
+/// leader, at 1.354 s, so it comes at 1.37 s; in those 50 ms server 3 catches server 2 up, server
+/// 2 is elected at index 15, and nothing is lost. The verdict is now the other witness, state
+/// machine safety on the meta range. No seed of 0 to 19 999 reaches the harm on this tree, so
+/// there is no seed to move this pin to. The day this one does, the verdict and the last index
+/// below both say so, and the pin can go back to asserting it.
+///
+/// The correct node on the same seed is the other half: the same victim, its replica of range 4
+/// refused with its node, restated refused, granting no vote after the refusal (D-035), and the
+/// seed green. Its cut does not move, since its root has a leader by 1.37 s either way.
 // PROPOSED(D-101): the amnesiac vote, pinned where the nightly found it.
+// PROPOSED(D-119): the hold clauses ask the system ranges too.
 #[test]
-fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry() {
+fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry() {
     let seed = 2994u64;
     let (group, index, candidate, term) = (4u64, 14u64, 2u64, 3u64);
     let report = quorum::node_run(
@@ -4079,16 +4690,20 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
     assert_eq!(
         violation,
         format!(
-            "seed {seed}: leader completeness: index {index} of group {group} (term 1) was \
-             committed in term 1 but server {candidate}, leader of term {term}, does not \
-             hold it"
+            "seed {seed}: state machine safety: index 2 of group 1 was applied to effect none \
+             on one server and took on server 1"
         ),
-        "seed {seed}'s schedule has moved off the amnesiac vote this pin asserts; assert \
-         the absence with its reason, and name the seed the pair's sweep counts by \
-         leader completeness instead"
+        "seed {seed}'s schedule has moved again. If this is leader completeness of group \
+         {group}, the amnesiac vote's harm is back: assert it here as D-101 did"
     );
-    assert_eq!(leader_completeness_group(&violation), Some(group));
-    let victim = report.cast.as_ref().expect("the cast was taken").victim;
+    assert_eq!(leader_completeness_group(&violation), None);
+    let cast = report.cast.as_ref().expect("the cast was taken");
+    let victim = cast.victim;
+    assert_ne!(
+        cast.leaders[&ananke_sim::ranges::ROOT_RANGE],
+        victim,
+        "seed {seed}: the cut left the root naming the victim, which is what D-119's wait stops"
+    );
     let records = &report.records;
     let refusal = records
         .iter()
@@ -4164,9 +4779,9 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
         unreachable!("found as a leader record")
     };
     assert!(
-        last_index < index,
+        last_index >= index,
         "seed {seed}: server {candidate} was elected with index {last_index} as its last, \
-         which holds index {index}"
+         without index {index}: the amnesiac vote's harm is back, so upgrade this pin"
     );
     let granted: BTreeSet<u64> = after[..elected]
         .iter()
@@ -4257,8 +4872,8 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
     println!(
         "seed {seed}: server {victim}'s empty, unmarked replica of group {group} granted the \
          one vote that elected server {candidate} in term {term} with index {last_index} as \
-         its last, without index {index}; the correct node refused it and it voted {} times, \
-         granting none",
+         its last, so holding index {index}; the correct node refused it and it voted {} \
+         times, granting none",
         votes.len()
     );
 }
@@ -4276,8 +4891,8 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
 /// instead of inferring the absence of a store from a stamp. What this test asserts
 /// now, per variant, over the tier's seeds:
 ///
-/// 1. **The refusal landed** — four replicas a seed, as before, or nothing below is
-///    evidence.
+/// 1. **The refusal landed** — six replicas a seed, the root's and the meta range's with
+///    the four user ranges' (PROPOSED D-119), or nothing below is evidence.
 /// 2. **The node sends the mark**: `refused_rejections` is no longer 0. This is the
 ///    assertion that would fail if the key were reverted, if the mark stopped being
 ///    set where a re-seed builds the store, or if it stopped surviving the wire, and
@@ -4304,6 +4919,11 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
 ///    the window whichever way the variant counts the rejection. Measured, and the
 ///    figures say it: over a hundred seeds the node delivered 33 refused rejections
 ///    and 25 010 answers that fitted, and **0** step-downs left anyone `uncounted`.
+///    A hundred seeds is not all of it: `step_downs_naming_anyone_uncounted` moved from
+///    45 to 126 at ten thousand seeds under PROPOSED D-119, the 126 being 34 on user
+///    ranges and 92 on ranges 0 and 1. "Elected 8 to 12 ms before the cut", which is
+///    D-119's account of the system ranges' step-downs, holds only for the five seeds at
+///    one thousand: seeds 2605 and 7195 are 1.1 s.
 ///
 /// **Nothing is lowered.** §10's standard for this pair — caught on every seed at
 /// every tier — is asserted where the pair is caught, `sim/tests/raft.rs`'s four
@@ -4322,7 +4942,9 @@ fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed
 // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
 #[test]
 fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold() {
-    let ranges = u64::try_from(ranges().len()).expect("small");
+    // Every replica the node hosts, the system ranges' with the user ranges' (PROPOSED
+    // D-119).
+    let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
         let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
         eprintln!(

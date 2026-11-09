@@ -47,8 +47,13 @@
 //! And a pre-vote or vote request of R reached `x` before `x`'s `RangeCreated` of R
 //! (SHARD.md §12, Stage C's exit). The verdict is checks 1 to 4 and the range layer's
 //! folds, checks 7 to 20, and that no node stopped.
+//!
+//! **A follower cut off from its first start** ([`run_cut_from_the_start`]) is no shape of
+//! §10's. It is the directed run for an install onto an empty replica that holds a
+//! descriptor, which creates nothing (PROPOSED D-116 §4).
 // PROPOSED(D-109): `sim/split.rs` (ii).
 // PROPOSED(D-110): `sim/split.rs` (i).
+// PROPOSED(D-116): the run cut off from the first start.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1263,6 +1268,82 @@ pub fn run_overlap_resplit(seed: u64, node: NodeVariants) -> Report {
     sim.heal();
     report.lifted = Some(sim.now());
     sim.run_for(AFTER_LIFT);
+    report.records = sim.trace();
+    report
+}
+
+/// A follower of P cut off from its first start, until P's leader has compacted, and then
+/// healed: its P holds the descriptor its bootstrap wrote and has applied nothing when P's
+/// snapshot reaches it, so the install lands on an empty replica that is initialised and
+/// creates nothing (SHARD.md §8; PROPOSED D-116 §4). No split is asked and no limit put on:
+/// [`Report::split`] stays `None`, and [`Report::x`] is the follower, a draw on stream
+/// `split-cut` from the bootstrap nodes.
+// PROPOSED(D-116)
+#[must_use]
+pub fn run_cut_from_the_start(seed: u64) -> Report {
+    let range_variants = RangeVariants::correct();
+    let mut sim = Sim::new(config(seed));
+    let nodes: Vec<NodeId> = (0..NODES).map(|_| sim.add_node()).collect();
+    let client = sim.add_node();
+    let mut draw = moirae_sched::stream(seed, "split-cut");
+    let x = 1 + draw.below(BOOTSTRAP);
+    let others: Vec<NodeId> = (1..=NODES)
+        .filter(|id| *id != x)
+        .map(|id| nodes[id as usize - 1])
+        .chain([client])
+        .collect();
+    sim.partition(&[nodes[x as usize - 1]], &others);
+    let cut = sim.now();
+    for id in 1..=NODES {
+        spawn(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            (range_variants, NodeVariants::correct()),
+            Shape::Vote,
+        );
+    }
+    let routes: Routes = Arc::default();
+    let right_off: RightOff = Arc::default();
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("writer", writer(inner, routes, VOTE_LOAD, right_off));
+    }
+    let mut report = Report {
+        shape: Shape::Vote,
+        seed,
+        range_variants,
+        records: Vec::new(),
+        run: sim.run_header(),
+        x,
+        crashed: None,
+        split: None,
+        cut,
+        healed: None,
+        lifted: None,
+        resplit: None,
+        unbuilt: None,
+    };
+    let budget = SETTLE + COMPACT_BUDGET;
+    let deadline = sim.now() + budget;
+    loop {
+        let records = sim.trace();
+        if leader_of(&records, PARENT)
+            .is_some_and(|leader| compacted_past(&records, PARENT, 0, Some(leader)))
+        {
+            break;
+        }
+        if sim.now() >= deadline {
+            report.unbuilt = Some(format!("P's leader did not compact within {budget:?}"));
+            report.records = records;
+            return report;
+        }
+        sim.run_for(SLICE);
+    }
+    sim.heal();
+    report.healed = Some(sim.now());
+    sim.run_for(AFTER);
     report.records = sim.trace();
     report
 }

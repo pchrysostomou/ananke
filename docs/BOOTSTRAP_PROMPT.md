@@ -158,6 +158,51 @@ _Update this section at the end of every session._
   are green on a scratch copy of its scenario, which is not committed here. #199, a re-seeded
   range that came back by log replay and refuses its next split, is the same family and not
   covered: it holds no descriptor whichever way this switch goes, 40 of 40 on its probe.
+- Branch `phase-3-stage-c-reseed-engine-dir` (2026-11-06), off `main` at de9f4d7, PROPOSED
+  D-117, **#176: the start that re-seeded runs its tasks on the directory the re-seed
+  built**. `reseed` returns the fresh engine's configuration and `run()` rebinds `engine`,
+  so the `apply` task's takes, the `snapshot` task's staging and its two sweeps no longer
+  write into the refused directory until the next start (D-041). `run_after_split` audits
+  the refused directory recursively before `x`'s restart and at the end, both with `x`
+  down: before the fix it changed on 200 of 200 seeds, two staging directories staged,
+  synced and cleared there; after, on none, and both streams staged in `/node-g1`. The pair is
+  `TasksOnTheRefusedDir` (bit 25, Q15's sixth), caught on 200 of 200. #192's review added a
+  clause for each consumer that had none: the fresh staging directories are empty at the end
+  (the `snapshot` task), and `run_split_after_reseed`, a split of P's left half that `x` leads,
+  takes and sweeps in the fresh directory (the `apply` task). The re-seed shape's own
+  top-level-only audit is #190; a split of a range the log rebuilt fails on `main`, #199.
+- Branch `phase-3-stage-c-reseed-after-split-review` (2026-11-06), off `main` at de9f4d7,
+  **#187's review fixes** (PROPOSED D-115). #187 merged at 2d9e8ad before them and closed
+  #172: a re-seed after a split creates P by an install at the split's generation over its
+  left half, check 7 holds it at its floor, and the creation's generation put back fails the
+  run on 200 of 200 at the cap. These fixes ask that clause inside D-109's test on the same
+  runs, drop the duplicate sweep and its row, re-weigh D-109's row, and rest the run's cap on
+  its own figures (0.17 to 0.21 cpu s a seed; a whole nightly shard at ten thousand), which
+  is PROPOSED and the owner's. D-115 is corrected in place, each correction marked.
+- Branch `phase-3-stage-c-created-twice-fold` (2026-11-01, merged with `main` at de9f4d7 on
+  2026-11-06), off `main` at b1da6ec, PROPOSED D-116 (footer D-117), **#181: check 8's
+  created-twice clause**. A `RangeCreated` of a range on a node whose check-8 spans already
+  hold it is a violation, whatever made either creation: §5's "the apply asserts" that R is
+  not "already initialised here", asked of the trace instead of failing the node, so it no
+  longer hides check 18's reused id. `Fold::CreatedTwice`, in the checker's verdict after
+  the overlap clause. The correct system trips it on none of 1 000 seeds of the node
+  sweep, `sim/split.rs` (i) and (ii), the membership scenario on the node, the re-seed
+  shapes and `sim/install.rs`. Its tripping variant under the equivalence test is
+  `IdBlockResumed` on the node sweep: 14 of 20, 71 of 100 and 630 of 1 000, the same seeds
+  as check 18's range-id clause, asserted at every tier. Seed 219 under
+  `SnapshotOverlapsReplica` is pinned: the clause trips at node 3's install's creation of
+  62 after its split's, 16 ms before Raft's state machine safety. The clause found a false
+  creation, fixed here: an install onto an empty replica that holds a descriptor (a re-seed's
+  system range, or a bootstrap's replica that has applied nothing) was traced as created, on
+  about 7 % of S10's correct seeds; 0 of 1 000 there with the fix, with the 21 seeds D-113
+  lists failing as before. `split::run_cut_from_the_start` is its directed run. Every figure
+  reproduces on the merged tree (D-116 §10).
+- Branch `phase-3-stage-c-quorum-root-hold` (2026-11-06), off `main` at de9f4d7, PROPOSED D-119
+  (footer D-120), **#143**: the sharded quorum scenario asks its hold of ranges 0 and 1 too, and
+  the keeper's commit there where the run gave it an entry. `Variant::ReseededRootReplicaVotes`
+  and `ReseededMetaReplicaVotes` are caught on 4 578 and 4 651 of 10 000, the correct node 0 of
+  10 000. The wait moves the cut on about a third of the seeds and seed 2994's pin to the vote
+  without its harm, with D-101's split now 3 338 / 6 662 / 0.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit
