@@ -23332,20 +23332,156 @@ creation's own. The trace format is not changed for this.
 
 ---
 
+## PROPOSED D-113 — `sim/shard.rs`, Stage C's sharded sweep (S10): five nodes, a driver on stream `shard`, four clients over sixteen keys and Phase 2's faults; stopped at its first measurement on a correct-server failure, an install onto a re-seeded replica that deletes the right halves beside it
+
+**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for this
+slice (#162's S10); the footer moves past it, and the slices beside it (#185, S8 (c), #181)
+take D-114 and up. Every code site carries `// PROPOSED(D-113)`. **This entry is in
+progress**: it records what is built and why the slice stopped, and it grows as the slice
+resumes.
+
+### 1. What is built
+
+`sim/shard.rs` (SHARD.md §10; §12, Stage C; Q39):
+
+- **Five nodes, three of them bootstrap nodes.** Nodes 1 to 3 write ranges 0, 1 and 2,
+  range 2 over `[k, l)`, the whole user keyspace the clients write (§2). Nodes 4 and 5 join
+  and hold nothing: no leader of this stage sends them anything, so they never make even a
+  placeholder (Q22), and `Report::shape` asserts that on every seed, with the nine
+  bootstrap creations.
+- **The driver, on stream `shard`.** Four to eight actions a run, drawn before the run at
+  times spread over the faults and resolved against the trace when each fires, so the
+  stream's draws never depend on what the run did (D-031). Two in three are a split of a
+  current span: a user range whose latest descriptor holds at least two of the clients'
+  keys on each side of some key strictly inside it, split at one such key and asked of its
+  leader by an admin that follows `NotLeader` and retries after `NoRangeId` (D-092's A).
+  The rest are leadership transfers of any range, ranges 0 and 1 included, to another
+  voter. So halves split again, which the node sweep's split arms never draw (D-104).
+- **Four clients over sixteen keys**, `k00` to `k15`: the node sweep's client, routing by
+  its cache through ranges 0 and 1, starting by thirds stale, root-only or with the
+  bootstrap descriptor. `raft::client_on` is split so its keys and first cache are the
+  scenario's (`raft::client_over`, `ClientKeys`); every draw of the two clusters of
+  `sim/raft.rs` falls where it fell, so no schedule and no pinned hash moves.
+- **Phase 2's faults**: drops, duplicates, delays; every node's clock drawn as the raft
+  sweep draws its servers' (within the lease's bound on half the seeds, one bootstrap node
+  slow and the rest fast on the other half); four to seven of isolate a node with a
+  client, isolate a drawn range's leader, a one-way block, a crash and a drawn range's
+  leader crashed, each healed before the next; and the disk's bit rot at Phase 2's 0.02
+  with torn writes, `fsync` honoured.
+- **The checks**: the raft sweep's over this trace (`raft::Report::over_a_run`) —
+  checks 1 to 4 keyed by range, the range layer's folds in one incremental checker that
+  stops the run (D-046), linearizability of every key across every split, which with the
+  drifting clocks is check 6 as Phase 2 built it, pre-vote's property, and on uniform seeds
+  the timer check and the write bound — and the shape. Check 19 is S7's (D-093).
+- The sweep, `every_seed_passes_on_the_correct_sharded_sweep`, prints the driver's work
+  and the refusals by loss, and has its nightly row (D-064), shard 6.
+
+### 2. Why it stopped: what the first thousand seeds found
+
+At a thousand seeds in release (on this tree; about 81 s real):
+
+- 3 721 splits took effect, 1 726 of them of a range a split made; every seed but 9 split;
+  up to 8 user ranges at a run's end. The driver asked 3 899 splits: 3 484 done, 370
+  refused `key-outside-span` (a second split of a span drawn while the first was in
+  flight), **18 refused `NoRangeId` on 7 of 1 000 seeds**, 45 unanswered; 1 673 of 2 022
+  transfers done.
+- 340 store refusals on 293 of 1 000 seeds: 126 name a dropped table, and 214 are
+  reasons the loss classifier does not read yet (a missing log head, among others).
+- **21 seeds fail the correct system**, on three mechanisms:
+
+**(a) A correct-server failure: an install onto a re-seeded replica deletes the right
+halves beside it.** 7 seeds, all linearizability: 41, 119, 447, 466, 782, 793 and 865, each
+an answer only a replica that had lost the key's value could give. Seed 41, range 19 on node 2:
+1. Range 2 splits at `k11` (index 109; right half 19) and at `k08` (121; right half 20).
+2. Node 2 is refused at 3.869 s ("dropped tables [4]") and re-seeds configuration's
+   ranges, 0, 1 and 2 (Q15, D-077). The re-seeded range 2 holds no descriptor and is no
+   initialised replica in the host's map, but the `snapshot` task's plan hosts it at
+   configuration's span, `[k, l)`.
+3. Node 2's placeholder of 19 is installed at 4.112 s: `SpanInstalled` of `[k11, l)` into
+   table 2, `RangeCreated { range: 19, cause: snapshot }` at `[k11, l)`. The overlap rule
+   lets it in, since nothing initialised on node 2 overlaps it.
+4. Node 2's re-seeded range 2 is installed at 4.243 s: its switch replaces the plan's
+   hosted span, **`[k, l)`**, though the snapshot's descriptor is `[k, k08)` and that is
+   what its `RangeCreated` names. Table 2 is taken out and rewritten without its user keys:
+   range 19's data on node 2 is gone.
+5. Range 19 splits at `k13` (index 136) into 21, which node 2 creates from its emptied 19;
+   node 1, leading 21, is crashed, node 2 leads 21 at term 3 at 4.713 s and serves `k15`'s
+   get at index 138 as `None`, where 19's snapshot at 121 held a value.
+
+A probe over the same thousand seeds finds an install on a re-seeded node replacing keys of
+another replica initialised on that node on **151 of 1 000 seeds**; 15 of those fail the
+verdict, the rest lose data on a replica no client then reads. It is a server bug, not a
+check defect: the trace's own `SpanInstalled` shows the deletion. It is #172's case, a
+re-seed after a split, which no scenario reached before this one, and S8 (c)'s to fix. No
+fold sees it: every descriptor the trace names is right, and only the engine's switch is
+wrong. **Not fixed here; reported to the owner.**
+
+**(b) A bound the correct system trips: `READS_OUTSTANDING`.** 2 seeds, 128 and 643, "server
+1 failed: range 2 holds 39 registered reads, over the 38 its clients can have in flight with
+it". Seed 128: nodes 2 and 3 are both refused (2.548 s, 3.269 s), so two of range 2's three
+voters run quarantined (D-035). The leader, node 1, goes on committing writes at term 1
+(indices 112 to 146), since a quarantined follower counts for commits, and confirms no read
+after 3.048 s, since a quarantined follower's echo is 0 and never a read's confirmation
+(RAFT.md §3). Every get registered at it waits for good; the four clients retry, each retry
+a registration of its own (#125); the count passes 38 at 7.411 s and the node fails itself.
+No registration is lost: the bound, sized on two clients by D-076's rule, counts retries
+against a leader that cannot confirm a read. **Not widened; reported to the owner.**
+
+**(c) A check defect of this slice's own.** 12 seeds, 217, 248, 253, 260, 281, 309, 313,
+329, 457, 657, 945 and 952: "liveness: no client write completed after the last heal". Two nodes are refused, so range 2 has lost its majority, as (b)'s seeds have, and the
+check asks nothing of its keys; but a right half on a refused node traces no
+`RaftReplicaRefused` (#178), so it still counts as live, the live set is not empty, and the
+check's "no write was asked of a live range" arm fires. The fix is this slice's: §8 counts
+every replica on a refused node as refused, and the sweep's write bound is to be asked per
+range the run ended with, read that way. Not fixed before the owner's word on (a) and (b),
+since both move what this sweep's figures mean.
+
+### 3. What is left of S10
+
+- (c)'s fix: the write bound per final range, with §8's refusal reading.
+- The meta convergence bound, measured then asserted (§8).
+- #45's loss kinds read in full, and dropped tables by the ranges they touch.
+- D-092's `NoRangeId`: 18 refusals on 7 of 1 000 seeds at the block of eight and the
+  threshold of two; the choice of the pair, and D-092's per-seed assertion where it is
+  reached, wait on (a), which the same seeds' refusals sit beside.
+- The node scenarios in `sim/tests/parallel.rs`; the pair rule's variants on this sweep;
+  the first Phase 3 seeds pinned.
+
+### 4. PROPOSED, for the owner
+
+- **(a)'s fix**, S8 (c)'s: the install's switch replaces the snapshot descriptor's span
+  for a replica that holds none — a re-seeded one, as a placeholder's install already
+  does — or the re-seed hosts its replicas at their Raft interval alone until their
+  installs name their spans. Recommended: both, the second being what makes a re-seeded
+  replica what §5 says it is, a replica with no span until its install.
+- **(b)**: a leader that cannot confirm a read — fewer unquarantined voters than a
+  majority — refuses it at the step, as it refuses a read it is not the leader for, so no
+  registration waits on what cannot come; or `READS_OUTSTANDING` stays as it is and the
+  sweep counts such seeds apart. Recommended: the first; the bound then measures what it
+  was written to.
+- **The scenario's own choices**, all tunable and none measured yet: four clients, sixteen
+  keys, two keys a side, Phase 2's bit rot of 0.02, four to eight driver actions a run.
+
+---
+
 ## PROPOSED D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
 
-**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for
-S10 in the tracking issue #162; D-114 is this slice's. The footer moves to D-115, and
-at a merge the entries are a union in numerical order with one footer, the highest plus
-one. The code site carries `// PROPOSED(D-114)`. Closes #183.
+**The number.** Off `main` at b1da6ec, whose footer read D-113. #162 records the
+reservations of 2026-11-01: D-113 for S10, D-114 for #186 (this, #183), D-115 for #187
+(#172), D-116 for #181 and D-117 for #176 (*corrected after #186 merged*, #186's review,
+N2: this first cited #162 for a reservation it did not then record). This entry took D-114
+and moved the footer to D-115. At a merge the entries are a union in numerical order with
+one footer, the highest plus one. Every code site carries `// PROPOSED(D-114)`. #186 closed
+#183. It merged at c7040b3 before its review's fixes, and each correction is marked where it
+stands.
 
 **Context.** #180's review (N10) found it, and it predates S9. A voter's apply of a split
 wrote the two descriptors into the host's `descriptors` table under two acquisitions:
 P's narrowed descriptor first, then R's new one after the `RangeCreated { cause: split }`
-trace. The `snapshot` task's overlap rule (D-110) reads the same table in one
-acquisition, when it decides whether a placeholder's install of R may go in. Between the
-two acquisitions, the table held P off R's span and no R, and the rule admits R's
-install on that state.
+trace. The `snapshot` task's overlap rule (D-110, `install::admission`) reads the same
+table in one acquisition, when it decides whether a placeholder's install of R may go in.
+Between the two acquisitions, the table held P off R's span and no R, and the rule admits
+R's install on that state.
 - **In the simulator** no task runs there: the executor is cooperative and nothing
   between the two inserts awaits.
 - **Under `RealEnv`'s multi-thread runtime** the `snapshot` task can run on another worker
@@ -23355,34 +23491,64 @@ install on that state.
   server.
 
 **The rule.** The two inserts are one critical section. `put_split_descriptors`
-(`server.rs`) puts P's narrowed descriptor and, on a voter, R's into the table. It takes
-the table, not its lock, so the caller's one guard covers both. A reader of the table
-sees P's descriptor before the split or both halves after it, and the overlap rule
-refuses R's install in both states: by P's span before, by R itself after. A non-voter
-holds no R, and its table goes from P to P narrowed, as before.
+(`server.rs`) takes the table's lock itself, once, and puts P's narrowed descriptor and,
+on a voter, R's under it. It is the only place a split's apply touches the table. A
+reader of the table sees P's descriptor before the split or both halves after it, and the
+overlap rule refuses R's install in both states: by P's span before, by R itself after. A
+non-voter holds no R, and its table goes from P to P narrowed, as before.
+
+*Corrected after #186 merged* (#186's review, B1). As first built the helper took the table,
+and the caller took the lock. This entry said the helper's signature held the one
+acquisition, and that was false: a caller could take the lock twice and still call it.
 
 **The trace and the schedules do not change.** R's creation is still traced before its
 descriptor is in place. P's descriptor now goes in with R's, after that trace and not
-before it. Nothing between the two points awaits or draws, so every simulated run is
-the run it was.
+before it. Nothing between the two points awaits or draws, so every simulated run is the
+run it was. A scratch test hashed `split::run` seeds 0 to 7 and `reseed::run_after_split`
+seeds 0 and 1 on this tree and on b1da6ec's code, byte-identical, and #186's review
+re-hashed four and two of them the same. The helper's change after #186 merged moves
+where the lock is taken and nothing else, and the same hashes on it are identical to
+`main`'s at de9f4d7.
 
-**The test, and why the window itself has none.**
+**The test, and what it can and cannot see.**
 `a_splits_two_descriptors_reach_the_hosts_table_in_one_step` (a unit test in `server.rs`)
-holds the helper's update:
-- a voter's table goes from P alone to P narrowed and R, with the range beside untouched;
-- the overlap rule refuses an install of R's span in both states;
-- the state between, P narrowed with R absent, admits it, so it is the state no reader
-  may see;
-- a non-voter's table ends in P narrowed and no R.
+runs `ServerApplier::split` itself, through an environment that reads the table at every
+event the apply traces. A task on another worker could read the table at any moment outside
+the lock, and the traced events are the moments this test can read it at. On a voter:
+- the table is P's descriptor alone or both halves at every traced event;
+- `install::admission`, the overlap rule itself on the correct range layer, refuses a
+  placeholder's install of R on every table seen;
+- the state between, P narrowed with R absent, is one the rule admits.
 
-No test of this tree can reach the window itself, before or after the fix.
-- The simulator never ran a task between the two inserts.
-- A test that raced host threads against the table is what `clippy.toml` and
-  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040).
-- The real binary does not run the shard server.
+On a non-voter the table ends with P narrowed and no R.
 
-The one acquisition is held by the helper's signature, which takes the table rather than
-its lock. **PROPOSED.**
+*Corrected after #186 merged* (#186's review, B1 and N1). As first built the test ran the
+helper alone, on maps it built by hand, and read a copy of the overlap rule of its own, so
+it could fail on neither `split` nor the rule. Each row below is a plant measured on both
+versions:
+
+| the plant | #186 as merged | this version |
+|---|---|---|
+| the review's: the helper for P alone before R's `RangeCreated` trace, R under a second lock after it | test ok; clippy clean | **test fails**: "at RangeCreated a reader found the table {RangeId(4): … generation: 2 …}: neither P's descriptor alone nor both halves"; clippy clean |
+| b1da6ec's two inserts, word for word | test ok; clippy's `dead_code` alone | **test fails** the same way; `dead_code` too |
+| two acquisitions with no traced event between them, after the trace, the helper kept for P alone | test ok; clippy clean | test ok; clippy clean |
+| the same without the helper | test ok; `dead_code` | test ok; `dead_code` |
+| the overlap rule switched off in `install.rs` (the review's N1) | test ok | **test fails**: the rule no longer refuses R's install on P's descriptor alone |
+
+The third row is the limit: **a return to two acquisitions with no traced event between them
+fails no test of this tree.** No test here can see between them:
+- the simulator never runs a task there;
+- a test racing host threads against the table is what `clippy.toml` and
+  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040);
+- the real binary does not run the shard server.
+
+What stands against that revert is the helper, which takes the lock itself, and review.
+**PROPOSED.**
+
+**Related, not fixed here.** A creation is traced before its descriptor reaches the table,
+on the split's path and on a placeholder's install, so on a multi-threaded runtime
+`ServerHost::unheld` can answer for a replica already created as its placeholder (#186's
+review, N3; issue #189).
 
 **The nightly's rows (D-064).** No sweep is added, so no row.
 
@@ -23465,12 +23631,11 @@ lightest shard, shard 6, at 1832.3 -> 1867.0.
 
 ## PROPOSED D-117 — The start that re-seeded runs its tasks on the directory the re-seed built: `engine` rebound for the `apply` task's takes, the `snapshot` task's staging and its sweeps, so the refused directory is never written again (#176)
 
-**The number.** This branch is off `main` at de9f4d7, whose footer reads D-116. D-116 is
-reserved for #181 and D-113 is S10's (#188), neither merged yet; D-114 (#186) and D-115
-(#187) are on `main`. D-117 was reserved for #176. This entry takes it and sets the footer
-to D-118, the next after this one. At the merges of D-113 and D-116 the entries are a union
-in numerical order with one footer, the highest number plus one. Every code site carries
-`// PROPOSED(D-117)`.
+**The number.** This branch is merged with `main` at 8a4cdad, whose footer reads D-116.
+D-116 is reserved for #181, not merged yet; D-113 (#188), D-114 (#186) and D-115 (#187) are
+on `main`. D-117 was reserved for #176. This entry takes it and sets the footer to D-118,
+the next after this one. At D-116's merge the entries are a union in numerical order with
+one footer, the highest number plus one. Every code site carries `// PROPOSED(D-117)`.
 
 **Context: a correct-server failure against D-041.** D-041 and D-044, as Q15 applies them on
 the node (SHARD.md §11, storage 8; D-077), say a refused directory stays marked lost and
@@ -23584,8 +23749,8 @@ right half until `x` does, and writes to `x` past the threshold several times ov
 **The pair.**
 - **The buggy half.** `NodeVariant::TasksOnTheRefusedDir` keeps today's binding: under it,
   the `Refused` arm does not rebind `engine`.
-  - It takes bit 25, free since PROPOSED D-108. Nothing on `main` at de9f4d7, in #188 or on any
-    other open branch uses that bit; it is to be asked again at the merge.
+  - It takes bit 25, free since PROPOSED D-108. Nothing on `main` at 8a4cdad or in an open PR
+    uses that bit; it is to be asked again at the merge.
   - It is Q15's sixth way to get the refusal wrong, in `NodeVariant::RESEED`, which grows
     from five to six. `BUGS` grows from 48 to 49.
   - It changes nothing any trace check reads: the stores, the installs and every event are
@@ -23662,11 +23827,14 @@ a retake. No check of the trace sees it.
   files on 197 seeds and 2 on 3.
 - **The directed run, `TasksOnTheRefusedDir`:** on 200 of 200 the takes were all in the
   refused directory (8 on 14 seeds, 9 on 158, 10 on 28) and no version in the fresh one.
+- **Again on the merge of `main` at 8a4cdad,** every clause above held at 200 seeds: the right
+  half's test, D-115's test, the directed test on both halves, and the variant's test,
+  caught on 200 of 200, the two twenty-seed tests widened to 200 for this run alone.
 
 **The rows (D-064).**
 - The right half's test is re-weighed in place at 30.2 cpu s, from 27.8.
 - The variant's test is a new row at 2.8 cpu s, in the lightest shard, shard 1.
-- The directed test is a new row at 22.7 cpu s, then also in the lightest shard, shard 1.
+- The directed test is a new row at 22.7 cpu s, in the merged tree's lightest shard, shard 5.
 - `scripts/nightly-shards.txt` gives the measurements, and every header is recomputed from
   the rows beneath it.
 
