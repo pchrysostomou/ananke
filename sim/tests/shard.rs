@@ -15,8 +15,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use ananke_env::TraceEvent;
 use ananke_env::sim::TraceRecord;
+use ananke_env::{NodeId, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::message::Message;
 use ananke_shard::invariants::{self, Fold};
@@ -42,6 +42,8 @@ struct Seen {
     most_ids: usize,
     /// The meta convergence lags asked of the run, `None` a descriptor not named.
     meta_lags: Vec<Option<Duration>>,
+    /// The descriptors #220's exception excused from that bound, each with its seed.
+    meta_excused: Vec<(u64, shard::MetaLag)>,
     /// Whether every key the fixed map would ask is asked by the write bound.
     keys_asked: Result<(), String>,
     slowest_write: Option<Duration>,
@@ -143,6 +145,11 @@ fn seen_of(seed: u64) -> Seen {
             .iter()
             .map(shard::MetaLag::lag)
             .collect(),
+        meta_excused: report
+            .meta_lags_excused()
+            .into_iter()
+            .map(|lag| (seed, lag))
+            .collect(),
         keys_asked: every_key_still_asked(&report),
         slowest_write,
         recovery_from_heal: from_heal,
@@ -166,9 +173,11 @@ fn seen_of(seed: u64) -> Seen {
 }
 
 /// The correct system, under every check, at every tier. At the nightly's ten thousand it fails
-/// four seeds and this test says so: 2272 and 7949, a right half with no possible majority, and
-/// 3870 and 5303, #175's committed entry lost. Each waits for an owner ruling (PROPOSED D-113
-/// §6, §11); nothing here is narrowed for them.
+/// two seeds and this test says so: 3870 and 5303, #175's committed entry lost, whose fix the
+/// owner ruled lands in its own PR after the PRs now open. Nothing here is narrowed for them.
+/// Seeds 2272 and 7949, a right half with no possible majority, pass under the owner's ruling
+/// of 2026-11-09, which excuses exactly that shape from the meta convergence bound and from
+/// nothing else, and which this prints (#220; PROPOSED D-113 §6, §11).
 #[test]
 fn every_seed_passes_on_the_correct_sharded_sweep() {
     let seen = sweep(seeds(), seen_of);
@@ -264,6 +273,20 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         lags.get(lags.len() * 99 / 100),
         lags.last(),
         shard::meta_convergence_bound(),
+    );
+    let excused: Vec<&(u64, shard::MetaLag)> = seen.iter().flat_map(|s| &s.meta_excused).collect();
+    println!(
+        "shard: meta convergence excused {} descriptors, a right half with no possible majority \
+         (#220; PROPOSED D-113 §6), {} of them never named; as (seed, range, generation): {:?}",
+        excused.len(),
+        excused
+            .iter()
+            .filter(|(_, lag)| lag.named.is_none())
+            .count(),
+        excused
+            .iter()
+            .map(|(seed, lag)| (*seed, lag.range, lag.generation))
+            .collect::<Vec<_>>(),
     );
     println!(
         "shard: the write bound of {:?}: slowest post-heal write {:?}; a range's first completion \
@@ -1132,4 +1155,205 @@ fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracki
         )),
         "the violation the old reading made of it: {old_reading}"
     );
+}
+
+// --- The owner's ruling of 2026-11-09 (#220; PROPOSED D-113 §6): a right half the correct system
+// leaves wedged for good, excused from the meta convergence bound and from nothing else.
+
+/// Seeds 2272 and 7949, the two seeds of ten thousand on which the correct system fails the meta
+/// convergence bound without the exception. Node 3 alone ever leads the right half, crashes
+/// before meta applied its update and is refused; node 1 and node 3 hold only placeholders, whose
+/// parent reached the split by an install; and node 2 alone is initialised and stays a
+/// pre-candidate for ever. Range 36 of seed 7949, a child of its range 35, has voters that hold
+/// no parent at all, and meta had named it, so excusing it changes no verdict. Each condition of
+/// the ruling is asserted of the reading and the leaders of the trace, each range is live by the
+/// majority rule all the same, and the bound says what it said before the ruling.
+#[test]
+fn seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound() {
+    use shard::Stuck::{NoParent, ParentPastTheSplit as Past};
+    for (seed, first_failure, pins) in [
+        (
+            2272,
+            36,
+            vec![(36, 2, 119, [(1, Past(119)), (3, Past(122))])],
+        ),
+        (
+            7949,
+            35,
+            vec![
+                (35, 2, 89, [(1, Past(107)), (3, Past(124))]),
+                (36, 35, 102, [(1, NoParent), (3, NoParent)]),
+            ],
+        ),
+    ] {
+        let report = shard::run(seed);
+        report.check().unwrap();
+        report.meta_converges().unwrap();
+        assert!(
+            report.refusals().iter().any(|(node, _)| *node == 3),
+            "seed {seed}: node 3's store was not refused: read its trace"
+        );
+        let live = report.checked.ranges_with_a_majority_up();
+        let halves = report.right_halves();
+        for (range, parent, split, stuck) in pins {
+            let half = &halves[&range];
+            assert!(
+                live.contains(&range),
+                "seed {seed}: range {range} is live by the majority rule, which the exception \
+                 leaves alone"
+            );
+            assert_eq!((half.parent, half.split), (parent, split), "seed {seed}");
+
+            assert_eq!(
+                half.able,
+                BTreeSet::from([2]),
+                "seed {seed}, range {range}: condition one, fewer than two voters able to vote"
+            );
+
+            assert_eq!(
+                (half.led_since_heal, half.leader_at_end),
+                (0, None),
+                "seed {seed}, range {range}: condition two, no leader since the heal or at the end"
+            );
+            let leaders: Vec<_> = report
+                .records()
+                .iter()
+                .filter(
+                    |r| matches!(r.event, TraceEvent::RaftLeader { range: of, .. } if of == range),
+                )
+                .collect();
+            assert!(
+                !leaders.is_empty() && leaders.iter().all(|r| r.at < report.last_fault_healed),
+                "seed {seed}, range {range}: the trace's leaders, all before the last fault healed"
+            );
+
+            assert_eq!(
+                half.stuck,
+                BTreeMap::from(stuck),
+                "seed {seed}, range {range}: condition three, every other voter a placeholder no \
+                 apply can end"
+            );
+            assert!(half.others.is_empty(), "seed {seed}, range {range}");
+
+            assert!(half.excused(), "seed {seed}, range {range}");
+            let lag_of = |lags: Vec<shard::MetaLag>| lags.iter().any(|lag| lag.range == range);
+            assert!(lag_of(report.meta_lags_excused()), "seed {seed}");
+            assert!(lag_of(report.meta_lags_of_live_ranges()), "seed {seed}");
+            assert!(!lag_of(report.meta_lags_asked()), "seed {seed}");
+        }
+        let without = report
+            .meta_converges_without_the_exception()
+            .expect_err("the bound fails this seed without the exception");
+        assert!(
+            without.contains(&format!("meta does not name range {first_failure} ")),
+            "seed {seed}: the failure the exception stands in front of: {without}"
+        );
+    }
+}
+
+/// The bound keeps a tripping case with the exception in place, and at the price of one run: seed
+/// 2272's own trace with one condition of the ruling broken at a time, and the bound fails on
+/// its range 36 again. The last one is the shape of the plant D-113 §6 measures, a voter whose
+/// parent reached the split with no install, which is a bug where the wedge is none.
+#[test]
+fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken() {
+    let (range, parent, split) = (36, 2, 119);
+    let mut report = shard::run(2272);
+    report.meta_converges().unwrap();
+    let whole = report.checked.records.clone();
+    let heal = report.last_fault_healed;
+    let is_right = |record: &&TraceRecord, node: u64| {
+        record.node == node_id(node)
+            && matches!(
+                record.event, TraceEvent::RangeCreated { range: of, .. } if of == range
+            )
+    };
+    let leader_at_a_time_before_the_heal = whole
+        .iter()
+        .find(|r| matches!(r.event, TraceEvent::RaftLeader { range: of, .. } if of == range))
+        .expect("the range's one leader")
+        .clone();
+    assert!(leader_at_a_time_before_the_heal.at < heal);
+
+    let mut trips =
+        |case: &str, records: Vec<TraceRecord>, broke: &dyn Fn(&shard::RightHalf) -> bool| {
+            report.checked.records = records;
+            let halves = report.right_halves();
+            let half = &halves[&range];
+            assert!(
+                broke(half),
+                "{case}: the record edited did not break its condition: {half:?}"
+            );
+            assert!(!half.excused(), "{case}: {half:?}");
+            let tripped = report.meta_converges().expect_err(case);
+            assert!(
+                tripped.contains(&format!("meta does not name range {range} ")),
+                "{case}: {tripped}"
+            );
+        };
+
+    // Condition one, two voters able to vote: node 1 creates the right half node 2 created.
+    let mut records = whole.clone();
+    let mut on_node_1 = whole
+        .iter()
+        .find(|record| is_right(record, 2))
+        .expect("node 2 created the right half")
+        .clone();
+    on_node_1.node = node_id(1);
+    records.push(on_node_1);
+    trips("two voters able to vote", records, &|half| {
+        half.able.len() == 2
+    });
+
+    // Condition two, a leader since the heal, gone again by the end.
+    let mut records = whole.clone();
+    let at = |event| TraceRecord {
+        at: heal,
+        decided: heal,
+        node: node_id(2),
+        event,
+    };
+    records.push(at(TraceEvent::RaftLeader {
+        server: 2,
+        range,
+        term: 9,
+        last_index: 0,
+    }));
+    records.push(at(TraceEvent::RaftTerm {
+        server: 2,
+        range,
+        term: 10,
+        role: "follower",
+        received: None,
+    }));
+    trips("a leader since the heal", records, &|half| {
+        half.led_since_heal == 1 && half.leader_at_end.is_none()
+    });
+
+    // Condition two, a leader from before the heal with its office unended where the trace ends.
+    let mut records = whole.clone();
+    records.push(leader_at_a_time_before_the_heal);
+    trips("a leader standing at the end", records, &|half| {
+        half.led_since_heal == 0 && half.leader_at_end == Some(3)
+    });
+
+    // Condition three: node 1's parent reached the split with no install, so it should have
+    // applied the split: the "only node 1 creates R" plant's shape.
+    let mut records = whole.clone();
+    let before = records.len();
+    records.retain(|record| {
+        !matches!(record.event,
+        TraceEvent::RaftSnapshot { server: 1, range: of, last_index, taken: false, .. }
+            if of == parent && last_index >= split)
+    });
+    assert!(records.len() < before, "node 1's install past the split");
+    trips(
+        "a placeholder an apply should have ended",
+        records,
+        &|half| half.others == BTreeSet::from([1]),
+    );
+}
+
+fn node_id(node: u64) -> Option<NodeId> {
+    Some(NodeId::new(u32::try_from(node).expect("small")))
 }

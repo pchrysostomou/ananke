@@ -52,7 +52,8 @@
 //! and, on uniformly scheduled seeds, the timer check and the write bound, per key and
 //! per range the run ended with (`raft::Report::liveness_by_final_range`), where a range
 //! whose replicas on refused nodes leave it no majority is asked nothing (§8) — then this
-//! sweep's own: the meta convergence bound (§8), the shape (nodes 4 and 5 hold nothing;
+//! sweep's own: the meta convergence bound (§8), less the right halves the owner's ruling of
+//! 2026-11-09 excuses from it and from nothing else (#220), the shape (nodes 4 and 5 hold nothing;
 //! every bootstrap node created ranges 0, 1 and 2), and D-092's per-seed assertion wherever
 //! a split was refused for want of a range id. Check 19 is S7's, which waits on D-093.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
@@ -65,8 +66,8 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, Socket,
-    TraceEvent, race,
+    Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, RecoveredAs,
+    Socket, TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
@@ -1553,6 +1554,183 @@ pub fn meta_lags_of(records: &[TraceRecord], last_heal: Instant) -> Vec<MetaLag>
         .collect()
 }
 
+/// Why a voter holding nothing of a right half can never be initialised by an apply: the second
+/// half of what #220's owner ruling excuses from the meta convergence bound.
+// PROPOSED(D-113): §6, #220.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stuck {
+    /// Its replica of the parent reached the split by an install, at this index, so it never
+    /// applies the split, and only the right half's leader could install the right half.
+    ParentPastTheSplit(u64),
+    /// It holds no replica of the parent, so there is nothing there to apply the split.
+    NoParent,
+}
+
+/// What a right half's voters and leaders had come to where the trace ends: the three conditions
+/// under which the meta convergence bound excuses the range ([`RightHalf::excused`]).
+// PROPOSED(D-113): §6, #220.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RightHalf {
+    /// The range it was split from, as the first `RangeSplit` naming it says.
+    pub parent: u64,
+    /// The split entry's index in the parent: the split point `s`.
+    pub split: u64,
+    /// The voters of its latest descriptor able to vote: each holds a replica on a store not
+    /// refused since it was made, and is neither impaired nor quarantined.
+    pub able: BTreeSet<u64>,
+    /// The voters holding nothing of it that no apply can ever end, by why.
+    pub stuck: BTreeMap<u64, Stuck>,
+    /// Every other voter of it: impaired while holding a replica, or holding nothing where an
+    /// apply could still end that.
+    pub others: BTreeSet<u64>,
+    /// How many `RaftLeader`s of it were traced at or after the heal the reading was given.
+    pub led_since_heal: usize,
+    /// The server that became its leader and had not left office where the trace ends.
+    pub leader_at_end: Option<u64>,
+}
+
+impl RightHalf {
+    /// Whether the meta convergence bound excuses the range (owner's ruling of 2026-11-09,
+    /// #220): fewer than two voters able to vote, no leader traced since the last heal and none
+    /// standing at the end, and every other voter a placeholder that no apply can ever end.
+    /// Any one of them missing and the bound asks of the range as it asks of any other.
+    #[must_use]
+    pub fn excused(&self) -> bool {
+        self.able.len() < 2
+            && self.led_since_heal == 0
+            && self.leader_at_end.is_none()
+            && self.others.is_empty()
+    }
+}
+
+/// Every right half of the run's latest descriptors, read for #220's exception to the meta
+/// convergence bound. `heal` is the last heal and `impaired` is the raft report's
+/// `impaired_voters`, the majority rule's own reading, which this adds to and does not change.
+/// A range no `RangeSplit` names is no right half and has no entry here, so the bound asks of it.
+/// A refusal ends everything the node held: its replicas, its applies and its installs.
+// PROPOSED(D-113): §6, #220.
+#[must_use]
+pub fn right_halves_of(
+    records: &[TraceRecord],
+    heal: Instant,
+    impaired: &BTreeMap<u64, BTreeSet<u64>>,
+) -> BTreeMap<u64, RightHalf> {
+    let mut spans = Spans::default();
+    spans.extend(records);
+    let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut applied_the_split: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut installed: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut split_of: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut leader: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut led_since: BTreeMap<u64, usize> = BTreeMap::new();
+    for record in records {
+        let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RaftRefused { server, .. } => {
+                held.retain(|(_, on)| on != server);
+                applied_the_split.retain(|(_, on)| on != server);
+                installed.retain(|(_, on), _| on != server);
+                leader.retain(|_, by| by != server);
+            }
+            TraceEvent::RaftReseeded { server, range } => {
+                quarantined.insert((*range, *server));
+            }
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                state: RecoveredAs::Quarantined,
+                ..
+            } => {
+                quarantined.insert((*range, *server));
+            }
+            TraceEvent::RaftSnapshot {
+                server,
+                range,
+                last_index,
+                taken: false,
+                ..
+            } => {
+                let to = installed.entry((*range, *server)).or_default();
+                *to = (*to).max(*last_index);
+            }
+            TraceEvent::RangeCreated { range, .. } => {
+                if let Some(node) = node {
+                    held.insert((*range, node));
+                }
+            }
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } => {
+                split_of.entry(*right).or_insert((*range, *index));
+                if let Some(node) = node {
+                    applied_the_split.insert((*right, node));
+                }
+            }
+            TraceEvent::RaftLeader { server, range, .. } => {
+                leader.insert(*range, *server);
+                if record.at >= heal {
+                    *led_since.entry(*range).or_default() += 1;
+                }
+            }
+            TraceEvent::RaftTerm {
+                server,
+                range,
+                role,
+                ..
+            } if *role != "leader" && leader.get(range) == Some(server) => {
+                leader.remove(range);
+            }
+            TraceEvent::NodeCrashed { node: gone } => {
+                let gone = u64::from(gone.get());
+                leader.retain(|_, by| *by != gone);
+            }
+            _ => {}
+        }
+    }
+    let none = BTreeSet::new();
+    spans
+        .user()
+        .filter_map(|(range, span)| {
+            let &(parent, split) = split_of.get(&range)?;
+            let hurt = impaired.get(&range).unwrap_or(&none);
+            let mut half = RightHalf {
+                parent,
+                split,
+                able: BTreeSet::new(),
+                stuck: BTreeMap::new(),
+                others: BTreeSet::new(),
+                led_since_heal: led_since.get(&range).copied().unwrap_or(0),
+                leader_at_end: leader.get(&range).copied(),
+            };
+            for &voter in &span.voters {
+                let holds = held.contains(&(range, voter));
+                let stuck = if holds || applied_the_split.contains(&(range, voter)) {
+                    None
+                } else if let Some(&to) = installed.get(&(parent, voter)).filter(|&&to| to >= split)
+                {
+                    Some(Stuck::ParentPastTheSplit(to))
+                } else if held.contains(&(parent, voter)) {
+                    None
+                } else {
+                    Some(Stuck::NoParent)
+                };
+                if holds && !hurt.contains(&voter) && !quarantined.contains(&(range, voter)) {
+                    half.able.insert(voter);
+                } else if let Some(stuck) = stuck {
+                    half.stuck.insert(voter, stuck);
+                } else {
+                    half.others.insert(voter);
+                }
+            }
+            Some((range, half))
+        })
+        .collect()
+}
+
 /// How many descriptors a split made, by the first apply of each meta index, won a key meta
 /// already named at their generation or a newer one: an update still being resent after the
 /// update it repeats had landed. SHARD.md §1's maximum by generation leaves such an update alone,
@@ -1714,11 +1892,24 @@ impl Report {
         meta_lags_of(self.records(), self.checked.last_heal)
     }
 
-    /// The lags the meta convergence bound is asked of: on a uniformly scheduled seed
-    /// (D-016), with the meta range's unimpaired replicas a majority and the range's too
-    /// (§8), since each needs a leader to send or take the update.
+    /// Every right half at the run's end, read for #220's exception ([`right_halves_of`]). "The
+    /// last heal" is the last fault's, the earlier of the two this report holds, so a leader
+    /// traced in the driver's drain counts against the exception.
+    // PROPOSED(D-113): §6, #220.
     #[must_use]
-    pub fn meta_lags_asked(&self) -> Vec<MetaLag> {
+    pub fn right_halves(&self) -> BTreeMap<u64, RightHalf> {
+        right_halves_of(
+            self.records(),
+            self.last_fault_healed,
+            &self.checked.impaired_voters(),
+        )
+    }
+
+    /// The lags of §8's asked set, before #220's exception: on a uniformly scheduled seed
+    /// (D-016), with the meta range's unimpaired replicas a majority and the range's too,
+    /// since each needs a leader to send or take the update.
+    #[must_use]
+    pub fn meta_lags_of_live_ranges(&self) -> Vec<MetaLag> {
         if !self.checked.uniform() {
             return Vec::new();
         }
@@ -1732,16 +1923,56 @@ impl Report {
             .collect()
     }
 
+    /// The lags the meta convergence bound is asked of: [`Report::meta_lags_of_live_ranges`]
+    /// less the ones #220's exception excuses ([`RightHalf::excused`]). The exception is this
+    /// bound's alone; the majority rule means what it meant to every other check.
+    // PROPOSED(D-113): §6, #220.
+    #[must_use]
+    pub fn meta_lags_asked(&self) -> Vec<MetaLag> {
+        let halves = self.right_halves();
+        self.meta_lags_of_live_ranges()
+            .into_iter()
+            .filter(|lag| !halves.get(&lag.range).is_some_and(RightHalf::excused))
+            .collect()
+    }
+
+    /// The lags #220's exception excuses from the bound: what the sweep prints.
+    // PROPOSED(D-113): §6, #220.
+    #[must_use]
+    pub fn meta_lags_excused(&self) -> Vec<MetaLag> {
+        let halves = self.right_halves();
+        self.meta_lags_of_live_ranges()
+            .into_iter()
+            .filter(|lag| halves.get(&lag.range).is_some_and(RightHalf::excused))
+            .collect()
+    }
+
     /// The meta convergence bound (SHARD.md §8): after the last heal, meta names every
-    /// key's current descriptor within [`meta_convergence_bound`].
+    /// key's current descriptor within [`meta_convergence_bound`], for every range of
+    /// [`Report::meta_lags_asked`].
     ///
     /// # Errors
     ///
     /// The first range meta names late or not at all.
     pub fn meta_converges(&self) -> Result<(), String> {
+        self.meta_converges_over(self.meta_lags_asked())
+    }
+
+    /// [`Report::meta_converges`] with #220's exception taken out: what it would have said of
+    /// a right half it excuses. No check calls this; the pins and the plants read it.
+    ///
+    /// # Errors
+    ///
+    /// The first live range meta names late or not at all.
+    // PROPOSED(D-113): §6, #220.
+    pub fn meta_converges_without_the_exception(&self) -> Result<(), String> {
+        self.meta_converges_over(self.meta_lags_of_live_ranges())
+    }
+
+    fn meta_converges_over(&self, lags: Vec<MetaLag>) -> Result<(), String> {
         let seed = self.seed;
         let bound = meta_convergence_bound();
-        for lag in self.meta_lags_asked() {
+        for lag in lags {
             match lag.lag() {
                 Some(took) if took <= bound => {}
                 Some(took) => {
@@ -1789,10 +2020,16 @@ impl Report {
     /// [`Report::retries_asked`] ends on an answer, and within the write bound of the last
     /// fault's heal ([`Retried::took_no_effect`]).
     ///
-    /// It reads [`Report::last_fault_healed`] and not `checked.last_heal`. That one opens the
-    /// liveness window, past the driver's drain, so an asker the drain waited for has ended
-    /// before it and nothing can be late of it: read from there this check could not fail
-    /// (#216's review, B6).
+    /// An answer is any but `NoRangeId`, so one that refuses the split for another reason passes.
+    ///
+    /// As first written this check could not fail, and the fix changed two things (#216's review,
+    /// B6). The origin: it read `checked.last_heal`, which opens the liveness window past the
+    /// driver's drain, so an asker the drain waited for had ended before it and nothing could be
+    /// late of it; it now reads [`Report::last_fault_healed`]. The predicate: it asked only that
+    /// an asker with no answer be over the bound, and an asker still asking at the heal now has
+    /// to end on an answer, however soon it stops. Neither alone is enough: of the 382 seeds of
+    /// a thousand that `RefillNotResent` trips by the two together, the new origin with the old
+    /// predicate trips 101, and the new predicate with the old origin 96.
     ///
     /// # Errors
     ///
@@ -2157,6 +2394,303 @@ mod tests {
         let lags = meta_lags_of(&records, at(100));
         assert_eq!(lag_of(&lags, 2), Some(Duration::from_millis(10)));
         assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(20)));
+    }
+
+    // --- #220's exception to the meta convergence bound, one condition each. Range 2 splits at
+    // index 50 into 19, and the heal is at 1 000 ms.
+
+    const PARENT: u64 = 2;
+    const SPLIT_AT: u64 = 50;
+    const RIGHT: u64 = 19;
+    const HEAL: u64 = 1000;
+
+    fn created(ms: u64, node: u32, range: u64) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Split,
+                parent: None,
+                start: Bytes::from_static(b"m"),
+                end: Bytes::from_static(b"z"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                floor_index: 0,
+                floor_term: 0,
+                incarnation: 1,
+            },
+        )
+    }
+
+    fn applied_the_split(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RangeSplit {
+                range: PARENT,
+                right: RIGHT,
+                key: Bytes::from_static(b"m"),
+                index: SPLIT_AT,
+            },
+        )
+    }
+
+    fn installed(ms: u64, node: u32, range: u64, last_index: u64) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftSnapshot {
+                server: u64::from(node),
+                range,
+                last_index,
+                last_term: 1,
+                taken: false,
+            },
+        )
+    }
+
+    fn led(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftLeader {
+                server: u64::from(node),
+                range: RIGHT,
+                term: 2,
+                last_index: 60,
+            },
+        )
+    }
+
+    fn stepped_down(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftTerm {
+                server: u64::from(node),
+                range: RIGHT,
+                term: 3,
+                role: "follower",
+                received: None,
+            },
+        )
+    }
+
+    fn refused(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftRefused {
+                server: u64::from(node),
+                reason: "dropped tables [4]".to_owned(),
+            },
+        )
+    }
+
+    /// The parent on every node; node 2 applied the split and alone holds the right half; and
+    /// nodes 1 and 3 reached the split by an install, so they never apply it.
+    fn wedged() -> Vec<TraceRecord> {
+        vec![
+            created(1, 1, PARENT),
+            created(1, 2, PARENT),
+            created(1, 3, PARENT),
+            applied_the_split(10, 2),
+            created(10, 2, RIGHT),
+            installed(20, 1, PARENT, 60),
+            installed(20, 3, PARENT, 60),
+        ]
+    }
+
+    fn read_impaired(
+        records: &[TraceRecord],
+        impaired: &BTreeMap<u64, BTreeSet<u64>>,
+    ) -> RightHalf {
+        right_halves_of(records, at(HEAL), impaired)
+            .remove(&RIGHT)
+            .expect("a right half")
+    }
+
+    fn read(records: &[TraceRecord]) -> RightHalf {
+        read_impaired(records, &BTreeMap::new())
+    }
+
+    fn past(to: u64) -> Stuck {
+        Stuck::ParentPastTheSplit(to)
+    }
+
+    /// The shape the owner excused, each of its parts read: without this case the ones below
+    /// could pass on a fold that excuses nothing.
+    #[test]
+    fn a_right_half_with_no_possible_majority_is_excused() {
+        let half = read(&wedged());
+        assert_eq!((half.parent, half.split), (PARENT, SPLIT_AT));
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(1, past(60)), (3, past(60))]));
+        assert!(half.others.is_empty());
+        assert_eq!((half.led_since_heal, half.leader_at_end), (0, None));
+        assert!(half.excused());
+    }
+
+    /// A child of a wedged parent: its voters hold no replica of the parent, so nothing there can
+    /// apply the split that would initialise them. The install exactly at the split counts, and
+    /// an install below it does not.
+    #[test]
+    fn a_placeholder_that_holds_no_parent_or_a_parent_at_the_split_by_an_install_is_stuck() {
+        let records = [
+            created(1, 2, PARENT),
+            applied_the_split(10, 2),
+            created(10, 2, RIGHT),
+        ];
+        let half = read(&records);
+        assert_eq!(
+            half.stuck,
+            BTreeMap::from([(1, Stuck::NoParent), (3, Stuck::NoParent)])
+        );
+        assert!(half.excused());
+
+        let mut records = wedged();
+        records[5] = installed(20, 1, PARENT, SPLIT_AT);
+        assert_eq!(read(&records).stuck[&1], past(SPLIT_AT));
+        assert!(read(&records).excused());
+        records[5] = installed(20, 1, PARENT, SPLIT_AT - 1);
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "it will apply the split");
+        assert!(!half.excused());
+    }
+
+    /// Condition two's first half. A leader before the heal whose office is over leaves the range
+    /// excused, as seed 2272's did; one traced at the heal or after it does not.
+    #[test]
+    fn a_range_led_since_the_last_heal_is_not_excused() {
+        let mut records = wedged();
+        records.extend([led(HEAL - 1, 3), stepped_down(HEAL - 1, 3)]);
+        assert!(read(&records).excused(), "led before the heal and gone");
+        records.extend([led(HEAL, 2), stepped_down(HEAL + 5, 2)]);
+        let half = read(&records);
+        assert_eq!(
+            (half.led_since_heal, half.leader_at_end),
+            (1, None),
+            "led at the heal itself, and no leader stands at the end"
+        );
+        assert!(!half.excused());
+    }
+
+    /// Condition two's second half: a leader elected before the heal and never gone, and each of
+    /// the three things that end its office.
+    #[test]
+    fn a_range_with_a_leader_standing_at_the_end_is_not_excused() {
+        let mut records = wedged();
+        records.push(led(HEAL - 100, 2));
+        let half = read(&records);
+        assert_eq!((half.led_since_heal, half.leader_at_end), (0, Some(2)));
+        assert!(!half.excused());
+        let crashed = record(
+            HEAL - 50,
+            2,
+            TraceEvent::NodeCrashed {
+                node: NodeId::new(2),
+            },
+        );
+        for (what, ended) in [
+            ("its step down", stepped_down(HEAL - 50, 2)),
+            ("its crash", crashed),
+        ] {
+            let mut gone = records.clone();
+            gone.push(ended);
+            assert_eq!(read(&gone).leader_at_end, None, "{what}");
+            assert!(read(&gone).excused(), "{what}");
+        }
+        let mut gone = records.clone();
+        gone.push(refused(HEAL - 50, 2));
+        assert_eq!(read(&gone).leader_at_end, None, "its node's refusal");
+        // Another server's step down ends nothing of it.
+        let mut other = records.clone();
+        other.push(stepped_down(HEAL - 50, 3));
+        assert_eq!(read(&other).leader_at_end, Some(2));
+    }
+
+    /// Condition three, on "only node 1 creates R"'s shape: a voter whose parent applied the split
+    /// and made no replica is a placeholder an apply should have ended, which is a bug and not
+    /// the wedge, and the plain form of the exception hid it.
+    #[test]
+    fn a_placeholder_whose_parent_applied_the_split_is_not_excused() {
+        let mut records = wedged();
+        records.remove(5);
+        let half = read(&records);
+        assert_eq!(
+            half.others,
+            BTreeSet::from([1]),
+            "its parent has no install"
+        );
+        assert_eq!(half.stuck, BTreeMap::from([(3, past(60))]));
+        assert!(!half.excused());
+        // And one that traced the split without an install of its parent, and one with both.
+        let mut records = wedged();
+        records.push(applied_the_split(15, 3));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([3]), "it applied the split");
+        assert!(!half.excused());
+    }
+
+    /// Condition one: two voters able to vote can elect. And a replica that holds the range
+    /// and cannot vote is not a placeholder, so it is not one of what condition three names.
+    #[test]
+    fn a_range_with_two_voters_able_to_vote_is_not_excused() {
+        let mut records = wedged();
+        records.push(created(30, 1, RIGHT));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([1, 2]));
+        assert_eq!(half.stuck, BTreeMap::from([(3, past(60))]));
+        assert!(!half.excused());
+
+        let impaired = BTreeMap::from([(RIGHT, BTreeSet::from([1]))]);
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.others, BTreeSet::from([1]), "impaired, holding it");
+        assert!(!half.excused());
+
+        records.push(record(
+            31,
+            1,
+            TraceEvent::RaftReseeded {
+                server: 1,
+                range: RIGHT,
+            },
+        ));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "quarantined, holding it");
+        assert!(!half.excused());
+    }
+
+    /// A refusal ends what its node held, so it is its later history that counts. Node 1 loses
+    /// its replicas and with them the install: it then holds no parent until one is made.
+    #[test]
+    fn a_refused_voter_reads_from_what_it_has_held_since() {
+        let mut records = wedged();
+        records.push(refused(40, 1));
+        assert_eq!(read(&records).stuck[&1], Stuck::NoParent);
+        records.push(created(50, 1, PARENT));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "a parent, and no install");
+        records.push(installed(60, 1, PARENT, 70));
+        assert_eq!(read(&records).stuck[&1], past(70));
+
+        let mut records = wedged();
+        records.push(refused(40, 2));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::new(), "the replica it held is gone");
+        assert_eq!(half.stuck[&2], Stuck::NoParent);
+    }
+
+    /// Only a right half can be excused: a range no split made has no entry to excuse it by.
+    #[test]
+    fn a_range_no_split_named_has_no_reading() {
+        let mut records = wedged();
+        records.push(descriptor(30, 7, ("a", "m"), 2));
+        let halves = right_halves_of(&records, at(HEAL), &BTreeMap::new());
+        assert!(halves.contains_key(&RIGHT));
+        assert!(!halves.contains_key(&7));
     }
 
     /// The shape of `MetaOverwritesByArrival`: a split's descriptor stored over a key meta

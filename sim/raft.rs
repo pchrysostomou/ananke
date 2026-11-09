@@ -3649,6 +3649,19 @@ impl Report {
     // per-replica refusal events name, and not every range in the run.
     #[must_use]
     pub fn ranges_with_a_majority_up(&self) -> BTreeSet<u64> {
+        self.impaired_voters()
+            .into_iter()
+            .filter(|(_, impaired)| (impaired.len() as u64) * 2 < SERVERS)
+            .map(|(range, _)| range)
+            .collect()
+    }
+
+    /// Per range of the run, the voters [`Report::ranges_with_a_majority_up`] counts as neither
+    /// up nor able to help elect: refused, quarantined, or holding nothing of a right half on an
+    /// engine a re-seed built. That rule's reading, and nothing else.
+    // PROPOSED(D-113): §6 reads the sets as well as their sizes.
+    #[must_use]
+    pub fn impaired_voters(&self) -> BTreeMap<u64, BTreeSet<u64>> {
         let ranges = self.ranges();
         let mut down: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
@@ -3728,13 +3741,13 @@ impl Report {
         }
         ranges
             .into_iter()
-            .filter(|range| {
+            .map(|range| {
                 let impaired: BTreeSet<u64> = down
                     .union(&quarantined)
-                    .filter(|(g, _)| g == range)
+                    .filter(|(g, _)| *g == range)
                     .map(|&(_, server)| server)
                     .collect();
-                (impaired.len() as u64) * 2 < SERVERS
+                (range, impaired)
             })
             .collect()
     }

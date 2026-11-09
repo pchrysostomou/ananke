@@ -106,12 +106,14 @@ _Update this section at the end of every session._
   range the run ended with (the same constant and every key still asked, asserted per seed; each
   final range is read from its first call in the history, so D-076's reading from the heal is kept
   beside it, worst 994 ms at 10 000 seeds against 2 s; it reads the history, so #197 and #158 stand),
-  the meta convergence bound (worst 587 ms against 2 s at 1 000 seeds), refusals by loss (#45), D-092's measurement (eight and two kept), the node
+  the meta convergence bound (worst 1.099 s against 2 s at 10 000 seeds), refusals by loss (#45), D-092's measurement (eight and two kept), the node
   scenarios in `sim/tests/parallel.rs`, the pairs on this sweep and the first Phase 3 pins. At
-  1 000 seeds, 0 fail. **At 10 000 the correct system still fails four seeds, each waiting for an
-  owner ruling (D-113 §6, §11):** 2272 and 7949, a right half with no possible majority (one refused
-  node and one placeholder, which grants no vote), and 3870 and 5303, #175 (one refused node, a
-  committed entry lost). Not fixed here; the live set and the bound are unchanged. Check 8's
+  1 000 seeds, 0 fail. **At 10 000 the correct system still fails two seeds, 3870 and 5303 (D-113 §11),**
+  #175 (one refused node, a committed entry lost), whose fix the owner ruled lands in its own PR after
+  the PRs now open. 2272 and 7949, a right half with no possible majority (one refused node and one
+  placeholder, which grants no vote), pass: the owner's ruling of 2026-11-09 (#220, D-113 §6) excuses
+  exactly that shape from the meta convergence bound and from nothing else, 18 of 23 283
+  descriptors, and the sweep prints which. The bound's constant and the majority rule are unchanged. Check 8's
   right-half clause trips on 9 of the 1 000, each D-107's mechanism. R's keys agree on the eight
   where R arrives; on seed 281 R never arrives and `k12`'s latest acknowledged write was applied only
   on a refused node.

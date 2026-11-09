@@ -784,9 +784,15 @@ still covers its span has its install refused by the overlap rule until P moves 
 such an answer can start streams that are refused; that cost is accepted with Q22.
 
 R can still elect: R's voters are P's, P's leader keeps bringing P's replicas up to date,
-and each of them applies `s`. The exception is a
+and each of them applies `s`. There are two exceptions. The first is a
 replica of P removed before it applied `s`: its node's R is then initialised only by a
-snapshot, after the stale P is collected (Q27).
+snapshot, after the stale P is collected (Q27). The second (PROPOSED D-113, #220) is a
+replica of P installed past `s`, which never applies `s`, so that its R is a placeholder
+only R's leader can end. Where R's other voters are one that was refused and one that is
+initialised, R has no leader and can get none: the initialised voter stays a pre-candidate
+for good, and no data is lost. Nothing built today ends that shape. §8's meta convergence
+bound excuses exactly it, by the owner's ruling of 2026-11-09 recorded in #220 and D-113
+§6, and #220 tracks the fix.
 
 **The overlap rule (Q27).** A snapshot is installed on a node only if its span overlaps
 no other initialised replica there; otherwise it is refused and asked for again later.
@@ -1416,7 +1422,9 @@ cluster (sim/raft.rs:967-986). After the last fault heals, a client write to eve
 completes within ten maximum election timeouts; today the check takes one minimum over
 every write (sim/raft.rs:990-998), which a wedged range beside a live one would pass, so
 it is asked per key. After the last heal, meta names every key's current descriptor
-within a bound; a move the rebalancer began is traced done or abandoned within a bound;
+within a bound, which asks nothing of a right half §5's second exception has left with
+no possible majority (PROPOSED D-113 §6, #220); a move the rebalancer began is traced
+done or abandoned within a bound;
 a subsumed range is merged or unfrozen within a bound (each bound measured on the
 correct system before it is asserted, Q39).
 

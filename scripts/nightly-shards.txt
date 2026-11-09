@@ -584,6 +584,11 @@
 # a_client_that_ignores_a_mismatch_trips_the_write_bound_on_the 104.8 (104.82) into shard 2, 2148.6 -> 2253.4.
 # a_node_that_does_not_resend_its_refill_leaves_the_askers_retr 20.4 (20.41) into shard 5, 2148.6 -> 2169.0.
 # clients_cut_off_past_the_bound_after_the_heal_are_caught_by_t 14.9 (14.86) into shard 4, 2161.9 -> 2176.8.
+# PROPOSED D-113 §6 (#220, the owner's ruling of 2026-11-09) added two rows, each a pin of a seed or two and
+# so the same at any tier, weighed the same way, the median of three as user + sys, on the same machine
+# (load average about 140), longest-first into the lightest shard:
+# seeds_2272_and_7949_a_right_half_with_no_possible_majority_is 0.3 (0.29) into shard 5, 2169.0 -> 2169.3.
+# seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_ 0.1 (0.12) into shard 5, 2169.3 -> 2169.4.
 # shard	binary	cpu_s	test
 # shard 1: 2325.2 cpu s
 1	shard	203.5	every_seed_passes_on_the_correct_sharded_sweep
@@ -696,8 +701,10 @@
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
-# shard 5: 2169.0 cpu s
+# shard 5: 2169.4 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
+5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
+5	shard	0.1	seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 5	shard	0.1	seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split
 5	shard	0.1	seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh
 5	shard	0.2	seed_986_a_leader_refuses_the_reads_it_can_never_confirm
