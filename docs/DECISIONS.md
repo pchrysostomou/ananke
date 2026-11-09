@@ -25900,16 +25900,21 @@ server and `SplitLeavesQuarantineBehind`, which is the server as it stood before
   term 5 with last index 88 against a committed 89: "leader completeness: index 89 of group 44
   (term 2) was committed in term 2 but server 1, leader of term 5, does not hold it".
 - The correct server fails none of the 10 000 (this entry's own tree, before the pins it adds).
-  It makes 4 883 replicas of right halves on a quarantined replica of their parent, and states
-  every one of them quarantined at its creation. Grants from a replica with no quarantine on a
-  node that has been refused: 0, where the variant has 9 676.
+  It makes 4 883 replicas of right halves on a quarantined replica of their parent. It states
+  4 881 of them quarantined at their creation; the other two, on seeds 4148 and 7113, crashed
+  between `RangeCreated` and the statement and were stated at the restart, with no grant between.
+  Grants from a replica with no quarantine on a node that has been refused: 0, where the variant
+  has 9 676.
 
 **Decision.** PROPOSED: how the ruling is carried out.
 
 1. *The store.* `RaftStore` keeps a `quarantined` flag in memory, set from the disk at the open and
    by `mark_reseeded`, read through `RaftStore::quarantined()` with no I/O. An install's repair
-   writes the flag too and builds a new store, so the field cannot go stale. Reading it costs the
-   engine nothing, so a seed with no quarantine has the schedule it had.
+   writes the flag too, and a live install onto an existing replica builds no new store
+   (`restate_after_install` works in place), so the field is not reread. It cannot go stale because
+   what that repair writes is the core's own flag (`Repair.quarantined` is `core.quarantined()`),
+   and the core and the store agree. Reading it costs the engine nothing, so a seed with no
+   quarantine has the schedule it had.
 2. *The split's apply.* `split_state_into` takes `quarantined` and writes R's quarantine key in the
    split's own batch when P's replica here is quarantined. It is durable with everything else in
    the batch, or none of it is.
@@ -25921,7 +25926,9 @@ server and `SplitLeavesQuarantineBehind`, which is the server as it stood before
    same `RaftReseeded`, so it would count the replica as able too.
 4. *A restart.* The key is what the disk says, and the restart's `restate` traces it, per replica,
    as any quarantined replica's: `RaftReseeded`, then `RaftRecovered { state: quarantined }`.
-   `seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split` pins that.
+   `seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split` pins that. A crash
+   between `RangeCreated` and the apply's statement leaves the statement to this one, and the key
+   went down in the split's batch, so nothing is lost (seeds 4148 and 7113).
 
 **The pair.** `NodeVariant::SplitLeavesQuarantineBehind`, bit 50, restores the server as it stood:
 the split's apply copies no quarantine. Two seeds in ten thousand is far below D-061's 5 %, so the
@@ -25936,6 +25943,13 @@ leader completeness on 5303, with the replica having voted and never stated quar
 2097 is the pair for the restart: the correct restart states the replica quarantined, and under
 the variant the replica votes and the restart states it with none.
 `a_right_half_takes_its_parents_quarantine_in_the_splits_batch` is the store's own round trip.
+`seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too` pins the chain, of
+which 10 000 seeds make 1 314 replicas: node 2's range 2, quarantined by the re-seed, makes 3 at
+57, which takes a live install and makes 4 at 76, which makes 5 at 90, each stated quarantined at
+its creation and, asked for a vote, granting none. Without it nothing failed a server that exempts
+a split-made parent from passing the quarantine on: that plant passes every other pin and the
+10 000-seed sweep, and fails this pin at range 4. Under the variant the three replicas have no
+quarantine and vote.
 
 **What the fix moved, and what each pin now says.**
 
@@ -26022,8 +26036,8 @@ Apple M2 of 8 cores under load averages of 16 to 23. Two pins renamed in place i
 variant's runs. New rows longest-first into the lightest shard:
 `a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes` at 9.6,
 shard 4 at 2176.8 -> 2186.4; the pair of 3870 and 5303 at 0.3, shard 6 at 2179.9 -> 2180.2; seed
-2097's at 0.2, shard 6, -> 2180.4. D-117's directed test keeps its 22.7: it runs the runs it ran,
-and one weighing here read 23.9.
+2097's at 0.2, shard 6, -> 2180.4; seed 9's chain at 0.2, shard 6, -> 2180.6. D-117's directed
+test keeps its 22.7: it runs the runs it ran, and one weighing here read 23.9.
 
 ---
 

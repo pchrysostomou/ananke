@@ -787,9 +787,11 @@ pub struct RaftStore<E: Environment> {
     incarnation: u64,
     /// Whether the store holds the re-seed quarantine flag (D-035), as it opened or as
     /// [`mark_reseeded`](Self::mark_reseeded) set it. An install's repair writes the
-    /// flag too, and that builds a new store, so the field cannot go stale. A split's
-    /// apply reads it here and not from the engine, so that a seed with no quarantine
-    /// has the schedule it had before the rule that reads it (D-130).
+    /// flag too, and a live install onto an existing replica builds no new store, so
+    /// this field is not reread. It cannot go stale because what that repair writes is
+    /// the core's own flag (`core.quarantined()`), and the core and this store agree. A
+    /// split's apply reads it here and not from the engine, so that a seed with no
+    /// quarantine has the schedule it had before the rule that reads it (D-130).
     // PROPOSED(D-130): a right half made on a quarantined parent takes the quarantine.
     quarantined: bool,
 }

@@ -674,6 +674,9 @@
 # Longest-first into the lightest shard: `a_right_half_made_after_a_reseed_...` 9.6 (9.10 + 0.52), shard
 # 4 at 2176.8 -> 2186.4; the pair on seeds 3870 and 5303, 0.3, shard 6 at 2179.9 -> 2180.2; seed 2097's
 # restart, 0.2, shard 6 -> 2180.4. Every header is recomputed.
+# D-130's review added one `shard` row, seed 9's pin on a chain of right halves, weighed the same way
+# on the same machine on AC power under a load average of 9: 0.2 (0.17 + 0.00, 0.16 + 0.00, 0.16 + 0.00,
+# the median rounded up to a tenth). Into the lightest shard, shard 6 at 2180.4 -> 2180.6.
 # shard 1: 2580.8 cpu s
 1	shard	203.5	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -848,7 +851,7 @@
 5	reseed	6.6	a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm
 5	reseed	22.7	a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs
 5	node	60.4	a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario
-# shard 6: 2180.4 cpu s
+# shard 6: 2180.6 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -898,3 +901,4 @@
 6	node	0.7	seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second
 6	shard	0.3	seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries
 6	shard	0.2	seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split
+6	shard	0.2	seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too

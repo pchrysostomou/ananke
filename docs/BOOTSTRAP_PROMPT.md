@@ -113,8 +113,10 @@ _Update this section at the end of every session._
   D-117's directed run now reaches a take only under the variant, and the correct node's absence
   is asserted beside it. The meta convergence bound's exception is unchanged, and no correct seed
   fails it. Not built: a leader-carried bound as the possible narrowing, and the crash inside
-  `reseed()`'s marking loop, unforced. Local, not pushed: the owner wants no new PR until the
-  open ones have merged.
+  `reseed()`'s marking loop, unforced. Its adversarial review found nothing blocking and four notes,
+  folded in: why the store's flag cannot go stale, seeds 4148 and 7113 stated at the restart, why
+  seeds 128 and 643 are absent, and seed 9's pin on a chain of right halves. The PRs it was built on
+  have merged to `main` with an identical tree to its base, and the branch is pushed.
 - Branch `phase-3-stage-c-shard-sim-rest` (2026-11-09), on #198 and #200, PROPOSED D-113 §5 to
   §11, **the rest of #162's S10**, after #188 merged at 08f0c62 unfinished: the write bound per
   range the run ended with (the same constant and every key still asked, asserted per seed; each

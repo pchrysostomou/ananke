@@ -881,11 +881,12 @@ fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
 
 /// Seeds 128, 643 and 986, where the sweep found D-113's (b): a leader whose followers were
 /// both quarantined, reads no round could confirm, and each client's retry a registration, until
-/// `READS_OUTSTANDING`. #200 moved 128 and 643 off it, and D-130 moved 986 off it: with a right
-/// half made on a quarantined parent now quarantined, each of the three has one store refused
-/// where it had two, so no leader is left unable to confirm a read, and `UnconfirmableReadKept`
-/// has nothing to keep. The situation is absent, asserted, with that reason; seed 463 carries it
-/// now.
+/// `READS_OUTSTANDING`. #200 moved 128 and 643 off it: with no right half's keys taken, each has
+/// one store refused where it had two, and D-130 left that as it was. D-130 moved 986 off it: with
+/// a right half made on a quarantined parent now quarantined, it has one store refused where it
+/// had two. So no leader on any of the three is left unable to confirm a read, and
+/// `UnconfirmableReadKept` has nothing to keep. The situation is absent, asserted, with those
+/// reasons; seed 463 carries it now.
 #[test]
 fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
     for seed in [128, 643, 986] {
@@ -1536,6 +1537,156 @@ fn seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() 
         [RecoveredAs::Neither],
         "under the variant the restart states no quarantine"
     );
+}
+
+/// Seed 9: a right half made on a quarantined right half takes the quarantine too, so a chain of
+/// splits carries it down. Node 2 is refused and the re-seed quarantines its replica of range 2.
+/// It applies range 2's split at 57 and range 3 takes the quarantine. A live install on range 3
+/// builds no new store and leaves it quarantined. It applies range 3's split at 76 and range 4, the
+/// second generation, takes the quarantine from a parent a split made; and it applies range 4's at
+/// 90 and range 5 takes it from a parent that took no install. Each is stated quarantined at its
+/// creation and, asked for a vote, grants none. Only this pin fails if a split-made parent stops
+/// passing the quarantine on: the store's test shows a right half reopens quarantined, the other
+/// pins that a quarantined parent passes it on, and the sweep's checks pass either way. Under
+/// `SplitLeavesQuarantineBehind` the same three replicas have no quarantine, and vote (PROPOSED
+/// D-130).
+// PROPOSED(D-130)
+#[test]
+fn seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too() {
+    let node = 2;
+    // The links, in order: the parent on node 2, the right half it makes and the split's index.
+    let chain = [(2, 3, 57), (3, 4, 76), (4, 5, 90)];
+    let made_on = |record: &TraceRecord, parent: u64, right: u64, split: u64| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Split,
+                parent: Some(of),
+                floor_index,
+                ..
+            } if range == right && of == parent && floor_index == split)
+    };
+    let granted_on = |record: &TraceRecord, right: u64| {
+        matches!(record.event, TraceEvent::RaftVote { server, range, granted: true, .. }
+            if server == node && range == right)
+    };
+    let correct = shard::run(9);
+    correct.check().unwrap();
+    let records = correct.records();
+    assert_eq!(correct.refusals().len(), 1, "one store refused");
+    assert_eq!(correct.refusals()[0].0, node, "node 2's");
+    let at = |from: usize, what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records[from..]
+            .iter()
+            .position(want)
+            .map(|found| from + found)
+            .unwrap_or_else(|| panic!("seed 9 no longer reaches {what}: read its trace"))
+    };
+    let refused = at(
+        0,
+        "node 2's refusal",
+        &|record| matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == node),
+    );
+    let reseeded = at(
+        refused,
+        "the re-seed's quarantine of range 2",
+        &|record| matches!(record.event, TraceEvent::RaftReseeded { server, range: 2 } if server == node),
+    );
+    let mut from = reseeded;
+    let mut made_at = Vec::new();
+    for (parent, right, split) in chain {
+        let made = at(
+            from,
+            &format!("the split that makes range {right}"),
+            &|record| made_on(record, parent, right, split),
+        );
+        let marked = at(made, &format!("range {right}'s quarantine"), &|record| {
+            matches!(record.event, TraceEvent::RaftReseeded { server, range }
+                if server == node && range == right)
+        });
+        let stated = at(marked, &format!("range {right}'s statement"), &|record| {
+            matches!(record.event, TraceEvent::RaftRecovered {
+                server,
+                range,
+                applied,
+                state: RecoveredAs::Quarantined,
+                ..
+            } if server == node && range == right && applied == split)
+        });
+        assert!(
+            records[made..].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftVote { server, range, granted: false, .. }
+                    if server == node && range == right
+            )),
+            "range {right}: never asked for a vote, so its granting none says nothing"
+        );
+        assert!(
+            !records[made..]
+                .iter()
+                .any(|record| granted_on(record, right)
+                    || matches!(record.event, TraceEvent::RaftLeader { server, range, .. }
+                    if server == node && range == right)),
+            "range {right}: the quarantined replica granted a vote or led"
+        );
+        made_at.push(made);
+        from = stated;
+    }
+    // Each statement is the creation's and not a restart's, and the chain is the one pinned: range
+    // 3's quarantine came through a live install on the store its split built, and range 4's store
+    // is the one its split built with no install on it before it split in turn.
+    assert!(
+        !records[refused..from].iter().any(|record| matches!(
+            record.event,
+            TraceEvent::NodeCrashed { node: gone } if u64::from(gone.get()) == node
+        )),
+        "node 2 crashed inside the chain, so a restart may have stated it"
+    );
+    let installed = |range: u64, between: std::ops::Range<usize>| {
+        records[between].iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftSnapshot { server, range: of, taken: false, .. }
+                if server == node && of == range)
+        })
+    };
+    assert!(
+        installed(3, made_at[0]..made_at[1]),
+        "range 3 took no live install before its split"
+    );
+    assert!(
+        !installed(4, made_at[1]..made_at[2]),
+        "range 4 took an install before its split"
+    );
+
+    let variant = shard::run_of(
+        9,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
+        RangeVariants::correct(),
+    );
+    variant
+        .check()
+        .expect("the variant's named failures are 3870's and 5303's");
+    let on_variant = variant.records();
+    for (parent, right, split) in chain {
+        let made = on_variant
+            .iter()
+            .rposition(|record| made_on(record, parent, right, split))
+            .expect("the variant makes the same right halves on node 2");
+        assert!(
+            on_variant[made..]
+                .iter()
+                .any(|record| granted_on(record, right)),
+            "range {right}: under the variant the replica votes"
+        );
+        assert!(
+            !on_variant[made..].iter().any(|record| matches!(
+                record.event,
+                TraceEvent::RaftRecovered { server, range, state: RecoveredAs::Quarantined, .. }
+                    if server == node && range == right
+            )),
+            "range {right}: the variant quarantined the replica after all"
+        );
+    }
 }
 
 // --- The owner's ruling of 2026-11-09 (#220; PROPOSED D-113 §6): a right half the correct system
