@@ -1700,6 +1700,9 @@ impl<E: Environment> Host for ServerHost<E> {
                 // nothing. A replica with no descriptor before this switch is not here:
                 // its switch replaced the snapshot's span and the task hosted it there,
                 // at the switch, before this answer existed (`install::switched_spans`).
+                // The switch reads this table for an initialised replica's span and no
+                // longer the plan (PROPOSED D-132); the re-host keeps the plan right for
+                // what still reads its copy, `InstallReplacesCopiedSpan`.
                 // PROPOSED(D-107)
                 // PROPOSED(D-128): a span-less replica is re-hosted in the task.
                 let hosted_at = before
@@ -3864,8 +3867,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         // without a descriptor — a node not named at bootstrap, or a re-seeded user
         // range, before its install — is hosted at configuration's span, which its
         // install does not replace (`install::switched_spans`, PROPOSED D-128): the
-        // plan's copy is what `InstallReplacesHostedSpan` reads, and a chunk's check
-        // that the range is hosted here.
+        // plan's copy is what `InstallReplacesHostedSpan` and `InstallReplacesCopiedSpan`
+        // read, and a chunk's check that the range is hosted here (PROPOSED D-132).
         let span = lock(&descriptors)
             .get(&range.id)
             .map_or_else(|| range.span(), |d| d.start.clone()..d.end.clone());
@@ -4361,6 +4364,64 @@ fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, appli
         voters: descriptor.voters.iter().map(|voter| voter.0).collect(),
         state: descriptor.state,
     });
+}
+
+/// A split's apply as the `apply` task makes it, for `install.rs`'s directed tests of what
+/// lands around a switch: the real [`ServerApplier::split`] of `parent` at `index`, cutting
+/// at `key`, on a voter of three, over `store`, the host's `table` and the `snapshot` task's
+/// `snaps`. Whether the split took.
+// PROPOSED(D-132)
+#[cfg(test)]
+pub(crate) async fn split_applied<E: Environment>(
+    env: &E,
+    store: &Arc<RaftStore<E>>,
+    (table, snaps): (
+        Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
+        Queue<SnapJob>,
+    ),
+    (parent, right): (RangeId, RangeId),
+    (index, key): (Index, &'static [u8]),
+) -> bool {
+    let sock = env
+        .net()
+        .bind(SocketAddr::from(([10, 0, 0, 1], 7100)))
+        .await
+        .expect("a bind");
+    let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+    let applier = ServerApplier {
+        env: env.clone(),
+        id: ServerId(1),
+        sock: Arc::new(sock),
+        stores: Arc::default(),
+        replicas: Arc::default(),
+        local: Queue::new(),
+        snaps,
+        engine_dir: PathBuf::from("/n1"),
+        node_variants: NodeVariants::correct(),
+        range_variants: RangeVariants::correct(),
+        cores: Variants::default(),
+        descriptors: table,
+        applied: Arc::new(Mutex::new(
+            [(
+                parent,
+                Applied {
+                    index: index - 1,
+                    term: 1,
+                    config,
+                },
+            )]
+            .into(),
+        )),
+        id_block: 8,
+        raft: RaftConfig::default(),
+    };
+    matches!(
+        applier
+            .split(parent, index, &Bytes::from_static(key), right.get(), store)
+            .await
+            .expect("the split's apply"),
+        Some((ApplyEffect::Took, _))
+    )
 }
 
 #[cfg(test)]

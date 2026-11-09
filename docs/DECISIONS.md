@@ -25528,12 +25528,19 @@ nothing else.
   (section 7). Reading the span from the host's descriptors at the switch would close it. It
   is a change for an initialised replica, which this correction leaves alone, so it is a
   candidate for an issue of its own.
+  **Corrected after #200 merged:** closed by D-132, on both halves of the reasoning above: the
+  span now comes from the host's descriptors at the switch, and the store is asked again there.
+  The read has to come after the last await before the engine numbers the install, which the
+  argument above did not say and seed 5620 of S11's sweep showed: the split's apply landed
+  inside `open_span_source`, past where `finish` used to read.
 - **A second window, on the same re-seed shape (#215), reached by a directed test and by no run.**
   Two senders' streams of a replica with no descriptor both complete before the first switch, so
   both copies hold configuration's span. The second is stepped after the first's `Switched`, by
   which time the replica counts as initialised, and it replaces its stale copy, R's keys with it.
   Check 8's install clause names it. S10's seeds 0 to 1999 made about 600 installs onto a replica
   with no descriptor and none met it.
+  **Corrected after #200 merged:** closed by D-132, by the same read of the host's descriptor at
+  the switch, and held by the directed test built from #215's account of it.
 - **#199: a replica with no descriptor that came back by the log.** The same family, not the same
   bug, and this correction does not cover it. A re-seeded user range whose leader has not compacted
   replays its log and never installs, so nothing here gives it a descriptor, and a later split of it
@@ -26041,4 +26048,96 @@ test keeps its 22.7: it runs the runs it ran, and one weighing here read 23.9.
 
 ---
 
-_Next entry: D-131. Add one before implementing anything not covered above._
+## PROPOSED D-132 — An install onto a replica the node holds a descriptor of replaces the host's descriptor's span at the switch and asks the store again there, not the plan's copy from the stream's last chunk: `InstallReplacesCopiedSpan` keeps the copy beside the fix, and check 8's install clause catches it; closes #215 and D-128 §9's window
+
+**The number.** Off aa5e46c, whose footer reads D-131. D-131 is S11's, on a local branch and absent from this tree, so this entry is D-132 and the footer moves to D-133, the next number after this tree's highest entry. At a merge the entries are a union in numerical order with one footer, the highest plus one. Every code site carries `// PROPOSED(D-132)`.
+
+**This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps one owner per key per node, §11, storage 5, has an install remove "the span's keys", and check 8's install clause (D-128 §3) forbids a switch removing another replica's. D-128 closed that for one stream at a time and §9 named what it left, an initialised replica replacing the plan's copy. This entry closes it. D-128's path for a replica with no descriptor is unchanged.
+
+**The bug, on a correct server.** `Snapshots::on_chunk` copies the plan's hosted spans into `Install::spans` at the stream's last chunk, and `Task::finish` replaced that copy on any replica the host held a descriptor of. Between the chunk and the switch the span can move, and the copy then names keys a right half now owns.
+
+1. **Two senders' streams (#215).** P has no descriptor and R is held on the node. Streams A and B both complete before A's switch, so both copies hold configuration's span. A's switch is D-128's. `Ready(B)` is deferred by A's hold and stepped after `Switched(A)`, by when the host's table holds P, so P counts as initialised and B's switch replaces its stale copy.
+2. **A split applied through the log (seed 5620 of S11's sweep, D-131's local branch).** Node 3 crashes at 5.089 s and restarts at 5.155 s. Node 1 splits range 3 at `k05`, index 113, at 5.285 s. Node 3's snapshot of range 3 at 113 has its hold taken at 5.5906 s, with the split's apply job already queued behind it. Measured at the switch on that seed, by reading the table and the store at both places: at the old read's place the store stood at 111 of the snapshot's 113 and the table held `[k03, k10)`; after `open_span_source` it stood at 113 and the table held `[k03, k05)`, range 20 made. The split had landed inside that await. The switch replaced the plan's copy `[k03, k10)`, range 20's keys with it, and `SpanInstalled` names that at 5.713 s; check 8's install clause tripped it.
+
+What the second route teaches is **where** to read. The span in the host's table at the place the switch read `initialised` was still `[k03, k10)`, so a read there would not have closed this route. The read has to come after the last await before the engine numbers the install.
+
+### 1. What is built
+
+- **`switched_spans` takes the host's descriptor** (`install.rs`). A replica the node holds one of replaces that descriptor's span; a replica with none replaces its Raft interval and the snapshot's span, D-128's path, unchanged. It is still a free function, for the reason `admission` is.
+- **`finish` reads `in_force` after `open_span_source`.** Nothing awaits between that read and `Engine::install_spans`, which numbers the install at the call (`begin_install`); so the table and the store are read at the numbering.
+- **The store is asked again there**, immediately before the read. A second call to what was one branch at `finish`'s top, now `caught_up`, answers installed without switching, on the rule the first was written for (D-083; RAFT.md:222-224). `finish` had two awaits past the first re-check, and a split that lands in them can carry the store to or past the snapshot's index.
+- **`Install::spans` is a copy the correct switch no longer reads.** It is read only by `InstallReplacesHostedSpan` and by the new variant, and its doc says so. So `InstallWrongRangesSpans` reaches no switch on the correct node: its doc named a re-seed's install, which D-128 had already stopped being true of, and now names what is left of it, the planner's output, which is where its one assertion sits (`snapshot.rs`). It is left there and not made to act; `sim/` still does not run it.
+
+D-128's path for a replica with no descriptor is unchanged. An install whose host's descriptor names the span the copy held, every install outside the two routes, switches what it switched.
+
+### 2. A snapshot below the split
+
+A snapshot's last index below a split the replica applied, whose span is wider than the replica's descriptor, is the one install this entry's span would replace with too little. It reaches this code only if the store moved past the snapshot during `finish`:
+
+| where the split's apply lands, for a snapshot at `L` and a split at `I` | what happens |
+|---|---|
+| before `finish`, `I <= applied` and so `L < I <= applied` | answered installed at `finish`'s first re-check, as before |
+| inside `finish`'s two awaits, `L < I` | answered installed at the new re-check, nothing switched |
+| at `L == I` (seed 5620's) | the same; the snapshot has nothing the store lacks |
+| `I < L`, before the numbering | switched, replacing the host's descriptor's span, the left half |
+| after the numbering, or in flight at it | not closed (section 5) |
+
+So the case that needed a different answer is the one the second re-check gives it: the span read from the table alone would have the switch replace too little against a snapshot wider than the descriptor, the engine would refuse it `OutsideSpan` where the snapshot holds a key beyond the descriptor, and the stream would start over. Asking the store first answers it installed and spends no stream.
+
+### 3. `NodeVariant::InstallReplacesCopiedSpan`, the pair
+
+The switch replaces the plan's copy on a replica with a descriptor and does not ask the store again: the tree before this entry. It is the node's, at **bit 51**, the next free on this tree; bits 52 and 53 stay free, and a branch that adds a variant after this one takes the next. A replica with no descriptor is D-128's under it too, `InstallReplacesHostedSpan` being that one.
+
+The catch is check 8's install clause: on the directed tests' two routes and four split cases it trips with "one owner per key: an install of range 2 ... overlaps its replica of range 9". On seed 5620 of S11's sweep, with this entry's fix on a scratch copy of that branch, the variant fails it with the same words the original did, range 3's install over `[k03, k10)` and range 20's replica. The window is rare: on S11's ten thousand the re-check fired on four installs (section 6) and this tree's sweep does not reach it, so per D-061 no tier asserts a sweep's catch of it; the directed tests assert it every run.
+
+### 4. What says so
+
+**Directed, through the task** (`install.rs`), each on the correct node and under the variant:
+
+- `a_second_streams_copy_of_configurations_span_leaves_the_right_half_beside_it`, route 1, through `on_chunk` and `finish`, with the host's table updated from the first stream's `Switched`. The archived test #215 names, `~/Desktop/ananke-archive/2026-11-06-wip/review-200-two-streams-test.rs`, is not on this machine, so this is built from the issue's account of it.
+- `a_split_applied_through_the_log_before_a_switch_leaves_the_right_halfs_keys`, route 2, the real `ServerApplier::split` (`server::split_applied`, a test-only wrapper) landing after the stream's last chunk and, through a test seam, at the switch: a snapshot past the split, at it, and below it. A `#[cfg(test)]` future on the task lands the split there, because timing it by the simulator's disk would move with every read on the path.
+- `an_install_onto_a_replica_with_a_descriptor_replaces_that_descriptors_whole_span`: #215's third point, the initialised install at the call site rather than only on the free function, which was cheap, and done.
+- `an_install_replaces_the_hosts_descriptors_span_and_the_snapshots_where_it_holds_none`, the free function on its six inputs; `an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of` until this entry made that name false.
+
+Plants, each applied alone to this tree in debug and reverted:
+
+| plant | caught by |
+|---|---|
+| the descriptor read before `open_span_source` | the split test's `AtTheSwitch` case past the split: "what the switch replaced", `[k0, k9)` for `[k0, k5)` |
+| no re-check at the switch | the split test's case at the split: a switch where none was due |
+| the variant does not skip the re-check | the same case under the variant, no switch to catch |
+| the call site passes no descriptor, so an initialised replica replaces the snapshot's span | the third test above, and the two routes, by what the switch replaced |
+| the variant's bit inverted | all four tests above |
+
+**The tiers.** The directed tests run at every tier, deterministically, and need no row in the nightly (D-064): they are in the crate's lib, where the `rest` job already runs them. No seed is pinned here; seed 5620 belongs to S11's schedule and its pin to S11's branch once the two meet, by the rule on pinned seeds, on the mechanism: the re-check at the switch firing at range 3's install at 113.
+
+### 5. What is not here
+
+- **A split's apply that lands after the install is numbered, or is in flight at it.** `Engine::install_spans` numbers an install at the call and makes the manifest switch tens of milliseconds later (a live install's tens of milliseconds, D-107), and the hold stops the core and not the `apply` task. A split's apply landing there writes its batch at a higher number and narrows the table, and the switch removes R's keys anyway, its spans having been read first. A scratch plant, the seam moved past the numbering, shows it on the correct node: the switch replaces `[k0, k9)` and R9's key goes. It is not reached: on this tree's sharded sweep at 2 000 seeds and on S11's at 10 000 no apply of a range landed between its install's numbering and its switch. Closing it needs the split's apply and the install to exclude each other, the voter's path waiting out the install as the non-voter's does (`apply_removing_unless_installed`) and the install waiting for a split in flight, which is a change to the `apply` task and the owner's to shape.
+- **#215's related window**, `finish` leaving P out of the host's table until `Switched`, so that R's placeholder admitted between a pre-split P's switch and `Switched` sees no overlap. Read, not run: this entry changes neither where the table is written nor where `admission` reads it, and a replica with no descriptor still goes down D-128's path, so the window stands as it stood.
+- **#215's stale wording**, `invariants.rs` describing check 8 as two clauses. #181 touches those lines, and this entry leaves them.
+- **`InstallWrongRangesSpans`** is corrected in its doc and left the planner's alone. Whether it should act on a switch again is a question for the variant's owner.
+
+### 6. What moves
+
+Two instrumented scratch copies, release, counting at the switch:
+
+| | seeds | reached the switch | re-check at the switch fired | span differed from the copy | apply during the switch |
+|---|---|---|---|---|---|
+| this tree's `every_seed_passes_on_the_correct_sharded_sweep` | 0 to 1 999 | 10 703 | **0** | **0** | **0** |
+| S11's, with this fix applied | 0 to 9 999 | not counted | **4**, seed 5620's among them | **0** | **0** |
+
+So on this tree nothing moves: no correct node's schedule changes at these seeds, the new reads being a lock and an atomic. On S11's schedule the four seeds whose install the re-check turned into an answer are the only ones that move. S11's sweep at 10 000 passes with the fix applied, zero failures, against the seed 5620 failure before it. D-128's own window (the first bullet of its §9) is closed on the same read, as the correction there says.
+
+### 7. For the owner (PROPOSED)
+
+The outcome is settled by the documents, so what is the owner's is the shape:
+
+1. Reading the host's table at the switch rather than giving `Install` a fresher copy.
+2. The second re-check at the switch, which is what the snapshot-below-a-split case rests on.
+3. Bit 51, and the variant restoring both halves of the old switch.
+4. The window in section 5, left open and named.
+
+---
+
+_Next entry: D-133. Add one before implementing anything not covered above._
