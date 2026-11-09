@@ -752,7 +752,29 @@ pub struct ServerHost<E: Environment> {
     on_a_reseed: bool,
 }
 
+/// What [`lock`] calls first in a test of this crate, with the address of the mutex about
+/// to be taken. It runs before the lock is taken, so a read of the table from here finds
+/// what a task on another worker could find there. It is not compiled into the crate that
+/// other crates build, so no run of the node has it.
+// PROPOSED(D-114)
+#[cfg(test)]
+type LockHook = Option<Box<dyn Fn(usize)>>;
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's [`LockHook`]: `split_observed`'s, while it runs.
+    // PROPOSED(D-114)
+    static LOCK_HOOK: std::cell::RefCell<LockHook> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // PROPOSED(D-114)
+    #[cfg(test)]
+    LOCK_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(std::ptr::from_ref(what) as usize);
+        }
+    });
     // A panic under a lock would poison it; nothing here panics under one, and a
     // poisoned lock is taken anyway rather than crashing the node, as the server's
     // own `lock_pending` does.
@@ -2893,8 +2915,8 @@ fn descriptors_for(
 /// only place a split's apply touches the table. A reader of the table, the `snapshot`
 /// task's overlap rule among them (`install::admission`), sees both halves or neither,
 /// never P narrowed with R absent (issue #183). What holds the call site to it is
-/// `a_splits_two_descriptors_reach_the_hosts_table_in_one_step`, and the limit of what
-/// that test can see is in its doc.
+/// `a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition` and its
+/// non-voter's, and what those can and cannot see is in the first's doc.
 // PROPOSED(D-114)
 fn put_split_descriptors(
     descriptors: &Mutex<BTreeMap<RangeId, RangeDescriptor>>,
@@ -4336,7 +4358,8 @@ mod tests {
     /// An environment that reads the host's descriptors table at every event traced
     /// through it, as a task on another worker of a multi-threaded runtime could read it
     /// there, and keeps what it saw (issue #183). An event traced while the table's lock
-    /// is held sees nothing, and is kept as such.
+    /// is held sees nothing, and is kept as such. `split_observed`'s [`LockHook`] keeps
+    /// the same read at every acquisition of the table.
     // PROPOSED(D-114)
     #[derive(Clone)]
     struct Observed {
@@ -4418,12 +4441,18 @@ mod tests {
         }
     }
 
+    /// The name [`split_observed`]'s hook keeps a read under.
+    // PROPOSED(D-114)
+    const AN_ACQUISITION: &str = "an acquisition of the table";
+
     /// Runs `ServerApplier::split` of `parent` at index 9, cutting at `k5` with `right`
-    /// the right half's id, on node `id` of the configuration {1, 2, 3}, through
-    /// [`Observed`]. What it saw, the table after, and the apply's effect.
+    /// the right half's id, on node `id` of the configuration {1, 2, 3}, on a host whose
+    /// table starts as `before`, through [`Observed`] and a [`LockHook`] on that table.
+    /// What they saw, the table after, and the apply's effect.
     // PROPOSED(D-114)
     fn split_observed(
         parent: &RangeDescriptor,
+        before: &BTreeMap<RangeId, RangeDescriptor>,
         id: ServerId,
         right: RangeId,
     ) -> (Vec<Seen>, BTreeMap<RangeId, RangeDescriptor>, Answered) {
@@ -4432,13 +4461,23 @@ mod tests {
         let mut sim = Sim::new(SimConfig::new(7));
         let node = sim.add_node();
         let table: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> =
-            Arc::new(Mutex::new([(parent.range, parent.clone())].into()));
+            Arc::new(Mutex::new(before.clone()));
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let env = Observed {
             inner: sim.env(node),
             table: table.clone(),
             seen: seen.clone(),
         };
+        LOCK_HOOK.with(|hook| {
+            let address = Arc::as_ptr(&table) as usize;
+            let (table, seen) = (table.clone(), seen.clone());
+            *hook.borrow_mut() = Some(Box::new(move |what| {
+                if what == address {
+                    let held = table.try_lock().ok().map(|held| held.clone());
+                    lock(&seen).push((AN_ACQUISITION.to_owned(), held));
+                }
+            }));
+        });
         let answered: Arc<Mutex<Answered>> = Arc::default();
         env.clone().spawn("test", {
             let (env, table, answered, parent) =
@@ -4510,44 +4549,31 @@ mod tests {
             }
         });
         sim.run_for(Duration::from_secs(1));
+        LOCK_HOOK.with(|hook| *hook.borrow_mut() = None);
         let seen = lock(&seen).clone();
         let table = lock(&table).clone();
         let answered = lock(&answered).take();
         (seen, table, answered)
     }
 
-    /// Issue #183: a split's apply puts both halves' descriptors in the host's table in
-    /// one acquisition of it. This runs `ServerApplier::split` itself, on a voter and on
-    /// a non-voter of P, through [`Observed`], which reads the table at every event the
-    /// apply traces. Before the fix (b1da6ec), P's narrowed descriptor went in before R's
-    /// `RangeCreated` trace and R's after it. A reader there found P off R's span and no
-    /// R, and the overlap rule admitted a placeholder's install of R.
-    ///
-    /// On a voter it holds three things:
-    /// - at every traced event the table is P's descriptor alone, before the change, or
-    ///   P narrowed with R, after it;
-    /// - the overlap rule itself (`install::admission`, on the correct range layer)
-    ///   refuses an install of R into a placeholder on every table seen;
-    /// - the state between, P narrowed with R absent, is one that rule admits, so it is
-    ///   the state no reader may see.
-    ///
-    /// On a non-voter, which makes no R, the table ends with P narrowed and no R.
-    ///
-    /// **What fails it, and what does not.** A return to two acquisitions fails it when
-    /// one of them puts P's descriptor in before R's creation is traced. b1da6ec's order
-    /// does this, and so does #186's review plant, which keeps the helper for P alone and
-    /// inserts R under a second lock. Two acquisitions with no traced event between them
-    /// pass it, and nothing in this tree fails on them. The simulator's executor is
-    /// cooperative and runs no task there. A test racing host threads against the table
-    /// is what `clippy.toml` and `scripts/check-direct-io.sh` keep out of this crate
-    /// (D-040). The real binary runs no shard server. What stands against that revert is
-    /// the helper, which takes the lock itself and is the only place `split` touches the
-    /// table (PROPOSED D-114).
+    /// The split [`split_observed`] runs, and the tables a reader can find through it.
     // PROPOSED(D-114)
-    #[test]
-    fn a_splits_two_descriptors_reach_the_hosts_table_in_one_step() {
-        use crate::install::{Admission, admission};
+    struct SplitCase {
+        r: RangeId,
+        parent: RangeDescriptor,
+        right: RangeDescriptor,
+        /// P's descriptor, before the split, beside the range next to it.
+        before: BTreeMap<RangeId, RangeDescriptor>,
+        /// P narrowed and R: a voter's table after the split, beside the range next to it.
+        after: BTreeMap<RangeId, RangeDescriptor>,
+        /// P narrowed and no R: a non-voter's table after the split, and on a voter the
+        /// state no reader may find, beside the range next to it.
+        between: BTreeMap<RangeId, RangeDescriptor>,
+    }
 
+    /// P, range 4 over `[k0, k9)`, split at `k5` into R, range 9, with range 5 beside it.
+    // PROPOSED(D-114)
+    fn split_case() -> SplitCase {
         let p = RangeId(4);
         let r = RangeId(9);
         let voters = vec![ServerId(1), ServerId(2), ServerId(3)];
@@ -4555,6 +4581,14 @@ mod tests {
             range: p,
             start: user_key(b"k0"),
             end: user_key(b"k9"),
+            generation: FIRST_GENERATION,
+            voters: voters.clone(),
+            state: RangeState::Live,
+        };
+        let beside = RangeDescriptor {
+            range: RangeId(5),
+            start: user_key(b"k9"),
+            end: user_key(b"kz"),
             generation: FIRST_GENERATION,
             voters: voters.clone(),
             state: RangeState::Live,
@@ -4572,29 +4606,84 @@ mod tests {
             voters,
             state: RangeState::Live,
         };
+        SplitCase {
+            r,
+            before: [(p, parent.clone()), (beside.range, beside.clone())].into(),
+            after: [
+                (p, left.clone()),
+                (r, right.clone()),
+                (beside.range, beside.clone()),
+            ]
+            .into(),
+            between: [(p, left), (beside.range, beside)].into(),
+            parent,
+            right,
+        }
+    }
+
+    /// Issue #183: a split's apply puts both halves' descriptors in the host's table in
+    /// one acquisition of it. This runs `ServerApplier::split` itself on a voter of P. It
+    /// reads the table two ways: at every event the apply traces ([`Observed`]), and at the
+    /// top of every acquisition of the table ([`LockHook`]), where a second acquisition
+    /// finds what a reader between the two would find. Before the fix (b1da6ec), P's
+    /// narrowed descriptor went in before R's `RangeCreated` trace and R's after it. A
+    /// reader there found P off R's span and no R, and the overlap rule admitted a
+    /// placeholder's install of R.
+    ///
+    /// It holds four things:
+    /// - every table read is P's descriptor alone, before the change, or P narrowed with
+    ///   R, after it, with the range beside P untouched;
+    /// - the overlap rule itself (`install::admission`, on the correct range layer)
+    ///   refuses an install of R into a placeholder on every table read;
+    /// - the state between, P narrowed with R absent, is one that rule admits, so it is
+    ///   the state no reader may find;
+    /// - the apply acquires the table once.
+    ///
+    /// **What fails it.** A return to two acquisitions, in either order, under the helper
+    /// or not, with or without an event traced between them, and whichever of them holds
+    /// its guard across that event.
+    ///
+    /// **What it does not see.**
+    /// - A direct `self.descriptors.lock()` bypasses [`LockHook`], so neither the read nor
+    ///   the count sees it. A grep finds no such site in the crate today.
+    /// - [`Observed`] reads only at traced events and nothing is traced after the helper,
+    ///   so on this tree the only table either read finds is `before`. The hook at a next
+    ///   acquisition is what sees the far side of a first one.
+    /// - Both descriptors in one acquisition past `open_sibling(..).await` pass these.
+    ///   `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` catches R's
+    ///   descriptor landing past that await (`sim/tests/node.rs`, D-109 §1.6's rule), not
+    ///   two acquisitions as such.
+    // PROPOSED(D-114)
+    #[test]
+    fn a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition() {
+        use crate::install::{Admission, admission};
+
+        let case = split_case();
         let refuses_r = |held: &BTreeMap<RangeId, RangeDescriptor>| {
-            admission(r, Some(&right), held, true, RangeVariants::correct()) == Admission::Overlaps
+            admission(
+                case.r,
+                Some(&case.right),
+                held,
+                true,
+                RangeVariants::correct(),
+            ) == Admission::Overlaps
         };
-        let before: BTreeMap<RangeId, RangeDescriptor> = [(p, parent.clone())].into();
-        let after: BTreeMap<RangeId, RangeDescriptor> =
-            [(p, left.clone()), (r, right.clone())].into();
-        let between: BTreeMap<RangeId, RangeDescriptor> = [(p, left)].into();
         assert!(
-            refuses_r(&before) && refuses_r(&after),
+            refuses_r(&case.before) && refuses_r(&case.after),
             "the overlap rule refuses R's install on P alone and on both halves"
         );
         assert!(
-            !refuses_r(&between),
+            !refuses_r(&case.between),
             "the overlap rule admits R's install on P narrowed with R absent"
         );
 
-        let (seen, table, answered) = split_observed(&parent, ServerId(1), r);
+        let (seen, table, answered) =
+            split_observed(&case.parent, &case.before, ServerId(1), case.r);
         assert_eq!(
             answered,
             Some(Ok(Some(ApplyEffect::Took))),
             "a voter's split"
         );
-        assert_eq!(table, after, "a voter's table holds P narrowed and R");
         let names: Vec<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
         for traced in ["RangeSplit", "RangeDescriptor", "RangeCreated"] {
             assert!(
@@ -4607,7 +4696,7 @@ mod tests {
                 continue;
             };
             assert!(
-                *held == before || *held == after,
+                *held == case.before || *held == case.after,
                 "at {name} a reader found the table {held:?}: neither P's descriptor alone \
                  nor both halves"
             );
@@ -4616,24 +4705,52 @@ mod tests {
                 "at {name} the overlap rule admits a placeholder's install of R on {held:?}"
             );
         }
+        assert_eq!(
+            table, case.after,
+            "a voter's table holds P narrowed and R, and the range beside untouched"
+        );
+        assert_eq!(
+            names.iter().filter(|name| **name == AN_ACQUISITION).count(),
+            1,
+            "a voter's split acquires the table once: {names:?}"
+        );
+    }
 
-        // A non-voter is in no configuration of R and makes no R at the split, so an
-        // install is how R would reach it, and the rule admitting one there is right.
-        let (seen, table, answered) = split_observed(&parent, ServerId(4), r);
+    /// A non-voter of P is in no configuration of R and makes no R at the split, so an
+    /// install is how R would reach it, and the overlap rule admitting one there is right.
+    /// Its table goes from P to P narrowed in one acquisition, with the range beside P
+    /// untouched. See the voter's test for what these read and what they do not see.
+    // PROPOSED(D-114)
+    #[test]
+    fn a_non_voters_split_puts_ps_descriptor_in_the_hosts_table_in_one_acquisition() {
+        let case = split_case();
+        let (seen, table, answered) =
+            split_observed(&case.parent, &case.before, ServerId(4), case.r);
         assert_eq!(
             answered,
             Some(Ok(Some(ApplyEffect::Took))),
             "a non-voter's split"
         );
+        for (name, held) in &seen {
+            let Some(held) = held else {
+                continue;
+            };
+            assert!(
+                *held == case.before || *held == case.between,
+                "at {name} a reader of a non-voter's table found {held:?}: neither P's \
+                 descriptor nor P narrowed"
+            );
+        }
         assert_eq!(
-            table, between,
-            "a non-voter's table holds P narrowed and no R"
+            table, case.between,
+            "a non-voter's table holds P narrowed and no R, and the range beside untouched"
         );
-        assert!(
+        assert_eq!(
             seen.iter()
-                .filter_map(|(_, held)| held.as_ref())
-                .all(|held| *held == before || *held == between),
-            "a non-voter's table is P alone or P narrowed at every traced event"
+                .filter(|(name, _)| name == AN_ACQUISITION)
+                .count(),
+            1,
+            "a non-voter's split acquires the table once: {seen:?}"
         );
     }
 

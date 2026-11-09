@@ -23472,14 +23472,15 @@ reservations of 2026-11-01: D-113 for S10, D-114 for #186 (this, #183), D-115 fo
 N2: this first cited #162 for a reservation it did not then record). This entry took D-114
 and moved the footer to D-115. At a merge the entries are a union in numerical order with
 one footer, the highest plus one. Every code site carries `// PROPOSED(D-114)`. #186 closed
-#183. It merged at c7040b3 before its review's fixes, and each correction is marked where it
-stands.
+#183. It merged at c7040b3 before its review's fixes, #191 delivered those and merged at
+8a4cdad before its own review's fixes, and each correction is marked where it stands.
 
 **Context.** #180's review (N10) found it, and it predates S9. A voter's apply of a split
 wrote the two descriptors into the host's `descriptors` table under two acquisitions:
 P's narrowed descriptor first, then R's new one after the `RangeCreated { cause: split }`
-trace. The `snapshot` task's overlap rule (D-110, `install::admission`) reads the same
-table in one acquisition, when it decides whether a placeholder's install of R may go in.
+trace. The `snapshot` task's overlap rule (D-110, `install::admission`; the function's name
+*added after #186 merged*) reads the same table in one acquisition, when it decides whether a
+placeholder's install of R may go in.
 Between the two acquisitions, the table held P off R's span and no R, and the rule admits
 R's install on that state.
 - **In the simulator** no task runs there: the executor is cooperative and nothing
@@ -23504,51 +23505,82 @@ acquisition, and that was false: a caller could take the lock twice and still ca
 **The trace and the schedules do not change.** R's creation is still traced before its
 descriptor is in place. P's descriptor now goes in with R's, after that trace and not
 before it. Nothing between the two points awaits or draws, so every simulated run is the
-run it was. A scratch test hashed `split::run` seeds 0 to 7 and `reseed::run_after_split`
-seeds 0 and 1 on this tree and on b1da6ec's code, byte-identical, and #186's review
-re-hashed four and two of them the same. The helper's change after #186 merged moves
-where the lock is taken and nothing else, and the same hashes on it are identical to
-`main`'s at de9f4d7.
+run it was (*added after #186 merged*, from its PR and its review:) a scratch test hashed
+`split::run` seeds 0 to 7 and `reseed::run_after_split` seeds 0 and 1 on this tree and on
+b1da6ec's code, byte-identical, and #186's review re-hashed four and two of them the same.
+The helper's change after #186 merged moves where the lock is taken and nothing else, and the
+guard below is `cfg(test)`, in no crate's build but this crate's own tests. The same hashes on
+the tree with both are identical to `main`'s at de9f4d7.
 
-**The test, and what it can and cannot see.**
-`a_splits_two_descriptors_reach_the_hosts_table_in_one_step` (a unit test in `server.rs`)
-runs `ServerApplier::split` itself, through an environment that reads the table at every
-event the apply traces. A task on another worker could read the table at any moment outside
-the lock, and the traced events are the moments this test can read it at. On a voter:
-- the table is P's descriptor alone or both halves at every traced event;
+**The test, and what it can and cannot see.** Two unit tests in `server.rs`,
+`a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition` and
+`a_non_voters_split_puts_ps_descriptor_in_the_hosts_table_in_one_acquisition`, run
+`ServerApplier::split` itself. They read the table two ways: through an environment that
+reads it at every event the apply traces, and through a `cfg(test)` hook at the top of `lock`,
+which reads it at every acquisition. A read at the top of an acquisition finds what a task on
+another worker could find between that acquisition and the one before, and it needs no host
+thread. On a voter:
+- every table read is P's descriptor alone or both halves, with the range beside P untouched;
 - `install::admission`, the overlap rule itself on the correct range layer, refuses a
-  placeholder's install of R on every table seen;
-- the state between, P narrowed with R absent, is one the rule admits.
+  placeholder's install of R on every table read;
+- the state between, P narrowed with R absent, is one the rule admits;
+- the apply acquires the table once.
 
-On a non-voter the table ends with P narrowed and no R.
+On a non-voter every table read is P's descriptor or P narrowed, the table ends with P
+narrowed and no R, and the apply acquires it once.
 
 *Corrected after #186 merged* (#186's review, B1 and N1). As first built the test ran the
-helper alone, on maps it built by hand, and read a copy of the overlap rule of its own, so
-it could fail on neither `split` nor the rule. Each row below is a plant measured on both
-versions:
+helper alone, on maps it built by hand, and read a copy of the overlap rule of its own, so it
+could fail on neither `split` nor the rule.
 
-| the plant | #186 as merged | this version |
-|---|---|---|
-| the review's: the helper for P alone before R's `RangeCreated` trace, R under a second lock after it | test ok; clippy clean | **test fails**: "at RangeCreated a reader found the table {RangeId(4): … generation: 2 …}: neither P's descriptor alone nor both halves"; clippy clean |
-| b1da6ec's two inserts, word for word | test ok; clippy's `dead_code` alone | **test fails** the same way; `dead_code` too |
-| two acquisitions with no traced event between them, after the trace, the helper kept for P alone | test ok; clippy clean | test ok; clippy clean |
-| the same without the helper | test ok; `dead_code` | test ok; `dead_code` |
-| the overlap rule switched off in `install.rs` (the review's N1) | test ok | **test fails**: the rule no longer refuses R's install on P's descriptor alone |
+*Corrected after #191 merged* (#191's review, B1, B2 and N1). #191, merged from ecaba15, read
+the table at traced events alone, and this entry said a return to two acquisitions with no
+traced event between them failed no test, because no test could see between them. That was
+false: the read at the top of `lock` sees between them. It also said the simulator never runs
+a task there, which holds only while nothing awaits between them, and it dropped the range
+beside P from its tables. The third column below measures it.
 
-The third row is the limit: **a return to two acquisitions with no traced event between them
-fails no test of this tree.** No test here can see between them:
-- the simulator never runs a task there;
-- a test racing host threads against the table is what `clippy.toml` and
-  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040);
-- the real binary does not run the shard server.
+Each row is a plant on `split` or the helper, measured on the voter's and the non-voter's
+test. The voter's fails on every row but the last two, and each row but `held.clear()` and the
+non-voter's own leaves the non-voter's green, since it changes only a voter's path:
 
-What stands against that revert is the helper, which takes the lock itself, and review.
-**PROPOSED.**
+| the plant | #186 as merged | ecaba15 | this version |
+|---|---|---|---|
+| #186's review's: the helper for P alone before R's `RangeCreated` trace, R under a second lock after it | test ok; clippy clean | test fails; clippy clean | **test fails**: "at RangeCreated a reader found the table {…}: neither P's descriptor alone nor both halves", 2 acquisitions; clippy clean |
+| b1da6ec's two inserts, word for word | test ok; `dead_code` | test fails; `dead_code` | **test fails** the same way; `dead_code` |
+| two acquisitions with no traced event between them, after the trace, the helper kept for P alone | test ok; clippy clean | test ok; clippy clean | **test fails**: "at an acquisition of the table a reader found the table {…}", 2 acquisitions; clippy clean |
+| the same without the helper | test ok; `dead_code` | test ok; `dead_code` | **test fails** the same way; `dead_code` |
+| two helper calls, P and then R through the helper with `None` | | test ok | **test fails** the same way; clippy clean |
+| R first, then P | | test ok | **test fails** the same way; clippy clean |
+| P under a guard held across R's `RangeCreated` trace, R under a second lock | | test ok | **test fails** at the second acquisition; `dead_code` |
+| `held.clear()` as the helper's first statement | | test ok | **both tests fail**: the range beside P is gone |
+| the overlap rule switched off in `install.rs` | test ok | test fails | **test fails** |
+| a non-voter's P in two acquisitions | | | **the non-voter's test fails** on the count, 2 acquisitions; the voter's is green |
+| the correct tree | | | both pass, 1 acquisition each; 179 lib tests, clippy and `check-direct-io.sh` clean |
 
-**Related, not fixed here.** A creation is traced before its descriptor reaches the table,
-on the split's path and on a placeholder's install, so on a multi-threaded runtime
-`ServerHost::unheld` can answer for a replica already created as its placeholder (#186's
-review, N3; issue #189).
+**What remains.** **PROPOSED.**
+- **A direct `self.descriptors.lock()` bypasses the hook.** A grep finds no such site in the
+  crate today, and the crate's way to take a lock is `lock`.
+- **`Observed`, the traced-event read, sees nothing past the helper.** Nothing is traced after
+  the helper on either path, so on the correct tree the only table either read finds is
+  P's descriptor alone, and the voter's "both halves" arm runs only on a plant. The hook at a
+  next acquisition is what sees the far side of a first one, and the end of the run is what
+  sees the table the helper left.
+- **An insert moved past an await is a different fault, and another test's.** The Context's
+  "in the simulator no task runs there" holds because nothing between the two inserts awaits.
+  Moved past `open_sibling(..).await`, R's descriptor lands after simulated time has passed, and
+  `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` fails at
+  `sim/tests/node.rs:1207` at 20 seeds, "a placeholder answered for a replica its node had
+  created", where the correct tree passes. Measured two ways: P through the helper before the
+  await with R under a second lock after it, which also fails the voter's test, and both
+  descriptors in one acquisition past the await, which passes both unit tests at 1 acquisition
+  each. So what the sweep catches is R's descriptor landing past the await (D-109 §1.6's rule),
+  not two acquisitions as such.
+
+**Related, not fixed here** (*added after #186 merged*). A creation is traced before its
+descriptor reaches the table, on the split's path and on a placeholder's install, so on a
+multi-threaded runtime `ServerHost::unheld` can answer for a replica already created as its
+placeholder (#186's review, N3; issue #189).
 
 **The nightly's rows (D-064).** No sweep is added, so no row.
 
