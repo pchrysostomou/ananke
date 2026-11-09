@@ -677,8 +677,18 @@
 # D-130's review added one `shard` row, seed 9's pin on a chain of right halves, weighed the same way
 # on the same machine on AC power under a load average of 9: 0.2 (0.17 + 0.00, 0.16 + 0.00, 0.16 + 0.00,
 # the median rounded up to a tenth). Into the lightest shard, shard 6 at 2180.4 -> 2180.6.
-# shard 1: 2580.8 cpu s
-1	shard	203.5	every_seed_passes_on_the_correct_sharded_sweep
+# PROPOSED D-131 (#162's S11, the workload's shapes) re-weighed one `shard` row and added six, each from the
+# built release binary (`<binary>-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user +
+# sys, three runs, the median, on an Apple M2 of 8 cores under load averages of 14 to 54, so if anything high.
+# `every_seed_passes_on_the_correct_sharded_sweep` 203.5 -> 311.8 (299.46, 311.81, 312.63), shard 1 at 2580.8 ->
+# 2689.1: the shapes' bursts and the restart arm's crash add to every run, and the row keeps its shard, which is
+# left the heaviest for the owner's next re-weigh. New rows longest-first into the lightest shard: the stale
+# descriptor's lin catch 181.0 (180.27, 180.95, 180.96), shard 6 at 2180.6 -> 2361.6; ApplyIgnoresSpan's check 10
+# 17.4 (17.09, 17.37, 17.70), shard 4 at 2186.4 -> 2203.8; ReadCheckAtReceiptOnly's check 9 13.8 (13.38, 13.81,
+# 14.14), shard 4 -> 2217.6; its fold-by-fold row in `node` 12.8 (12.20, 12.81, 12.89), shard 4 -> 2230.4; and the
+# pins on seeds 992 (0.13) and 707 (0.09), each 0.1, shard 4 -> 2230.6.
+# shard 1: 2689.1 cpu s
+1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
@@ -756,7 +766,7 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2186.4 cpu s
+# shard 4: 2230.6 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -793,6 +803,11 @@
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
 4	reseed	9.6	a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes
+4	shard	17.4	a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep
+4	shard	13.8	a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep
+4	node	12.8	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only
+4	shard	0.1	seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
+4	shard	0.1	seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view
 # shard 5: 2252.7 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
@@ -851,7 +866,7 @@
 5	reseed	6.6	a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm
 5	reseed	22.7	a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs
 5	node	60.4	a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario
-# shard 6: 2180.6 cpu s
+# shard 6: 2361.6 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -902,3 +917,4 @@
 6	shard	0.3	seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries
 6	shard	0.2	seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split
 6	shard	0.2	seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too
+6	shard	181.0	a_server_that_trusts_a_stale_descriptor_serves_what_a_write_through_r_replaced

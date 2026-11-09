@@ -101,6 +101,23 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
+  #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
+  pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
+  a split while a client's cache names the parent (`Load::StaleCache`), a restart then a split from
+  that node (`Fault::SplitFromRestarted`), and any split with load (`Load::Clients`). Each is shown
+  reached on the correct system's trace and printed (ten thousand seeds: 4 874, 3 784, 4 427,
+  3 674 and 9 947), and asserted at every tier; `Schedule::plain` is the schedule from before it, one
+  seed in eight, and what every pin found on it runs, byte-identical. New variant
+  `ReadCheckAtReceiptOnly` (bit 10), caught by check 9 at serving on 59 of 100 seeds. The re-homed
+  variants fail for their named reasons at measured rates: `TrustStaleDescriptor` by check 9 on 100 of
+  100 and linearizability on 32 of 1 000, `ApplyIgnoresSpan` by check 9 on 81 of 100 and check 10 on
+  73 of 100, `IdBlockResumed` by check 18 on 44 of 100, `ClientIgnoresMismatch` by check 17 on 99 of
+  100. Seed 707 was a defect of the log view (a replica's creation forgets the store it replaced),
+  which moved seed 3870's variant catch to leader completeness; seed 992 a defect of the asker (asks
+  anew after a silence behind `NoRangeId`). **Seed 5620 is a correct-system data loss, unfixed and for
+  the owner: an install's switch replaced the span the plan hosted before a split applied (D-131).**
+  Owner questions in D-131. Not pushed.
 - Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
   open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
   that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable

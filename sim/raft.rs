@@ -8051,7 +8051,8 @@ fn aim_among_lagging(
     lagging[at]
 }
 
-fn to_command(op: &ClientOp) -> Command {
+// PROPOSED(D-131): shared with the sharded sweep's load clients.
+pub(crate) fn to_command(op: &ClientOp) -> Command {
     match op {
         ClientOp::Put { key, value } => Command::Put {
             key: key.clone(),
@@ -8067,7 +8068,8 @@ fn to_command(op: &ClientOp) -> Command {
     }
 }
 
-fn to_result(outcome: Outcome) -> ClientResult {
+// PROPOSED(D-131): shared with the sharded sweep's load clients.
+pub(crate) fn to_result(outcome: Outcome) -> ClientResult {
     match outcome {
         Outcome::Done => ClientResult::Done,
         Outcome::Swapped(swapped) => ClientResult::Swapped(swapped),

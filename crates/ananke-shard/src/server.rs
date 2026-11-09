@@ -1913,12 +1913,17 @@ impl<E: Environment> Host for ServerHost<E> {
             // §3, at serving: the descriptor at the applied index the read is served
             // at, read from the same engine version as the value, so a split or
             // subsume applied between receipt and serving answers `RangeMismatch`.
-            // `TrustStaleDescriptor` checks nothing here (§10).
+            // `TrustStaleDescriptor` checks nothing here, and `ReadCheckAtReceiptOnly` kept
+            // only the receipt check, so a split applied since then goes unseen (§10).
             // PROPOSED(D-097): the read check.
             // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
+            // PROPOSED(D-131): `ReadCheckAtReceiptOnly` skips this check and no other.
             let descriptor = if self
                 .range_variants
                 .contains(RangeVariant::TrustStaleDescriptor)
+                || self
+                    .range_variants
+                    .contains(RangeVariant::ReadCheckAtReceiptOnly)
             {
                 None
             } else {

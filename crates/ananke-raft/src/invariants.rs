@@ -166,6 +166,15 @@ impl Logs {
                 ..
             } => {
                 if let Some(server) = traced.node {
+                    // A creation is a new store: whatever the view held of the replica was
+                    // the store a refusal lost (D-077), and a re-seed's floor can lie below
+                    // an entry of it. The sharded sweep's seed 707 re-seeds node 1 at 112
+                    // over a log that stopped at 120, whose prefix the restart had already
+                    // compacted to 119: the view kept 120 and lost what is below it, so the
+                    // next leader's 120 read as agreeing with a neighbour that differs at
+                    // 119. Nothing is compared against a store that no longer exists.
+                    // PROPOSED(D-131)
+                    self.logs.remove(&(*range, server));
                     self.snapshot(*range, server, *floor_index, *floor_term, true)?;
                 }
             }

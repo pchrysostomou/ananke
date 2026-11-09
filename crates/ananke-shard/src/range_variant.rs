@@ -18,9 +18,10 @@
 //! classified as well as given a bit:
 //!
 //! - **One of §10's twenty-four**, the variants SHARD.md tables, each breaking one
-//!   rule with a reference, built by the stage §12 assigns it. Seven are built:
+//!   rule with a reference, built by the stage §12 assigns it. Eight are built:
 //!   [`RangeVariant::TrustStaleDescriptor`], [`RangeVariant::ApplyIgnoresSpan`] and
 //!   [`RangeVariant::ClientIgnoresMismatch`] (routing, PROPOSED D-097),
+//!   [`RangeVariant::ReadCheckAtReceiptOnly`] (routing, PROPOSED D-131),
 //!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, PROPOSED D-098),
 //!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099),
 //!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, PROPOSED D-109) and
@@ -84,6 +85,14 @@ pub enum RangeVariant {
     /// the first resend, and the liveness bound a client that never converges.
     // PROPOSED(D-097)
     ClientIgnoresMismatch,
+    /// A read is checked against the node's descriptors at its receipt and not again at its
+    /// serving, where §3 checks it against the descriptor at the applied index it is served
+    /// at: a split applied between the two goes unseen, and the read is served by the parent
+    /// for a key the right half now owns. Check 9 catches the first `RaftRead` whose `applied`
+    /// lies at or past the split, for a right-half key (SHARD.md §10). `sim/shard.rs`'s split
+    /// under a pending burst of right-half gets aims at that window.
+    // PROPOSED(D-131)
+    ReadCheckAtReceiptOnly,
     /// The meta range stores each update as it arrives: every record an update
     /// overlaps is cut and replaced whatever its generation, where §1 keeps, per key,
     /// the descriptor of the highest generation. An older update that arrives after a
@@ -179,6 +188,7 @@ impl RangeVariant {
         RangeVariant::TrustStaleDescriptor,
         RangeVariant::ApplyIgnoresSpan,
         RangeVariant::ClientIgnoresMismatch,
+        RangeVariant::ReadCheckAtReceiptOnly,
         RangeVariant::MetaOverwritesByArrival,
         RangeVariant::IdBlockResumed,
         RangeVariant::AnyFreshNodeBootstraps,
@@ -211,6 +221,8 @@ impl RangeVariant {
             RangeVariant::SnapshotOverlapsReplica => 1 << 8,
             // PROPOSED(D-113): a refill sent once and not again.
             RangeVariant::RefillNotResent => 1 << 9,
+            // PROPOSED(D-131): a read checked at its receipt and not at its serving.
+            RangeVariant::ReadCheckAtReceiptOnly => 1 << 10,
         }
     }
 
@@ -223,6 +235,7 @@ impl RangeVariant {
             RangeVariant::TrustStaleDescriptor
             | RangeVariant::ApplyIgnoresSpan
             | RangeVariant::ClientIgnoresMismatch
+            | RangeVariant::ReadCheckAtReceiptOnly
             | RangeVariant::MetaOverwritesByArrival
             | RangeVariant::IdBlockResumed
             | RangeVariant::UninitialisedReplicaVotes
@@ -240,6 +253,7 @@ impl RangeVariant {
             RangeVariant::TrustStaleDescriptor => "TrustStaleDescriptor",
             RangeVariant::ApplyIgnoresSpan => "ApplyIgnoresSpan",
             RangeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
+            RangeVariant::ReadCheckAtReceiptOnly => "ReadCheckAtReceiptOnly",
             RangeVariant::MetaOverwritesByArrival => "MetaOverwritesByArrival",
             RangeVariant::IdBlockResumed => "IdBlockResumed",
             RangeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
@@ -362,11 +376,11 @@ mod tests {
             seen |= variant.bit();
         }
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
-        // the range-id blocks, D-109's one for placeholders and D-110's one for the
-        // overlap rule, all of them §10's; and
+        // the range-id blocks, D-109's one for placeholders, D-110's one for the
+        // overlap rule and D-131's one for the read check, all of them §10's; and
         // the two instruments PROPOSED D-108 moved here from the node's set and PROPOSED
         // D-113's one for D-092's refill, none of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 10);
+        assert_eq!(RangeVariant::BUGS.len(), 11);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -379,7 +393,7 @@ mod tests {
             .filter(|variant| variant.in_section_10())
             .count();
         assert!(counted <= SECTION_10.len());
-        assert_eq!(counted, 7, "§10's seven built so far");
+        assert_eq!(counted, 8, "§10's eight built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
         // a replica's incarnation at its creation), and D-113's (D-092's refill).

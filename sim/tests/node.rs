@@ -2856,6 +2856,31 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
     );
 }
 
+/// Check 9 against `ReadCheckAtReceiptOnly` (SHARD.md §12, Stage C's exit), over the sharded
+/// sweep's own trace, since it is that sweep's read burst that reaches the variant: a read let in
+/// at receipt, served past the split that took its key. Compared fold by fold on the tier's first
+/// hundred at most, as every pair here is; caught on 59 of the hundred and 14 of the gate's
+/// twenty, so asserted at every tier.
+// PROPOSED(D-131)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only() {
+    let seeds = range_folds_compared();
+    let found = range_folds_under("ReadCheckAtReceiptOnly", seeds, |seed| {
+        ananke_sim::shard::run_of(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::ReadCheckAtReceiptOnly]),
+        )
+        .records()
+        .to_vec()
+    });
+    assert!(
+        tripped_on(&found, Fold::ServingWithinSpan) > 0,
+        "check 9 tripped on no compared seed of ReadCheckAtReceiptOnly's {seeds}"
+    );
+}
+
 /// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
 /// hundred, since check 16 reads one meta index against the next by index (PROPOSED
 /// D-109): 48 and 66, each a resend of a split parent's first generation applied at an
