@@ -784,9 +784,15 @@ still covers its span has its install refused by the overlap rule until P moves 
 such an answer can start streams that are refused; that cost is accepted with Q22.
 
 R can still elect: R's voters are P's, P's leader keeps bringing P's replicas up to date,
-and each of them applies `s`. The exception is a
+and each of them applies `s`. There are two exceptions. The first is a
 replica of P removed before it applied `s`: its node's R is then initialised only by a
-snapshot, after the stale P is collected (Q27).
+snapshot, after the stale P is collected (Q27). The second (PROPOSED D-113, #220) is a
+replica of P installed past `s`, which never applies `s`, so that its R is a placeholder
+only R's leader can end. Where R's other voters are one that was refused and one that is
+initialised, R has no leader and can get none: the initialised voter stays a pre-candidate
+for good, and no data is lost. Nothing built today ends that shape. §8's meta convergence
+bound excuses exactly it, by the owner's ruling of 2026-11-09 recorded in #220 and D-113
+§6, and #220 tracks the fix.
 
 **The overlap rule (Q27).** A snapshot is installed on a node only if its span overlaps
 no other initialised replica there; otherwise it is refused and asked for again later.
@@ -814,7 +820,11 @@ snapshot answers it installed without switching (RAFT.md:222-224), so a replica 
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
 R could have been installed on the node only if no initialised replica of P covered its
 span, and then no initialised replica of P is there to apply `s`; a replica with no
-descriptor that replays to `s` refuses the split instead (#199). The apply asserts it.
+descriptor that replays to `s` refuses the split instead (#199). Check 8 asserts it, of the
+trace and whatever made either creation: a `RangeCreated` of a range on a node that holds it
+initialised is a violation (§8). The node does not fail on it, which would stop every voter
+of a split whose right half's id was taken twice before check 18 read the reused id (D-109,
+D-116).
 
 **What is atomic with what.**
 
@@ -1143,7 +1153,10 @@ replica on the node counts as refused in the per-range majority rule below.
 `RaftRecovered`, `RaftReseeded` and `RaftProgressReset` are per replica and gain
 `range`, and `RaftRecovered`'s `incarnation` is the replica's (Q26). A replica's re-seed
 install traces `RangeCreated { cause: snapshot }` on its node, which restarts that
-replica's floors in checks 2 to 4. A refused node re-seeds into a fresh engine in a new
+replica's floors in checks 2 to 4. A re-seeded system replica is the exception: its re-seed
+writes its descriptor and index-0 state and its start restates it, so it is initialised,
+and its install, as any install onto an initialised replica, creates nothing and restarts
+the floors by the installed snapshot (D-116). A refused node re-seeds into a fresh engine in a new
 directory, opened at once, each range installed live as its stream completes (Q15; §11,
 storage 8).
 
@@ -1240,8 +1253,11 @@ when its consequence lands.
    is not a voter there traces no `RangeCreated { cause: split }` of R. And the spans an
    install replaces, `SpanInstalled`, overlap no span the node holds of a replica other
    than the one installed, which its Raft keys among the spans name: a descriptor says
-   what a replica claims and a switch what it removes (D-128). Incremental: an
-   interval map per node.
+   what a replica claims and a switch what it removes (D-128). And a node creates
+   no replica it holds: a `RangeCreated` of a range on a node whose spans hold it —
+   created there, or restated there since its last crash, with no `RangeRemoved` of it and
+   no `RaftRefused` on the node between — is a violation, whatever the cause of either
+   creation (§5's "R already initialised here"). Incremental: an interval map per node.
 9. **Serving within span.** Fold `RaftApply` and `RaftRead` with check 7's map. A
    `RaftApply` whose effect is `applied` and whose key lies outside the span of its
    range's descriptor in force before its index, or whose descriptor is subsumed, is a
@@ -1336,9 +1352,12 @@ when its consequence lands.
     addressable keyspace with no gap. Where check 8 is one node, this is the cluster.
     Incremental: an interval map.
 20. **A placeholder grants nothing** (a rule fold, Q22). Fold `RangeReplicaCreated`,
-    `RangeCreated`, `RangeRemoved` and `RaftVote`. A `RaftVote` with `granted`, vote or
-    pre-vote, of range R on node `n` when `n` has traced no `RangeCreated` of R since its
-    last `RangeRemoved` of R is a violation. Cheap, exact.
+    `RangeCreated`, `RangesRestated`, `RangeRemoved` and `RaftVote`. A `RaftVote` with
+    `granted`, vote or pre-vote, of range R on node `n` when `n` has traced neither a
+    `RangeCreated` of R nor a `RangesRestated` naming R since its last `RangeRemoved` of
+    R is a violation. The restatement counts because a creation can be durable and never
+    traced: a node that crashed with a split's batch durable restates the right half at
+    its next start (D-113). Cheap, exact.
 21. **A removal is durable** (a rule fold). Fold `RangeRemoved`, `RangeCreated`,
     `RangeDescriptor` restatements and `RaftRecovered` per node. A restatement or a
     `RaftRecovered` of range X on node `n` after `n`'s `RangeRemoved` of X, with no
@@ -1413,7 +1432,9 @@ cluster (sim/raft.rs:967-986). After the last fault heals, a client write to eve
 completes within ten maximum election timeouts; today the check takes one minimum over
 every write (sim/raft.rs:990-998), which a wedged range beside a live one would pass, so
 it is asked per key. After the last heal, meta names every key's current descriptor
-within a bound; a move the rebalancer began is traced done or abandoned within a bound;
+within a bound, which asks nothing of a right half §5's second exception has left with
+no possible majority (PROPOSED D-113 §6, #220); a move the rebalancer began is traced
+done or abandoned within a bound;
 a subsumed range is merged or unfrozen within a bound (each bound measured on the
 correct system before it is asserted, Q39).
 
@@ -2487,8 +2508,9 @@ per-replica incarnation and quarantine (Q26), the re-seed shape and its variant
 - The range layer's variant set in `ananke-shard`, beside `ananke-raft`'s unchanged
   `Variants(u32)` (Q37).
 - The folds: check 7; check 8's clause that no two of a node's spans overlap, its
-  clause that a voter of P at `s` that applied `s` holds R, and its clause that an
-  install replaces no other replica's span (D-128); checks 9, 10, 16, 17 and 20;
+  clause that a voter of P at `s` that applied `s` holds R, its clause that an
+  install replaces no other replica's span (D-128), and its clause that a node
+  creates no replica it holds; checks 9, 10, 16, 17 and 20;
   check 18's split and range-id clauses; check 19; and, for check 18's split clause, the
   history per (range, index) of the configuration in force, built from each `RaftConfig`'s
   `index`, which §8 defines under check 11 and which check 18 folds (SHARD.md:1248-1250,
@@ -2521,7 +2543,8 @@ first split commit is made on. Stage B's exit. Questions 1 and 2 approved.
 - Measured before asserted (Q39): the meta convergence bound, `Fault::MetaReorder`'s
   hold, and (i)'s frame-length limit.
 - The equivalence test, each fold against the variant of this stage that trips it:
-  check 8 against `SnapshotOverlapsReplica`; checks 9 and 10 against `ApplyIgnoresSpan`,
+  check 8 against `SnapshotOverlapsReplica`, and its clause that a node creates no replica
+  it holds against `IdBlockResumed`; checks 9 and 10 against `ApplyIgnoresSpan`,
   check 9 also against `ReadCheckAtReceiptOnly` and `TrustStaleDescriptor`; check 16
   against `MetaOverwritesByArrival`; check 17 against `ClientIgnoresMismatch`; check 18
   against `IdBlockResumed`; check 20 against `UninitialisedReplicaVotes`. Check 7 runs

@@ -586,6 +586,8 @@ fn convert(
             number,
             first_seq,
             max_seq,
+            first_key,
+            last_key,
             reason,
         } => log(
             "ananke.sst.dropped",
@@ -593,6 +595,8 @@ fn convert(
                 ("number", int(*number)),
                 ("firstSeq", int(*first_seq)),
                 ("maxSeq", int(*max_seq)),
+                ("firstKey", Json::str(&hex(first_key))),
+                ("lastKey", Json::str(&hex(last_key))),
                 ("reason", Json::str(reason)),
             ])),
         ),

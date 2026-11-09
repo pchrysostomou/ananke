@@ -23348,6 +23348,13 @@ take D-114 and up. Every code site carries `// PROPOSED(D-113)`. **This entry is
 progress**: it records what is built and why the slice stopped, and it grows as the slice
 resumes.
 
+**Corrected after #188 merged:** #188 merged at 08f0c62 with §1 to §4 as they stood, the slice
+unfinished. The branch `phase-3-stage-c-shard-sim-rest` finishes it on top of #198 and #200
+(D-128, D-129), and §5 to §11 below are additions made after that merge. The title's "stopped"
+is how #188 left it. Main's nightly was red on seed 41. These end that and do not make it green:
+at ten thousand seeds the correct system still fails seeds 3870 and 5303, #175's, whose fix lands in
+its own PR after the PRs now open (§11).
+
 ### 1. What is built
 
 `sim/shard.rs` (SHARD.md §10; §12, Stage C; Q39):
@@ -23382,7 +23389,8 @@ resumes.
   drifting clocks is check 6 as Phase 2 built it, pre-vote's property, and on uniform seeds
   the timer check and the write bound — and the shape. Check 19 is S7's (D-093).
 - The sweep, `every_seed_passes_on_the_correct_sharded_sweep`, prints the driver's work
-  and the refusals by loss, and has its nightly row (D-064), shard 6.
+  and the refusals by loss, and has its nightly row (D-064), shard 1 (*corrected after #188
+  merged*: this read shard 6, and the row has been in shard 1 since #188).
 
 ### 2. Why it stopped: what the first thousand seeds found
 
@@ -23424,6 +23432,9 @@ re-seed after a split, which no scenario reached before this one, and S8 (c)'s t
 fold sees it: every descriptor the trace names is right, and only the engine's switch is
 wrong. **Not fixed here; reported to the owner.**
 
+**Corrected after #188 merged:** fixed by #200 (D-128): an install onto a replica that holds no
+descriptor replaces the snapshot descriptor's span. Seed 41 is pinned on it (§11).
+
 **(b) A bound the correct system trips: `READS_OUTSTANDING`.** 2 seeds, 128 and 643, "server
 1 failed: range 2 holds 39 registered reads, over the 38 its clients can have in flight with
 it". Seed 128: nodes 2 and 3 are both refused (2.548 s, 3.269 s), so two of range 2's three
@@ -23435,6 +23446,12 @@ a registration of its own (#125); the count passes 38 at 7.411 s and the node fa
 No registration is lost: the bound, sized on two clients by D-076's rule, counts retries
 against a leader that cannot confirm a read. **Not widened; reported to the owner.**
 
+**Corrected after #188 merged:** the owner ruled on 2026-11-06 that the leader refuses reads it
+can never confirm and drops the pending ones, and `READS_OUTSTANDING` stays 38: #198 (D-129).
+**(b) moved seeds.** #200 changes what a re-seeded node's engine holds, so seeds 128 and 643 no
+longer reach this: each has one store refused where it had two. On the merged tree the situation
+stands on seed 986. All three are pinned, 128 and 643 on the absence with that reason (§11).
+
 **(c) A check defect of this slice's own.** 12 seeds, 217, 248, 253, 260, 281, 309, 313,
 329, 457, 657, 945 and 952: "liveness: no client write completed after the last heal". Two nodes are refused, so range 2 has lost its majority, as (b)'s seeds have, and the
 check asks nothing of its keys; but a right half on a refused node traces no
@@ -23443,6 +23460,9 @@ check's "no write was asked of a live range" arm fires. The fix is this slice's:
 every replica on a refused node as refused, and the sweep's write bound is to be asked per
 range the run ended with, read that way. Not fixed before the owner's word on (a) and (b),
 since both move what this sweep's figures mean.
+
+**Corrected after #188 merged:** fixed, §5. On the merged tree the seeds of this shape are the
+ones #200's premerge named (217, 253, 281, 309, 329, 361, 376, 465, 657, 769), and all pass.
 
 ### 3. What is left of S10
 
@@ -23454,6 +23474,8 @@ since both move what this sweep's figures mean.
   reached, wait on (a), which the same seeds' refusals sit beside.
 - The node scenarios in `sim/tests/parallel.rs`; the pair rule's variants on this sweep;
   the first Phase 3 seeds pinned.
+
+**Corrected after #188 merged:** every item is done, in §5 to §11. Nothing was moved out.
 
 ### 4. PROPOSED, for the owner
 
@@ -23467,8 +23489,442 @@ since both move what this sweep's figures mean.
   registration waits on what cannot come; or `READS_OUTSTANDING` stays as it is and the
   sweep counts such seeds apart. Recommended: the first; the bound then measures what it
   was written to.
+
+  **Corrected after #188 merged:** (a) is D-128 and (b) D-129, the first recommendation each.
 - **The scenario's own choices**, all tunable and none measured yet: four clients, sixteen
   keys, two keys a side, Phase 2's bit rot of 0.02, four to eight driver actions a run.
+
+### 5. (c)'s fix: the write bound per range the run ended with, and what it moves (added after #188 merged)
+
+`raft::Report::key_range` is the map a run starts with, and this sweep starts with one user
+range, so it reads every key as range 2's: one majority test for the whole keyspace, one
+minimum for the per-range reading, and the false arm of §2 (c) wherever range 2 is impaired
+and a right half is not. Two changes, neither touching a constant:
+
+- **`ranges_with_a_majority_up` takes §8's reading for what no event names.** §8: "every
+  replica on the node counts as refused in the per-range majority rule". The node traces
+  `RaftReplicaRefused` from configuration, which never names a right half (#178), so a
+  `RaftRefused` now takes down every range outside configuration that its node traced a
+  `RangeCreated` of since its last refusal, until that replica's `RaftRecovered`. A voter of
+  such a range on an engine a re-seed built that holds nothing of it counts as impaired too:
+  a placeholder grants no vote (Q22) and the install that ends it quarantines (D-109).
+  Configuration's ranges read what they read before, so `RefuseOneRangeOnly`, the node naming
+  too few, is not papered over.
+- **`liveness_by_final_range`**, which this sweep alone calls, through `check_by_final_range`;
+  every other check runs as before and in the same order.
+  - Per key: the same fold and the same bound as `liveness`, asked where the range serving the
+    key at the run's end (D-102's `serving_at`) has a majority up.
+  - Per range: a range whose post-heal writes in the history all stayed pending is the wedge;
+    otherwise its first completion comes within the bound of its **first call in the history**, not
+    of the heal. A range here is as few as two of sixteen keys. At a thousand seeds a live final
+    range's first completion from the heal reaches 2.193 s against the bound's 2 s, where from its
+    first call it is 226 ms. The difference is the clients' routing and the network. On the two
+    ranges over the bound, seed 25's range 20 and seed 841's range 44, clients had invoked 5 and 4
+    writes before the first in the history. Those went to a node that does not lead the range
+    (nodes 4 and 5 hold nothing), fell in seed 25's 204 ms election or were dropped by the injected
+    loss. A write is abandoned at its 60 ms timeout and not asked again, and one no leader proposed
+    leaves no operation (`lin.rs`). Read from the first invoke, seed 25 is still over, at 2.053 s.
+    Being the history's, this origin moves with any stall in which nothing is proposed, so it cannot
+    say how long the cluster took to come back. The next arm can.
+  - The keyspace from the heal: `liveness`'s own per-range reading, the same code, kept beside that
+    arm, and D-076's "how long after the heal the range became writable at all". Every key starts in
+    range 2, so it asks the whole keyspace's first completion within the bound of the heal, where
+    range 2 has a majority up. On the correct system it is asked of 489 seeds of a thousand, worst
+    896 ms, and of 4 867 of ten thousand, worst 994 ms, none over.
+  - "The clients wrote nothing" is asked where every range the history touched has a majority up.
+    Where only some have, a live range with no write in the history says nothing.
+
+**What moved.** The bound is the same constant, ten maximum election timeouts. The asked set does not
+shrink: a voter impaired on a final range is on a refused node, a refused bootstrap node impairs range
+2, so if range 2 has a majority up every final range has one, and every key `liveness` asks of this
+sweep is still asked. `every_key_still_asked` in `sim/tests/shard.rs` asserts that inclusion on every
+seed of every tier. It says nothing of when a reading's clock starts. Three things moved:
+
+1. The arm from each final range's first call is new. Nothing before it asked anything of a final
+   range, and it is weaker than asking each one from the heal, which would be over the bound on 2 of
+   the 2 334 live final ranges at a thousand seeds, as above, which is why it reads from the first call.
+2. As first built that arm took the place of the reading from the heal, and this section said "not a
+   widening". Of the origin that was false (#216's review, B4). A stall in which nothing is proposed
+   moves every first call with it, so the effective bound from the heal had moved from 2.0 s to the
+   sweep's 2.2 s window (the settle, the bound and 200 ms), for the whole keyspace and nothing else.
+   Inside the window the two readings differ only when the whole keyspace's first completion lands in
+   (2.0 s, 2.2 s]: a stall that reaches the run's end leaves nothing completed and the
+   clients-wrote-nothing arm catches it on both, and no wedge that outlasts the run passes. Over the 242
+   uniform seeds of 500 with range 2 live, seeds failed by the old reading against this function as
+   first built, with the clients partitioned from every node for that long after the heal: 1.9 s 82
+   against 0, 2.05 s 242 against 28, 2.15 s 242 against 193, 2.2 s 242 against 242. With the servers
+   dropping every client request instead: 93 against 1, 242 against 23, 242 against 192, 242 against
+   242. It turned no seed green on the correct system, where neither reading fails a seed with range 2
+   live; the seeds that went green are §2 (c)'s. The band is closed now: the reading from the heal is
+   back beside the arm, and the keyspace is asked at 2.0 s.
+3. "The clients wrote nothing" asks less, on purpose: that is §2 (c)'s false arm.
+
+The timer check reads the same majority rule and runs on (c)'s seeds, which the false arm stopped short
+of it, and passes on them. Each reading has unit cases over hand-written records.
+
+**The pair for the reading from the heal.** `Schedule::clients_held_off`, an instrument a test sets and
+no drawn schedule holds, so no schedule moves: the clients cut off from every node for 2.05 s of the 2.2 s
+window, the heal not moved, and so a cluster nothing can write to for longer than the bound after the heal.
+Every uniform seed fails, 50 of 100 seeds, 42 of them first by this arm, each past every arm before it, and
+the other 8 by the clients-wrote-nothing arm. Asserted at every tier. On a variant: `ClientIgnoresMismatch`,
+each run to its end, trips this arm on 8 of 500 uniform seeds (§10), asserted at the thousand.
+
+**What this reading cannot see.** Every arm reads the history, and a write no leader proposed is not in it
+(`lin.rs`). So a live range whose clients asked for writes that nothing proposed is in none of the arms: no
+client having drawn its keys and no leader having taken its writes read the same, and a live range with no
+leader passes. Seed 2272's range 36 was asked 19 writes after the heal and seed 7949's ranges 35 and 36
+were asked 13 and 8, none of them in the history. Only the meta bound (§6) ever failed those two seeds, and
+the owner's ruling of 2026-11-09 excuses them from it (§6, #220), so no check fails them now and the sweep's
+printed count is what shows them. At ten thousand seeds, 24 of the 5 000 uniform seeds have a live final
+range with post-heal writes invoked and none completed, 3 to 34 of them. The bound passes all 24, most with
+no leader after the heal. When this was measured 22 passed `check()`; the other two were 2272 and 7949,
+which pass it since the ruling. At a thousand it is none of the 500. And the first completion ends the question: a range that
+recovers and then wedges passes, as does a key with one completed write and one left pending. Planted on
+the highest live final range, dropping its client requests at the server is caught on 4 of 495
+uniform-and-live seeds, on 0 starting 300 ms after the heal, and dropping its Raft frames on 100 to 201,
+by which frames the plant drops. Neither limit is new: `liveness` reads the same history. The first is
+#197, which also measures why D-103's reading from the invocations is not a drop-in (it fails a live half
+on the correct node), and the second is #158. Both stay open.
+
+**A second check defect, the payload oracle's.** `payload_is_well_formed` took a right half as
+hosted from its first `RangeSplit`. A node crashed with the split's batch durable and its
+`RangeSplit` not yet traced restates the right half at its next start before any node has traced
+the split: seed 88 under `NoPreVote`. Nothing in that shape is the variant's. The oracle now takes
+the ranges named anywhere in the run; a range no record names is still a stamp from nowhere.
+
+**Two more check defects, from the nightly's ten thousand on the correct system.** Both failed at
+the base too (2f223b1), so #216 did not make them, and each is the check's: the server's behaviour
+is one the documents already describe, as read here from the traces.
+
+*Check 20, seed 3291: the window above, in a second reader.* Node 3 commits the split of range 27 at
+122, crashes at 3.303 s with the apply's batch durable and neither its `RangeSplit` nor its
+`RangeCreated` traced, and restarts. At 3.7589 s it restates range 30 with a log, a descriptor at
+generation 4 and a core, before any node has traced the split: node 1's first `RangeSplit` of 30 is
+at 3.7788 s. It grants a pre-vote at 3.786 s, and that grant is the core's, since no placeholder
+survives a restart and node 3 has none of 30. Check 20 took only a `RangeCreated` as evidence of a
+replica and named the grant a node's that holds none. It now also takes a `RangesRestated` naming
+the range, which is what the node traces for every initialised replica it restated, and SHARD.md §8
+says so. Nothing a placeholder could grant for is ever named there, so the trip is unmoved: before
+and after, `UninitialisedReplicaVotes` trips check 20 on 89 of the node sweep's 100 compared seeds
+and 98 of this sweep's 100 and grants 3 043 times on `sim/split.rs`'s thousand. A relaxation can only
+remove violations, so equal counts are the same seeds.
+
+*The match-starts fold, seed 8934: a change to 0 is not a store's number.* Node 2's placeholder of
+range 43 answers leader 1 at 5.490970 s, stamped 0. Node 2's split creates its replica at 5.491099 s,
+and the store's first answer, sent at 5.496088 s, reaches the leader at 5.499330 s, ahead of the
+placeholder's at 5.499817 s. So the leader traces a first rise under the store's number, a reset to
+0, a reset back and a second first rise under the one number. `match_starts_are_first_rises` said a
+retired number had come back and D-079's comment said the correct system cannot do that, which this
+seed falsifies. D-042's consequences name the shape, "a rejection stamped 0 that is delayed past the
+install is a change too", costing a round trip; SHARD.md §8's `RaftMatchStarted` is the first rise
+after the leader recorded the number, "whether as its first record or by a change". This amends
+D-079, whose M7 ("a changed incarnation opens a window") stays dead for every change between two
+stores' numbers.
+
+The obvious fix, a reset to 0 opens a window, is the wrong one: a refused server answers 0 too, and
+`RefusalNotDurable` is caught by exactly a 0 between two rises of one number. So the fold reads what
+could have sent the 0. A window opens at a reset to 0 read **while the follower holds a store**, and
+the trace says it does from its `RaftRecovered`, `RangeCreated` or an install's `RaftSnapshot`
+(`taken: false`) to its node's next `RaftRefused` or its `RangeRemoved`. A store stamps its own
+number, so a 0 read then is older than the store. A refused follower's 0 is its own and opens none,
+and a number that then comes back is a store that lost its state: `RefusalNotDurable` is caught on
+54 of 1 000 raft seeds before and after, all 54 by this fold. Read with the trace's refusals taken
+out, which is the obvious fix, the same 1 000 runs are caught on none: the refusal is what the catch
+rests on. `seed_21_a_refused_followers_zero_opens_no_window` holds that at every tier, on the one
+seed. The fold cannot see a live store that stamped 0 on an answer; no path does.
+
+Each seed is pinned on its mechanism and on what the old reading did, by taking out the records it
+did not read (`seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant`,
+`seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh`). Neither
+change moves a bound, a key or the system's behaviour. Check 20 is folded during a run, so a seed
+it stopped, 3291, now runs to its end and passes; the fold over `RaftMatchStarted` runs after the
+run and moves nothing.
+
+### 6. The meta convergence bound, measured and then asserted (added after #188 merged)
+
+**The reading** (`meta_lags_of`). §8: "After the last heal, meta names every key's current
+descriptor within a bound". The keys are the user ranges' spans, so it is asked per descriptor the
+run ended with: the first apply of each meta index, folded as `MetaApplied`'s won sub-intervals say,
+names a descriptor from the apply after which it names its whole span at its generation and goes on
+naming it, so an update that overwrites it ends what came before. Each is owed from the last heal,
+or from its first statement if that is later. It is asked on a uniformly scheduled seed (D-016) where
+the meta range's unimpaired replicas form a majority and the range's do, less the right halves the
+owner's ruling excuses (below). It runs at the end with the
+other checks about time and is no fold of the incremental checker, so the per-fold equivalence test
+has nothing to compare; its reasoning has unit cases.
+
+**Measured on the correct system**, at 1 000 seeds in release: 2 313 descriptors asked of, none left
+unnamed, median 0, p99 269 ms, worst 587 ms. **Asserted: ten maximum election timeouts, 2 s**, the
+write bound's own. That is 1.82 times the worst the nightly's ten thousand measures, 1.099 s; this section
+first called it 3.4 times the worst, which was the thousand's 587 ms.
+
+**The nightly's ten thousand did not hold it as first asked.** This section first said it did; #216's
+review ran it. On 21b2c78 in release: 23 283 descriptors asked of, the worst of those named 1.099 s, and
+**2 never named: at 10 000 seeds the correct system failed this bound on seeds 2272 and 7949.** Each is
+a right half with no possible majority, left by one refused node and one
+placeholder, which grants no vote (Q22):
+
+- *Seed 2272, range 36*, at generation 4 where the run stops. Node 3 is the only node that ever
+  leads it (3.62 s). It crashes at 4.274 s, before meta applied the update, and is refused at
+  4.705 s. Node 1 holds only a placeholder, made at 3.808 s: its range 2 reached the split's index,
+  119, by an install, so it never applied the split and never creates the replica. Node 2 alone is
+  initialised, and stays a pre-candidate.
+- *Seed 7949, range 35*, generation 3, the same. Node 3 is the only leader (2.303 s), crashes at
+  3.295 s and is refused at 3.484 s. Node 1's placeholder dates from 2.616 s, its range 2 installed
+  at 107, past the split at 89. Node 2 is the only initialised replica.
+
+A placeholder becomes a replica only by applying the split or by an install from the range's leader,
+and with no leader neither can happen, so each wedge lasts to the end of the run, 2.2 s past when
+meta was owed. `ranges_with_a_majority_up` counts the range as live, since it takes a placeholder as
+impaired only on a re-seeded node (§5) and node 1 is not one, so the bound as first asked asked of a
+range that cannot elect. D-035 prices in a deadlock with two impaired servers; this is one refused
+node. The write bound does not see these ranges (§5, "What this reading cannot see"); this bound was
+what named them.
+
+**The owner's ruling of 2026-11-09 (#220): this bound excuses exactly that shape, in a narrow form.** The
+wedge is real and permanent: with the settle extended by 300 s of virtual time seed 2272's range 36 and
+seed 7949's range 35 never elect, while the parent keeps advancing. It is availability and not safety, no
+data is lost, and nothing built today reaches it, since Stage D's rebalancer, merge and the meta update all
+need R's leader. A range is excused from this bound only where **all** of these hold
+(`shard::RightHalf::excused`, read by `right_halves_of`):
+
+1. fewer than two of its voters are able to vote: holding a replica on a store not refused since, neither
+   impaired nor quarantined;
+2. no `RaftLeader` of the range has been traced since the last heal, read as the last fault's
+   (`Report::last_fault_healed`, the earlier of the two heals this sweep holds), and none stands at the end of
+   the run;
+3. every other voter is a placeholder whose parent P is past the split point `s` by an install, or that holds
+   no P, so that no apply can ever end it. A voter that holds a replica and cannot vote with it is not one of
+   these, and keeps the range asked.
+
+Only a right half a `RangeSplit` named can be excused. The exception is in this bound's asked set alone
+(`Report::meta_lags_asked`): `ranges_with_a_majority_up` means what it meant, every other check asks what it
+asked, and the range is still live to them. `raft::Report::impaired_voters` exposes that rule's own sets and
+changes none of them.
+
+*What it excuses at 10 000 seeds*, as the sweep prints it (on this tree, in release): **18 of 23 283
+descriptors, on 17 of the 5 000 uniform seeds**, leaving 23 265 asked. 2 of the 18 were never named, seed
+2272's range 36 and seed 7949's range 35, and those are the only two whose excuse moves a verdict; the other
+16 meta had named. As (seed, range, generation): (2272, 36, 4), (2797, 11, 2), (2917, 20, 4), (3768, 37, 4),
+(4137, 19, 3), (5593, 51, 3), (5821, 12, 3), (6245, 35, 2), (6445, 3, 3), (7949, 35, 3), (7949, 36, 3),
+(7961, 35, 2), (8004, 19, 5), (8105, 3, 3), (9049, 40, 6), (9424, 20, 5), (9724, 35, 2), (9852, 19, 4). Seed
+7949's range 36 is a child of its range 35, and its placeholders hold no P. Of the descriptors still asked,
+none was left unnamed: median 0, p99 222 ms, worst 1.099 s.
+
+*It does not hide what the bound is for.* The plain form, "a placeholder counts as not up", was measured first and
+not taken, because it does. The plant is `only node 1 creates R`: at a split's apply only node 1 creates the right
+half, so every right half has one initialised voter and two placeholders whose P applied `s`, a bug where the wedge is
+none. Over 200 seeds, 100 uniform, each run to its end, on this tree (the plant is a throwaway and in no tree; its
+patch is `pwedge-b1-probe-tree.patch` of `~/Desktop/ananke-archive/2026-11-09-probes/`): **the bound trips on 74 seeds
+without the exception and on the same 74 with it**, excusing 1 of the 294 descriptors asked of, which meta had named. The
+plain form cuts the asked set to 99 descriptors and trips on **34**. `MetaOverwritesByArrival` is where it was with the
+exception in place: check 16 on 46 of 1 000 seeds and the bound on 8 of 1 000.
+
+*The test that keeps a tripping case with the exception in place.* `seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken`
+is seed 2272's own trace with one condition broken at a time: a second voter able to vote, a leader since the heal, a
+leader standing at the end, and node 1's parent reaching the split with no install, the plant's shape. Each makes the
+range asked and the bound fail on it. `seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound`
+pins the two seeds, each condition and what the bound would have said; hand-written cases in `sim/shard.rs` say the same
+of each condition one at a time.
+
+*What the exception costs.* This bound was the one check that named these ranges (§5, "What this reading cannot see").
+Since the ruling no check fails them, and the sweep's printed line is what shows them. #220 tracks the fix, which is not
+built here: a placeholder becoming a voter without a leader where its node's engine never held R. It must come after
+#175's.
+
+The same ten thousand also fails the correct system on seeds 3870 and 5303, by another check: #175, one refused node,
+a committed entry lost (§11). The owner ruled on 2026-11-09 that its fix lands in its own PR after the PRs now open. Until
+then 3870 and 5303 stay red.
+
+**The pair.** `MetaOverwritesByArrival`, on what this sweep's drops and resends do by themselves, each
+run taken to its end (`shard::run_to_the_end`, since check 16 would otherwise stop it first): check 16
+on 46 of 1 000 seeds, **the bound on 8 of 1 000**, the same figures with the owner's exception in
+place. Both are under D-061's 5 %, so both are asserted from the thousand and printed below it.
+`Fault::MetaReorder` is S12's.
+
+### 7. Refusals by the loss that made them (#45) (added after #188 merged)
+
+Over 1 000 seeds, 339 refusals on 293 seeds, each read off its reason's words (`Loss::of`): a dropped
+table 129, lost log records 128 (a missing head, a damaged segment), the manifest or `CURRENT` 82. A
+reason that names none of these fails the sweep, so a new way to lose state is read and named.
+
+**For a dropped table, the replicas it touches.** `SstDropped` named a table's sequence numbers and
+not its keys; it now carries the bounds the manifest holds, exported as the other tables' are. Two
+traces are pinned by hash, echo's and seed 42 of the one-group raft sweep (`SEED_42_BODY_HASH`,
+D-105); echo writes no table, seed 42 drops none, and both still pass. 146 tables were dropped, and
+**133 touch every replica on their node**, since a flushed table holds tenant 0's Raft state of every replica. By replicas
+touched: `{1: 9, 2: 1, 3: 28, 4: 27, 5: 31, 6: 20, 7: 12, 8: 12, 9: 6}`. So on this sweep the case #45
+asks to be revisited does not hold: 13 tables of 146, against 339 refusals, could have been attributed
+to fewer than all of a node's ranges. The bounds are the table's, not its keys, so this is an upper
+bound on what a table holds. #45's third question, Q33's moves and the quarantine cascade, is Stage E's.
+
+### 8. D-092: the block and the threshold, chosen from the measurement (added after #188 merged)
+
+**How often a split finds an empty block**, at a block of eight and a threshold of two, over 1 000
+seeds: `NoRangeId` 7 times on **6 seeds**, of 3 896 splits asked. 6 of the 7 are a node with no block
+granted since its restart; 5 had a grant traced within a minimum election timeout. **None spent a
+block**: at most 0 ids had been taken from the block in force, and the most any one block gave splits
+over the run was 6 of 8. A new run holds no id until its refill lands (§5's second rule), whatever the
+block's size, so the figure is about restarts and not about the pair.
+
+**The alternatives**, re-measured on the tip over the same thousand seeds (#216's review, N3: as
+first written the table was measured before D-128 and D-129, and its middle row disagreed with the
+figures just above it):
+
+| Block, threshold | `NoRangeId` | Seeds | Most ids from one block | Splits unanswered |
+|---|---|---|---|---|
+| 4, 1 | 587 | 56 | 4, spent | 87 |
+| **8, 2** | 7 | 6 | 6 | 47 |
+| 16, 4 | 11 | 4 | 6 | 45 |
+
+Four and one spends blocks: 580 of its 587 refusals are on a node granted a block since its restart,
+and 17 of the thousand seeds fail the sweep, the first (seed 20) on an asker left with no answer. At
+eight and at sixteen no block is spent, and 6 of the 7 and 9 of the 11 refusals are on a node with no
+block granted since its restart. Six seeds against four is too few to choose by.
+**Chosen: eight and two**, the pair the node scenarios already run, so no schedule moves.
+
+**D-092's per-seed assertion, read against what the trace can say.** The asker's retry ends on an answer:
+`retries_take_effect`, on uniform seeds with range 0 and the asked range live, each asker still asking
+when the last fault healed ends on an answer, within the write bound of that heal, or of its first
+refusal if that came later. An answer is any but `NoRangeId`, so one that refuses the split for another
+reason passes: D-092's "takes effect" is asked as far as an answer. An asker that stopped before the heal
+made no retry after it and is asked nothing. As first written the check could not fail, even with every
+entry marked unanswered (#216's review, B6), and the fix changed two things. The origin: it read
+`checked.last_heal`, the liveness window's start, which is past the driver's drain, so an asker the drain
+waited for had ended before it; it now reads the last fault's heal (`Report::last_fault_healed`). The
+predicate: it asked only that an asker with no answer be over the bound, and it now asks that an asker still
+asking at the heal end on an answer, however soon it stops. On the correct system it asks 3 askers of a thousand seeds and 7 of ten thousand, all
+answered, the slowest in 1.39 s against 2 s (seed 981, from its refusal). Seed 368's pin asserts it asks
+of its asker.
+
+**The pair.** `RefillNotResent`, an instrument outside §10's count: a refill is sent once and not again,
+which breaks the rule this entry states is what makes A enough. A refill sent while range 0 has no leader
+is then the last, so every split on that node is refused. It trips this check on 382 of the 1 000 seeds, 382 of
+the 500 uniform, and on no other check, so it is asserted at every tier (40 of `share()`'s 100). The check as
+first written trips none of the same runs, and neither of the two changes above is enough alone: the last
+fault's heal with the old predicate trips 101 of the 382, and the new predicate read from the window's start
+trips 96.
+
+**What is not asserted as D-092 wrote it.** D-092 also asks that no split follow on that node "until a
+`RangeIdsLeased` carrying that node's run is traced". This section first said that was check 18's clause
+already, and it is not (#216's review, N1). Check 18 asks that the right half lie in a block granted to
+the node that led the split, and it compares the node (`holders_of`), not the run; the run is folded only
+for the grants' uniqueness. So a split out of a block of that node's earlier run passes unless an id is
+then taken twice, and `IdBlockResumed`'s catch is that double use and not the resumption. Nothing here
+folds the run. Over the thousand seeds the correct system takes such an id on none: the 2 seeds the
+reading of §10 names are splits proposed before their holder's restart and first applied after it.
+
+**PROPOSED: the tier of the coverage.** D-092 asks the count asserted non-zero from CI's hundred and
+calls a hundred seeds' zero a hole in the driver's draw. At 6 of 1 000 a hundred seeds see none about
+half the time, and D-061, the owner's rule, puts a counter under 5 % at the thousand. It is asserted
+at the thousand and printed below it; S11's restart-then-split shape should raise the rate. D-092
+itself remains the owner's.
+
+### 9. The node scenarios in `sim/tests/parallel.rs` (added after #188 merged)
+
+`a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace`: the node under the raft
+sweep's arms, the node scenario, membership and quorum on the node, the install and re-seed scenarios,
+`sim/split.rs` (i) and (ii), and this sweep, each with seed 42 alone against the same seed beside its
+neighbours inside the driver.
+
+### 10. The pairs on this sweep (added after #188 merged)
+
+Measured on this tree, each over the seeds its test runs: `share()`, a tenth of the tier and at least
+twenty, is a hundred at the premerge.
+
+| Variant | Caught by | Rate | Asserted |
+|---|---|---|---|
+| `ClientIgnoresMismatch` | check 17 | 99/100 | every tier |
+| `ClientIgnoresMismatch`, each run to its end | the write bound: no write completed after the heal; the first completion later than the bound from the heal | 14/500 uniform; 8/500 uniform | the thousand |
+| `TrustStaleDescriptor` | check 9 | 99/100 | every tier |
+| `ApplyIgnoresSpan` | check 9, check 10 on 10 | 57/100 | every tier |
+| `UninitialisedReplicaVotes` | check 20 | 98/100 | every tier |
+| `SnapshotOverlapsReplica` | check 8, overlap clause; install clause on 21 | 19/100 | every tier |
+| `NoPreVote` | pre-vote's property | 80/100 | every tier |
+| `ResetTimerOnAnyRpc` | the timer check | 31/100 | every tier |
+| `RefuseOneRangeOnly` | state machine safety, on the rot's refusals | 19/100 | every tier |
+| `SendBeforePersist` | commit by majority | 100/100 | every tier |
+| `IdBlockResumed` | check 18's range-id clause, an id taken twice | 10/100 | the thousand's share |
+| `MetaOverwritesByArrival` | check 16; the meta convergence bound | 46/1 000; 8/1 000 | the thousand |
+| `RefillNotResent`, an instrument | D-092's `retries_take_effect` | 40/100 | every tier |
+| the clients held off past the bound, an instrument | the write bound's reading from the heal | 42/100 | every tier |
+
+**The two rows asserted at the thousand assert their shapes at every tier** (#216's review, N4: below the
+thousand these two tests asserted nothing). The catch stays where D-061 puts it. Each test also reads, from
+its own runs, that the shape it aims at was reached, which is the variant seen firing. `IdBlockResumed`: a
+split that took its id from a block of an earlier run of its node
+(`shard::splits_from_a_block_of_an_earlier_run_of`), on 6 of the gate's 20 seeds and 30 of the premerge's
+100; the correct system's new run holds no such id, and over a thousand seeds the reading names 2 seeds, 281
+and 781, each a split proposed before its holder's restart and first applied after it.
+`MetaOverwritesByArrival`: a split's update stored over a key meta already named at its generation or a newer
+one (`shard::meta_resends_stored_of`), on 19 of 20 and 985 of 1 000; on the correct system none, since §1's
+maximum by generation leaves such an update alone. Each reading has unit cases over hand-written records.
+
+S11 re-homes the routing variants with their shapes and S12 brings `Fault::MetaReorder`; these are what
+the sweep reaches without them. **Not on this sweep:** `LeaseTrustsTheClock`, caught on at most 1 of 475
+drift-exceeded seeds (the clocks are there, and 79 023 lease reads are served over the thousand, 1 973 of
+them past the drift bound, but the catch takes the raft sweep's lease trials, which the node sweep keeps),
+and `CountOlderTermForCommit`, which takes the Figure 8 driver. Check 6 here is check 5 under those clocks.
+**PROPOSED**: neither arm is drawn here. Recommended: keep it so, since each would add a cost for a catch
+the node sweep already has.
+
+### 11. What the merged tree shows, and the first Phase 3 seeds pinned (added after #188 merged)
+
+At 1 000 seeds in release on #198 and #200 with this work: **0 fail**, and all 24 tests of the binary pass.
+
+**At 10 000 seeds the correct system still fails, on two seeds, 3870 and 5303** (#216's review; 3291 and 8934
+failed there too, and those two were check defects, §5). So this branch does not turn the nightly green.
+
+- **Seeds 2272 and 7949: a right half with no possible majority**, one refused node and one placeholder,
+  which grants no vote. It elects no one and meta is never told. Both pass: the owner's ruling of 2026-11-09
+  excuses exactly that shape from the meta convergence bound, in a narrow form, and from nothing else, and the
+  sweep prints what it excused (§6, #220).
+- **Seeds 3870 and 5303: #175, one refused node, and a committed entry lost.** A node whose parent range is
+  re-seeded from a checkpoint below a split replays the split, re-creates the right half with no
+  quarantine, and votes, which D-109's PROPOSED section warned of and Q26 argues only for a re-seed before
+  the split. *Seed 3870, range 19:* entries 107 to 115 of term 2 are committed on nodes 2 and 3, node 3 is
+  refused at 4.620 s, its range 11 is re-seeded at 103, below the split at 106, and it re-creates 19 at
+  4.900 s. With node 1's vote it leads term 4 from last index 106 and applies a 107 of its own: state
+  machine safety. *Seed 5303, range 44:* node 3 is refused at 6.073 s, re-seeded at 83, below the split at
+  87, re-creates 44 at 6.384 s and grants node 1 term 5 with last index 88 against a committed 89: leader
+  completeness. Both fail in the same words on the base, 2f223b1, and nothing on this branch changes what
+  the correct server does there.
+
+**#175's fix lands in its own PR after the PRs now open**, the owner's ruling of 2026-11-09 on #175. It is not
+built here, and neither the live set nor the bound is changed for those two. Until it lands,
+`every_seed_passes_on_the_correct_sharded_sweep` fails seeds 3870 and 5303 at the nightly's tier.
+
+**The pins**, each asserting its mechanism: seed 41 on (a) (the right half's install first; under
+`InstallReplacesHostedSpan`, check 8's install clause at the switch); seeds 128 and 643 asserting (b)'s
+absence, with #200 as the reason; seed 986 on (b) as it stands now (reads refused and dropped; under
+`UnconfirmableReadKept`, the bound); seed 286 on a new run's empty block and seed 368 on a grant whose
+answer has not landed, neither of which refuses a store; seeds 2272 and 7949 on the wedge the owner excused, each
+condition of the ruling and what the bound would have said (§6).
+
+**Check 8's right-half clause, folded and not asserted (D-107), trips on 9 of 1 000 of this sweep's
+seeds: 281, 328, 444, 458, 508, 519, 525, 784, 825.** All nine were read, not only their messages, for
+the owner's ruling on the clause. Each is D-107's mechanism: a voter's P is installed past the split,
+by a lagging voter's stream or a re-seed's, the node crashes, and it restates P without R; on seeds 281,
+458 and 784 the crash falls between the install's switch and its read-back. Then, with the clients cut
+off, the cluster caught up and each engine read at rest with no rot at the audit's own crash:
+- **Eight of the nine**: R arrives on that voter by an install, its read-back equals the take that fed
+  it, and all three voters' engines hold the same keys and values.
+- **Seed 281**: R never arrives. Its other two voters' stores were refused, one before the split and one
+  after, so only node 1 holds an initialised R, the placeholders grant no votes, and R elects no leader:
+  D-035's deadlock with two refused nodes, and no range is live on that run, so nothing is asked of it.
+  Node 1's engine holds 13 keys, and the two re-seeded nodes hold 5 and 2.
+
+**What that shows, and what it does not.** The audit was a throwaway probe and no test in the tree
+reproduces it. What it showed is that on the eight seeds where R arrives, R's read-back equals the take that
+fed it and the three engines agree. Key counts cannot show that a key holds its latest value, so this section
+first overclaimed in saying "no key is lost" of seed 281 and "nothing is lost on any of the nine" (#216's
+review, N2). Read against the trace, each key's latest acknowledged write (re-run on this tree): on the
+eight seeds every one is in the applied log of a replica still standing. **On seed 281 one is not: `k12`'s
+latest acknowledged write, entry 82 of range 27 at term 4, was applied only on node 3, a refused node.** Node
+3 applied it at 3.4527 s and crashed at 3.453 s, the client's answer landed at 3.455 s, and node 3's store was
+refused at 3.609 s. Nodes 1 and 2 hold the entry in their logs, unapplied, having committed only to 81, and
+range 27 has no leader after node 3's. It is outside R, and it is the two-refused-nodes deadlock's cost and
+not the clause's. The clause's question stays the one D-107 puts to the owner.
 
 ---
 
@@ -23480,14 +23936,15 @@ reservations of 2026-11-01: D-113 for S10, D-114 for #186 (this, #183), D-115 fo
 N2: this first cited #162 for a reservation it did not then record). This entry took D-114
 and moved the footer to D-115. At a merge the entries are a union in numerical order with
 one footer, the highest plus one. Every code site carries `// PROPOSED(D-114)`. #186 closed
-#183. It merged at c7040b3 before its review's fixes, and each correction is marked where it
-stands.
+#183. It merged at c7040b3 before its review's fixes, #191 delivered those and merged at
+8a4cdad before its own review's fixes, and each correction is marked where it stands.
 
 **Context.** #180's review (N10) found it, and it predates S9. A voter's apply of a split
 wrote the two descriptors into the host's `descriptors` table under two acquisitions:
 P's narrowed descriptor first, then R's new one after the `RangeCreated { cause: split }`
-trace. The `snapshot` task's overlap rule (D-110, `install::admission`) reads the same
-table in one acquisition, when it decides whether a placeholder's install of R may go in.
+trace. The `snapshot` task's overlap rule (D-110, `install::admission`; the function's name
+*added after #186 merged*) reads the same table in one acquisition, when it decides whether a
+placeholder's install of R may go in.
 Between the two acquisitions, the table held P off R's span and no R, and the rule admits
 R's install on that state.
 - **In the simulator** no task runs there: the executor is cooperative and nothing
@@ -23512,51 +23969,86 @@ acquisition, and that was false: a caller could take the lock twice and still ca
 **The trace and the schedules do not change.** R's creation is still traced before its
 descriptor is in place. P's descriptor now goes in with R's, after that trace and not
 before it. Nothing between the two points awaits or draws, so every simulated run is the
-run it was. A scratch test hashed `split::run` seeds 0 to 7 and `reseed::run_after_split`
-seeds 0 and 1 on this tree and on b1da6ec's code, byte-identical, and #186's review
-re-hashed four and two of them the same. The helper's change after #186 merged moves
-where the lock is taken and nothing else, and the same hashes on it are identical to
-`main`'s at de9f4d7.
+run it was (*added after #186 merged*, from its PR and its review:) a scratch test hashed
+`split::run` seeds 0 to 7 and `reseed::run_after_split` seeds 0 and 1 on this tree and on
+b1da6ec's code, byte-identical, and #186's review re-hashed four and two of them the same.
+The helper's change after #186 merged moves where the lock is taken and nothing else, and the
+guard below is `cfg(test)`, in no crate's build but this crate's own tests. The same hashes on
+the tree with both are identical to `main`'s at de9f4d7.
 
-**The test, and what it can and cannot see.**
-`a_splits_two_descriptors_reach_the_hosts_table_in_one_step` (a unit test in `server.rs`)
-runs `ServerApplier::split` itself, through an environment that reads the table at every
-event the apply traces. A task on another worker could read the table at any moment outside
-the lock, and the traced events are the moments this test can read it at. On a voter:
-- the table is P's descriptor alone or both halves at every traced event;
+**The test, and what it can and cannot see.** Two unit tests in `server.rs`,
+`a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition` and
+`a_non_voters_split_puts_ps_descriptor_in_the_hosts_table_in_one_acquisition`, run
+`ServerApplier::split` itself. They read the table two ways: through an environment that
+reads it at every event the apply traces, and through a `cfg(test)` hook at the top of `lock`,
+which reads it at every acquisition. A read at the top of an acquisition finds what a task on
+another worker could find between that acquisition and the one before, and it needs no host
+thread. On a voter:
+- every table read is P's descriptor alone or both halves, with the range beside P untouched;
 - `install::admission`, the overlap rule itself on the correct range layer, refuses a
-  placeholder's install of R on every table seen;
-- the state between, P narrowed with R absent, is one the rule admits.
+  placeholder's install of R on both of those tables, which the test checks before the run;
+- the state between, P narrowed with R absent, is one the rule admits;
+- the apply acquires the table once.
 
-On a non-voter the table ends with P narrowed and no R.
+On a non-voter every table read is P's descriptor or P narrowed, the table ends with P
+narrowed and no R, and the apply acquires it once.
 
 *Corrected after #186 merged* (#186's review, B1 and N1). As first built the test ran the
-helper alone, on maps it built by hand, and read a copy of the overlap rule of its own, so
-it could fail on neither `split` nor the rule. Each row below is a plant measured on both
-versions:
+helper alone, on maps it built by hand, and read a copy of the overlap rule of its own, so it
+could fail on neither `split` nor the rule.
 
-| the plant | #186 as merged | this version |
-|---|---|---|
-| the review's: the helper for P alone before R's `RangeCreated` trace, R under a second lock after it | test ok; clippy clean | **test fails**: "at RangeCreated a reader found the table {RangeId(4): … generation: 2 …}: neither P's descriptor alone nor both halves"; clippy clean |
-| b1da6ec's two inserts, word for word | test ok; clippy's `dead_code` alone | **test fails** the same way; `dead_code` too |
-| two acquisitions with no traced event between them, after the trace, the helper kept for P alone | test ok; clippy clean | test ok; clippy clean |
-| the same without the helper | test ok; `dead_code` | test ok; `dead_code` |
-| the overlap rule switched off in `install.rs` (the review's N1) | test ok | **test fails**: the rule no longer refuses R's install on P's descriptor alone |
+*Corrected after #191 merged* (#191's review, B1, B2 and N1). #191, merged from ecaba15, read
+the table at traced events alone, and this entry said a return to two acquisitions with no
+traced event between them failed no test, because no test could see between them. That was
+false: the read at the top of `lock` sees between them. It also said the simulator never runs
+a task there, which holds only while nothing awaits between them, and it dropped the range
+beside P from its tables. The fourth column below measures it.
 
-The third row is the limit: **a return to two acquisitions with no traced event between them
-fails no test of this tree.** No test here can see between them:
-- the simulator never runs a task there;
-- a test racing host threads against the table is what `clippy.toml` and
-  `scripts/check-direct-io.sh` keep out of `ananke-shard` (D-040);
-- the real binary does not run the shard server.
+Each row but the last is a plant, on `split`, on the helper or, in the overlap rule's row, on
+`install.rs`, and the last is the correct tree; all are measured on the voter's and the
+non-voter's test. The voter's fails on every row but the last two, and each row but
+`held.clear()` and the non-voter's own leaves the non-voter's green, since it changes only a
+voter's path:
 
-What stands against that revert is the helper, which takes the lock itself, and review.
-**PROPOSED.**
+| the plant | #186 as merged | ecaba15 | this version |
+|---|---|---|---|
+| #186's review's: the helper for P alone before R's `RangeCreated` trace, R under a second lock after it | test ok; clippy clean | test fails; clippy clean | **test fails**: "at RangeCreated a reader found the table {…}: neither P's descriptor alone nor both halves", 2 acquisitions; clippy clean |
+| b1da6ec's two inserts, word for word | test ok; `dead_code` | test fails; `dead_code` | **test fails** the same way; `dead_code` |
+| two acquisitions with no traced event between them, after the trace, the helper kept for P alone | test ok; clippy clean | test ok; clippy clean | **test fails**: "at an acquisition of the table a reader found the table {…}", 2 acquisitions; clippy clean |
+| the same without the helper | test ok; `dead_code` | test ok; `dead_code` | **test fails** the same way; `dead_code` |
+| two helper calls, P and then R through the helper with `None` | | test ok | **test fails** the same way; clippy clean |
+| R first, then P | | test ok | **test fails** the same way; clippy clean |
+| P under a guard held across R's `RangeCreated` trace, R under a second lock | | test ok | **test fails** at the second acquisition; `dead_code` |
+| `held.clear()` as the helper's first statement | | test ok | **both tests fail**: the range beside P is gone |
+| the overlap rule switched off in `install.rs` | test ok | test fails | **test fails** |
+| a non-voter's P in two acquisitions | | | **the non-voter's test fails** on the count, 2 acquisitions; the voter's is green |
+| the correct tree | | | both pass, 1 acquisition each; 179 lib tests, clippy and `check-direct-io.sh` clean |
 
-**Related, not fixed here.** A creation is traced before its descriptor reaches the table,
-on the split's path and on a placeholder's install, so on a multi-threaded runtime
-`ServerHost::unheld` can answer for a replica already created as its placeholder (#186's
-review, N3; issue #189).
+**What remains.** **PROPOSED.**
+- **A direct `self.descriptors.lock()` bypasses the hook.** A grep finds no direct lock of the
+  descriptors table in the crate today. Not every lock in the crate goes through `lock`:
+  `install.rs` locks the `applied` table directly, twice, and `inbox.rs` locks its own state
+  directly, in a private `lock` of its own.
+- **`Observed`, the traced-event read, sees nothing past the helper.** Nothing is traced after
+  the helper on either path, so on the correct tree the only table either read finds is
+  P's descriptor alone, and the voter's "both halves" arm runs only on a plant. The hook at a
+  next acquisition is what sees the far side of a first one, and the end of the run is what
+  sees the table the helper left.
+- **An insert moved past an await is a different fault, and another test's.** The Context's
+  "in the simulator no task runs there" holds because nothing between the two inserts awaits.
+  Moved past `open_sibling(..).await`, R's descriptor lands after simulated time has passed, and
+  `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` fails at
+  `sim/tests/node.rs:1207` at 20 seeds, "a placeholder answered for a replica its node had
+  created", where the correct tree passes. Measured two ways: P through the helper before the
+  await with R under a second lock after it, which also fails the voter's test, and both
+  descriptors in one acquisition past the await, which passes both unit tests at 1 acquisition
+  each. So what the sweep catches is R's descriptor landing past the await (D-109 §1.6's rule),
+  not two acquisitions as such.
+
+**Related, not fixed here** (*added after #186 merged*). A creation is traced before its
+descriptor reaches the table, on the split's path and on a placeholder's install, so on a
+multi-threaded runtime `ServerHost::unheld` can answer for a replica already created as its
+placeholder (#186's review, N3; issue #189).
 
 **The nightly's rows (D-064).** No sweep is added, so no row.
 
@@ -23564,10 +24056,15 @@ review, N3; issue #189).
 
 ## PROPOSED D-115 — A re-seed after a split holds an install creation's generation: P's install on the re-seeded node is created at the split's generation over its left half, check 7 holds it at its floor, and reverting the creation's generation fails the run
 
-**The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for S10
-in the tracking issue #162, and D-114 for #183's fix (#186). This entry takes D-115, and the
-footer moves to D-116. At a merge the entries are a union in numerical order with one
-footer, the highest plus one. Every code site carries `// PROPOSED(D-115)`. Closes #172.
+**The number.** Off `main` at b1da6ec, whose footer read D-113. #162 records the
+reservations of 2026-11-01: D-113 for S10, D-114 for #186 (#183), D-115 for #187 (this,
+#172), D-116 for #181 and D-117 for #176 (*corrected after #187 merged*, #187's review, N3:
+this first cited #162 for a reservation it did not then record). This entry took D-115 and
+moved the footer to D-116. At a merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-115)` (*corrected after
+#187 merged*, N3: this said so first, and only `sim/reseed.rs` did). #187 closed #172. It
+merged at 2d9e8ad (`main` de9f4d7) before its review's fixes, and each correction is marked
+where it stands.
 
 **Context.** D-107 §2 item 2 makes an install's creation (`RangeCreated { cause: snapshot }`)
 name the generation and voters of the descriptor the switch put in place. Before, it named
@@ -23581,40 +24078,64 @@ reaches that reading. No seed re-seeded a node after a split, so a unit test of
 - `x` stays down until P's leader has compacted past the split;
 - `x` restarts on a store marked lost, so it is refused and re-seeded.
 
-Its `reached` already asks, on every seed, that `x`'s re-seed install P at generation 2
-with P's left half's end. The run's `check` folds check 7 over the trace. Two things were
-missing:
-- **Check 7 holding the creation.** Check 7 judges an install's creation as a statement at
-  its floor, and a statement with no value at or below its floor waits unjudged (D-107
-  §3). A green check 7 alone does not say the creation was compared with anything.
-- **The revert.** No run had been seen to fail with the reading reverted.
+D-109's test on it,
+`a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`, asks on every
+seed the run's `check`, which folds check 7, and its `reached`, which asks that `x`'s re-seed
+install P at generation 2 with P's left half's end.
+
+*Corrected after #187 merged* (#187's review, B1 and N1). This first said two things were
+missing: check 7 holding the creation, and a run that fails on the revert. Neither stands as
+written. `reached` alone fails the revert on every seed, so the revert already failed a
+standing test on `main`, and only the measurement was missing. In this run the split's value
+of P, at generation 2, lies at or below the creation's floor on every seed (measured 200 of
+200), so neither of check 7's waits arises here and it judges the creation. P's bootstrap
+value would not do that alone: a creation of a later generation than the value under it
+waits (#195's review, N1, which measured the creation still waiting, 200 of 200, with every
+generation-2 descriptor of P removed from the trace). What was missing was the measurement,
+and an ask of the creation whole. `reached` reads neither its start nor its voters. Check 8
+reads the start (`OneOwnerPerKey::push`) and asks only that it overlap nothing; the voters
+of this creation are read by check 7 alone (#195's review, N2).
 
 **What is added.**
-1. `AfterSplit::parent_created_after_refusal` (`sim/reseed.rs`): `x`'s first install
-   creation of P after its refusal, with its floor index and the descriptor it names, as
-   check 7 holds a creation.
-2. `AfterSplit::parent_created_at_the_splits_generation`, #172's clause per seed:
+1. `AfterSplit::created_by_install_after_refusal` (`sim/reseed.rs`): `x`'s first install
+   creation of a range after its refusal, with its position, its floor index and the
+   descriptor it names, as check 7 holds a creation's. `installed_after_refusal` reads it,
+   so the search is one (*corrected after #187 merged*, N1: first a second search, for P
+   alone).
+2. `AfterSplit::parent_created_at_the_splits_generation`, #172's clause per seed, asked
+   after `check`:
    - the creation names generation 2 and P's left half, `[k0, k1)`, both ends;
-   - check 7's own verdict holds (`Fold::DescriptorAgreement`);
-   - check 7's map has a value for P at or below the creation's floor, and the creation
-     equals it. So it was judged and agreed, not left waiting.
-3. `a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it`
-   (`sim/tests/reseed.rs`). On every seed of the tier, capped at the binary's `TIER_CAP` of
-   200 (D-081), it asks the run's `check`, its `reached` and the clause above. It is a
-   test of its own, beside D-109's quarantine test on the same run, so that the revert
-   fails a test named for what it reverts.
+   - it equals the value check 7's map holds for P at or below its floor.
+
+   *Corrected after #187 merged* (#187's review, B1, which both its verifiers refuted as
+   blocking; N1). This first said the second half showed the creation "was judged and
+   agreed, not left waiting". It makes check 7's comparison again, and does not show check 7
+   made it: with check 7 blinded to install creations the clause stays green. That check 7
+   judges them is held by its own unit test,
+   `an_install_must_agree_with_the_descriptor_in_force_at_its_index`, and `check`, asked
+   first, is check 7 on this trace. The clause adds the voters and a fault check 7 would
+   miss. With check 7 blinded to install creations and the creation's voters reversed, seed
+   0 fails it, "node 3's install creation of range 2 at its floor 128 names Held { …,
+   voters: [3, 2, 1], … }", where D-109's test as it stood passed 200 of 200 (the review's
+   measure). It no longer asks `Fold::DescriptorAgreement` again, which repeated `check`.
+3. The clause is asked inside D-109's test, on the same 200 runs. *Corrected after #187
+   merged* (#187's review, N1): it first swept in a test of its own,
+   `a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it`,
+   which re-ran those deterministic runs for one more clause. That test and its nightly row
+   are gone.
 4. The unit test of `created_from` (`server.rs`) no longer says no scenario reaches its
    call site. It names this run as the one that does.
 
-**The revert, measured.** A scratch plant, reverted before the gate, gave the call site
-in `created_by_install` no descriptor: `created_from(None, config)`. That is the first
-generation and the configuration's voters, whatever the snapshot held, as before D-107.
+**The revert, measured.** A scratch plant, reverted before the gate, gave the call site in
+`installed` no descriptor: `created_from(None, config)` (*corrected after #187 merged*,
+#195's review, N3: this first named `created_by_install`, which never calls it). That is the
+first generation and the configuration's voters, whatever the snapshot held, as before D-107.
+*Re-measured after #187 merged*, on the test as it now stands:
 
 | | the plant | the correct tree |
 |---|---|---|
-| the new test, 20 seeds, debug | fails, 20 of 20 | passes, 20 of 20 |
-| per seed, 200 seeds at the cap, release | check 7 fails 200 of 200 on `x`'s install of range 2; the new clause fails 200 of 200; `reached` fails 200 of 200; every creation of P at generation 1 | none fails; every creation of P at generation 2 |
-| D-109's quarantine test, 20 seeds, debug | fails, 20 of 20, by check 7 (its `check` runs first) | passes |
+| D-109's test with the clause, 20 seeds, debug | fails, 20 of 20, by check 7 (its `check` runs first) | passes, 20 of 20 |
+| per seed, 200 seeds at the cap, release | check 7 fails 200 of 200 on `x`'s install of range 2; the clause fails 200 of 200; `reached` fails 200 of 200; every creation of P at generation 1 | none fails; every creation of P at generation 2 |
 
 Seed 0 under the plant: "descriptor agreement: node Some(3)'s replica of range 2 was
 installed at index 128 with Held { …, generation: 1, voters: [1, 2, 3], state: Live },
@@ -23624,16 +24145,1098 @@ what check 7 catches. The rate is 100 %, so the catch would hold at every tier (
 is not a standing variant: #172 asks that the revert be seen to fail the run, and the
 plant is not shipped. **PROPOSED.**
 
+**The tier: capped, on this run's own figures.** *Corrected after #187 merged* (#187's
+review, N2): this first cited D-081 for the cap, and D-081's case is `run`'s cost, 0.40 to
+0.47 CPU seconds a seed. `run_after_split` costs about 0.17 to 0.21 CPU seconds a seed:
+- D-109's test, with the clause, weighs 39.9 to 43.5 CPU seconds for its 200 seeds at load
+  averages of 497 to 541, and #187's own test on the same runs weighed 31.8 to 35.2 at 86
+  to 100;
+- its peak RSS was 0.21 to 0.24 GB at the first load and 1.42 GB in the review's run at a
+  lower one, which follows how many seeds run at once and not how many run in all.
+
+Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the nightly's ten
+thousand some 1 700 to 2 100, about a whole nightly shard (shards carry 1 977 to 2 237,
+D-064), for clauses that hold or fail on every seed at twenty. So the run stays under the
+binary's `TIER_CAP`, and that cap is put to the owner with D-081's. The line the run prints
+names this entry, where it named D-081 (#195's review, N5). The cap samples the run's
+rarer schedules thinly: 5 of 200 seeds install P at floor 192, after a second compaction,
+against 127 to 129 on the rest (counted by the review, and again here), and nothing asserted
+reads that schedule apart. **PROPOSED.**
+
 **What is not here.** #175 is the other half of a re-seed after a split, a node that replays
 the split from a pre-split snapshot and creates R unquarantined; it is the owner's question
 (D-109 §2). #178 is also the owner's. Neither is touched. #176, a re-seeded node staging in
 the directory it refused until its next start, is unchanged too, and nothing asserted here
 reads that directory.
 
-**The nightly's rows (D-064).** One `reseed` row, weighed in release from the built binary
-at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs the cap's 200: 34.7 cpu s, the median
-of three runs taken beside other slices' builds (load averages 86 to 100). It goes into the
-lightest shard, shard 6, at 1832.3 -> 1867.0.
+**The nightly's rows (D-064).** *Corrected after #187 merged* (#187's review, N1): #187 added
+one `reseed` row for its own test at 34.7 cpu s, in shard 6, 1832.3 -> 1867.0, and 2168.1 ->
+2202.8 at #185's merge. That row is gone with the test. D-109's row, for the test that now
+asks the clause, is re-weighed in place, from the built release binary at ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100, which runs the cap's 200: 27.8 -> 41.9 cpu s, the median of three runs
+(33.88 + 5.97, 35.58 + 7.89, 34.88 + 7.00), at load averages of 497 to 541, so the figure is
+if anything high. Shard 6's header is recomputed from its rows: 2202.8 -> 2182.2.
+
+---
+
+## PROPOSED D-116 — Check 8's created-twice clause: a `RangeCreated` of a range on a node that holds it initialised is a violation whatever made either creation, which is §5's "the apply asserts it" asked of the trace; `IdBlockResumed` trips it under the equivalence test, and seed 219 of the node sweep under `SnapshotOverlapsReplica` is pinned
+
+**The number.** Off `main` at b1da6ec and merged with `main` at de9f4d7 (§10), whose footer
+reads D-116. D-113 is S10's, still open in #188; D-114 and D-115 are on `main`. This entry
+takes D-116, and the footer moves to D-117. At each merge the entries are a union in
+numerical order with one footer, the highest plus one. Every code site carries
+`// PROPOSED(D-116)`. Closes #181.
+
+**Context.** SHARD.md §5 said the overlap rule makes the apply's "R already initialised
+here" unreachable (SHARD.md:808-810 before this entry), and then: "The apply asserts it."
+Nothing asserted it:
+- D-109 §2 built it as a node failure, at a voter's split that finds R's store on the
+  node. It fired first under `IdBlockResumed`. That variant's second split takes an id the
+  first split already took, so every voter's apply found that right half, and every node
+  stopped before check 18 could see the reused id. The assertion went to S9.
+- D-110 §7 did not build it. Keyed on an install, it would need durable knowledge of
+  which replicas an install made. The entry recommended a fold.
+- D-110 §4 found the run it would have caught: seed 219 of the node sweep under
+  `SnapshotOverlapsReplica`. Node 3 creates range 62 twice, by its split's apply and by an
+  install, and only Raft's state machine safety sees the run fail. #181 records it and
+  recommends the fold built here.
+
+### 1. The clause
+
+A `RangeCreated` of R on a node whose spans hold R is a violation:
+- the spans are check 8's, folded from its events in §8's fixed orders;
+- R is in them from its creation there, or from its restatement since the node's last
+  crash;
+- it leaves them at a `RangeRemoved` of R, a crash of the node, or its `RaftRefused`;
+- the cause of either creation does not matter: a split's apply, an install or a
+  bootstrap.
+
+**The words** name the node, the creation's cause and floor index, and what made the range
+held (a creation, by its cause and floor index, or a restatement at its applied index):
+
+> one owner per key: node 3 traced a `RangeCreated { cause: snapshot }` of range 62 at
+> floor index 347 while it holds range 62 initialised, created by a split at floor index
+> 346, with no `RangeRemoved` of it, crash or refusal of the node between: a replica
+> created twice on one node (SHARD.md §5, the apply's "R already initialised here"; §8,
+> check 8)
+
+**Latched, like the other two clauses.** `OneOwnerPerKey::created_twice_verdict` and
+`Fold::CreatedTwice` (check 8, the words `one owner per key:`, shown as "check 8 (one owner
+per key, the created-twice clause)").
+
+**"Holds" is check 8's own reading: what the node's trace has said since its last start.**
+A crash forgets the node's spans and the restatement states them again. A node that
+restates no R holds none; for a voter of R's split, that is the right half's clause's to
+see. Refusals are covered by the same reading. A refusal also ends the holding, as it ends
+check 8's spans. On this tree a refusal is traced only by a start's re-seed, so a crash has
+already ended the holding (§7, M4).
+
+**The stronger reading.** A holding could instead last across a crash, ended only by a
+removal or a refusal. That reading sees one more fault: a node that does not restate a
+replica it holds and later creates it again. That fault is not "R already initialised
+here", since the node does not hold R. It is a creation that did not survive a restart, the
+mirror of check 21's removal. On the correct system the two readings agree: every creation
+is traced once its batch is durable (a split's apply is a synced batch, an install's
+creation is traced at its switch), so a restart restates it. Measured at the gate's twenty
+on every node binary (§7, M5). **PROPOSED**: check 8's reading, as #181 recommends ("since
+its last crash and restatement"); the stronger one is the owner's.
+
+**SHARD.md is amended to say so.**
+- §5: "The apply asserts it" becomes "Check 8 asserts it, of the trace and whatever made
+  either creation", with the reason the node does not fail.
+- §8: check 8 gains the clause.
+- §12: the clause is added to Stage C's folds, and its tripping variant to Stage C's exit
+  list.
+- §10's rows need no change. `SnapshotOverlapsReplica`'s row already names check 8 at the
+  install's `RangeCreated { cause: snapshot }`, which is where seed 219 trips the clause.
+  `IdBlockResumed`'s catch stays check 18's (§3).
+
+### 2. A clause of check 8, not a fold of its own
+
+- **The state it reads is check 8's.** That state is the spans of each node's initialised
+  replicas, folded from check 8's six events: `RangeCreated`, `RangeDescriptor`,
+  `RangeRemoved`, `RangesRestated`, `NodeCrashed` and the node's `RaftRefused`. A fold of
+  its own would keep a second copy of that map, from the same events, under the same
+  rules for a crash and a refusal. Those rules would then have to be kept the same in two
+  places. The clause adds one map beside the spans, `held_since`: per (node, range), what
+  put the range there, a creation or a statement, which its words name. It is kept and
+  cleared exactly as the spans are.
+- **§5 derives the assertion from the rule check 8 holds.** "The same rule makes the
+  apply's 'R already initialised here' unreachable", and §5 says that rule "keeps one
+  owner per key per node (check 8 of §8)". The assertion also needs a fresh right half's
+  id (Q17), which check 18 holds. A second creation writes R's state over the first's on
+  one node: the split's `split_state_into`, or the install's switch. That is one range
+  owning its keys twice over, with one history replacing another. It is check 8's
+  question asked of one range rather than of two.
+- **Not check 7's.** Check 7 is a map per (range, index) across the cluster and knows no
+  node. The second creation on seed 219 states the value the map holds there: the same
+  span, generation and voters at a floor above the split's. So check 7 rightly passes it.
+- **Not check 20's.** Check 20's set of held replicas lasts across a crash and ignores a
+  refusal, because a grant is judged against everything the node could ever have voted
+  with. It is a rule fold about votes.
+
+### 3. In the checker's verdict, last
+
+`Fold::VERDICT` gains the clause after the overlap clause, and `Fold::ALL` puts it between
+the overlap clause and the right half's. Asked last, it moves no violation that another fold
+reports.
+- **`IdBlockResumed`.** Check 18's freshness clause trips at the second split's first
+  `RangeSplit`. That precedes, in §8's fixed order, every voter's `RangeCreated` of the
+  reused id, so the run's verdict keeps check 18's words. Measured over the node sweep's
+  seeds 0 to 999 in release: the clause trips on 630 seeds. The run's own verdict there
+  names:
+
+  | Check | Seeds |
+  |---|---|
+  | check 18 (`descriptor lineage:`) | 482 |
+  | state machine safety | 92 |
+  | check 7 | 22 |
+  | check 9 | 15 |
+  | log matching | 9 |
+  | commit by current term | 9 |
+  | check 16 | 1 |
+
+  None of them names the new clause.
+- **Seed 219.** The raft checker is asked before the range layer's at every look
+  (`sim/raft.rs`, `advance`). The run's verdict is still state machine safety, as D-110
+  §4 reported.
+
+The clause stops runs because the correct system never trips it (§4). The unit test
+`check_8s_created_twice_clause_is_asked_last_and_a_reused_id_stays_check_18s` holds the
+order: on a split that names a held right half's id again, the verdict is check 18's. On a
+second creation alone, the verdict is the clause's.
+
+### 4. The correct system
+
+Release, seeds 0 to 999. The clause is read fold by fold over every run's records, and
+the run's verdict, which now asks it, is read beside it:
+
+| Run | Clause in violation | Run's verdict |
+|---|---|---|
+| the node sweep (`raft::run_on_the_node`) | 0 | green on 1 000 |
+| `sim/split.rs` (i) | 0 | green on 1 000 |
+| `sim/split.rs` (ii) | 0 | green on 1 000 |
+| the membership scenario on the node | 0 | green on 1 000 |
+| the re-seed shape (`reseed::run`) | 0 | green on 1 000 |
+| a re-seeded node's right half (`reseed::run_after_split`) | 0 | green on 1 000 |
+| `sim/install.rs`, and its joiner's re-seed | 0 | green on 1 000 each |
+| `sim/split.rs` (i) with R split again (`run_overlap_resplit`, #185), after the merge (§10) | 0 | green on 1 000 |
+
+Every other test of the node binaries passes at the gate's twenty with the clause in the
+verdict. `SnapshotOverlapsReplica` on (i) trips the overlap clause on 1 000 of 1 000 and
+the created-twice clause on none: `x`'s P is installed past the split and never applies
+it.
+
+**A false creation the clause found, and what is fixed here.** The node traced a creation
+it had not made. `installed` read a creation off the core alone: applied 0, no log, no
+snapshot. §8 defines `RangeCreated` at an install as "an install on a node that held no
+initialised replica of the range", and an empty replica can hold a descriptor in two ways:
+- **A re-seed's system range.** The re-seed writes its descriptor and index-0 state into the
+  fresh engine (D-098), so the start restates it as initialised. If its leader has compacted,
+  an install catches it up.
+- **A bootstrap's replica installed before it applied anything.** Its node created it at
+  its bootstrap and restated it, and it has applied nothing when the snapshot arrives.
+
+So the clause is right to flag both, and the trace was wrong.
+
+**The fix.** `install_creates` asks whether the replica held a descriptor before the switch.
+A replica that did is installed and not created. Checks 2 to 4 lose nothing: an installed
+snapshot sets the floor exactly as a creation does (`ananke_raft::invariants`, `snapshot`).
+A descriptor that changes is traced as a `RangeDescriptor`, as on any initialised replica.
+SHARD.md §8 says so of the re-seeded system replica.
+
+**Where it is reached.** On this tree nothing reached the first way: none of the runs above
+creates range 0 or range 1 on a node after its refusal on any of its thousand seeds, and the
+node sweep refused no store on any of the 10 000 seeds of the nightly on 7d15a83 (run
+41330474538). S10's `sim/shard.rs` does reach it. Measured on #188's tip f3977a5, in release,
+with the clause's reading folded beside its correct sweep:
+
+| S10's correct sweep | Seeds | Seeds with a refusal | A second creation | The run's own check |
+|---|---|---|---|---|
+| without the fix | 100 | 31 | 7, every one range 1 on a node refused before it, over its restatement at applied 0 | not read |
+| with the fix | 1 000 | 293 | 0 | fails on 21, the seeds D-113 lists on its three mechanisms |
+
+So this clause, merged without the fix, would have failed S10's correct sweep on about 7 % of
+seeds.
+
+**The tests.**
+- `an_install_creates_only_a_replica_that_holds_no_descriptor` holds the decision.
+- `split::run_cut_from_the_start` reaches the second way in a run: a follower of P, cut off
+  before its first start reaches anyone, restates P at applied 0, applies nothing, and is
+  installed after P's leader compacts. Its test asserts each of those per seed, that the
+  run's checks pass, and that the follower's only creation of P is its bootstrap's. Green on
+  20 of 20 and 1 000 of 1 000. With the old reading it fails: §7.
+- No test on this tree reaches the first way. S10's sweep, with the clause in its verdict,
+  is what asks it, from the day both are merged.
+
+### 5. Its tripping variant: `IdBlockResumed` on the node sweep
+
+The clause is compared fold by fold under D-106's equivalence test against
+`IdBlockResumed`, in the test that already compares check 18 against it. That test is
+renamed in place `the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`.
+
+Measured fold by fold, release, seeds `0..n`:
+
+| Tier | Created-twice clause | Of those, over a restatement | Check 18's range-id clause |
+|---|---|---|---|
+| 20 | 14 | 13 | 14 |
+| 100 | 71 | 67 | 71 |
+| 1 000 | 630 | 605 | 630 |
+
+- **Same seeds.** At every tier the clause trips on exactly the seeds check 18's range-id
+  clause trips on.
+- **Each trip is a split's creation of a range its node holds.** In most, the node had
+  restated it after the restart the variant needs; in the rest, the first split had
+  created it.
+- **Asserted at every tier** (D-061: 70 %), together with a trip over a restatement (65 %).
+  Twenty seeds at those rates miss about once in 10^10 and once in 10^9.
+- **Each trip's mechanism is asserted too.** It is a `cause: split` creation, on a seed
+  where check 18's range-id clause also trips. So what the clause sees here is the reused
+  id and not some other second creation.
+- **It is a high-rate comparison, so it is in violation at every tier.** A fold fed in
+  chunks that lost its holdings between them reads `Ok` there, and the comparison fails on
+  it (§7, M3; #166's review, N7).
+
+**Why not `SnapshotOverlapsReplica`, whose harm §5 names.** No scenario reaches its second
+creation at a rate any tier can assert:
+- On the node sweep it creates a range twice on 1 of 1 000 seeds, seed 219. A thousand
+  seeds would miss that about once in three.
+- On `sim/split.rs` (i) it does so on 0 of 1 000 (§4).
+
+A shape where `x`'s P catches up by its log after R's install would reach it on every
+seed. That needs a new directed shape, so it is not built here (§9).
+
+### 6. Seed 219, pinned
+
+`seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`
+(`sim/tests/node.rs`).
+
+**Under the variant:**
+1. Node 3 makes a placeholder of 62 at 17.653 s.
+2. Its apply of range 5's split at index 346 creates 62 at 18.211 s
+   (`RangeCreated { cause: split }`, floor 346).
+3. The install, which the variant had let past the overlap check while node 3's 5 still
+   covered 62's span, creates 62 again at 18.289 s (`cause: snapshot`, floor 347).
+4. Node 3 applies 347 again at 18.305 s.
+
+Asserted:
+- those records, in that order, with nothing between the two creations that lets node 3
+  drop 62;
+- the clause, fed one record at a time, first in violation at the second creation, in the
+  words of §1;
+- the overlap clause green, because the split shrank 5 before the install was traced;
+- the raft checker, fed the same way, first in violation 16 ms later, at the re-apply;
+- the run's verdict is state machine safety.
+
+**On the correct node:**
+- the run is green;
+- node 3 refuses 62's install for overlap at 18.192 s, while its 5 still covers 62;
+- its apply of the split creates 62 once.
+
+The day a schedule moves the seed off either shape, the test names which, and the pin is
+re-audited (CLAUDE.md).
+
+### 7. Plants: what fails without each part
+
+Each change below was made to the clause alone. Each was run against `ananke-shard`'s unit
+tests, then the node binary's correct-node comparison, the `IdBlockResumed` comparison, the
+seed 219 pin and the correct node's sweep, then the `reseed`, `split`, `ranges` and
+`install` binaries, all at the gate's twenty:
+
+| Plant | What fails |
+|---|---|
+| M1: the clause never latches | both of its unit tests; the `IdBlockResumed` comparison ("tripped on no compared seed"); the seed 219 pin ("did not first trip at node 3's second creation of 62") |
+| M2: the checker's verdict does not ask it | the verdict-order unit test. The sweeps assert a correct system green and read the clause's own verdict, so they cannot see it |
+| M3: the holdings cleared at each `Checker::extend`, a fold that loses its state between the looks an incremental checker takes | the verdict-order unit test, and the `IdBlockResumed` comparison: on 14 seeds, "fed in chunks said Ok(()) and folded over the whole prefix said Err(...)" |
+| M4: a refusal does not end the holding | the unit test's refusal case, since it now holds a refusal alone. First run against a case with the crash before the refusal, nothing failed: every refusal on this tree follows its node's crash |
+| M5: a crash does not end the holding (§1's stronger reading) | the unit test's case of a crash after which nothing is restated. Every sweep is green |
+| M6: a restatement does not hold the range | the unit test's restatement case, and the `IdBlockResumed` comparison's trip over a restatement. First run without that assertion, the comparison passed on the trips over a first split's creation |
+| M7: an install's creation read off the core alone again (§4) | the run cut off from the first start, in the clause's words: "seed 0: one owner per key: node 2 traced a `RangeCreated { cause: snapshot }` of range 2 at floor index 12 while it holds range 2 initialised, created by a bootstrap at floor index 0, ..."; the decision's unit test |
+
+### 8. Traces, schedules and the nightly
+
+- No trace event is added and no schedule moves. A fold reads the trace, and an install that
+  no longer traces a creation draws nothing less. A check moves a run only where it stops the
+  run at a look where nothing else had, and §3 and §4 measure none. No pinned hash moved.
+- D-064 nightly rows:
+  - the comparison is renamed in place, keeping its shard 5 and its 23.1 cpu s; its
+    created-twice assertions read the folds it already compared;
+  - seed 219's pin is weighed from the built release binary at 0.7 cpu s and goes into the
+    lightest shard, shard 6: 1832.3 -> 1833.0. After the merge of §10 it is 2203.5;
+  - the run cut off from the first start, weighed the same way at ANANKE_SEEDS=1000, 80.0
+    cpu s (74.18 + 5.78, under load averages of about 480, so if anything high), goes into
+    the lightest shard, shard 1: 1977.1 -> 2057.1.
+- The premerge runs nothing new at its thousand.
+
+### 10. The merge of `main` at de9f4d7 (#185, #186, #187)
+
+**What `main` brought.**
+- #185 (D-110's review fixes) moves the overlap rule's decision for both install paths into
+  one function, `admission`. It refuses a placeholder's install of a range created here
+  meanwhile, and fails closed on a held replica's install. It also adds the resplit run and
+  `RetakeNeverAfterOverlap`.
+- #186 (D-114) puts both halves' descriptors in the host's table in one acquisition of it.
+- #187 (D-115) has a re-seed after a split create P at the split's generation.
+
+**The merge.** It takes the union in DECISIONS.md (D-114 and D-115, then this entry, one
+footer) and in the Current status. The nightly table keeps every row in the shard its own
+side placed it in and recomputes every header from its rows: shard 6 carries #185's resplit
+run at 335.8, D-115's 34.7 and this entry's pin at 0.7, 2203.5.
+
+**Seed 219 reproduces record for record.** `admission` still decides when the stream's
+descriptor is read. The split's apply lands between that decision and the switch, as
+before, and #186's one acquisition does not move it. The pin's times are the same to the
+nanosecond on the merged tree.
+
+**`IdBlockResumed`'s comparison is unchanged on the merged tree**: 14 of 20 (13 over a
+restatement) and 71 of 100 (67), against check 18's range-id clause on the same 14 and 71.
+
+**The thousand seeds, measured again on the merged tree** (release, seeds 0 to 999, before
+§4's fix, which moves no run of this tree, since none of them traces a second creation).
+Every figure of §3 to §5 is unchanged:
+- the node sweep's correct node: the clause in violation on 0, green on 1 000;
+- `IdBlockResumed`: 14, 71 and 630 (13, 67 and 605 over a restatement), on the seeds of check
+  18's range-id clause, with the run verdicts of §3;
+- `SnapshotOverlapsReplica` on the node sweep: the clause on seed 219 alone and the overlap
+  clause on 8; on (i), the overlap clause on 1 000 and the clause on none;
+- every row of §4 at 0, with #185's resplit run added.
+
+`RetakeNeverAfterOverlap`'s test reads `x`'s creations and its waits, not the run's verdict,
+so the clause does not touch it.
+
+### 9. For the owner (PROPOSED)
+
+1. The assertion as a clause of check 8, not a fold of its own (§2).
+2. Asked by the checker's verdict, last (§3).
+3. "Holds" read as check 8's spans, which a crash forgets and the restatement states
+   again, rather than as a holding that lasts across a crash (§1).
+4. `IdBlockResumed` on the node sweep as its tripping variant, and seed 219 pinned for
+   `SnapshotOverlapsReplica`. A directed shape for that variant's second creation — (i)
+   with `x`'s P left to catch up by its log — is not built (§5).
+5. An install onto an empty replica that holds a descriptor creates nothing, fixed here
+   because the clause turns it into a failure of S10's correct sweep (§4). The re-seeded
+   system replica's way is held by a unit test and by S10's sweep once merged, not by a run
+   on this tree.
+6. SHARD.md §5, §8 and §12 amended (§1).
+
+---
+
+## PROPOSED D-117 — The start that re-seeded runs its tasks on the directory the re-seed built: `engine` rebound for the `apply` task's takes, the `snapshot` task's staging and its sweeps, so the refused directory is never written again (#176)
+
+**The number.** This branch is merged with `main` at 8a4cdad, whose footer reads D-116.
+D-116 is reserved for #181, not merged yet; D-113 (#188), D-114 (#186) and D-115 (#187) are
+on `main`. D-117 was reserved for #176. This entry takes it and sets the footer to D-118,
+the next after this one. At D-116's merge the entries are a union in numerical order with
+one footer, the highest number plus one. Every code site carries `// PROPOSED(D-117)`.
+
+**Context: a correct-server failure against D-041.** D-041 and D-044, as Q15 applies them on
+the node (SHARD.md §11, storage 8; D-077), say a refused directory stays marked lost and
+quiesced, and is never written again. #176, found in #173's triage, suspected the node broke
+that rule from the code alone. A probe in #173's triage then confirmed it at seed 0.
+
+**What `run()` did.**
+1. A start picks `engine.dir`: the newest directory not marked lost (D-066).
+2. A loss found at that start refuses that directory, and `reseed` builds a fresh engine in
+   a new directory beside it.
+3. `engine` was not rebound afterwards. The fresh directory existed only inside `reseed` and
+   in the stores it returned.
+4. Three consumers were then handed `engine.dir`, which was still the refused directory:
+   - the `apply` task's `engine_dir`, which is where a take's version directory goes
+     (`snapshot::version_dir`);
+   - the snapshot planner, `Snapshots::with_cores`, whose `staging` names every stream's
+     staging directory;
+   - the `snapshot` task, `install::Task::new`, whose two sweeps list that directory:
+     `sweep` after a take, and `clear_staging` after an install.
+
+This lasted until the node's next start. From then on, D-066 opens the fresh directory as
+the newest one not marked lost.
+
+**The reproduction.** `reseed::run_after_split` (#173) is a natural shape for it. Its `x`
+applies a split, loses its store, and is re-seeded. It is then **not** restarted, and that
+same start receives two streams: its re-seed's stream of P, and the right half's stream to
+its placeholder. This entry gives the run two audits, both taken with `x` down:
+- one of `x`'s refused directory just before the restart that refuses it;
+- one at the run's end, after `x` is crashed.
+
+Both use a new recursive audit, `audit_tree`, which descends into directories. The re-seed
+shape's `audit` reads only files, so it would have missed a staging directory (#190).
+
+On `main` at 7b02530, in release, the refused directory changed on 200 of 200 seeds. On
+each, exactly two new directories appeared: P's re-seed staging and the right half's
+staging, `staging-r2-s<leader>/` and `staging-r<R>-s<leader>/`. Both were empty by the end.
+Every file the store held kept its size and checksum.
+
+**Seed 0, in full.** `x` is node 3, P is range 2, R is range 6, and the leader is server 1.
+The refusal is at 6.110 s, and the re-seed's marks at 6.169 s. The timings come from
+temporary prints in each consumer, which were not committed.
+
+| Consumer | What it did | Where |
+|---|---|---|
+| `snapshot` task, staging (`Snapshots::staging` → `install::Task::stage`) | Created the directory, then wrote and synced every chunk, duplicate chunks rewritten: `RAFT-FORMAT` (74 B), `000001.sst` (512 B, then 134 or 91 B at offset 512), `CURRENT` (25 B), `MANIFEST-000001` (138 or 154 B). From 6.169 to 6.259 s. | `/node/staging-r6-s1/`, `/node/staging-r2-s1/` |
+| `snapshot` task, `clear_staging` | Listed `/node`, removed the four files of each staging directory after its install, and synced the directory: r6 at 6.359 s, r2 at 6.442 s. | the same two directories |
+| `apply` task, take (`version_dir`) | Computed `/node/snap-r2-192-0`, then `-257-0`, `-322-0` and `-386-0`, and wrote nothing. These are follower record-only takes (D-065, D-078): no version directory is made, and `record.dir` stays empty. | (nothing written) |
+
+**Why nothing caught it.**
+- The re-seed shape's `reseed-crash` arm restarts the refused node on its first refused
+  mark, before any stream arrives. From that restart on, D-066 opens the fresh directory.
+- The shape's (e) takes its baseline at that crash, and reads only top-level files (#190).
+- The scenarios that re-seed a node and keep it running assert nothing about the refused
+  directory: the node sweep's refusals, about one seed in 10 000, and none in 1 000 probed
+  here; `sim/quorum.rs`'s refused node; and `sim/install.rs`'s joiner.
+
+**Takes and sweeps: none observed in the scenarios, reached by a directed test, covered by
+the fix.** A checkpoint take, and the sweep that follows it, need a replica on the node that
+leads.
+- In the start that re-seeded, every replica the re-seed rebuilt is quarantined, and a
+  quarantined core never campaigns (D-035; `core.rs` 1369-1371 and 1527-1529).
+- So is every replica a placeholder's install creates on that node (PROPOSED D-109 §2).
+- What is left is a split's right half created **after** the re-seed. The split writes no
+  quarantine for it (Q20, Q26), so it may lead. It then takes checkpoints into
+  `snap-r<id>-…` under whatever directory it was handed, and sweeps its own versions there.
+- The worst case #176 named is not reachable on the correct server: a sweep emptying the
+  refused store's *own old* checkpoints. A range's sweep matches only its own id, and an id
+  leased after the re-seed is new.
+
+No scenario on `main` was observed to reach that right half. It needs a node refused,
+re-seeded and not restarted, which then applies a split of a range it holds and leads the
+right half. That is unobserved, not excluded: the node sweep inserts two split arms on every
+seed (`sim/raft.rs`:1771 and 1779), and refuses a node about once in 10 000 seeds, none in
+the 1 000 probed here. S10's sharded sweep (`sim/shard.rs`, #188) may reach it too, if its
+schedule refuses a node and later splits a range on it within that start.
+
+#199 narrows "a range it holds": a re-seeded node that got a user range back by log replay
+holds no descriptor of it and refuses its split, and state machine safety trips. So today the
+split that makes such a right half is of a range that came back by a stream.
+
+`reseed::run_split_after_reseed` is the directed run for it, and its test is
+`a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs`. After
+`run_after_split` it splits P's left half at `k0a`, crashes whichever other node leads the new
+right half until `x` does, and writes to `x` past the threshold several times over.
+
+**Decision.**
+1. `reseed` returns the fresh engine's configuration, the refused one's in the new
+   directory, as `Reseeded::engine`.
+2. `run()` makes the start's `engine` mutable and rebinds it in the `Start::Refused` arm, as
+   soon as the re-seed returns.
+3. Everything after that reads the rebound value: the `apply` task's `engine_dir`,
+   `Snapshots::with_cores` and `install::Task::new`.
+4. The two facts the start also reads from `engine.dir` mean what they meant:
+   - `bootstrapped_now` checks `!reseeded_now` before comparing `engine.dir` with
+     `base_dir`;
+   - `on_a_reseed` is `reseeded_now || engine.dir != base_dir`, and is true either way.
+5. The refused directory is touched after the refusal only by the refusal itself: its marker
+   (D-044), written before `RaftRefused`.
+
+**Alternatives.**
+- **Leave it to the next start**, as D-066 has it. That is the bug.
+- **Rebind each consumer separately**, handing the fresh directory to three call sites.
+  Rejected: three sites to keep in step, and a fourth consumer added later would get the
+  stale directory by default. The rebinding makes the directory the node runs on the only
+  one there is to hand out.
+- **`Snapshots::adopt_fresh`**, D-075's switch of the planner to a fresh directory, which
+  drops what the old one was assembling. That is for a node that adopts a directory mid-run
+  with streams in flight. At a start, nothing is in flight and the planner is built after
+  the re-seed, so building it on the right directory is simpler.
+
+**The pair.**
+- **The buggy half.** `NodeVariant::TasksOnTheRefusedDir` keeps today's binding: under it,
+  the `Refused` arm does not rebind `engine`.
+  - It takes bit 25, free since PROPOSED D-108. Nothing on `main` at 8a4cdad or in an open PR
+    uses that bit; it is to be asked again at the merge.
+  - It is Q15's sixth way to get the refusal wrong, in `NodeVariant::RESEED`, which grows
+    from five to six. `BUGS` grows from 48 to 49.
+  - It changes nothing any trace check reads: the stores, the installs and every event are
+    the correct node's. So only the directory audit can see it.
+- **The correct half** is folded into
+  `a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`, which
+  already runs `run_after_split` on every seed of the tier. That spares a second sweep over
+  the same runs. Its name and nightly row are kept, and its doc lists what it now holds. On
+  every seed, beside D-109 §2's quarantine, it asserts:
+  - `AfterSplit::refused_untouched`: the marker still says lost, and no entry of the refused
+    directory, at any depth and other than the marker, differs between the two audits;
+  - `AfterSplit::staged_where_it_runs`: the fresh directory, `reseed::fresh_dir()`, holds a
+    staging directory of P and one of the right half, so the first clause is asserted of
+    runs whose streams staged somewhere, and the somewhere is named. Each of them is empty
+    at the end, since an install clears its own staging where the `snapshot` task was told
+    the node runs.
+
+  `run_after_split` takes the node's variants.
+- **The variant's test** is `a_node_whose_tasks_stay_on_the_refused_directory_is_caught`, on
+  `HIGH_RATE_SHARE`'s twenty seeds at every tier. On every seed it asserts that:
+  - the run passes every check of the trace and reaches its situation;
+  - `refused_untouched` fails;
+  - what changed is staging alone, and includes a stream of P and one of the right half;
+  - `staged_where_it_runs` fails, so that clause has been seen to fail as well.
+
+  D-115's clause is asked in the correct half's test, beside these two audits on the same
+  runs: #187 landed it as a test of its own, and #195 folded that into D-109's test.
+- **The directed test,** on `HIGH_RATE_SHARE`'s twenty seeds at every tier, holds the other
+  two consumers. Correct: the trace checks pass, the run reaches its situation, the refused
+  directory is untouched, and `AfterSplit::took_where_it_runs` holds: `x` led the new right
+  half and took at least two checkpoints, each take's version directory is in the fresh
+  directory and none is in the refused one, and a version other than the newest was swept
+  empty there. The newest is left out because the crash that ends the run may cut its take
+  short, which leaves an empty directory no sweep emptied. Under `TasksOnTheRefusedDir`: the
+  trace checks pass, and at least as many versions as takes are in the refused directory and
+  none in the fresh one.
+
+**Each consumer is held by a clause that fails (#192's review, N2).** Each was planted alone
+in scratch, the one consumer left on the refused directory, and reverted. Twenty seeds each,
+release; the cells are the seeds that clause failed on, and every check of the trace passed
+in every cell.
+
+| Left on the refused directory | `run_after_split`: `refused_untouched` | `run_after_split`: `staged_where_it_runs` | Directed: `refused_untouched` | Directed: `took_where_it_runs` |
+|---|---|---|---|---|
+| `Snapshots::with_cores` | 20 | 20 | 20 | 0 |
+| `install::Task::new` | 0 | 20 | 0 | 20 |
+| `apply`'s `engine_dir` | 0 | 0 | 20 | 20 |
+| All three (`TasksOnTheRefusedDir`) | 20 | 20 | 20 | 20 |
+| None (correct) | 0 | 0 | 0 | 0 |
+
+Before these clauses the review measured 0 of 20 on `run_after_split` for
+`install::Task::new` and for `apply`'s `engine_dir`. Under each mutant the real tests agree
+on twenty seeds: `install::Task::new` fails both the right half's test and the directed test,
+`apply`'s `engine_dir` fails the directed test alone, and `Snapshots::with_cores` fails both.
+
+Leaving either of those two behind also inflates the takes, on the one seed read: seed 0 takes
+35 checkpoints with the `snapshot` task left behind and 32 with the `apply` task, where the
+correct node takes 8 to 10 on every seed measured. The reading, from the code and not traced,
+is that the two then disagree about where a version is, so `find_version` misses and asks for
+a retake. No check of the trace sees it.
+
+**Measured, release, on this tree, merged with `main` at de9f4d7.**
+- The correct node passes the right half's test at 200 of 200 seeds (`TIER_CAP`), with both
+  new clauses and D-115's clause on the audited run.
+- `TasksOnTheRefusedDir` is caught on 200 of 200. On each, the trace checks pass, what
+  changed is staging alone and includes both streams, and the fresh directory holds neither.
+- At 100 %, the catch is asserted at every tier (D-061).
+- **The staging clause:** on 200 of 200 seeds the fresh directory holds exactly two staging
+  directories and not one file in either. No seed left files, so nothing here is weakened
+  for a stream cut short; if a schedule ever reaches one, the clause fails and says which
+  files.
+- **The directed run, correct node:** on 200 of 200 seeds `x` applied the split and every
+  clause held, with 8 takes on 14 seeds, 9 on 160 and 10 on 26, and 1 version still holding
+  files on 197 seeds and 2 on 3.
+- **The directed run, `TasksOnTheRefusedDir`:** on 200 of 200 the takes were all in the
+  refused directory (8 on 14 seeds, 9 on 158, 10 on 28) and no version in the fresh one.
+- **Again on the merge of `main` at 8a4cdad,** every clause above held at 200 seeds: the right
+  half's test with D-115's clause, the directed test on both halves, and the variant's test,
+  caught on 200 of 200, the two twenty-seed tests widened to 200 for this run alone.
+
+**The rows (D-064).**
+- The right half's test is re-weighed in place at 38.9 cpu s, from 27.8, with these audits,
+  D-115's clause (#195) and D-128's second writer on the run.
+- The variant's test is a new row at 2.8 cpu s, in the lightest shard, shard 1.
+- The directed test is a new row at 22.7 cpu s, in the merged tree's lightest shard, shard 5.
+- `scripts/nightly-shards.txt` gives the measurements, and every header is recomputed from
+  the rows beneath it.
+
+**What this does not change.** The re-seed shape's `run()` and its (e) are as they were.
+Giving them `audit_tree` moves that shape's schedules and its pins, which is #190's work.
+**PROPOSED.**
+
+---
+
+## PROPOSED D-119 — The sharded quorum scenario asks its hold of the root and the meta range: a re-seeded replica of either that votes is caught on nearly one seed in two, where it passed ten thousand (#143)
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-118 are held by
+other branches, and D-119 was reserved for this one. The footer moves to D-120. At a
+merge the entries are a union in numerical order with one footer, the highest plus one.
+Every code site carries `// PROPOSED(D-119)`. Closes #143.
+
+**Context.** #143, filed from D-101's plants. `NodeReport::holds` and every per-range clause
+of `NodeReport::check` iterated `Cluster::Node.ranges()`, the user ranges 2 to 5. Ranges 0
+and 1, which every bootstrap node has hosted since D-096, were asked only through the log
+invariants. So D-035 broken on the root alone passed ten thousand seeds on fdc5fc0, and
+passes a thousand on this entry's base, de9f4d7, with the same plant. A refused replica of
+the root or the meta range voting is D-035 broken where the cluster's routing lives.
+
+The issue leaves a fork: ask them, measuring the correct node at ten thousand first, or
+record why they are exempt. Measured, nothing exempts them but part of one clause, so they
+are asked.
+
+**What is built.**
+
+1. **The cast names every range.** `NodeCast::leaders` holds `Cluster::hosted()`, and the
+   wait before the cut runs until no hosted range is led by the victim. Without that, a
+   system range the victim led and had not yet re-elected would reach the cut with no one to
+   ask. The keeper and `both_outcomes` are still read off the user ranges, which are the
+   ones the hold drives writes into, so neither changes meaning.
+2. **Every clause of the hold runs over six ranges.** The fan-out, the re-seed, both
+   directions of the mark, the store-less and stream absences, the incarnations and their
+   twins; the keeper's office and the answers that carried it; the cut-off leader's
+   step-down inside its bound, no answer across the cut, and no one elected in the hold.
+   None of these needed a reason to differ on a system range, and none does.
+3. **The keeper's commit, where there is something to commit.** This is the one clause that
+   cannot be asked as it stands. The scenario drives four puts into each user range the
+   keeper leads, and writes nothing to a system range: no client writes one (Q4), and the
+   hold's keys are user keys. On the correct node 6 070 of the 9 985 keeper-led system ranges
+   of ten thousand seeds had no entry past their commit index, so an unconditional clause
+   fails correct code. The other 3 915 have one the run sent of its own accord: a `Refill`
+   on the root, a `MetaUpdate` on the meta range, or the keeper's no-op after an election
+   just before the cut. So `RangeHold::entry_to_commit` records that the leader's log held
+   an entry of its term past its commit index at the cut by `SYSTEM_ENTRY_DEADLINE`, half
+   the hold, and such a range must commit in the hold. All 3 915 do.
+
+   The deadline is new and measured, not a bound widened. Over seeds 0 to 999 the last such
+   entry lands 303 ms into the hold and each first commit comes within 30 ms of its entry, so
+   750 ms is far from both. Its only job is that an entry landing the instant before the heal
+   is not an obligation.
+
+   Driving a write into a system range was considered and not taken. It would be a `Refill`
+   under an invented run or a `MetaUpdate` restating a descriptor, neither of them a client's
+   write, and a new task on every seed moves every schedule in the scenario.
+4. **Two variants.** `Variant::ReseededRootReplicaVotes` and
+   `Variant::ReseededMetaReplicaVotes` are the core's: a re-seeded replica of that range, and
+   no other, grants votes and pre-votes past its quarantine (`Raft::quarantine_refuses_votes`).
+   It still never campaigns and makes no lease promise. They take bits 17 and 18, and RAFT.md's
+   table goes to nineteen rows. On the merge with D-129, whose variant holds bit 17, they are
+   bits 18 and 19, and the table has twenty rows. A server of one group runs range 2, so
+   neither changes anything there. Two, not one, because the two ranges' clauses can fail
+   separately: a variant covering both would pass with the clause gone from either.
+5. **The pair.** `a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario`
+   and its meta range twin assert at every tier that the election clause catches the variant,
+   on that range; that every catch is a seed whose leader the cut left on the far side and whose
+   victim granted a vote in the hold (`RangeHold::votes_granted`, the mechanism); and that nothing
+   else catches it. The vote could elect a candidate without an entry the range committed, but no
+   seed of ten thousand shows that here, so by D-101's rule it is not admitted: a verdict nobody
+   has read fails the test and gets read. The correct half is the existing sweep, renamed
+   `the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node`. It now also
+   asserts that the system ranges reached both outcomes, that a keeper's system range had an
+   entry to commit, that the keeper asked each system range's re-seeded replica for a vote and
+   was refused, and that the victim granted no vote at all.
+
+No fold is added: `holds` is this scenario's reading of its own trace, not one of
+`ananke_shard::invariants`' folds, so the per-fold equivalence test has nothing to run.
+
+### Measured before asserted (Q39, D-061)
+
+From the built release binary, an Apple M2 of 8 cores, with other slices' builds and sweeps
+beside it (load averages 360 to 850).
+
+| | 20 | 100 | 1 000 | 10 000 |
+|---:|---:|---:|---:|---:|
+| correct node, failed | 0 | 0 | 0 | **0** |
+| its seeds where the keeper asked the victim's root replica and was refused | 9 | 59 | 521 | 4 947 |
+| its seeds where the keeper asked the victim's meta replica and was refused | 8 | 51 | 497 | 5 068 |
+| its keeper-led system ranges with an entry to commit, all committed | 7 of 23 | 32 of 90 | 396 of 982 | 3 915 of 9 985 |
+| votes the victim granted in the hold | 0 | 0 | 0 | **0** |
+| `ReseededRootReplicaVotes` caught, every one by the election clause on range 0 | 11 | 56 | 491 | **4 578** |
+| … the cut left the root's leader on the far side | 11 | 60 | 523 | 4 945 |
+| … the victim's root replica granted a vote in the hold | 11 | 56 | 493 | 4 590 |
+| `ReseededMetaReplicaVotes` caught, every one by the election clause on range 1 | 8 | 48 | 466 | **4 651** |
+| … the cut left the meta range's leader on the far side | 9 | 51 | 495 | 5 043 |
+| … the victim's meta replica granted a vote in the hold | 8 | 48 | 466 | 4 660 |
+
+At 45.8 % and 46.5 % both catches are far above D-061's 5 %, so they are asserted at every
+tier. The difference between "far side" and "caught" was read off the trace, 20 seeds of the
+first 500 on the root, and it is a matter of timing, not of the log: all three logs are even at
+the cut on those seeds. A quarantined replica's election timer resets at its timeout instead of
+campaigning (`Raft::on_tick`), and a replica takes a vote only past the minimum election timeout
+since its timer last reset (`heard_from_leader`), so only part of each of its cycles can grant.
+On those seeds the keeper's requests kept landing outside that part through the hold: pre-votes
+refused and, where one was granted, the vote behind it refused. The variant is there, and that
+seed's hold does not exercise it. The correct node's 10 000 took 597.2 cpu s
+(540.89 + 56.33), the two variants' 535.8 and 533.1.
+
+The user ranges' figures on the correct node are D-101's to the number at ten thousand:
+25 871 ranges on the keeper's majority and every one committed through a re-seeded replica,
+14 129 cut-off, 9 607 seeds carrying both outcomes, and now 60 000 replicas refused and
+re-seeded.
+
+**One figure moved and has a reason.** `step_downs_naming_anyone_uncounted` moved from 45 to
+126 at ten thousand seeds. It was not zero before this entry: `main` at de9f4d7, without it,
+gives 0 at a thousand seeds, 8 at three thousand and 45 at ten thousand, all on user ranges. On
+this tree it is 5 at a thousand and 126 at ten thousand, and of the 126, 34 are on user ranges
+and 92 on ranges 0 and 1. All five at the thousand are on a system range, a cut-off leader
+elected 8 to 12 ms before the cut, which is the wait's own exit (item 1). That 8 to 12 ms holds
+only for the five seeds at a thousand: seeds 2605 and 7195 are 1.1 s. On those five, in those
+few milliseconds all it had from the victim's replica was the first answer, a rejection
+carrying the refused mark, which D-049's rule does not count, so its first window ends in a
+step-down naming the victim, 79 to 90 ms after the cut. That is D-049's rule at work
+on a range nobody was reading, not a fault: the leader steps down inside the bound either way,
+and no clause depends on the list being empty. It is the one figure D-049's pair moves here:
+126 under `RefusedNeverCounts` as on the correct node, 0 under `RefusedCountsForQuorum`, which
+counts that rejection, and every other figure the same on all three.
+
+### The plants, before and after
+
+Each was applied to a scratch worktree, swept from the release binary, and never reached the
+branch. "Before" is `main` at de9f4d7 with the plant alone; "after" is this tree with the
+plant. Each plant is on the one range named. Before, 200 seeds, unless noted.
+
+| Plant | Before | After |
+|---|---|---|
+| a re-seeded replica grants votes, root (the variant) | 0 of 1 000 failed | **491 of 1 000**, the election clause |
+| the same, meta range (the variant) | 0 of 1 000 failed | **466 of 1 000**, the election clause |
+| check quorum never steps the leader down, root / meta | 0 / 0 of 200 | **106 / 103 of 200**, "kept its office" |
+| a quarantined follower's answers are no sign of life, root / meta | 0 / 0 | **94 / 97**, "keeper stepped down" |
+| a quarantined follower's acknowledgement counts for no commit, root / meta | 0 / 0 | **51 / 32**, "committed nothing past index", the conditional clause |
+| the refusal skips this replica, root | 139, all by the range-id check; 61 pass | **200**: the same 139, and 61 by the fan-out clause |
+| the refusal skips this replica, meta | 140, all by state machine safety; 60 pass | **200**: the same 140, and 60 by the fan-out clause |
+| the root and meta replicas share one store incarnation | 0 | **200**, the twin clause |
+| the refused mark is never set, root / meta | 0 / 0 | **200 / 199**, "carrying **no** refused mark" |
+
+And the shipped tests themselves: with the election clause switched off for ranges 0 and 1 (a
+scratch mutation), both variants' tests fail at the gate's twenty seeds, "the hold's election
+clause caught … on no seed". Nothing else catches either variant, so without that clause the
+scenario still passes a voting system replica, which is the issue. Seed 2994's new pin, run on the
+old wait, fails on its verdict with D-101's leader completeness.
+
+### What the wait moved
+
+The wait in item 1 is the one change to what a run does, and it moves the cut on every seed
+where the old cut found a system range still naming the victim: 1 102 of the first 3 000 on the
+correct node and 1 111 under `RefuseOneRangeOnly`, the victim and the keeper the same on every
+one. That share is why the other way, leaving the cut where it was and asking such a range
+nothing, was not taken: it exempts over a third of the seeds, and the check's own rule is that
+the scenario must not pass by not asking. No other scenario runs this code, no pinned trace hash
+is of this one, and the core's new variants are off on the correct path, so nothing else moves.
+
+Over those seeds the aggregate figures hold, since who leads the user ranges does not change in
+the extra wait. The correct node's are D-101's above. `RefuseOneRangeOnly` is caught on 10 000 of 10 000, by
+the fan-out clause on 3 338 as before, by state machine safety on the meta range on **6 662**
+against D-101's 6 661, and by leader completeness off group 0 on **0** against D-101's 1. Of the
+first 3 000 seeds, the kind of verdict changed on exactly one, seed 2994. D-049's pair is still
+not caught, by the test that fails the day it is: 0 of 10 000 under each of
+`RefusedCountsForQuorum` and `RefusedNeverCounts`, whose absence the new clauses could have
+ended, and did not.
+
+**Seed 2994, the one pin this touches.** On the old cut, at 1.32 s, server 3 had taken range 4 in
+term 2 only 8 ms before, and the root still named the victim. Server 2 was then elected in term 3
+by the victim's amnesiac vote at index 13, without the committed index 14, which is D-101's
+witness. The new cut waits for the root's leader, at 1.354 s, so it comes at 1.37 s; in those
+50 ms server 3 catches server 2 up. The vote is unchanged, the only one server 2 is given, but
+server 2 is elected at index 15 and loses nothing, and the verdict falls to state machine safety
+on the meta range. The correct node's run on that seed does not move. CLAUDE.md's rule is an
+upgrade to the seed that now reaches the situation, or the absence with its reason. Seeds 10 000
+to 19 999 were searched for a seed to move to and hold none, so it is the absence:
+`seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry` asserts the
+vote, the last index and the new verdict, and each of those fails if the harm comes back. D-101's
+witness stays admitted in the variant's attribution, since the vote that makes it is still there.
+
+### The nightly's rows (D-064)
+
+Two `node` rows, weighed from the built release binary at ANANKE_SEEDS=1000
+ANANKE_DEEP_SEEDS=100, as user + sys, at load averages 400 to 540, so if anything high: the
+meta range's at 61.3 (54.34 + 6.91) and the root's at 60.4 (53.59 + 6.82). Longest-first into
+the lightest shard: shard 1 at 1977.1 -> 2038.4, then shard 5 at 1981.0 -> 2041.4. The correct
+node's row and seed 2994's are renamed in place. **PROPOSED.**
+
+---
+
+## PROPOSED D-120 — `Fault::SplitFromRestarted` with no split done is a wait of its settle alone, by design: `last_heal` stays where the arm before it left it and no gap follows (answers #147)
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. The brief that assigned
+this branch reserved **D-120** for it; other open branches hold the numbers between. The
+footer moves to D-121, and at a merge the entries are a union in numerical order with one
+footer, the highest plus one. Every code site carries `// PROPOSED(D-120)`. Closes #147.
+
+**Context.** When no split is done yet, `Fault::SplitFromRestarted` (`run_on`,
+`sim/raft.rs`) waits its `settle` and `continue`s, past the `last_heal = sim.now()` and the
+`advance(gap)` every other arm reaches at the loop's foot; it is the one `continue` in that
+loop. D-102 read the branch for the liveness readings (its section
+"`SplitFromRestarted`'s no-split branch"): it does not corrupt `last_heal`; moving
+`last_heal` to the arm's end changes no verdict of the correct node and, under
+`SharedSnapshotDir`, turns 47 uniform liveness catches into passes and 2 passes into
+catches at ten thousand; and the skipped gap moved only `Schedule::total`. D-102 left the
+branch as it was and asked, through #147, whether the split slice (D-100) meant it.
+
+**The answer: it is meant, on both counts.** D-100's text does not speak of the branch: its
+point 9 describes the arm as reached and says nothing of the gap. What settles it is the
+definitions the branch is read against, which it keeps, and the arm's doc and the branch's
+comment as D-100 merged them (5ddc2fc), which say what it is.
+
+1. **`last_heal` stays — and the reason is the comparison, not the field's words.** The
+   first draft of this premise argued that the branch leaves `last_heal` "at the last real
+   heal, which is what the field says it is". That is false on most of the population this
+   entry measures, and #196's review (B2) was right to block it. `Fault::Split` sets
+   `last_heal` at its own end at the fault loop's foot whether its split was done, refused
+   or unanswered — a split heals nothing and crashes no one — and
+   `Schedule::draw_on_the_node` inserts that arm at `at` and this one at `after >= at + 1`,
+   so **every** node schedule carries a split arm before this one — and the fault loop
+   reaches this one only by having run it — and on **377 of the first thousand** the split
+   arm is the one immediately before it. Measured on this tree over
+   `Schedule::draw_on_the_node`, seeds 0 to 999: the arm is the last on 429, the split arm
+   is immediately before it on 377, and both at once on 163. Where it is immediately
+   before, its end is exactly where the kept reading leaves the field. So on much of the
+   branch-taken population the kept reading, too, "asks the bound from a moment nothing
+   healed at" — the words this entry uses of the moved reading on seeds 656 and 920 below.
+   That imprecision is `Fault::Split`'s, it is not what #147 asked about, and nothing here
+   changes it ("Not taken" below).
+
+   What survives, and is what #147 actually asked, is the comparison of the two readings,
+   and the two are not independent: the moved reading is the kept one **plus** the previous
+   arm's gap and this arm's settle, on every run that takes the branch. The last real heal,
+   if the run had one, is at or before the previous arm's end, so the kept reading lies
+   between it and the moved one: the kept reading is the nearer of the two to the last real
+   heal and the moved one is never nearer. Both carry the split arm's imprecision; the move
+   adds this arm's own wait on top of it and buys nothing for that. Where a later arm
+   follows, that arm sets the field and the move changes nothing at all. Where this arm is
+   the last, the move starts the readings' clock (the liveness fold per key and per range,
+   D-102's end-of-run exemption) late by that gap and settle, and the stretch it drops is
+   not idle: it is the first of the cluster's recovery from whatever the arm before did,
+   which is what the bound is there to time, and a slow recovery ending inside it would go
+   unread with no fault of **this** arm's to answer for the allowance. The branch keeps the
+   stricter of two imprecise readings. That is the looser reading #147 warned of, and
+   D-102 and the figures below measure what it costs: 47 uniform liveness catches lost
+   against 2 won at ten thousand, and no verdict of the correct node moved.
+
+   SHARD.md §8 asks the bound "after the last fault heals", RAFT.md asks it "of the last
+   heal", and the field is "when the last fault healed or the last crashed server
+   restarted" (`Report::last_heal`): this branch asks no split, crashes no proposer and
+   moves no lead, so it has no moment of its own that any of the three names, and the
+   field's doc is widened here to say what the field really holds rather than to claim the
+   branch restores its old words.
+2. **The gap is not owed.** `Schedule::faults` is "the faults, each healed before the next,
+   with `gaps[i]` of quiet after it", and `gaps` is "the quiet after each fault". The branch
+   asks nothing of the cluster, so there is nothing to be quiet after. Its own wait is that
+   quiet, and at 800 to 1 200 ms (the node schedule's draw for this arm's `settle`) it is
+   longer than any gap a node schedule draws (100 to 300 ms for the split arms, 450 to 700
+   for the rest), so the arm that follows still starts after more quiet than a gap would
+   have given it. Not a general rule about arms that inject nothing: an unanswered
+   `Fault::Split` injects nothing too and spends its gap, and `Schedule::gaps`'s doc now
+   says so (#196's review, B1). This arm is the only one that skips it, and what earns the
+   skip is that its own wait is both longer than the gap and unasked-for.
+3. **D-100 wrote the arm as nothing.** Its doc as merged reads "Drawn after the split;
+   nothing if no split is done", and the branch's comment "the arm is a wait, counted as
+   not reached". The `continue` has been there since that commit. The sweep counts the arm
+   unreached too: `SplitStats::from_restarted` counts only the asks of a restarted proposer,
+   and `IdBlockResumed`'s test asserts the shape reached on some seed of its share
+   (`resumed > 0`), not on every seed.
+4. **The alternative buys nothing.** Spending the gap would redraw the run of every node
+   seed that takes the branch where it is not the last arm (32 of the first thousand), and
+   shift the window's end where it is (27), with the pins of those seeds, for nothing
+   anything reads: since D-102 the
+   end is read off the simulator, and `Schedule::total` already counts this arm at
+   `down + TRANSFER_WAIT + SPLIT_WAIT_BUDGET + settle` against the `settle` the branch
+   spends, so the gap is the smaller part of the total's overcount.
+
+**What changes.** No behaviour, no schedule and no trace: no pinned hash moves and no
+pinned seed is re-audited. Four doc sites and a test, nothing else. The branch's comment
+says why it skips both, so the next reader does not "fix" it into the looser reading, and
+says what it does *not* claim: that the field is back at a real heal. The arm's own doc on
+`Fault` says it leaves `last_heal` where the arm before it left it, "a heal or not".
+`Report::last_heal`'s doc is widened to what the field really holds — every arm's own end,
+`Fault::Split`'s included, with this one arm excepted — rather than the three words it
+carried, which the split arm already broke. `Schedule::gaps` names this arm as the only one
+that spends no gap and says explicitly that it is **not** a general rule about arms that
+inject nothing, since an unanswered `Fault::Split` injects nothing and spends its gap
+(#196's review, B1). A test holds it:
+
+- `a_split_from_restarted_with_no_split_done_is_its_settle_alone` (`sim/raft.rs`, a unit
+  test of the library, run by the `rest` job, so no shard row is due). A hand-built node
+  schedule: a 1.2 s warmup, no lease trial, gaps of 200 ms, the arm (down 300 ms, settle
+  1 s), the 2.2 s liveness window and every clock true. Three parts, each asserting
+  `stopped: None`, `uniform()` — so the liveness fold is known to be asked of it rather
+  than skipped by `Report::check`'s gate (#196's review, N3) — and `check()` green:
+  1. **After a 500 ms isolation**, seed 5: no split asked at all and no server crashed,
+     `last_heal` at the isolation's heal, 1.7 s, and the run stopped at 5.1 s — the heal
+     plus the isolation's gap, the arm's settle and the window. The plainest reading of
+     "injects nothing", but **not a shape the sweep can produce** (#196's review, B3).
+  2. **After a `Split` of 600 ms whose split is not done**, seed 0: `asked: 1, done: 0`,
+     `from_restarted: 0`, no crash, `last_heal` at the split arm's end, 1.8 s, and the run
+     stopped at 5.2 s — that end plus the split arm's gap, the arm's settle and the
+     window.
+     This is the **only shape the sweep reaches the branch with**, since the draw places a
+     split arm before this one on every seed (premise 1), so it is the shape all ~59 of the
+     sweep's occurrences in a thousand take; and part 1, where nothing is asked, cannot
+     tell a `last_heal` keyed on the split *asked* from one keyed on the split *done*
+     (the fourth plant below). Seed 0's split goes unanswered within the admin's round
+     (`done: 0, unanswered: 1`), an ordinary outcome of a split asked (361 of 1 941 at
+     D-100's thousand).
+  3. **After a `Split` of 600 ms whose split is done**, seed 5: the arm asks once and
+     crashes once, and `last_heal` is its own end with the gap and the window after it.
+
+  Seed 5 is pinned for part 3 because its split is done and seed 0 for part 2 because its
+  is not; should a change redraw either the other way, that part's first assertion says so
+  and another seed is to be pinned.
+
+**Plants, each applied alone to this tree and reverted** (`cargo test -p ananke-sim --lib`,
+debug):
+
+- **`last_heal = sim.now()` before the branch's `continue`**, the reading #147 warned of:
+  part 1 fails, `last_heal` at 2.9 s, the arm's end, against the isolation's heal at 1.7 s.
+- **`advance(&mut sim, *gap, &mut watch)` before it**, the gap spent: part 1 fails, the run
+  stopped at 5.3 s against 5.1 s.
+- **The arm blind to a split done** (`proposer.filter(|_| false)` in the branch's
+  `let`): part 3 fails, the arm asking nothing and crashing no one, (0, 0) against
+  (1, 1), though seed 5's split before it was done (`done: 1`). Without that part a test
+  which could not tell the branch from a broken arm would pass.
+- **`last_heal` keyed on the split asked rather than the split done**
+  (`if split_stats.lock().unwrap().asked > 0 { last_heal = sim.now() }` before the
+  `continue`), the change part 2 exists for (#196's review, B3): **part 1 passes**, because
+  no split is asked there at all, and part 2 fails, `last_heal` at 3.0 s, the arm's end,
+  against the split arm's end at 1.8 s. Keyed on the ask, the move would land on every one
+  of the sweep's ~59 occurrences in a thousand, every one of which has a split asked and
+  not done, and parts 1 and 3 between them would not see it.
+
+Reverted, the test passes.
+
+**Measured on this tree** (release; the counterfactual is D-102's: `last_heal` set to the
+no-split arm's end, which is `ended - schedule.settle` where the arm is last, and every
+draw unchanged; D-102's own figures are at ten thousand on its tree, these at the
+premerge's tier):
+
+- **The correct node, seeds 0 to 999.** The branch is taken on 59, as the last arm on 27,
+  13 of those uniform, where the liveness readings are asked. `check()` passes all 1 000 as
+  the tree stands, and with `last_heal` moved on the 27 no verdict of `check()` or of the
+  liveness fold changes. The stretch the move drops from the window is 934 ms at the least,
+  1 423 ms at the median and 1 726 ms at the most.
+- **`SharedSnapshotDir`, seeds 0 to 1 999, the 818 whose schedule ends in the arm.** The
+  branch is the last arm on 184, the figure #147 read on fdc5fc0, 105 of them uniform; the
+  818 carry 215 uniform liveness catches. The move turns 11 of those catches into passes:
+  slow writes or slow recoveries in the dropped stretch, as on seed 257, where a write to
+  k6 took 2.420 s from its call over the 2 s bound and the move reads it no more. `check()`'s
+  own verdict moves on 8 of the 11; on seed 268, one of the other 3, the read bound fails
+  the run either way. The move also turns 2 passes into catches, seeds 656 and 920, where
+  range 5's first write of the narrowed window took 2.045 s and 2.032 s: the range had
+  completed a write in the dropped stretch, so the kept reading has its recovery and the
+  moved one has thrown that evidence away. What separates the two there is the dropped
+  completion, not that the moved reading starts where nothing healed — on this population
+  the kept reading often starts at an unanswered `Fault::Split`'s end and nothing healed
+  there either (premise 1). These are the two directions of D-102's 47 and 2 at ten
+  thousand. The kept reading is therefore not a superset of the moved one on every run; it
+  is the nearer of the two to the last real heal, the one the spec's words come closest to
+  naming, and the one that catches more.
+
+**Not taken.**
+- **`last_heal` at the no-split arm's end** (1 above): a looser reading with no fault behind
+  it.
+- **The gap spent with `last_heal` kept** (4 above): moves schedules and pins for nothing
+  read.
+- **Dropping the arm at the draw when no split will be done:** the draw cannot know; whether
+  a split is done by then is the run's, and
+  on 5 of the correct node's 59 the split was done only after the arm began, its admin
+  still inside its round when the arm came.
+- **`Fault::Split`'s `last_heal`.** The plain split arm sets `last_heal` at its end like
+  every arm that asks something of the cluster; it asks a split, done, refused or
+  unanswered, and its settle is for the right half to elect and the clients to find it.
+  A split is not a heal and crashes no one, so that end is not what `Report::last_heal`'s
+  old words named either, and the draw puts this arm immediately before the no-split arm
+  on 377 of the first thousand node schedules, which is why premise 1 above rests on the
+  comparison of the two readings and not on the field's words. Tightening it — a separate
+  field for "the last moment something healed", or the split arm leaving `last_heal` alone
+  when its ask goes unanswered — would move the liveness readings of every node seed whose
+  split went unanswered or refused, and every node schedule carries exactly one split arm
+  (measured over seeds 0 to 999). That is not #147's question and nothing here changes it;
+  it wants its own entry and an issue of its own before it is touched.
+
+**The nightly's rows (D-064).** No sweep is added and the test is the library's, so no row.
+
+---
+
+## PROPOSED D-123 — `IncarnationPerRangeStream`'s read at a split's right half is run: under it every right half a split creates on a voter restates its stream's draw and the correct node's restates none, asserted of the draw itself
+
+**The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-122 are held by
+the slices beside this one, and the brief that assigned this one gives it **D-123**. The
+footer moves to D-124, and at a merge the entries are a union in numerical order with one
+footer, the highest plus one. The test carries `// PROPOSED(D-123)`, and `// PROPOSED(D-108)`
+beside it, since D-108 marks the tests that run the two instruments and this is a third.
+Closes #160.
+
+**Context.** D-108 named the split's read as the variant's second and measured that nothing
+fails when it is wrong: its M6, the split's draw reading the correct set, failed no test
+(#160). #160 and its second comment leave two routes open: assert the draw at the split, as
+the directed refusal test does at the re-seed, or remove the read if the owner rules the
+variant is the re-seed's alone. This entry takes the first. It moves no code, so the second
+stays the owner's to take.
+
+**Why the draw and not a check.** `range_rng` continues across draws, handles and restarts,
+so the variant repeats no incarnation, and a right half is new on every node anyway (D-108).
+Nothing downstream can see what it draws. Measured again on this tree, the run's checks fail
+none of the thousand seeds below, on either system.
+
+### The test
+
+`a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument`
+(`sim/tests/node.rs`) runs the node sweep on `high_rate_share` seeds: twenty at the gate and
+in CI, a hundred at the premerge, a thousand in the nightly. Each seed runs under the variant
+and under the correct node. Each `RangeCreated { cause: split }` is matched against its node's
+`n{id}/r{range}/protocol`, read through `range_rng` off a fresh `Sim` of the same seed, with
+the floor the apply puts under a draw (Q26). It asserts:
+
+- **the reach:** a split created a right half on a voter on some seed of each system, so a run
+  that stops reaching the draw says so and does not pass on nothing;
+- **the variant:** every creation restates one of its stream's first `1 + c` draws, `c` being
+  the crashes of its node the trace holds before the creation;
+- **the correct node:** every creation restates none of them.
+
+**Why `1 + c`.** Nothing on a node draws from R's stream before that node's apply of the split.
+R's id is fresh from a block (Q17). A placeholder draws nothing, and a placeholder's install,
+which does, is refused while the node's parent still covers R (Q27). Inside the apply the
+incarnation is drawn before the core's seed (`ServerApplier::split`). The one way past the
+first draw is an apply that drew and never reached its synced batch, which only a crash
+interrupts: the restarted node applies the split again and draws again, and only the second is
+traced. `store.apply` syncs (`engine.write(writes, true)`), so an apply that reached the trace
+is not applied again.
+
+**No seed of the thousand needs that allowance**, and it is reasoned, not observed. It stays
+so that a schedule a later change moves into that window does not fail a correct tree. Its
+cost is that a draw moved to the stream's second is not seen on a creation after a crash of its
+node. Half of the creations have none before them, so that mistake is still caught at every
+tier (the plant below).
+
+### Measured
+
+In release on de9f4d7, seeds 0 to 999, from one untracked harness that ran both systems and is
+not committed. Each tier's figure is over the seeds it runs. Three runs of the test at the
+premerge's hundred printed these same figures for the hundred.
+
+| Over seeds | 20 | 100 | 1 000 |
+|---|---|---|---|
+| a split created a right half, variant | 20 | 100 | 999 |
+| a split created a right half, correct | 20 | 100 | 999 |
+| the variant's creations | 90 | 472 | 4 871 |
+| of them the stream's first draw | 90 | 472 | 4 871 |
+| of them on a node that had crashed before | 51 | 241 | 2 442 |
+| the correct node's creations | 93 | 476 | 4 854 |
+| of them a draw of that stream | 0 | 0 | 0 |
+| the run's checks fail, variant | 0 | 0 | 0 |
+| the run's checks fail, correct | 0 | 0 | 0 |
+
+Seed 680 lands no split on either system, D-108's 999 of 1 000. The reach is far above D-061's
+5 %, so it is asserted at every tier, and the draws are asserted of every creation, at no rate.
+
+### The plants
+
+Each was planted alone in `crates/ananke-shard/src/` and reverted, the test built in release
+and run at the gate's twenty. M6 is D-108's and had builds of its own. The others shared one
+build, each switched on alone by an environment variable the build read, never committed. On
+this tree only the refusal test and this one run the variant.
+
+| | Plant | The refusal test | This test |
+|---|---|---|---|
+| | none | passes | passes: `{Some(1): 90}`, the correct node's 0 of 93 on the stream |
+| M6 | the split's draw reads the correct set | **passes**: the "before", as D-108 found it | **fails**: `{None: 93}`, *"seed 0: under IncarnationPerRangeStream node n1 created right half 14 with incarnation 11742426426398889910, which no draw of its stream for the range gives"* |
+| P1 | the correct node's split also draws from R's stream | not run | **fails**: the correct node's 90 of 90 on the stream, *"seed 0: the correct node n1 created right half 14 with incarnation 9039933487526354782, its stream's draw Some(1) for the range"* |
+| P2 | under the variant something draws from R's stream first | not run | **fails**: `{None: 40, Some(2): 53}`, the 40 being the creations with no crash before them |
+| P3 | the split's creation is traced with another cause | not run | **fails**: the reach, *"no split created a right half on a voter on any of 20 seeds"* |
+| P4 | a placeholder's install draws from the correct set | passes | passes: see below |
+
+### What is not here
+
+**The variant's third read.** D-108 counted two sites, and D-109 added a third: a placeholder's
+install (`install.rs`), a creation with `cause: snapshot`. This test does not read it, and P4
+shows that no test does. Over the same seeds the variant creates through it on 0 of 20, 2 of 100
+and 19 of 1 000 seeds. That is under D-061's 5 %, so its catch belongs at the premerge's
+thousand, which this test's share does not run, and a stream that a non-voter's apply of the
+split has already drawn from gives it no fixed position. It wants a test of its own and is left
+as a finding. The doc of `RangeVariant::IncarnationPerRangeStream` and its module's now name all
+three reads and say this one is unread.
+
+**A comment that contradicts D-108.** `install.rs` says that the variant's draw "gives a replica
+created again for the same (range, node) the number its predecessor drew". D-108 withdrew that
+claim from the variant's own doc: the stream continues, so it repeats no number. It is left as
+a finding with the third read, since it is that site's comment.
+
+**Nothing moves.** No code outside a test changes, only doc comments in `range_variant.rs`, so
+no schedule, trace or pinned hash can. **PROPOSED.**
+
+**The nightly's rows (D-064).** One `node` row, weighed in release from the built binary at
+ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs a hundred seeds of both systems: 111.5 cpu s,
+the median of three runs taken beside other slices' builds (load averages 480 to 870). It goes
+into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 

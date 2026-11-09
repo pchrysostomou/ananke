@@ -25,7 +25,7 @@
 // PROPOSED(D-109): `sim/split.rs` (ii).
 // PROPOSED(D-110): `sim/split.rs` (i).
 
-use ananke_env::sim::{Sim, SimConfig};
+use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{Environment, TraceEvent};
 use ananke_raft::ServerId;
 use ananke_shard::invariants::{self, Fold};
@@ -692,5 +692,83 @@ fn a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_rig
         !caught.is_empty(),
         "under RetakeNeverAfterOverlap x made R on every one of {seeds} seeds: the stale \
          checkpoint reached x before R′ on every seed, or the run no longer reaches the harm"
+    );
+}
+
+/// **A replica cut off from its first start is installed, not created a second time**
+/// (PROPOSED D-116 §4). A follower of P holds the descriptor its bootstrap wrote and has
+/// applied nothing when P's snapshot reaches it. The node read a creation off the core
+/// alone, so it traced `RangeCreated { cause: snapshot }` of a replica it had created at
+/// its bootstrap and restated, which check 8's created-twice clause fails. The same reading
+/// made a re-seed's system replica, restated with the descriptor its re-seed wrote, created
+/// by its install, which `sim/shard.rs` reaches and no scenario on this tree does. Per seed,
+/// at every tier (every seed reaches it): the run's checks pass; `x` restated P at applied
+/// 0 and applied no entry of P before its install; `x` installed P; and `x`'s only creation
+/// of P is its bootstrap's.
+// PROPOSED(D-116)
+#[test]
+fn a_replica_cut_off_from_its_first_start_is_installed_and_not_created_twice() {
+    let outcomes = sweep(seeds(), |seed| -> Result<u64, String> {
+        let report = split::run_cut_from_the_start(seed);
+        if let Some(why) = &report.unbuilt {
+            return Err(format!("seed {seed}: not built: {why}"));
+        }
+        report.check()?;
+        let x = report.x;
+        let on_x = |record: &&TraceRecord| record.node.is_some_and(|n| u64::from(n.get()) == x);
+        let installed = report
+            .records
+            .iter()
+            .position(|record| {
+                matches!(&record.event, TraceEvent::RaftSnapshot {
+                    server, range, taken: false, ..
+                } if *server == x && *range == split::PARENT)
+            })
+            .ok_or_else(|| format!("seed {seed}: node {x}'s P was never installed"))?;
+        let before = &report.records[..installed];
+        if !before.iter().filter(on_x).any(|record| {
+            matches!(&record.event, TraceEvent::RangeDescriptor { range, applied: 0, .. }
+                if *range == split::PARENT)
+        }) {
+            return Err(format!(
+                "seed {seed}: node {x} did not restate P at applied 0 before its install"
+            ));
+        }
+        if before.iter().any(|record| {
+            matches!(&record.event, TraceEvent::RaftApply { server, range, .. }
+                if *server == x && *range == split::PARENT)
+        }) {
+            return Err(format!(
+                "seed {seed}: node {x} applied an entry of P before its install, so the install \
+                 did not land on an empty replica"
+            ));
+        }
+        let causes: Vec<ananke_env::RangeCause> = report
+            .records
+            .iter()
+            .filter(on_x)
+            .filter_map(|record| match &record.event {
+                TraceEvent::RangeCreated { range, cause, .. } if *range == split::PARENT => {
+                    Some(*cause)
+                }
+                _ => None,
+            })
+            .collect();
+        if causes != [ananke_env::RangeCause::Bootstrap] {
+            return Err(format!(
+                "seed {seed}: node {x} created P by {causes:?}, where its bootstrap alone does"
+            ));
+        }
+        Ok(x)
+    });
+    let verdicts: Vec<Result<(), String>> = outcomes
+        .iter()
+        .map(|outcome| outcome.as_ref().map(|_| ()).map_err(Clone::clone))
+        .collect();
+    verdict(&verdicts).expect("every seed of the run cut off from the first start");
+    println!(
+        "split: a follower cut off from its first start: installed and not created again on \
+         {} seeds",
+        outcomes.len()
     );
 }

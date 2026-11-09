@@ -49,11 +49,13 @@
 //! at its first violation and again over the whole trace (D-046); linearizability of
 //! every key across every split (§9), which with the drifting clocks is check 6, lease
 //! safety under drift, as Phase 2 built it; pre-vote's property per (range, server);
-//! and, on uniformly scheduled seeds, the timer check and the write bound per key —
-//! then this sweep's own: the write bound per range the run ended with, the meta
-//! convergence bound (§8), the shape (nodes 4 and 5 hold nothing; every bootstrap node
-//! created ranges 0, 1 and 2), and D-092's per-seed assertion wherever a split was
-//! refused for want of a range id. Check 19 is S7's, which waits on D-093.
+//! and, on uniformly scheduled seeds, the timer check and the write bound, per key and
+//! per range the run ended with (`raft::Report::liveness_by_final_range`), where a range
+//! whose replicas on refused nodes leave it no majority is asked nothing (§8) — then this
+//! sweep's own: the meta convergence bound (§8), less the right halves the owner's ruling of
+//! 2026-11-09 excuses from it and from nothing else (#220), the shape (nodes 4 and 5 hold nothing;
+//! every bootstrap node created ranges 0, 1 and 2), and D-092's per-seed assertion wherever
+//! a split was refused for want of a range id. Check 19 is S7's, which waits on D-093.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,13 +66,14 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, Socket,
-    TraceEvent, race,
+    Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, RecoveredAs,
+    Socket, TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
+use ananke_raft::store::KeyPrefix;
 use ananke_shard::client::{Cache, RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::range::RangeId;
@@ -124,6 +127,16 @@ const SPLIT_RETRY: Duration = Duration::from_millis(150);
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
 /// How long the run waits after the last fault for the driver's admins still asking.
 const DRIVER_DRAIN: Duration = Duration::from_secs(5);
+/// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
+/// correct system before it is asserted (Q39; D-113 §6).
+pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
+
+/// The meta convergence bound: how long past the last heal, or past a descriptor's first
+/// statement if that is later, meta may take to name a live range's descriptor.
+#[must_use]
+pub fn meta_convergence_bound() -> Duration {
+    election_max() * META_CONVERGENCE_TIMEOUTS
+}
 
 /// One fault of the schedule. Every fault heals before the next starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +233,12 @@ pub struct Schedule {
     pub drifts: Vec<i64>,
     /// Each node's clock offset in nanoseconds, by node index.
     pub skews: Vec<i64>,
+    /// How long after the liveness window opens the clients stay cut off from every node,
+    /// the window's start not moved and its length not changed: what a cluster nothing can
+    /// write to for that long looks like to the write bound read from the heal (PROPOSED
+    /// D-113 §5). `None` in every schedule [`Schedule::draw`] draws, so no run of the sweep
+    /// has one; a test sets it.
+    pub clients_held_off: Option<Duration>,
 }
 
 impl Schedule {
@@ -301,6 +320,7 @@ impl Schedule {
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
             drifts,
             skews,
+            clients_held_off: None,
         }
     }
 
@@ -579,6 +599,9 @@ pub struct DriverStats {
     pub refused: BTreeMap<&'static str, u64>,
     /// Every `NoRangeId` answer, as (the node that answered, when).
     pub no_range_id: Vec<(u64, Instant)>,
+    /// Every split a `NoRangeId` answered at least once: what its asker's retries came to
+    /// (PROPOSED D-092's per-seed assertion).
+    pub retried: Vec<Retried>,
     /// Splits asked of every node in turn and answered by none in time.
     pub splits_unanswered: u64,
     /// Split actions that found no span holding enough keys to split.
@@ -589,6 +612,84 @@ pub struct DriverStats {
     pub transfers_done: u64,
     /// Admins still asking.
     pub outstanding: u64,
+}
+
+/// One `NoRangeId` read against the trace: what emptied the node's block
+/// (PROPOSED D-092's figures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoRangeId {
+    /// The node that answered it.
+    pub node: u64,
+    /// When.
+    pub at: Instant,
+    /// The node's last restart before it, if it restarted.
+    pub restarted: Option<Instant>,
+    /// Whether a block was granted to the node since that restart. Where none was, the
+    /// block is empty because the run is new, whatever the block's size: a new run holds
+    /// no id until its refill lands (SHARD.md §5's second rule).
+    pub leased_since_restart: bool,
+    /// Whether a block was granted to the node within a minimum election timeout after
+    /// the answer: D-092's split of the figure.
+    pub leased_within: bool,
+    /// How many ids splits had taken from the latest block granted since that restart.
+    pub taken: usize,
+}
+
+/// A split `NoRangeId` answered at least once, and what its asker's retries came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retried {
+    /// The range asked of.
+    pub range: u64,
+    /// When the first `NoRangeId` came.
+    pub refused: Instant,
+    /// When the asker stopped asking.
+    pub ended: Instant,
+    /// Whether it stopped on an answer: done, or refused for a reason it does not retry.
+    pub answered: bool,
+}
+
+impl Retried {
+    /// Whether it was still asking when the last fault healed at `heal`, so that some retry
+    /// of its came after the heal.
+    #[must_use]
+    pub fn asking_at(&self, heal: Instant) -> bool {
+        self.ended >= heal
+    }
+
+    /// How long it took, read from `heal`, or from its first refusal if that came later.
+    #[must_use]
+    pub fn took(&self, heal: Instant) -> Duration {
+        self.ended.duration_since(self.refused.max(heal))
+    }
+
+    /// What D-092 asks of this asker, where the last fault healed at `heal` and the bound is
+    /// `bound`: "the same asker's retry after the heal takes effect within the liveness
+    /// bound". One that stopped before the heal made no retry after it and is asked nothing.
+    /// Any other is asked for an answer, within the bound of the heal, or of its first
+    /// refusal if that came after the heal. The violation, in words, if it did neither.
+    // PROPOSED(D-092): answer A; the asker retries.
+    // PROPOSED(D-113): read from the heal, §8.
+    #[must_use]
+    pub fn took_no_effect(&self, heal: Instant, bound: Duration) -> Option<String> {
+        if !self.asking_at(heal) {
+            return None;
+        }
+        let took = self.took(heal);
+        if !self.answered {
+            return Some(format!(
+                "the split of range {} refused at {:?} stopped asking at {:?}, {took:?} past the \
+                 last heal at {heal:?}, with no answer",
+                self.range, self.refused, self.ended
+            ));
+        }
+        (took > bound).then(|| {
+            format!(
+                "the split of range {} refused at {:?} was answered {took:?} past the last heal \
+                 at {heal:?}, over {bound:?}",
+                self.range, self.refused
+            )
+        })
+    }
 }
 
 type Driver = Arc<Mutex<DriverStats>>;
@@ -617,6 +718,7 @@ async fn split_admin<E: Environment>(
     };
     let mut tries = BOOTSTRAP * 4;
     let mut done = false;
+    let mut first_refused: Option<Instant> = None;
     while tries > 0 && !done {
         tries -= 1;
         let request = RangedRequest {
@@ -664,6 +766,7 @@ async fn split_admin<E: Environment>(
                     }
                 }
                 if reason == SplitRefusal::NoRangeId {
+                    first_refused.get_or_insert(now);
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
                 }
@@ -681,9 +784,18 @@ async fn split_admin<E: Environment>(
             }
         }
     }
+    let ended = env.clock().now();
     let mut stats = lock(&stats);
     if !done {
         stats.splits_unanswered += 1;
+    }
+    if let Some(refused) = first_refused {
+        stats.retried.push(Retried {
+            range,
+            refused,
+            ended,
+            answered: done,
+        });
     }
     stats.outstanding -= 1;
 }
@@ -754,9 +866,12 @@ struct Watch {
 }
 
 impl Watch {
-    fn new() -> Self {
+    /// A watch whose checkers stop the run, or, for [`run_to_the_end`], fold nothing.
+    fn new(stops: bool) -> Self {
+        let mut checks = raft::Watch::of_descriptors();
+        checks.stops = stops;
         Self {
-            checks: raft::Watch::of_descriptors(),
+            checks,
             spans: Spans::default(),
         }
     }
@@ -824,6 +939,10 @@ pub struct Report {
     pub driver: DriverStats,
     /// The trace under the raft sweep's checks (`raft::Report::over_a_run`).
     pub checked: raft::Report,
+    /// When the last fault healed: the heal D-092 reads its asker's retry from, where
+    /// `checked.last_heal`, the liveness window's start, is past the driver's drain and so
+    /// past every asker the drain saw finish (PROPOSED D-113 §8).
+    pub last_fault_healed: Instant,
 }
 
 /// Runs the correct system on `seed`.
@@ -856,6 +975,26 @@ pub fn run_of(
     )
 }
 
+/// [`run_of`] with no violation stopping it: the same run for as long as the sweep's
+/// would have lasted, and past that to its schedule's end, so a check about time can be read
+/// of a variant another check would have stopped first (PROPOSED D-113).
+#[must_use]
+pub fn run_to_the_end(
+    seed: u64,
+    variants: impl Into<Variants>,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+) -> Report {
+    run_watched(
+        seed,
+        Schedule::draw(seed),
+        variants.into(),
+        node_variants,
+        range_variants,
+        Watch::new(false),
+    )
+}
+
 /// Runs `schedule` on `seed`.
 #[must_use]
 pub fn run_with(
@@ -864,6 +1003,24 @@ pub fn run_with(
     variants: Variants,
     node_variants: NodeVariants,
     range_variants: RangeVariants,
+) -> Report {
+    run_watched(
+        seed,
+        schedule,
+        variants,
+        node_variants,
+        range_variants,
+        Watch::new(true),
+    )
+}
+
+fn run_watched(
+    seed: u64,
+    schedule: Schedule,
+    variants: Variants,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+    mut watch: Watch,
 ) -> Report {
     let mut sim = Sim::new(config(seed, &schedule));
     let nodes: Vec<NodeId> = (0..NODES as usize)
@@ -894,7 +1051,6 @@ pub fn run_with(
         );
     }
     let driver: Driver = Arc::default();
-    let mut watch = Watch::new();
     advance(&mut sim, schedule.warmup, &mut watch);
 
     // The timeline: each fault's beginning and heal, and each action of the driver,
@@ -1008,8 +1164,20 @@ pub fn run_with(
     while watch.checks.stopped.is_none() && lock(&driver).outstanding > 0 && sim.now() < drain {
         advance(&mut sim, SLICE, &mut watch);
     }
+    let last_fault_healed = last_heal;
     last_heal = last_heal.max(sim.now());
-    advance(&mut sim, schedule.settle, &mut watch);
+    // The instrument for the bound read from the heal (PROPOSED D-113 §5): the same window,
+    // its first stretch with no client reaching any node. `last_heal` is not moved, as the
+    // cluster's own slowness would not move it.
+    if let Some(held) = schedule.clients_held_off {
+        let held = held.min(schedule.settle);
+        sim.partition(&clients, &nodes);
+        advance(&mut sim, held, &mut watch);
+        sim.heal();
+        advance(&mut sim, schedule.settle - held, &mut watch);
+    } else {
+        advance(&mut sim, schedule.settle, &mut watch);
+    }
     let ended = sim.now();
     let records = sim.trace();
     let history = History::from_trace(&records);
@@ -1049,6 +1217,7 @@ pub fn run_with(
         schedule,
         driver,
         checked,
+        last_fault_healed,
     }
 }
 
@@ -1122,23 +1291,25 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
     }
 }
 
-/// The kinds of loss a refusal names (#45), read off its reason's words
-/// (`ananke_raft::store::LostState`'s display): one refusal may name several.
+/// The kinds of loss a refusal names (#45), read off its reason's words: the display of
+/// `ananke_raft::store::LostState`, `ananke_storage::wal::HeadGap` and
+/// `ananke_storage::engine::OpenRefused`. #45 asks three figures, dropped tables, lost log
+/// records and fallback manifests; the other two are what a sweep finds beside them. One
+/// refusal may name several.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Loss {
     /// A table the manifest listed could not be read.
     DroppedTable,
-    /// The manifest `CURRENT` named could not be read and an older one was used.
-    ManifestFallback,
-    /// A log head was discarded.
-    LogHead,
-    /// The log stopped short at a bad checksum or a gap: lost log records.
-    LogStop,
-    /// A corrupt record was skipped in a segment the tables cover.
-    LogSkipped,
-    /// The store was damaged before the engine opened.
+    /// Log records are gone: a missing or discarded head, a log stopped at a bad checksum
+    /// or a gap, or a corrupt record skipped in a segment the tables cover.
+    LostLogRecords,
+    /// The manifest in force could not be read, or `CURRENT` that names it: fallen back
+    /// from, or no intact one to fall back to.
+    Manifest,
+    /// The store's directory was damaged before the engine opened.
     Damaged,
-    /// None of the above words.
+    /// None of these words: a reason this list has not met, which the sweep fails on, so
+    /// a new way to lose state is read and named, never counted as nothing.
     Other,
 }
 
@@ -1149,13 +1320,18 @@ impl Loss {
         let mut kinds = Vec::new();
         for (words, kind) in [
             ("dropped tables", Self::DroppedTable),
-            ("fell back from manifest", Self::ManifestFallback),
-            ("discarded a log head", Self::LogHead),
-            ("stopped reading the log", Self::LogStop),
-            ("skipped the rest of log segment", Self::LogSkipped),
+            ("the log's head is missing", Self::LostLogRecords),
+            ("the log is damaged", Self::LostLogRecords),
+            ("discarded a log head", Self::LostLogRecords),
+            ("stopped reading the log", Self::LostLogRecords),
+            ("skipped the rest of log segment", Self::LostLogRecords),
+            ("fell back from manifest", Self::Manifest),
+            ("no manifest older than", Self::Manifest),
+            ("CURRENT", Self::Manifest),
+            ("MANIFEST-", Self::Manifest),
             ("the store is damaged", Self::Damaged),
         ] {
-            if reason.contains(words) {
+            if reason.contains(words) && !kinds.contains(&kind) {
                 kinds.push(kind);
             }
         }
@@ -1164,6 +1340,471 @@ impl Loss {
         }
         kinds
     }
+}
+
+/// One dropped table and the replicas it touches (#45): a table's bounds attribute its
+/// loss to the ranges whose keys lie inside them, which is what per-range refusal would
+/// need to be worth building.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedTable {
+    /// The node.
+    pub node: u64,
+    /// The table's number.
+    pub number: u64,
+    /// The replicas the node held when it was dropped.
+    pub held: usize,
+    /// How many of them have a key inside the table's bounds: in their Raft interval, or
+    /// in their user span.
+    pub touched: usize,
+}
+
+/// One final descriptor's wait for the meta range (SHARD.md §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaLag {
+    /// The range.
+    pub range: u64,
+    /// Its generation where the run stopped.
+    pub generation: u64,
+    /// When meta was owed it: the last heal, or the descriptor's first statement if later.
+    pub due: Instant,
+    /// When meta came to name it over its whole span and went on naming it; `None` if it
+    /// did not name it at the run's end.
+    pub named: Option<Instant>,
+}
+
+impl MetaLag {
+    /// How long meta took past when it was owed; zero where it named it by then.
+    #[must_use]
+    pub fn lag(&self) -> Option<Duration> {
+        self.named
+            .map(|named| named.checked_duration_since(self.due).unwrap_or_default())
+    }
+}
+
+/// What meta names, by the first apply of each meta index, as `MetaApplied`'s won
+/// sub-intervals say: keyed by end, each with its start, range and generation.
+#[derive(Clone, Debug, Default)]
+struct MetaNames {
+    highest: Option<u64>,
+    named: BTreeMap<Bytes, (Bytes, u64, u64)>,
+}
+
+impl MetaNames {
+    /// Folds one `MetaApplied`; whether it changed anything.
+    fn apply(&mut self, index: u64, descriptors: &[ananke_env::MetaDescriptor]) -> bool {
+        if self.highest.is_some_and(|highest| index <= highest) {
+            return false;
+        }
+        self.highest = Some(index);
+        for descriptor in descriptors {
+            for (start, end) in &descriptor.won {
+                self.name(start, end, descriptor.range, descriptor.generation);
+            }
+        }
+        true
+    }
+
+    fn name(&mut self, start: &Bytes, end: &Bytes, range: u64, generation: u64) {
+        let overlapped: Vec<Bytes> = self
+            .named
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(&start[..]),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(_, (from, ..))| from < end)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in overlapped {
+            let (from, was, at) = self.named.remove(&key).expect("listed");
+            if from < *start {
+                self.named.insert(start.clone(), (from.clone(), was, at));
+            }
+            if key > *end {
+                self.named.insert(key, (end.clone(), was, at));
+            }
+        }
+        self.named
+            .insert(end.clone(), (start.clone(), range, generation));
+    }
+
+    /// Whether meta names any key of `[start, end)` at `generation` or a newer one.
+    fn holds_no_older(&self, start: &Bytes, end: &Bytes, generation: u64) -> bool {
+        self.named
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(&start[..]),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(_, (from, ..))| from < end)
+            .any(|(_, (.., at))| *at >= generation)
+    }
+
+    /// Whether meta names `[start, end)` wholly as `range` at `generation`.
+    fn names(&self, start: &Bytes, end: &Bytes, range: u64, generation: u64) -> bool {
+        let mut cursor = start.clone();
+        for (to, (from, of, at)) in self.named.range::<[u8], _>((
+            std::ops::Bound::Excluded(&start[..]),
+            std::ops::Bound::Unbounded,
+        )) {
+            if *from > cursor || *of != range || *at != generation {
+                return false;
+            }
+            cursor = to.clone();
+            if cursor >= *end {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Every dropped table in `records`, and how many of the replicas on its node it touches
+/// (#45), from the spans the node held when the table was dropped: its Raft interval, or
+/// its user span, lying within the table's bounds.
+#[must_use]
+pub fn dropped_tables_of(records: &[TraceRecord]) -> Vec<DroppedTable> {
+    let mut held: BTreeMap<u64, BTreeMap<u64, (Bytes, Bytes)>> = BTreeMap::new();
+    let mut tables = Vec::new();
+    for record in records {
+        let node = record.node.map_or(0, |node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RangeCreated {
+                range, start, end, ..
+            }
+            | TraceEvent::RangeDescriptor {
+                range, start, end, ..
+            } => {
+                held.entry(node)
+                    .or_default()
+                    .insert(*range, (start.clone(), end.clone()));
+            }
+            TraceEvent::SstDropped {
+                number,
+                first_key,
+                last_key,
+                ..
+            } => {
+                let on = held.get(&node);
+                let touched = on.map_or(0, |ranges| {
+                    ranges
+                        .iter()
+                        .filter(|(range, (start, end))| {
+                            let raft = KeyPrefix::group(**range).span();
+                            (raft.start <= *last_key && *first_key < raft.end)
+                                || (*start <= *last_key && *first_key < *end)
+                        })
+                        .count()
+                });
+                tables.push(DroppedTable {
+                    node,
+                    number: *number,
+                    held: on.map_or(0, BTreeMap::len),
+                    touched,
+                });
+            }
+            TraceEvent::RaftRefused { .. } => {
+                held.remove(&node);
+            }
+            _ => {}
+        }
+    }
+    tables
+}
+
+/// When the meta range came to name each user range's descriptor at the end of `records`
+/// (SHARD.md §8), by the first apply of each meta index, each owed from `last_heal` or from
+/// its descriptor's first statement if that is later. Meta names a descriptor from the apply
+/// after which it names it wholly and goes on naming it, so an update that overwrites it
+/// later ends what came before.
+#[must_use]
+pub fn meta_lags_of(records: &[TraceRecord], last_heal: Instant) -> Vec<MetaLag> {
+    let mut spans = Spans::default();
+    spans.extend(records);
+    let finals: Vec<(u64, Span)> = spans
+        .user()
+        .map(|(range, span)| (range, span.clone()))
+        .collect();
+    let mut names = MetaNames::default();
+    let mut since: BTreeMap<u64, Option<Instant>> =
+        finals.iter().map(|(range, _)| (*range, None)).collect();
+    for record in records {
+        let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+            continue;
+        };
+        if !names.apply(*index, descriptors) {
+            continue;
+        }
+        for (range, span) in &finals {
+            let named = names.names(&span.start, &span.end, *range, span.generation);
+            let at = since.get_mut(range).expect("listed");
+            match (named, *at) {
+                (true, None) => *at = Some(record.at),
+                (false, Some(_)) => *at = None,
+                _ => {}
+            }
+        }
+    }
+    finals
+        .into_iter()
+        .map(|(range, span)| MetaLag {
+            range,
+            generation: span.generation,
+            due: last_heal.max(span.since),
+            named: since.get(&range).copied().flatten(),
+        })
+        .collect()
+}
+
+/// Why a voter holding nothing of a right half can never be initialised by an apply: the second
+/// half of what #220's owner ruling excuses from the meta convergence bound.
+// PROPOSED(D-113): §6, #220.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stuck {
+    /// Its replica of the parent reached the split by an install, at this index, so it never
+    /// applies the split, and only the right half's leader could install the right half.
+    ParentPastTheSplit(u64),
+    /// It holds no replica of the parent, so there is nothing there to apply the split.
+    NoParent,
+}
+
+/// What a right half's voters and leaders had come to where the trace ends: the three conditions
+/// under which the meta convergence bound excuses the range ([`RightHalf::excused`]).
+// PROPOSED(D-113): §6, #220.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RightHalf {
+    /// The range it was split from, as the first `RangeSplit` naming it says.
+    pub parent: u64,
+    /// The split entry's index in the parent: the split point `s`.
+    pub split: u64,
+    /// The voters of its latest descriptor able to vote: each holds a replica on a store not
+    /// refused since it was made, and is neither impaired nor quarantined.
+    pub able: BTreeSet<u64>,
+    /// The voters holding nothing of it that no apply can ever end, by why.
+    pub stuck: BTreeMap<u64, Stuck>,
+    /// Every other voter of it: impaired while holding a replica, or holding nothing where an
+    /// apply could still end that.
+    pub others: BTreeSet<u64>,
+    /// How many `RaftLeader`s of it were traced at or after the heal the reading was given.
+    pub led_since_heal: usize,
+    /// The server that became its leader and had not left office where the trace ends.
+    pub leader_at_end: Option<u64>,
+}
+
+impl RightHalf {
+    /// Whether the meta convergence bound excuses the range (owner's ruling of 2026-11-09,
+    /// #220): fewer than two voters able to vote, no leader traced since the last heal and none
+    /// standing at the end, and every other voter a placeholder that no apply can ever end.
+    /// Any one of them missing and the bound asks of the range as it asks of any other.
+    #[must_use]
+    pub fn excused(&self) -> bool {
+        self.able.len() < 2
+            && self.led_since_heal == 0
+            && self.leader_at_end.is_none()
+            && self.others.is_empty()
+    }
+}
+
+/// Every right half of the run's latest descriptors, read for #220's exception to the meta
+/// convergence bound. `heal` is the last heal and `impaired` is the raft report's
+/// `impaired_voters`, the majority rule's own reading, which this adds to and does not change.
+/// A range no `RangeSplit` names is no right half and has no entry here, so the bound asks of it.
+/// A refusal ends everything the node held: its replicas, its applies and its installs.
+// PROPOSED(D-113): §6, #220.
+#[must_use]
+pub fn right_halves_of(
+    records: &[TraceRecord],
+    heal: Instant,
+    impaired: &BTreeMap<u64, BTreeSet<u64>>,
+) -> BTreeMap<u64, RightHalf> {
+    let mut spans = Spans::default();
+    spans.extend(records);
+    let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut applied_the_split: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut installed: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut split_of: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut leader: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut led_since: BTreeMap<u64, usize> = BTreeMap::new();
+    for record in records {
+        let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RaftRefused { server, .. } => {
+                held.retain(|(_, on)| on != server);
+                applied_the_split.retain(|(_, on)| on != server);
+                installed.retain(|(_, on), _| on != server);
+                leader.retain(|_, by| by != server);
+            }
+            TraceEvent::RaftReseeded { server, range } => {
+                quarantined.insert((*range, *server));
+            }
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                state: RecoveredAs::Quarantined,
+                ..
+            } => {
+                quarantined.insert((*range, *server));
+            }
+            TraceEvent::RaftSnapshot {
+                server,
+                range,
+                last_index,
+                taken: false,
+                ..
+            } => {
+                let to = installed.entry((*range, *server)).or_default();
+                *to = (*to).max(*last_index);
+            }
+            TraceEvent::RangeCreated { range, .. } => {
+                if let Some(node) = node {
+                    held.insert((*range, node));
+                }
+            }
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } => {
+                split_of.entry(*right).or_insert((*range, *index));
+                if let Some(node) = node {
+                    applied_the_split.insert((*right, node));
+                }
+            }
+            TraceEvent::RaftLeader { server, range, .. } => {
+                leader.insert(*range, *server);
+                if record.at >= heal {
+                    *led_since.entry(*range).or_default() += 1;
+                }
+            }
+            TraceEvent::RaftTerm {
+                server,
+                range,
+                role,
+                ..
+            } if *role != "leader" && leader.get(range) == Some(server) => {
+                leader.remove(range);
+            }
+            TraceEvent::NodeCrashed { node: gone } => {
+                let gone = u64::from(gone.get());
+                leader.retain(|_, by| *by != gone);
+            }
+            _ => {}
+        }
+    }
+    let none = BTreeSet::new();
+    spans
+        .user()
+        .filter_map(|(range, span)| {
+            let &(parent, split) = split_of.get(&range)?;
+            let hurt = impaired.get(&range).unwrap_or(&none);
+            let mut half = RightHalf {
+                parent,
+                split,
+                able: BTreeSet::new(),
+                stuck: BTreeMap::new(),
+                others: BTreeSet::new(),
+                led_since_heal: led_since.get(&range).copied().unwrap_or(0),
+                leader_at_end: leader.get(&range).copied(),
+            };
+            for &voter in &span.voters {
+                let holds = held.contains(&(range, voter));
+                let stuck = if holds || applied_the_split.contains(&(range, voter)) {
+                    None
+                } else if let Some(&to) = installed.get(&(parent, voter)).filter(|&&to| to >= split)
+                {
+                    Some(Stuck::ParentPastTheSplit(to))
+                } else if held.contains(&(parent, voter)) {
+                    None
+                } else {
+                    Some(Stuck::NoParent)
+                };
+                if holds && !hurt.contains(&voter) && !quarantined.contains(&(range, voter)) {
+                    half.able.insert(voter);
+                } else if let Some(stuck) = stuck {
+                    half.stuck.insert(voter, stuck);
+                } else {
+                    half.others.insert(voter);
+                }
+            }
+            Some((range, half))
+        })
+        .collect()
+}
+
+/// How many descriptors a split made, by the first apply of each meta index, won a key meta
+/// already named at their generation or a newer one: an update still being resent after the
+/// update it repeats had landed. SHARD.md §1's maximum by generation leaves such an update alone,
+/// so on the correct meta range this is none. `MetaOverwritesByArrival` stores it, and the
+/// update of a parent's old descriptor that arrives this way is what check 16 and the meta
+/// convergence bound then see. Generation one is left out: before the first split every update
+/// names it and the variant has no path (PROPOSED D-098).
+// PROPOSED(D-113): §10's shape for `MetaOverwritesByArrival`, asserted at every tier (D-061).
+#[must_use]
+pub fn meta_resends_stored_of(records: &[TraceRecord]) -> usize {
+    let mut names = MetaNames::default();
+    let mut found = 0;
+    for record in records {
+        let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+            continue;
+        };
+        if names.highest.is_none_or(|highest| *index > highest) {
+            found += descriptors
+                .iter()
+                .filter(|descriptor| descriptor.generation > FIRST_GENERATION)
+                .filter(|descriptor| {
+                    descriptor
+                        .won
+                        .iter()
+                        .any(|(start, end)| names.holds_no_older(start, end, descriptor.generation))
+                })
+                .count();
+        }
+        names.apply(*index, descriptors);
+    }
+    found
+}
+
+/// How many splits, each by its first `RangeSplit`, took their right half's id from a block
+/// granted before its holder's latest restart: `IdBlockResumed`'s shape (SHARD.md §5's second
+/// rule, §10). A new run of the correct node holds no id until a grant of its own lands, so
+/// there it can only be a split proposed before the restart and first applied after it.
+// PROPOSED(D-113): §10's shape for `IdBlockResumed`, asserted at every tier (D-061).
+#[must_use]
+pub fn splits_from_a_block_of_an_earlier_run_of(records: &[TraceRecord]) -> usize {
+    // Each block by its first id: its last, its holder, whether the holder has restarted since.
+    let mut blocks: BTreeMap<u64, (u64, u64, bool)> = BTreeMap::new();
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut found = 0;
+    for record in records {
+        match &record.event {
+            TraceEvent::RangeIdsLeased {
+                node, first, last, ..
+            } => {
+                blocks.entry(*first).or_insert((*last, *node, false));
+            }
+            TraceEvent::NodeRestarted { node } => {
+                let node = u64::from(node.get());
+                for (_, holder, earlier) in blocks.values_mut() {
+                    *earlier |= *holder == node;
+                }
+            }
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } if seen.insert((*range, *index)) => {
+                found += usize::from(
+                    blocks
+                        .range(..=*right)
+                        .next_back()
+                        .is_some_and(|(_, (last, _, earlier))| *earlier && *right <= *last),
+                );
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 impl Report {
@@ -1238,6 +1879,279 @@ impl Report {
         by
     }
 
+    /// Every dropped table the trace names ([`dropped_tables_of`]).
+    #[must_use]
+    pub fn dropped_tables(&self) -> Vec<DroppedTable> {
+        dropped_tables_of(self.records())
+    }
+
+    /// When the meta range came to name each user range's descriptor at the run's end
+    /// ([`meta_lags_of`]).
+    #[must_use]
+    pub fn meta_lags(&self) -> Vec<MetaLag> {
+        meta_lags_of(self.records(), self.checked.last_heal)
+    }
+
+    /// Every right half at the run's end, read for #220's exception ([`right_halves_of`]). "The
+    /// last heal" is the last fault's, the earlier of the two this report holds, so a leader
+    /// traced in the driver's drain counts against the exception.
+    // PROPOSED(D-113): §6, #220.
+    #[must_use]
+    pub fn right_halves(&self) -> BTreeMap<u64, RightHalf> {
+        right_halves_of(
+            self.records(),
+            self.last_fault_healed,
+            &self.checked.impaired_voters(),
+        )
+    }
+
+    /// The lags of §8's asked set, before #220's exception: on a uniformly scheduled seed
+    /// (D-016), with the meta range's unimpaired replicas a majority and the range's too,
+    /// since each needs a leader to send or take the update.
+    #[must_use]
+    pub fn meta_lags_of_live_ranges(&self) -> Vec<MetaLag> {
+        if !self.checked.uniform() {
+            return Vec::new();
+        }
+        let live = self.checked.ranges_with_a_majority_up();
+        if !live.contains(&META_RANGE) {
+            return Vec::new();
+        }
+        self.meta_lags()
+            .into_iter()
+            .filter(|lag| live.contains(&lag.range))
+            .collect()
+    }
+
+    /// The lags the meta convergence bound is asked of: [`Report::meta_lags_of_live_ranges`]
+    /// less the ones #220's exception excuses ([`RightHalf::excused`]). The exception is this
+    /// bound's alone; the majority rule means what it meant to every other check.
+    // PROPOSED(D-113): §6, #220.
+    #[must_use]
+    pub fn meta_lags_asked(&self) -> Vec<MetaLag> {
+        let halves = self.right_halves();
+        self.meta_lags_of_live_ranges()
+            .into_iter()
+            .filter(|lag| !halves.get(&lag.range).is_some_and(RightHalf::excused))
+            .collect()
+    }
+
+    /// The lags #220's exception excuses from the bound: what the sweep prints.
+    // PROPOSED(D-113): §6, #220.
+    #[must_use]
+    pub fn meta_lags_excused(&self) -> Vec<MetaLag> {
+        let halves = self.right_halves();
+        self.meta_lags_of_live_ranges()
+            .into_iter()
+            .filter(|lag| halves.get(&lag.range).is_some_and(RightHalf::excused))
+            .collect()
+    }
+
+    /// The meta convergence bound (SHARD.md §8): after the last heal, meta names every
+    /// key's current descriptor within [`meta_convergence_bound`], for every range of
+    /// [`Report::meta_lags_asked`].
+    ///
+    /// # Errors
+    ///
+    /// The first range meta names late or not at all.
+    pub fn meta_converges(&self) -> Result<(), String> {
+        self.meta_converges_over(self.meta_lags_asked())
+    }
+
+    /// [`Report::meta_converges`] with #220's exception taken out: what it would have said of
+    /// a right half it excuses. No check calls this; the pins and the plants read it.
+    ///
+    /// # Errors
+    ///
+    /// The first live range meta names late or not at all.
+    // PROPOSED(D-113): §6, #220.
+    pub fn meta_converges_without_the_exception(&self) -> Result<(), String> {
+        self.meta_converges_over(self.meta_lags_of_live_ranges())
+    }
+
+    fn meta_converges_over(&self, lags: Vec<MetaLag>) -> Result<(), String> {
+        let seed = self.seed;
+        let bound = meta_convergence_bound();
+        for lag in lags {
+            match lag.lag() {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "seed {seed}: meta convergence: meta came to name range {} at generation \
+                         {} {took:?} after it was owed at {:?}, over {bound:?}",
+                        lag.range, lag.generation, lag.due
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "seed {seed}: meta convergence: meta does not name range {} at \
+                         generation {} where the run stopped, owed since {:?}",
+                        lag.range, lag.generation, lag.due
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The askers [`Report::retries_take_effect`] asks of: on a uniformly scheduled seed whose
+    /// ranges 0 and the asked range have a majority, each still asking when the last fault
+    /// healed.
+    #[must_use]
+    pub fn retries_asked(&self) -> Vec<Retried> {
+        if !self.checked.uniform() {
+            return Vec::new();
+        }
+        let live = self.checked.ranges_with_a_majority_up();
+        if !live.contains(&ROOT_RANGE) {
+            return Vec::new();
+        }
+        self.driver
+            .retried
+            .iter()
+            .filter(|retried| {
+                live.contains(&retried.range) && retried.asking_at(self.last_fault_healed)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// D-092's assertion where a split was refused for want of a range id, per seed: each of
+    /// [`Report::retries_asked`] ends on an answer, and within the write bound of the last
+    /// fault's heal ([`Retried::took_no_effect`]).
+    ///
+    /// An answer is any but `NoRangeId`, so one that refuses the split for another reason passes.
+    ///
+    /// As first written this check could not fail, and the fix changed two things (#216's review,
+    /// B6). The origin: it read `checked.last_heal`, which opens the liveness window past the
+    /// driver's drain, so an asker the drain waited for had ended before it and nothing could be
+    /// late of it; it now reads [`Report::last_fault_healed`]. The predicate: it asked only that
+    /// an asker with no answer be over the bound, and an asker still asking at the heal now has
+    /// to end on an answer, however soon it stops. Neither alone is enough: of the 382 seeds of
+    /// a thousand that `RefillNotResent` trips by the two together, the new origin with the old
+    /// predicate trips 101, and the new predicate with the old origin 96.
+    ///
+    /// # Errors
+    ///
+    /// The first asker whose retries took no effect.
+    // PROPOSED(D-092): answer A; the asker retries.
+    // PROPOSED(D-113): read from the heal, §8.
+    pub fn retries_take_effect(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        for retried in self.retries_asked() {
+            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound) {
+                return Err(format!("seed {seed}: NoRangeId: {why}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `NoRangeId` of the run, read against the trace (PROPOSED D-092's figures).
+    #[must_use]
+    pub fn no_range_ids(&self) -> Vec<NoRangeId> {
+        self.driver
+            .no_range_id
+            .iter()
+            .map(|&(node, at)| {
+                let mut restarted = None;
+                let mut leased_since_restart = false;
+                let mut leased_within = false;
+                let mut taken = 0usize;
+                let mut block: Option<(u64, u64)> = None;
+                let mut seen: BTreeSet<u64> = BTreeSet::new();
+                for record in self.records() {
+                    match &record.event {
+                        TraceEvent::NodeRestarted { node: of } if u64::from(of.get()) == node => {
+                            if record.at <= at {
+                                restarted = Some(record.at);
+                                leased_since_restart = false;
+                                taken = 0;
+                                block = None;
+                            }
+                        }
+                        TraceEvent::RangeIdsLeased {
+                            node: of,
+                            first,
+                            last,
+                            ..
+                        } if *of == node => {
+                            if record.at <= at {
+                                leased_since_restart = true;
+                                block = Some((*first, *last));
+                            } else if record.at.duration_since(at) <= raft::ELECTION_MIN {
+                                leased_within = true;
+                            }
+                        }
+                        TraceEvent::RangeSplit { right, .. }
+                            if record.at <= at
+                                && seen.insert(*right)
+                                && block.is_some_and(|(first, last)| {
+                                    first <= *right && *right <= last
+                                }) =>
+                        {
+                            taken += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                NoRangeId {
+                    node,
+                    at,
+                    restarted,
+                    leased_since_restart,
+                    leased_within,
+                    taken,
+                }
+            })
+            .collect()
+    }
+
+    /// The most range ids one block granted over the run gave to splits that took effect:
+    /// how near a run comes to spending a block ([`ID_BLOCK`]).
+    #[must_use]
+    pub fn most_ids_from_one_block(&self) -> usize {
+        let mut blocks: Vec<(u64, u64, usize)> = Vec::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        for record in self.records() {
+            match &record.event {
+                TraceEvent::RangeIdsLeased { first, last, .. }
+                    if !blocks.iter().any(|(f, ..)| f == first) =>
+                {
+                    blocks.push((*first, *last, 0));
+                }
+                TraceEvent::RangeSplit { right, .. } if seen.insert(*right) => {
+                    if let Some(block) = blocks
+                        .iter_mut()
+                        .find(|(first, last, _)| first <= right && right <= last)
+                    {
+                        block.2 += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks.iter().map(|(.., taken)| *taken).max().unwrap_or(0)
+    }
+
+    /// Every refusal's reason names a loss this file knows (#45): one that names none is a
+    /// new way to lose state, and is read and named rather than counted as nothing.
+    ///
+    /// # Errors
+    ///
+    /// The first reason [`Loss::of`] does not read.
+    pub fn losses_are_named(&self) -> Result<(), String> {
+        let seed = self.seed;
+        for (node, reason) in self.refusals() {
+            if Loss::of(&reason).contains(&Loss::Other) {
+                return Err(format!(
+                    "seed {seed}: node {node}'s refusal names a loss #45's kinds do not: {reason}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The shape, per seed: every bootstrap node created ranges 0, 1 and 2 at its first
     /// start, and nodes 4 and 5 created nothing, not even a placeholder (SHARD.md §2,
     /// §12's Stage C; Q22).
@@ -1284,14 +2198,658 @@ impl Report {
         Ok(())
     }
 
-    /// The run's verdict: the raft sweep's checks over this trace
-    /// (`raft::Report::check`), then the shape.
+    /// The run's verdict: the raft sweep's checks over this trace, its write bound per
+    /// range the run ended with (`raft::Report::check_by_final_range`), then the shape, the
+    /// meta convergence bound, D-092's retries and #45's kinds.
     ///
     /// # Errors
     ///
     /// The first violation, naming the seed.
     pub fn check(&self) -> Result<(), String> {
-        self.checked.check()?;
-        self.shape()
+        self.checked.check_by_final_range()?;
+        self.shape()?;
+        if self.checked.stopped.is_none() {
+            self.meta_converges()?;
+            self.retries_take_effect()?;
+        }
+        self.losses_are_named()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The readings' reasoning on records written by hand, one shape each.
+
+    use ananke_env::MetaDescriptor;
+
+    use super::*;
+
+    fn at(ms: u64) -> Instant {
+        Instant::from_nanos(ms * 1_000_000)
+    }
+
+    fn record(ms: u64, node: u32, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(ms),
+            decided: at(ms),
+            node: Some(NodeId::new(node)),
+            event,
+        }
+    }
+
+    fn descriptor(ms: u64, range: u64, span: (&str, &str), generation: u64) -> TraceRecord {
+        record(
+            ms,
+            1,
+            TraceEvent::RangeDescriptor {
+                range,
+                index: ms,
+                applied: ms,
+                start: Bytes::copy_from_slice(span.0.as_bytes()),
+                end: Bytes::copy_from_slice(span.1.as_bytes()),
+                generation,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        )
+    }
+
+    fn meta(ms: u64, index: u64, range: u64, span: (&str, &str), generation: u64) -> TraceRecord {
+        let (start, end) = (
+            Bytes::copy_from_slice(span.0.as_bytes()),
+            Bytes::copy_from_slice(span.1.as_bytes()),
+        );
+        record(
+            ms,
+            1,
+            TraceEvent::MetaApplied {
+                index,
+                descriptors: vec![MetaDescriptor {
+                    range,
+                    start: start.clone(),
+                    end: end.clone(),
+                    generation,
+                    voters: vec![1, 2, 3],
+                    won: vec![(start, end)],
+                }],
+            },
+        )
+    }
+
+    /// D-092's asker read from the last fault's heal, on what #216's review found the check
+    /// could not say when it was read from the liveness window's start.
+    // PROPOSED(D-113): read from the heal, §8.
+    #[test]
+    fn an_askers_retries_are_asked_of_from_the_heal() {
+        let (heal, bound) = (at(5000), Duration::from_secs(2));
+        let asker = |refused, ended, answered| Retried {
+            range: 2,
+            refused: at(refused),
+            ended: at(ended),
+            answered,
+        };
+        let no_effect = |of: Retried| of.took_no_effect(heal, bound);
+        assert_eq!(no_effect(asker(4900, 5300, true)), None, "answered in time");
+        assert_eq!(
+            no_effect(asker(4900, 7000, true)),
+            None,
+            "the bound is inclusive"
+        );
+        // An asker that stopped before the heal made no retry after it, however it ended.
+        assert_eq!(no_effect(asker(3000, 4900, false)), None);
+        assert_eq!(no_effect(asker(3000, 4900, true)), None);
+        // Still asking at the heal, and it stopped with no answer: the check's whole point.
+        let why = no_effect(asker(4900, 5300, false)).expect("no answer");
+        assert!(why.contains("with no answer"), "{why}");
+        // Refused only after the heal, and it never got one.
+        let why = no_effect(asker(5500, 5900, false)).expect("no answer");
+        assert!(why.contains("with no answer"), "{why}");
+        // Answered too late: from the heal for one refused before it...
+        let why = no_effect(asker(4900, 7001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+        // ...and from its refusal for one refused after it.
+        assert_eq!(no_effect(asker(6000, 7900, true)), None);
+        let why = no_effect(asker(6000, 8001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+    }
+
+    /// Range 2 over `[a, z)` split at `m`: 19 is `[m, z)`, both at generation 2.
+    fn split() -> Vec<TraceRecord> {
+        vec![
+            descriptor(1, 2, ("a", "z"), 1),
+            meta(1, 0, 2, ("a", "z"), 1),
+            descriptor(100, 2, ("a", "m"), 2),
+            descriptor(100, 19, ("m", "z"), 2),
+        ]
+    }
+
+    fn lag_of(lags: &[MetaLag], range: u64) -> Option<Duration> {
+        lags.iter()
+            .find(|lag| lag.range == range)
+            .expect("a lag")
+            .lag()
+    }
+
+    #[test]
+    fn meta_names_a_descriptor_from_the_apply_that_covers_its_whole_span() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(150, 2, 19, ("m", "z"), 2),
+        ]);
+        let lags = meta_lags_of(&records, at(120));
+        // Named before it was owed is no lag; named after it is the difference.
+        assert_eq!(lag_of(&lags, 2), Some(Duration::ZERO));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(30)));
+        // Owed from the descriptor's first statement where that is after the heal.
+        let lags = meta_lags_of(&records, at(50));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn meta_that_names_part_of_a_span_or_an_older_generation_does_not_name_it() {
+        let mut records = split();
+        records.push(meta(110, 1, 19, ("m", "t"), 2));
+        assert_eq!(
+            lag_of(&meta_lags_of(&records, at(100)), 19),
+            None,
+            "part of it"
+        );
+        let mut records = split();
+        records.push(meta(110, 1, 19, ("m", "z"), 1));
+        assert_eq!(lag_of(&meta_lags_of(&records, at(100)), 19), None, "older");
+    }
+
+    /// What `MetaOverwritesByArrival` does to meta: an update that wins a span a newer
+    /// record held ends the naming, so the descriptor reads as not named where the run stops.
+    #[test]
+    fn an_update_that_overwrites_a_named_descriptor_ends_its_naming() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(120, 2, 19, ("m", "z"), 2),
+            meta(130, 3, 2, ("a", "z"), 1),
+        ]);
+        let lags = meta_lags_of(&records, at(100));
+        assert_eq!(lag_of(&lags, 2), None);
+        assert_eq!(lag_of(&lags, 19), None);
+        // And a later resend of the right update names it from there.
+        records.push(meta(140, 4, 19, ("m", "z"), 2));
+        assert_eq!(
+            lag_of(&meta_lags_of(&records, at(100)), 19),
+            Some(Duration::from_millis(40))
+        );
+    }
+
+    /// A replica behind, applying an index already folded, moves nothing: first apply of
+    /// each index, as check 16's fold reads it.
+    #[test]
+    fn a_lagging_replicas_apply_of_an_index_already_folded_moves_nothing() {
+        let mut records = split();
+        records.extend([
+            meta(110, 1, 2, ("a", "m"), 2),
+            meta(120, 2, 19, ("m", "z"), 2),
+            meta(130, 0, 2, ("a", "z"), 1),
+        ]);
+        let lags = meta_lags_of(&records, at(100));
+        assert_eq!(lag_of(&lags, 2), Some(Duration::from_millis(10)));
+        assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(20)));
+    }
+
+    // --- #220's exception to the meta convergence bound, one condition each. Range 2 splits at
+    // index 50 into 19, and the heal is at 1 000 ms.
+
+    const PARENT: u64 = 2;
+    const SPLIT_AT: u64 = 50;
+    const RIGHT: u64 = 19;
+    const HEAL: u64 = 1000;
+
+    fn created(ms: u64, node: u32, range: u64) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RangeCreated {
+                range,
+                cause: RangeCause::Split,
+                parent: None,
+                start: Bytes::from_static(b"m"),
+                end: Bytes::from_static(b"z"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                floor_index: 0,
+                floor_term: 0,
+                incarnation: 1,
+            },
+        )
+    }
+
+    fn applied_the_split(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RangeSplit {
+                range: PARENT,
+                right: RIGHT,
+                key: Bytes::from_static(b"m"),
+                index: SPLIT_AT,
+            },
+        )
+    }
+
+    fn installed(ms: u64, node: u32, range: u64, last_index: u64) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftSnapshot {
+                server: u64::from(node),
+                range,
+                last_index,
+                last_term: 1,
+                taken: false,
+            },
+        )
+    }
+
+    fn led(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftLeader {
+                server: u64::from(node),
+                range: RIGHT,
+                term: 2,
+                last_index: 60,
+            },
+        )
+    }
+
+    fn stepped_down(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftTerm {
+                server: u64::from(node),
+                range: RIGHT,
+                term: 3,
+                role: "follower",
+                received: None,
+            },
+        )
+    }
+
+    fn refused(ms: u64, node: u32) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftRefused {
+                server: u64::from(node),
+                reason: "dropped tables [4]".to_owned(),
+            },
+        )
+    }
+
+    /// The parent on every node; node 2 applied the split and alone holds the right half; and
+    /// nodes 1 and 3 reached the split by an install, so they never apply it.
+    fn wedged() -> Vec<TraceRecord> {
+        vec![
+            created(1, 1, PARENT),
+            created(1, 2, PARENT),
+            created(1, 3, PARENT),
+            applied_the_split(10, 2),
+            created(10, 2, RIGHT),
+            installed(20, 1, PARENT, 60),
+            installed(20, 3, PARENT, 60),
+        ]
+    }
+
+    fn read_impaired(
+        records: &[TraceRecord],
+        impaired: &BTreeMap<u64, BTreeSet<u64>>,
+    ) -> RightHalf {
+        right_halves_of(records, at(HEAL), impaired)
+            .remove(&RIGHT)
+            .expect("a right half")
+    }
+
+    fn read(records: &[TraceRecord]) -> RightHalf {
+        read_impaired(records, &BTreeMap::new())
+    }
+
+    fn past(to: u64) -> Stuck {
+        Stuck::ParentPastTheSplit(to)
+    }
+
+    /// The shape the owner excused, each of its parts read: without this case the ones below
+    /// could pass on a fold that excuses nothing.
+    #[test]
+    fn a_right_half_with_no_possible_majority_is_excused() {
+        let half = read(&wedged());
+        assert_eq!((half.parent, half.split), (PARENT, SPLIT_AT));
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(1, past(60)), (3, past(60))]));
+        assert!(half.others.is_empty());
+        assert_eq!((half.led_since_heal, half.leader_at_end), (0, None));
+        assert!(half.excused());
+    }
+
+    /// A child of a wedged parent: its voters hold no replica of the parent, so nothing there can
+    /// apply the split that would initialise them. The install exactly at the split counts, and
+    /// an install below it does not.
+    #[test]
+    fn a_placeholder_that_holds_no_parent_or_a_parent_at_the_split_by_an_install_is_stuck() {
+        let records = [
+            created(1, 2, PARENT),
+            applied_the_split(10, 2),
+            created(10, 2, RIGHT),
+        ];
+        let half = read(&records);
+        assert_eq!(
+            half.stuck,
+            BTreeMap::from([(1, Stuck::NoParent), (3, Stuck::NoParent)])
+        );
+        assert!(half.excused());
+
+        let mut records = wedged();
+        records[5] = installed(20, 1, PARENT, SPLIT_AT);
+        assert_eq!(read(&records).stuck[&1], past(SPLIT_AT));
+        assert!(read(&records).excused());
+        records[5] = installed(20, 1, PARENT, SPLIT_AT - 1);
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "it will apply the split");
+        assert!(!half.excused());
+    }
+
+    /// Condition two's first half. A leader before the heal whose office is over leaves the range
+    /// excused, as seed 2272's did; one traced at the heal or after it does not.
+    #[test]
+    fn a_range_led_since_the_last_heal_is_not_excused() {
+        let mut records = wedged();
+        records.extend([led(HEAL - 1, 3), stepped_down(HEAL - 1, 3)]);
+        assert!(read(&records).excused(), "led before the heal and gone");
+        records.extend([led(HEAL, 2), stepped_down(HEAL + 5, 2)]);
+        let half = read(&records);
+        assert_eq!(
+            (half.led_since_heal, half.leader_at_end),
+            (1, None),
+            "led at the heal itself, and no leader stands at the end"
+        );
+        assert!(!half.excused());
+    }
+
+    /// Condition two's second half: a leader elected before the heal and never gone, and each of
+    /// the three things that end its office.
+    #[test]
+    fn a_range_with_a_leader_standing_at_the_end_is_not_excused() {
+        let mut records = wedged();
+        records.push(led(HEAL - 100, 2));
+        let half = read(&records);
+        assert_eq!((half.led_since_heal, half.leader_at_end), (0, Some(2)));
+        assert!(!half.excused());
+        let crashed = record(
+            HEAL - 50,
+            2,
+            TraceEvent::NodeCrashed {
+                node: NodeId::new(2),
+            },
+        );
+        for (what, ended) in [
+            ("its step down", stepped_down(HEAL - 50, 2)),
+            ("its crash", crashed),
+        ] {
+            let mut gone = records.clone();
+            gone.push(ended);
+            assert_eq!(read(&gone).leader_at_end, None, "{what}");
+            assert!(read(&gone).excused(), "{what}");
+        }
+        let mut gone = records.clone();
+        gone.push(refused(HEAL - 50, 2));
+        assert_eq!(read(&gone).leader_at_end, None, "its node's refusal");
+        // Another server's step down ends nothing of it.
+        let mut other = records.clone();
+        other.push(stepped_down(HEAL - 50, 3));
+        assert_eq!(read(&other).leader_at_end, Some(2));
+    }
+
+    /// Condition three, on "only node 1 creates R"'s shape: a voter whose parent applied the split
+    /// and made no replica is a placeholder an apply should have ended, which is a bug and not
+    /// the wedge, and the plain form of the exception hid it.
+    #[test]
+    fn a_placeholder_whose_parent_applied_the_split_is_not_excused() {
+        let mut records = wedged();
+        records.remove(5);
+        let half = read(&records);
+        assert_eq!(
+            half.others,
+            BTreeSet::from([1]),
+            "its parent has no install"
+        );
+        assert_eq!(half.stuck, BTreeMap::from([(3, past(60))]));
+        assert!(!half.excused());
+        // And one that traced the split without an install of its parent, and one with both.
+        let mut records = wedged();
+        records.push(applied_the_split(15, 3));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([3]), "it applied the split");
+        assert!(!half.excused());
+    }
+
+    /// Condition one: two voters able to vote can elect. And a replica that holds the range
+    /// and cannot vote is not a placeholder, so it is not one of what condition three names.
+    #[test]
+    fn a_range_with_two_voters_able_to_vote_is_not_excused() {
+        let mut records = wedged();
+        records.push(created(30, 1, RIGHT));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([1, 2]));
+        assert_eq!(half.stuck, BTreeMap::from([(3, past(60))]));
+        assert!(!half.excused());
+
+        let impaired = BTreeMap::from([(RIGHT, BTreeSet::from([1]))]);
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.others, BTreeSet::from([1]), "impaired, holding it");
+        assert!(!half.excused());
+
+        records.push(record(
+            31,
+            1,
+            TraceEvent::RaftReseeded {
+                server: 1,
+                range: RIGHT,
+            },
+        ));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "quarantined, holding it");
+        assert!(!half.excused());
+    }
+
+    /// A refusal ends what its node held, so it is its later history that counts. Node 1 loses
+    /// its replicas and with them the install: it then holds no parent until one is made.
+    #[test]
+    fn a_refused_voter_reads_from_what_it_has_held_since() {
+        let mut records = wedged();
+        records.push(refused(40, 1));
+        assert_eq!(read(&records).stuck[&1], Stuck::NoParent);
+        records.push(created(50, 1, PARENT));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "a parent, and no install");
+        records.push(installed(60, 1, PARENT, 70));
+        assert_eq!(read(&records).stuck[&1], past(70));
+
+        let mut records = wedged();
+        records.push(refused(40, 2));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::new(), "the replica it held is gone");
+        assert_eq!(half.stuck[&2], Stuck::NoParent);
+    }
+
+    /// Only a right half can be excused: a range no split made has no entry to excuse it by.
+    #[test]
+    fn a_range_no_split_named_has_no_reading() {
+        let mut records = wedged();
+        records.push(descriptor(30, 7, ("a", "m"), 2));
+        let halves = right_halves_of(&records, at(HEAL), &BTreeMap::new());
+        assert!(halves.contains_key(&RIGHT));
+        assert!(!halves.contains_key(&7));
+    }
+
+    /// The shape of `MetaOverwritesByArrival`: a split's descriptor stored over a key meta
+    /// already names at its generation or a newer one. A win over an older one is what the
+    /// correct meta range makes, the first generation's resends have no older descriptor to
+    /// bring back, and an index already folded is not read again.
+    // PROPOSED(D-113): §10's shape.
+    #[test]
+    fn a_resend_counts_only_where_it_repeats_a_split_meta_already_names() {
+        let count = meta_resends_stored_of;
+        let mut records = vec![meta(1, 0, 2, ("a", "z"), 1), meta(2, 1, 2, ("a", "z"), 1)];
+        assert_eq!(count(&records), 0, "a resend of the first generation");
+        records.extend([meta(3, 2, 2, ("a", "m"), 2), meta(4, 3, 19, ("m", "z"), 2)]);
+        assert_eq!(count(&records), 0, "each over an older");
+        records.push(meta(5, 3, 19, ("m", "z"), 2));
+        assert_eq!(
+            count(&records),
+            0,
+            "a lagging replica's apply of an index already folded"
+        );
+        records.push(meta(6, 4, 19, ("m", "z"), 2));
+        assert_eq!(count(&records), 1, "a resend of the split's update");
+        records.push(meta(7, 5, 19, ("m", "t"), 3));
+        records.push(meta(8, 6, 19, ("m", "z"), 2));
+        assert_eq!(count(&records), 2, "and one older than meta holds");
+    }
+
+    /// The shape of `IdBlockResumed`: a right half out of a block its holder was granted before
+    /// it last restarted. Not a block of the new run, and not the other node's.
+    // PROPOSED(D-113): §10's shape.
+    #[test]
+    fn a_split_counts_only_from_a_block_granted_before_its_holders_latest_restart() {
+        let leased = |ms, node, first, last| {
+            record(
+                ms,
+                1,
+                TraceEvent::RangeIdsLeased {
+                    node,
+                    run: ms,
+                    first,
+                    last,
+                    index: ms,
+                },
+            )
+        };
+        let split = |ms, range, index, right| {
+            record(
+                ms,
+                1,
+                TraceEvent::RangeSplit {
+                    range,
+                    right,
+                    key: Bytes::from_static(b"m"),
+                    index,
+                },
+            )
+        };
+        let restarted = |ms, node| {
+            record(
+                ms,
+                node,
+                TraceEvent::NodeRestarted {
+                    node: NodeId::new(node),
+                },
+            )
+        };
+        let count = splits_from_a_block_of_an_earlier_run_of;
+        let mut records = vec![leased(1, 1, 10, 17), split(2, 2, 5, 10)];
+        assert_eq!(count(&records), 0, "granted and taken in the one run");
+        records.extend([leased(3, 2, 18, 25), restarted(4, 1), leased(5, 1, 26, 33)]);
+        records.push(split(6, 2, 9, 26));
+        assert_eq!(count(&records), 0, "from the new run's block");
+        records.push(split(7, 2, 12, 18));
+        assert_eq!(count(&records), 0, "from the other node's block");
+        records.push(split(8, 2, 12, 10));
+        assert_eq!(count(&records), 0, "that split was already read");
+        records.push(split(9, 2, 15, 10));
+        assert_eq!(count(&records), 1, "the id of the earlier run, taken again");
+    }
+
+    #[test]
+    fn a_refusals_reason_is_read_for_every_loss_it_names() {
+        assert_eq!(
+            Loss::of("the engine's recovery lost state: dropped tables [4]"),
+            vec![Loss::DroppedTable]
+        );
+        assert_eq!(
+            Loss::of(
+                "the engine's recovery lost state: dropped tables [4] fell back from manifest 7"
+            ),
+            vec![Loss::DroppedTable, Loss::Manifest]
+        );
+        assert_eq!(
+            Loss::of("the log's head is missing: expected record 409, found 430"),
+            vec![Loss::LostLogRecords]
+        );
+        assert_eq!(
+            Loss::of(
+                "the log is damaged: a record at segment 1 offset 9307 (bad-checksum) was skipped \
+                 and the rest of the segment with it"
+            ),
+            vec![Loss::LostLogRecords]
+        );
+        assert_eq!(Loss::of("CURRENT cannot be read"), vec![Loss::Manifest]);
+        assert_eq!(
+            Loss::of("no manifest older than 9 has every table it lists on disk and intact"),
+            vec![Loss::Manifest]
+        );
+        assert_eq!(Loss::of("something new"), vec![Loss::Other]);
+    }
+
+    /// A table's bounds attribute its loss: the replicas whose Raft interval or user span
+    /// lie within them, and none past them.
+    #[test]
+    fn a_dropped_table_touches_the_replicas_within_its_bounds() {
+        let held = [
+            descriptor(1, 2, ("a", "m"), 2),
+            descriptor(1, 19, ("m", "z"), 2),
+        ];
+        let dropped = |first: &[u8], last: &[u8]| {
+            let mut records = held.to_vec();
+            records.push(record(
+                2,
+                1,
+                TraceEvent::SstDropped {
+                    number: 7,
+                    first_seq: 1,
+                    max_seq: 2,
+                    first_key: Bytes::copy_from_slice(first),
+                    last_key: Bytes::copy_from_slice(last),
+                    reason: "bad",
+                },
+            ));
+            dropped_tables_of(&records)[0].clone()
+        };
+        let table = dropped(b"b", b"c");
+        assert_eq!(
+            (table.touched, table.held),
+            (1, 2),
+            "the left half's keys alone"
+        );
+        let table = dropped(b"b", b"p");
+        assert_eq!(table.touched, 2, "across the two");
+        let raft = KeyPrefix::group(19).span();
+        let table = dropped(&raft.start, &raft.start);
+        assert_eq!(table.touched, 1, "the right half's Raft interval");
+    }
+
+    #[test]
+    fn a_split_leaves_at_least_the_fewest_keys_on_either_side() {
+        let span = |start: &[u8], end: &[u8]| Span {
+            start: user_key(start),
+            end: user_key(end),
+            generation: 1,
+            voters: vec![1, 2, 3],
+            since: at(0),
+        };
+        assert_eq!(split_keys(&span(b"k", b"l")), (2..=14).collect::<Vec<_>>());
+        assert_eq!(split_keys(&span(b"k04", b"k08")), vec![6]);
+        assert!(split_keys(&span(b"k04", b"k07")).is_empty());
     }
 }

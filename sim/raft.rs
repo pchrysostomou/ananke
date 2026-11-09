@@ -997,7 +997,11 @@ pub enum Fault {
     /// and asked, alone, to split it, then `settle` follows. A correct node's new run
     /// draws a fresh block for the second split; the variant resumes its record's
     /// block from the first id, the one the first split took, and check 18 sees the
-    /// right half named before. Drawn after the split; nothing if no split is done.
+    /// right half named before. Drawn after the split. If no split is done by then, the
+    /// arm is a wait of `settle` and nothing else: it asks nothing of the cluster, so it
+    /// leaves the run's `last_heal` where the arm before it left it — which is that arm's
+    /// end, a heal or not — and no gap follows it (PROPOSED D-120).
+    // PROPOSED(D-120): with no split done the arm is its settle alone.
     SplitFromRestarted {
         /// How long the proposer stays down.
         down: Duration,
@@ -1543,7 +1547,12 @@ pub struct Schedule {
     pub trials: Vec<Trial>,
     /// The faults, each healed before the next, with `gaps[i]` of quiet after it.
     pub faults: Vec<Fault>,
-    /// The quiet after each fault.
+    /// The quiet after each fault. One arm spends none: [`Fault::SplitFromRestarted`]
+    /// with no split done, whose own wait is that quiet (PROPOSED D-120). It is the
+    /// only one, and not because it injects nothing — a [`Fault::Split`] whose ask goes
+    /// unanswered or refused injects nothing either, and spends its gap at the loop's
+    /// foot like every other arm.
+    // PROPOSED(D-120): that one arm spends no gap; no general rule is claimed.
     pub gaps: Vec<Duration>,
     /// The quiet after the last fault: the liveness window.
     pub settle: Duration,
@@ -2022,7 +2031,17 @@ pub struct Report {
     /// [`Report::jsonl`] writes the trace from the two when it is asked for.
     // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
     pub run: RunHeader,
-    /// When the last fault healed or the last crashed server restarted.
+    /// When the last fault healed or the last crashed server restarted — or, where the
+    /// last arm healed nothing, when it finished. Every arm but one sets this at its own
+    /// end at the fault loop's foot, whether or not it injected anything:
+    /// [`Fault::Split`] sets it at its end with its split done, refused or unanswered,
+    /// and a split is no heal and crashes no one. The one exception is
+    /// [`Fault::SplitFromRestarted`] with no split done, which asks nothing of the
+    /// cluster at all and so has no moment of its own to date this from; it leaves the
+    /// field where the arm before it left it, which is as near the last real heal as the
+    /// run can say and never further from it than the arm's own end would be
+    /// (PROPOSED D-120).
+    // PROPOSED(D-120): the no-split arm asks nothing, so it does not move this.
     pub last_heal: Instant,
     /// Where the simulation stopped: the virtual time once the run's last advance
     /// returned, read off the simulator and not worked out from the schedule.
@@ -2105,6 +2124,17 @@ pub struct Report {
     pub aimed: Vec<(u64, u64, Instant)>,
     /// What the split arms' admins recorded (PROPOSED D-100).
     pub splits: SplitStats,
+}
+
+/// A range's first client write after the last heal
+/// ([`Report::recoveries_by_final_range`]).
+// PROPOSED(D-113): the write bound per range the run ended with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery {
+    /// When the first of them was called.
+    pub first_call: Instant,
+    /// When the first of them completed, if one did.
+    pub first_completed: Option<Instant>,
 }
 
 /// What another scenario's run hands [`Report::over_a_run`].
@@ -2987,12 +3017,23 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
 pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result<(), String> {
     // The ranges the run hosts: configuration's, and every right half a split's apply
-    // creates from then on (SHARD.md §5; PROPOSED D-100).
+    // creates (SHARD.md §5; PROPOSED D-100), named anywhere in the run and not only before
+    // the record. A node crashed with a split's batch durable and its `RangeSplit` not yet
+    // traced restates the right half at its next start, log first and descriptor last,
+    // before any node has traced the split: seed 88 of the sharded sweep under `NoPreVote`
+    // (PROPOSED D-113).
     let mut hosted: BTreeSet<u64> = hosted.iter().copied().collect();
     for record in records {
-        if let TraceEvent::RangeSplit { right, .. } = &record.event {
-            hosted.insert(*right);
+        match &record.event {
+            TraceEvent::RangeSplit { right: range, .. }
+            | TraceEvent::RangeCreated { range, .. }
+            | TraceEvent::RangeDescriptor { range, .. } => {
+                hosted.insert(*range);
+            }
+            _ => {}
         }
+    }
+    for record in records {
         let range = range_of(&record.event);
         if let Some(range) = range
             && !hosted.contains(&range)
@@ -3128,17 +3169,44 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 /// {1, 2, 3} and grew again, and server 4's match rose from zero a second time
 /// under the incarnation it had never left.
 ///
-/// A change of the follower's incarnation clears the flag too (core.rs:1845), and
-/// that is deliberately *not* a window: it changes the key's own incarnation, so a
-/// repeat under one key means a retired incarnation came back. In the correct
-/// system it cannot — a fresh store is incarnation 1 and a re-seed draws
-/// `next_u64().max(2)` (node.rs:2327) — so a repeat is either D-042's window, a
-/// delayed answer from the store the leader has moved past, which SHARD.md §8 says
-/// is the case D-042 names the step to take for and not a bound to widen, or a
-/// store that lost its state and opened fresh at 1 again. The second is how
-/// `RefusalNotDurable` is caught on 58 of a thousand raft seeds, every one of them
-/// by this fold, which is what `a_server_whose_refusal_is_not_durable_is_caught`
-/// asserts from the thousand-seed tier (D-056).
+/// A change of the follower's incarnation clears the flag too (core.rs:1845). A
+/// change to a store's own number is deliberately *not* a window: it changes the
+/// key's own incarnation, so a repeat under one key means that number came back
+/// after another store's. No store of the correct system takes a number already
+/// used — a fresh store is incarnation 1 and a re-seed draws `next_u64().max(2)`
+/// (node.rs:2327) — so such a repeat is D-042's window, a delayed success from the
+/// store the leader has moved past, which SHARD.md §8 says is the case D-042 names
+/// the step to take for and not a bound to widen.
+///
+/// **A change to 0 is read by what could have sent it.** 0 is no store's number: a
+/// node stamps it on an answer for a replica it holds no store of, a placeholder's
+/// (`ServerHost::unheld`, PROPOSED D-109) or a refused server's (D-042), and a store
+/// stamps its own. So a store's number *can* repeat around a 0 on the correct system:
+/// D-042's own consequences name it, "a rejection stamped 0 that is delayed past the
+/// install is a change too", which forgets the follower's progress for a round trip.
+/// The store's next answer is a change back, the leader records the same number
+/// again, and the rise after it is the first rise after that record, which is what
+/// SHARD.md §8's `RaftMatchStarted` says it is. Seed 8934 of the sharded sweep is the
+/// shape: node 2's placeholder of range 43 answered, node 2's split made the store,
+/// the store's first answer overtook the placeholder's, and leader 1 traced a rise, a
+/// reset to 0, a reset back and a rise under the one number. (This comment said a
+/// retired incarnation could not repeat; that seed is what falsified it. PROPOSED
+/// D-113 §5.)
+///
+/// What tells that from a store that lost its state is whether the follower holds a
+/// store when the leader reads the 0. If it does, the 0 is older than the store, a
+/// delayed answer, and the leader is tracking the follower afresh: a window. If its
+/// last word was a refusal, the 0 is the refused server's own and nothing has replaced
+/// what it lost, so a number that then comes back is a store that lost its state and
+/// opened again as if whole. That is how `RefusalNotDurable` is caught on 54 of a
+/// thousand raft seeds, every one of them by this fold, which is what
+/// `a_server_whose_refusal_is_not_durable_is_caught` asserts from the thousand-seed
+/// tier (D-056); `seed_21_a_refused_followers_zero_opens_no_window` holds it at every
+/// tier. The trace says a store is held from the follower's `RaftRecovered`,
+/// `RangeCreated` or an install's `RaftSnapshot` (`taken: false`, traced before the
+/// install's answer goes) to its node's next `RaftRefused` or its `RangeRemoved`. A
+/// store that stamped 0 on a live answer would be read as a delayed one here; none
+/// does, `stamp` and `send_message` taking the number from the store that answers.
 ///
 /// A fresh tracking is read in the trace by *refining* what SHARD.md §8 recognises
 /// (SHARD.md:1358-1364): §8 takes a `RaftChangeAccepted` of the leader whose
@@ -3174,7 +3242,11 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 // incarnation)`.
 // PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
 // is a fresh first rise (issue #81).
+// PROPOSED(D-113): a 0 read while the follower holds a store is a delayed answer, and
+// opens a window; a refused follower's 0 does not.
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
+    // (range, server): the replicas whose store the trace says is there.
+    let mut stores: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
     // Each replica's configuration as its own `RaftConfig` states it: the voters
     // in force, and whether it is joint.
@@ -3187,6 +3259,27 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
     let mut started: BTreeSet<(u64, u64, u64, u64, u64, u64)> = BTreeSet::new();
     for record in records {
         let node = record.node.map_or(0, |node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RaftRecovered { server, range, .. }
+            | TraceEvent::RaftSnapshot {
+                server,
+                range,
+                taken: false,
+                ..
+            } => {
+                stores.insert((*range, *server));
+            }
+            TraceEvent::RangeCreated { range, .. } => {
+                stores.insert((*range, node));
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                stores.remove(&(*range, node));
+            }
+            TraceEvent::RaftRefused { server, .. } => {
+                stores.retain(|(_, on)| on != server);
+            }
+            _ => {}
+        }
         match &record.event {
             TraceEvent::RaftTerm {
                 server,
@@ -3226,6 +3319,14 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
                     }
                 }
                 last_accepted.insert((*range, node), voters.clone());
+            }
+            TraceEvent::RaftProgressReset {
+                range,
+                follower,
+                incarnation: 0,
+                ..
+            } if stores.contains(&(*range, *follower)) => {
+                *windows.entry((*range, node, *follower)).or_default() += 1;
             }
             TraceEvent::RaftMatchStarted {
                 range,
@@ -3549,14 +3650,50 @@ impl Report {
     /// its range is `SINGLE_GROUP`, the only range of those runs, and it is marked down
     /// by its own per-replica event once the node traces one. Until a scenario runs the
     /// node, the sole reader of this is the node's own sweep.
+    ///
+    /// **A replica configuration never names is read from the node's own creations**
+    /// (PROPOSED D-113). The node's refusal names configuration's ranges, since those
+    /// are all it knows before it opens its store, so a right half on a refused node is
+    /// named by no `RaftReplicaRefused` (#178). §8 is plain about it: every replica on a
+    /// refused node counts as refused in this rule. So a `RaftRefused` takes down every
+    /// range outside configuration that its node traced a `RangeCreated` of since its
+    /// last refusal, until that replica's `RaftRecovered`; and a voter of such a range on
+    /// an engine a re-seed built, holding nothing of it, counts as impaired too, since a
+    /// placeholder grants no vote (Q22) and the install that ends it quarantines
+    /// (PROPOSED D-109). Configuration's ranges are read as they were, from the events
+    /// the node traces of them: `RefuseOneRangeOnly` is the node naming too few, which
+    /// this must not paper over.
     // PROPOSED(D-071): the checks about time are asked per range.
     // PROPOSED(D-077): a refusal marks down the ranges its node held, which its
     // per-replica refusal events name, and not every range in the run.
     #[must_use]
     pub fn ranges_with_a_majority_up(&self) -> BTreeSet<u64> {
+        self.impaired_voters()
+            .into_iter()
+            .filter(|(_, impaired)| (impaired.len() as u64) * 2 < SERVERS)
+            .map(|(range, _)| range)
+            .collect()
+    }
+
+    /// Per range of the run, the voters [`Report::ranges_with_a_majority_up`] counts as neither
+    /// up nor able to help elect: refused, quarantined, or holding nothing of a right half on an
+    /// engine a re-seed built. That rule's reading, and nothing else.
+    // PROPOSED(D-113): §6 reads the sets as well as their sizes.
+    #[must_use]
+    pub fn impaired_voters(&self) -> BTreeMap<u64, BTreeSet<u64>> {
         let ranges = self.ranges();
         let mut down: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut configured: BTreeSet<u64> = BTreeSet::new();
+        let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut on_a_reseed: BTreeSet<u64> = BTreeSet::new();
+        let mut voters: BTreeMap<u64, (u64, Vec<u64>)> = BTreeMap::new();
+        let mut state = |range: u64, generation: u64, named: &[u64]| {
+            let latest = voters.entry(range).or_insert((generation, named.to_vec()));
+            if generation >= latest.0 {
+                *latest = (generation, named.to_vec());
+            }
+        };
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftReplicaRefused { server, range } => {
@@ -3568,18 +3705,68 @@ impl Report {
                 TraceEvent::RaftReseeded { server, range } => {
                     quarantined.insert((*range, *server));
                 }
+                // PROPOSED(D-113): the node's refusal, for the replicas no per-replica
+                // refusal can name (#178).
+                TraceEvent::RaftRefused { server, .. } => {
+                    let lost: Vec<u64> = held
+                        .iter()
+                        .filter(|(_, on)| on == server)
+                        .map(|&(range, _)| range)
+                        .collect();
+                    for range in lost {
+                        held.remove(&(range, *server));
+                        if !configured.contains(&range) {
+                            down.insert((range, *server));
+                        }
+                    }
+                    on_a_reseed.insert(*server);
+                }
+                TraceEvent::RangeCreated {
+                    range,
+                    cause,
+                    generation,
+                    voters: named,
+                    ..
+                } => {
+                    if *cause == ananke_env::RangeCause::Bootstrap {
+                        configured.insert(*range);
+                    }
+                    if let Some(node) = record.node {
+                        held.insert((*range, u64::from(node.get())));
+                    }
+                    state(*range, *generation, named);
+                }
+                TraceEvent::RangeDescriptor {
+                    range,
+                    generation,
+                    voters: named,
+                    ..
+                } => state(*range, *generation, named),
                 _ => {}
+            }
+        }
+        // A voter on an engine a re-seed built that holds nothing of a range configuration
+        // never named: it grants no vote from a placeholder, and the install that ends the
+        // placeholder quarantines it (PROPOSED D-109), so it helps elect nobody either way.
+        for (range, (_, named)) in &voters {
+            if configured.contains(range) {
+                continue;
+            }
+            for server in named {
+                if on_a_reseed.contains(server) && !held.contains(&(*range, *server)) {
+                    down.insert((*range, *server));
+                }
             }
         }
         ranges
             .into_iter()
-            .filter(|range| {
+            .map(|range| {
                 let impaired: BTreeSet<u64> = down
                     .union(&quarantined)
-                    .filter(|(g, _)| g == range)
+                    .filter(|(g, _)| *g == range)
                     .map(|&(_, server)| server)
                     .collect();
-                (impaired.len() as u64) * 2 < SERVERS
+                (range, impaired)
             })
             .collect()
     }
@@ -3878,6 +4065,23 @@ impl Report {
     ///
     /// A message naming the seed and the violation.
     pub fn check(&self) -> Result<(), String> {
+        self.check_with(Self::liveness)
+    }
+
+    /// [`Report::check`] for a run whose ranges are made by splits, its write bound asked
+    /// per range the run ended with ([`Report::liveness_by_final_range`]); every other
+    /// check is the same, in the same order.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the seed and the violation.
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    pub fn check_by_final_range(&self) -> Result<(), String> {
+        self.check_with(Self::liveness_by_final_range)
+    }
+
+    /// The checks, with `liveness` as the reading of the write bound.
+    fn check_with(&self, liveness: fn(&Self) -> Result<(), String>) -> Result<(), String> {
         let seed = self.seed;
         let fail = |what: String| Err(format!("seed {seed}: {what}"));
         if let Some(why) = &self.stopped {
@@ -3947,7 +4151,7 @@ impl Report {
         // Both are asked only of a range whose unimpaired replicas form a majority
         // (SHARD.md §8), which each reads for itself: with none, both pass.
         if self.uniform() {
-            if let Err(violation) = self.liveness() {
+            if let Err(violation) = liveness(self) {
                 return fail(violation);
             }
             if let Err(violation) = self.timers_fire() {
@@ -4051,6 +4255,23 @@ impl Report {
                 }
             }
         }
+        self.recovery_from_the_heal(&live)?;
+        if asked == 0 {
+            return Err(format!(
+                "liveness: no client write completed after the last heal at {:?}",
+                self.last_heal
+            ));
+        }
+        Ok(())
+    }
+
+    /// The recovery time proper (D-076): per range of [`Report::key_range`] with a majority
+    /// up, of those in `live`, the first write completed within the bound of **the heal**
+    /// ([`Report::writes_after_heal_by_range`]).
+    // PROPOSED(D-076): the recovery time proper is asked per range.
+    // PROPOSED(D-113): read beside the per-range arm from the first call.
+    fn recovery_from_the_heal(&self, live: &BTreeSet<u64>) -> Result<(), String> {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
         for (range, took) in self.writes_after_heal_by_range() {
             if !live.contains(&range) {
                 continue;
@@ -4073,7 +4294,147 @@ impl Report {
                 }
             }
         }
-        if asked == 0 {
+        Ok(())
+    }
+
+    /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then every
+    /// split the trace took, read where the run stopped ([`Report::ended`]).
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    #[must_use]
+    pub fn final_range_of(&self, key: &Bytes) -> u64 {
+        self.serving_at(&self.splits_taken(), key, self.ended)
+    }
+
+    /// Per range the run ended with that some client wrote to after the last heal, when
+    /// the first of those writes was called and when the first of them completed.
+    /// The writes are the ones the per-key reading reads ([`Report::writes_after_heal_by_key`]).
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    #[must_use]
+    pub fn recoveries_by_final_range(&self) -> BTreeMap<u64, Recovery> {
+        let splits = self.splits_taken();
+        let mut by_range: BTreeMap<u64, Recovery> = BTreeMap::new();
+        for op in self.post_heal_writes() {
+            let range = self.serving_at(&splits, op.op.key(), self.ended);
+            let recovery = by_range.entry(range).or_insert(Recovery {
+                first_call: op.call,
+                first_completed: None,
+            });
+            recovery.first_call = recovery.first_call.min(op.call);
+            recovery.first_completed = match (recovery.first_completed, op.ret) {
+                (Some(one), Some(another)) => Some(one.min(another)),
+                (one, another) => one.or(another),
+            };
+        }
+        by_range
+    }
+
+    /// The write bound of [`Report::liveness`], asked per range the run ended with
+    /// (SHARD.md §8), for a run whose ranges are made by splits: [`Report::key_range`] is
+    /// the map the run started with, and on such a run it reads every key as one range's.
+    ///
+    /// - **Per key**, the same fold and the same bound: every key some client wrote after
+    ///   the heal, its slowest write from its own call, asked where the range serving the
+    ///   key at the run's end has a majority up ([`Report::ranges_with_a_majority_up`]).
+    /// - **Per range**, what [`Report::recoveries_by_final_range`] reads: a range whose
+    ///   post-heal writes in the history all stayed pending is the wedge, and otherwise the
+    ///   first completion comes within the bound of the first call in the history. That
+    ///   call and not the heal, because a range here is as few as two of sixteen keys, and
+    ///   a write to one sent to a node that does not lead it, or dropped, is abandoned
+    ///   after one [`WRITE_TIMEOUT`] and never proposed, so it leaves no operation
+    ///   (`lin.rs`): the delay is the clients' routing and the network's loss. Being the
+    ///   history's, this origin moves with any stall in which nothing is proposed, so it
+    ///   cannot say how long the cluster took to come back. The next arm can.
+    /// - **The keyspace from the heal**, [`Report::liveness`]'s own per-range reading and
+    ///   D-076's "how long after the heal the range became writable at all", kept beside
+    ///   the arm above: per range of [`Report::key_range`] with a majority up, the first
+    ///   write completed within the bound of the heal. A run whose keys all start in one
+    ///   range asks that of its whole keyspace.
+    /// - **The clients wrote nothing**, the arm [`Report::liveness`] ends with, is asked
+    ///   where every range the history touched has a majority up. Where only some have, a
+    ///   live range with no write in the history says nothing.
+    ///
+    /// **What this cannot see** (#197, #158). Every arm reads the history, and a write no
+    /// leader proposed is not in it, so a range whose clients asked for writes that nothing
+    /// proposed is in none of them: no client having drawn its keys and no leader having
+    /// taken its writes read the same, and a live range with no leader passes. And the
+    /// first completion ends the question: a range that recovers and then wedges passes,
+    /// as does a key with one completed write and one left pending. Neither is new here;
+    /// D-103's reading from the invocations is not a drop-in, as #197 measures.
+    ///
+    /// **What moved against [`Report::liveness`] under the map that starts every key in one
+    /// range** (PROPOSED D-113 §5). The bound is the same constant, the whole-keyspace
+    /// reading from the heal is the same code, and every key that reading asks is still
+    /// asked: a voter impaired on any final range is on a refused node, and a refused
+    /// bootstrap node impairs every range configuration names, so if the first range has a
+    /// majority up every final range has. `sim/tests/shard.rs` asserts that inclusion on
+    /// every seed, and it says nothing of a reading's origin. The arm read from each
+    /// range's first call is an addition, and it is weaker than asking each final range
+    /// from the heal would be, which nothing here asks. The arm for the clients writing
+    /// nothing asks less, on purpose: that is §2 (c)'s false arm.
+    ///
+    /// # Errors
+    ///
+    /// The violation, naming the key or the range and the bound.
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    pub fn liveness_by_final_range(&self) -> Result<(), String> {
+        let live = self.ranges_with_a_majority_up();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        let splits = self.splits_taken();
+        let final_range = |key: &Bytes| self.serving_at(&splits, key, self.ended);
+        let mut asked = 0usize;
+        for (key, took) in self.writes_after_heal_by_key() {
+            if !live.contains(&final_range(&key)) {
+                continue;
+            }
+            asked += 1;
+            let key = String::from_utf8_lossy(&key).into_owned();
+            match took {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "liveness: the slowest client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to {key} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        for (range, recovery) in self.recoveries_by_final_range() {
+            if !live.contains(&range) {
+                continue;
+            }
+            match recovery.first_completed {
+                Some(completed) => {
+                    let took = completed.duration_since(recovery.first_call.max(self.last_heal));
+                    if took > bound {
+                        return Err(format!(
+                            "liveness: range {range} took {took:?} from its first client write after the last heal to complete one, over {bound:?}"
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to range {range} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        self.recovery_from_the_heal(&live)?;
+        let touched: BTreeSet<u64> = self
+            .history
+            .ops
+            .iter()
+            .map(|op| final_range(op.op.key()))
+            .collect();
+        if asked == 0 && touched.iter().all(|range| live.contains(range)) {
             return Err(format!(
                 "liveness: no client write completed after the last heal at {:?}",
                 self.last_heal
@@ -8858,6 +9219,36 @@ pub fn run_on(
                 let (Some(proposer), Some(cut)) = (proposer, cut) else {
                     // No split is done yet, so there is no block a restart could
                     // resume from: the arm is a wait, counted as not reached.
+                    //
+                    // The `continue` skips `last_heal` and the gap **deliberately**
+                    // (PROPOSED D-120, issue #147). The arm asks nothing of the cluster
+                    // — no split, no crash, no transfer — so it has no moment of its own
+                    // to date `last_heal` from, and a gap is the quiet after a fault,
+                    // which this settle already was.
+                    //
+                    // What it is *not* is a return to the last real heal, and the reason
+                    // for the `continue` must not pretend otherwise (#196's review, B2).
+                    // `Schedule::draw_on_the_node` inserts `Fault::Split` at `at` and
+                    // this arm at `after >= at + 1`, so every node schedule carries a
+                    // split arm before this one and the loop reaches this one only by
+                    // having run it; on 377 of the first thousand node schedules that
+                    // split arm is the one immediately before: `last_heal` is then its
+                    // end, set at the loop's foot whether its split was done, refused or
+                    // unanswered, and a split is no heal. That imprecision is the split
+                    // arm's, it is not #147's question, and nothing here changes it.
+                    //
+                    // What this `continue` keeps out is only this arm's own gap and
+                    // settle *on top of* that. Setting `last_heal` here, as the arms
+                    // that ask something of the cluster do below, can only start the
+                    // liveness readings' clock later than the arm before it already
+                    // starts it, with no fault of this arm's to answer for the
+                    // allowance, leaving the first of the recovery unread. So the kept
+                    // reading is the nearer of the two to the last real heal, never the
+                    // further. D-102 measured the move at ten thousand node seeds as
+                    // losing 47 of `SharedSnapshotDir`'s uniform liveness catches and
+                    // winning 2 — it is not a superset either way — and moving no verdict
+                    // of the correct node. A looser reading, not a fix.
+                    // PROPOSED(D-120): the no-split branch is the arm's settle alone.
                     advance(&mut sim, *settle, &mut watch);
                     continue;
                 };
@@ -9023,6 +9414,11 @@ pub fn run_on(
 pub(crate) struct Watch {
     slices: u32,
     pub(crate) stopped: Option<String>,
+    /// Whether the checkers fold at all, and so whether a violation can stop the run: off
+    /// for a run taken to its end, so that a check about time can be read of a variant
+    /// another check would have stopped first (`shard::run_to_the_end`).
+    // PROPOSED(D-113)
+    pub(crate) stops: bool,
     /// The safety checks, one checker for the whole run with the state of each
     /// check kept across looks, so a look costs only the records since the last
     /// one (D-046).
@@ -9040,6 +9436,7 @@ impl Default for Watch {
         Self {
             slices: 0,
             stopped: None,
+            stops: true,
             checker: invariants::Checker::new(SERVERS as usize),
             shard: ananke_shard::invariants::Checker::new(false),
             checked: 0,
@@ -9062,6 +9459,9 @@ impl Watch {
         let records = sim.trace_from(self.checked);
         self.checked += records.len();
         read(&records);
+        if !self.stops {
+            return;
+        }
         self.checker.extend(crate::traced(&records));
         if let Err(violation) = self.checker.verdict() {
             self.stopped = Some(format!("{violation} (at {:?})", sim.now()));
@@ -11394,14 +11794,14 @@ mod tests {
         );
     }
 
-    /// An incarnation carried back is a second first rise and stays one, reset or
+    /// A store's number carried back is a second first rise and stays one, reset or
     /// no reset. A leader forgets a follower's progress at every change of its
     /// incarnation (D-042), so the core does trace a first rise after one; but the
-    /// incarnation is in the key, and the correct system never returns to a number
-    /// it has retired — a fresh store is 1 and a re-seed draws above it. A repeat
-    /// under one incarnation is therefore either D-042's one-message window, which
-    /// SHARD.md §8 asks to be shown rather than allowed, or a store that lost its
-    /// state and opened fresh at 1 again, which is `RefusalNotDurable`.
+    /// incarnation is in the key, and no store of the correct system takes a number
+    /// already used — a fresh store is 1 and a re-seed draws above it. A repeat
+    /// from one store's number straight to another's and back is therefore D-042's
+    /// one-message window, which SHARD.md §8 asks to be shown rather than allowed.
+    /// A 0 between the two is read by the cases after this one.
     // PROPOSED(D-079): a first rise per tracking window.
     #[test]
     fn an_incarnation_carried_back_is_a_second_first_rise() {
@@ -11417,6 +11817,213 @@ mod tests {
             a_second_first_rise(&there_and_back, "4's match under incarnation 1"),
             "an incarnation the leader had already retired came back: D-042's case, not a window"
         );
+    }
+
+    /// A replica's store opening at a restart, carrying its number.
+    fn store_recovered(server: u64, incarnation: u64) -> TraceEvent {
+        TraceEvent::RaftRecovered {
+            server,
+            range: SINGLE_GROUP,
+            term: 2,
+            applied: 0,
+            last_index: 0,
+            incarnation,
+            state: ananke_env::RecoveredAs::Neither,
+        }
+    }
+
+    fn store_refused(server: u64) -> TraceEvent {
+        TraceEvent::RaftRefused {
+            server,
+            reason: "lost state".to_owned(),
+        }
+    }
+
+    /// Leader 3 reads a rise under `incarnation`, a 0 from 4, then the same number
+    /// and a rise again: the leader's half of every shape below.
+    fn a_rise_a_zero_and_a_rise(incarnation: u64) -> Vec<(u64, TraceEvent)> {
+        vec![
+            (3, match_started(4, incarnation, 10)),
+            (3, progress_reset(3, 4, 0)),
+            (3, progress_reset(3, 4, incarnation)),
+            (3, match_started(4, incarnation, 10)),
+        ]
+    }
+
+    /// Seed 8934's shape: the follower holds a store when the leader reads the 0, so
+    /// the 0 is older than the store, and the leader tracks the follower afresh. The
+    /// old reading took the two rises as a retired number coming back.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_zero_read_while_the_follower_holds_a_store_is_a_delayed_answer_and_opens_a_window() {
+        let mut delayed = vec![(4, store_recovered(4, 7))];
+        delayed.extend(a_rise_a_zero_and_a_rise(7));
+        assert_eq!(match_starts_are_first_rises(&traced_by(delayed)), Ok(()));
+
+        // The window is the 0's: a rise after the same number with no 0 between is
+        // still a second first rise.
+        let mut no_zero = vec![
+            (4, store_recovered(4, 7)),
+            (3, match_started(4, 7, 10)),
+            (3, progress_reset(3, 4, 7)),
+            (3, match_started(4, 7, 10)),
+        ];
+        assert!(
+            a_second_first_rise(&traced_by(no_zero.clone()), "4's match under incarnation 7"),
+            "only a 0 opens a window"
+        );
+        // And another number's change opens none, where the store is held all along.
+        no_zero.insert(2, (3, progress_reset(3, 4, 9)));
+        assert!(
+            a_second_first_rise(&traced_by(no_zero), "4's match under incarnation 7"),
+            "a store's number is no 0"
+        );
+    }
+
+    /// `RefusalNotDurable`'s shape, the fold's catch: the follower refused its store
+    /// and answered 0, and the same number came back when it opened again. Nothing
+    /// replaced what it lost, so the 0 opens no window.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_zero_from_a_refused_follower_opens_no_window() {
+        let events = vec![
+            (4, store_recovered(4, 1)),
+            (3, match_started(4, 1, 10)),
+            (4, store_refused(4)),
+            (3, progress_reset(3, 4, 0)),
+            (4, store_recovered(4, 1)),
+            (3, progress_reset(3, 4, 1)),
+            (3, match_started(4, 1, 10)),
+        ];
+        assert!(
+            a_second_first_rise(&traced_by(events), "4's match under incarnation 1"),
+            "a store that lost its state and opened again as if whole"
+        );
+    }
+
+    /// With no store of the follower in the trace at all the 0 explains nothing.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_zero_with_no_store_traced_opens_no_window() {
+        assert!(
+            a_second_first_rise(
+                &traced_by(a_rise_a_zero_and_a_rise(7)),
+                "4's match under incarnation 7"
+            ),
+            "no record says follower 4 holds a store"
+        );
+    }
+
+    /// D-042's own consequence, "a rejection stamped 0 that is delayed past the
+    /// install": the refusal ended one store and the install's `RaftSnapshot`, traced
+    /// before its answer goes, is the store the leader read a rise from.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_refused_followers_zero_delayed_past_its_install_opens_a_window() {
+        let mut installed = vec![
+            (4, store_recovered(4, 1)),
+            (4, store_refused(4)),
+            (
+                4,
+                TraceEvent::RaftSnapshot {
+                    server: 4,
+                    range: SINGLE_GROUP,
+                    last_index: 10,
+                    last_term: 2,
+                    taken: false,
+                },
+            ),
+        ];
+        installed.extend(a_rise_a_zero_and_a_rise(7));
+        assert_eq!(match_starts_are_first_rises(&traced_by(installed)), Ok(()));
+
+        // A checkpoint a store took is no install: `taken` is the store's own.
+        let mut taken = vec![
+            (4, store_recovered(4, 1)),
+            (4, store_refused(4)),
+            (
+                4,
+                TraceEvent::RaftSnapshot {
+                    server: 4,
+                    range: SINGLE_GROUP,
+                    last_index: 10,
+                    last_term: 2,
+                    taken: true,
+                },
+            ),
+        ];
+        taken.extend(a_rise_a_zero_and_a_rise(7));
+        assert!(a_second_first_rise(
+            &traced_by(taken),
+            "4's match under incarnation 7"
+        ));
+    }
+
+    /// A store is the replica's, in its range and on its node: a split's creation
+    /// opens one, a removal ends it, and neither says anything of another replica.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_store_held_is_read_per_range_and_per_node() {
+        let created = |range: u64| TraceEvent::RangeCreated {
+            range,
+            cause: ananke_env::RangeCause::Split,
+            parent: Some(SINGLE_GROUP),
+            start: Bytes::new(),
+            end: Bytes::new(),
+            generation: 2,
+            voters: vec![3, 4, 5],
+            floor_index: 0,
+            floor_term: 0,
+            incarnation: 7,
+        };
+        let removed = TraceEvent::RangeRemoved {
+            range: SINGLE_GROUP,
+            generation: 2,
+            incarnation: 7,
+            cause: ananke_env::RangeRemovedCause::Collected,
+        };
+        let mut held = vec![(4, created(SINGLE_GROUP))];
+        held.extend(a_rise_a_zero_and_a_rise(7));
+        assert_eq!(match_starts_are_first_rises(&traced_by(held)), Ok(()));
+
+        let mut another_range = vec![(4, created(SINGLE_GROUP + 1))];
+        another_range.extend(a_rise_a_zero_and_a_rise(7));
+        assert!(a_second_first_rise(
+            &traced_by(another_range),
+            "4's match under incarnation 7"
+        ));
+
+        let mut another_node = vec![(5, created(SINGLE_GROUP))];
+        another_node.extend(a_rise_a_zero_and_a_rise(7));
+        assert!(a_second_first_rise(
+            &traced_by(another_node),
+            "4's match under incarnation 7"
+        ));
+
+        let mut gone = vec![(4, created(SINGLE_GROUP)), (4, removed)];
+        gone.extend(a_rise_a_zero_and_a_rise(7));
+        assert!(a_second_first_rise(
+            &traced_by(gone),
+            "4's match under incarnation 7"
+        ));
+    }
+
+    /// A delayed 0 opens the window of the follower it is about and of the leader
+    /// that read it: follower 5's rises are in no window of 4's.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_delayed_zero_opens_the_window_of_its_follower_alone() {
+        let records = traced_by(vec![
+            (4, store_recovered(4, 7)),
+            (5, store_recovered(5, 8)),
+            (3, match_started(5, 8, 10)),
+            (3, progress_reset(3, 4, 0)),
+            (3, match_started(5, 8, 20)),
+        ]);
+        assert!(a_second_first_rise(
+            &records,
+            "5's match under incarnation 8"
+        ));
     }
 
     /// A term record of the leader's own ends the catch-up phase, as a
@@ -11845,6 +12452,212 @@ mod tests {
         );
     }
 
+    /// [`Fault::SplitFromRestarted`] with no split done is a wait of its settle and
+    /// nothing else, **by design** (PROPOSED D-120, issue #147). The arm asks nothing of
+    /// the cluster, so it has no moment of its own to date `last_heal` from and leaves the
+    /// field where the arm before it left it; and no gap follows it, because a gap is "the
+    /// quiet after a fault" and the arm's settle, longer than any gap the node schedule
+    /// draws, was that quiet already. The other end of the pair is the same arm after a
+    /// split done: there it crashes the proposer, and `last_heal` is the arm's end with its
+    /// gap after it, as every arm that asks something of the cluster sets it.
+    ///
+    /// What the no-split parts guard is a reading, not a schedule, and the reading they
+    /// keep is not "the last real heal": [`Fault::Split`] sets `last_heal` at its own end
+    /// whether its split was done, refused or unanswered, and the node draw puts that arm
+    /// immediately before this one on 377 of the first thousand schedules (#196's review,
+    /// B2). The field is the arm-before's end either way. Moving it to *this* arm's end
+    /// would add this arm's gap and settle on top, starting the liveness readings' clock
+    /// later still with no fault of its own to answer for it and leaving the first of the
+    /// recovery unread: D-102 measured that at ten thousand node seeds as moving no verdict
+    /// of the correct node, turning 47 of `SharedSnapshotDir`'s uniform liveness catches
+    /// into passes and 2 passes into catches. Spending the gap would redraw every node run
+    /// that takes the branch before another arm, for nothing anything reads.
+    ///
+    /// The schedule is built by hand: a 1.2 s warmup, no lease trial, the arms with a gap
+    /// of 200 ms each and the liveness window, every clock true. Three parts, each
+    /// asserting `uniform()` so the liveness fold is known to be asked of it (#196's
+    /// review, N3):
+    ///
+    /// 1. After a 500 ms **isolation**, seed 5: no split asked at all. The plainest
+    ///    reading of "injects nothing", but not a shape the sweep can produce.
+    /// 2. After a **`Split` not done**, seed 0: the sweep's own shape, and the only one it
+    ///    reaches the branch with, since [`Schedule::draw_on_the_node`] inserts
+    ///    `Fault::Split` at `at` and this arm at `after >= at + 1` on every seed. Part 1
+    ///    cannot tell a `last_heal` keyed on the split *asked* from one keyed on the split
+    ///    *done*; this part can (#196's review, B3). Seed 0's split goes unanswered within
+    ///    the admin's round, an ordinary outcome of a split asked (361 of 1 941 at D-100's
+    ///    thousand).
+    /// 3. After a **`Split` done**, seed 5: the arm fires.
+    ///
+    /// Seed 5 is pinned for part 3 because its split is done and seed 0 for part 2 because
+    /// its is not. Should a change redraw either the other way, that part's first assertion
+    /// says so and another seed is to be pinned.
+    // PROPOSED(D-120): the no-split branch is the arm's settle alone, by design.
+    #[test]
+    fn a_split_from_restarted_with_no_split_done_is_its_settle_alone() {
+        const SEED: u64 = 5;
+        const UNANSWERED: u64 = 0;
+        let origin = Instant::default();
+        let warmup = Duration::from_millis(1200);
+        let quiet = election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200);
+        let gap = Duration::from_millis(200);
+        let isolated = Duration::from_millis(500);
+        let settle = Duration::from_millis(1000);
+        let asked_for = Duration::from_millis(600);
+        let arm = Fault::SplitFromRestarted {
+            down: Duration::from_millis(300),
+            settle,
+        };
+        let run = |seed: u64, faults: Vec<Fault>| {
+            let arms = faults.len();
+            let schedule = Schedule {
+                warmup,
+                trials: Vec::new(),
+                faults,
+                gaps: vec![gap; arms],
+                settle: quiet,
+                drifts: vec![0; SERVERS as usize],
+                skews: vec![0; SERVERS as usize],
+                range_picks: vec![0; arms],
+            };
+            run_on(
+                Cluster::Node,
+                seed,
+                schedule,
+                Variants::default(),
+                NodeVariants::correct(),
+                RangeVariants::correct(),
+            )
+        };
+        let crashes = |report: &Report| {
+            report
+                .records
+                .iter()
+                .filter(|r| matches!(r.event, TraceEvent::NodeCrashed { .. }))
+                .count()
+        };
+
+        // No split asked before it at all: the arm is its settle alone, and counted
+        // unreached. Not the sweep's shape — the sweep always asks a split before the
+        // arm (below) — but the plainest reading of "injects nothing".
+        let waited = run(
+            SEED,
+            vec![
+                Fault::Isolate {
+                    server: 1,
+                    client: 1,
+                    for_: isolated,
+                },
+                arm.clone(),
+            ],
+        );
+        assert_eq!(waited.stopped, None, "the correct node stopped early");
+        assert!(
+            waited.uniform(),
+            "seed {SEED} is a uniform run, so liveness is asked"
+        );
+        assert_eq!(
+            (
+                waited.splits.asked,
+                waited.splits.from_restarted,
+                crashes(&waited)
+            ),
+            (0, 0, 0),
+            "with no split done the arm asked a split or crashed a server"
+        );
+        let healed = origin + warmup + isolated;
+        assert_eq!(
+            waited.last_heal, healed,
+            "the no-split arm moved last_heal off the isolation's heal: it healed nothing, so \
+             the liveness readings' clock would start late with no fault to answer for it and \
+             the first of the recovery would go unread (PROPOSED D-120)"
+        );
+        assert_eq!(
+            waited.ended,
+            healed + gap + settle + quiet,
+            "the no-split arm did not spend its settle alone, the isolation's gap before it: \
+             a gap is the quiet after a fault, and it injected none (PROPOSED D-120)"
+        );
+        assert_eq!(
+            waited.check().err(),
+            None,
+            "the correct node fails the isolation and the wait"
+        );
+
+        // A split asked and not done before it: the sweep's own shape, the only one it
+        // can reach the branch with, because `Schedule::draw_on_the_node` inserts
+        // `Fault::Split` at `at` and this arm at `after >= at + 1` on every seed. Part 1
+        // above cannot tell a `last_heal` keyed on the split *asked* from one keyed on
+        // the split *done*; this part can, and the sweep's ~59 seeds in a thousand are
+        // all of this kind.
+        let unanswered = run(
+            UNANSWERED,
+            vec![Fault::Split { settle: asked_for }, arm.clone()],
+        );
+        assert_eq!(unanswered.stopped, None, "the correct node stopped early");
+        assert!(
+            unanswered.uniform(),
+            "seed {UNANSWERED} is a uniform run, so liveness is asked"
+        );
+        assert_eq!(
+            (
+                unanswered.splits.asked,
+                unanswered.splits.done,
+                unanswered.splits.from_restarted,
+                crashes(&unanswered)
+            ),
+            (1, 0, 0, 0),
+            "seed {UNANSWERED}'s split before the arm was answered done, or the arm fired: \
+             the sweep's shape for the branch is a split asked and not done, and another \
+             seed is to be pinned: {:?}",
+            unanswered.splits
+        );
+        let asked = origin + warmup + asked_for;
+        assert_eq!(
+            unanswered.last_heal, asked,
+            "the no-split arm moved last_heal off the end of the split arm before it: the arm \
+             heals nothing and crashes no one, and moving the field here can only start the \
+             liveness readings' clock later than the split arm already starts it, dropping the \
+             first of the recovery with no fault to answer for the allowance (PROPOSED D-120)"
+        );
+        assert_eq!(
+            unanswered.ended,
+            asked + gap + settle + quiet,
+            "the no-split arm did not spend its settle alone, the split arm's gap before it: \
+             a gap is the quiet after a fault, and it injected none (PROPOSED D-120)"
+        );
+        assert_eq!(
+            unanswered.check().err(),
+            None,
+            "the correct node fails the unanswered split and the wait"
+        );
+
+        // After a split done: the arm crashes the proposer and asks again, and last_heal
+        // is its end, with its gap and the settle after it.
+        let after = run(SEED, vec![Fault::Split { settle: asked_for }, arm]);
+        assert_eq!(after.stopped, None, "the correct node stopped early");
+        assert!(
+            after.uniform(),
+            "seed {SEED} is a uniform run on this shape, so liveness is asked: without it \
+             `check()` folds no liveness and this part would pass on nothing"
+        );
+        assert_eq!(
+            (after.splits.from_restarted, crashes(&after)),
+            (1, 1),
+            "the arm did not fire after seed {SEED}'s split: either no split was done by the \
+             time the arm came (`done` 0 below, or done during the arm's own wait), so the \
+             pair's other half is not reached and another seed is to be pinned, or the arm \
+             skipped a split that was done: {:?}",
+            after.splits
+        );
+        assert_eq!(
+            after.last_heal + gap + quiet,
+            after.ended,
+            "the arm that fired did not set last_heal at its end"
+        );
+        assert_eq!(after.check().err(), None, "the correct node fails the arm");
+    }
+
     /// A write pending inside the bound of the end is excused only on a range some
     /// post-heal write **completed** on (PROPOSED D-102). The true end alone excused
     /// the only post-heal writes of ranges `SharedSnapshotDir` had wedged for 6.5 to
@@ -11859,6 +12672,350 @@ mod tests {
     /// after it was called. With both keys in one range `k0` shows `k1`'s range live
     /// and the write is excused; with each key its own range, nothing shows `k1`'s
     /// range live and it is the wedge.
+    /// A right half restated before any node has traced its split: a node crashed with the
+    /// split's batch durable and its `RangeSplit` not yet traced restates it, log first and
+    /// descriptor last. Its range is the run's though nothing has named it yet, and a range
+    /// the run names nowhere is still a stamp from nowhere.
+    // PROPOSED(D-113)
+    #[test]
+    fn the_payload_oracle_takes_a_right_half_its_split_has_not_been_traced_for() {
+        const RIGHT: u64 = 28;
+        let truncate = |range| TraceEvent::RaftTruncate {
+            server: 1,
+            range,
+            from_index: 74,
+        };
+        let descriptor = TraceEvent::RangeDescriptor {
+            range: RIGHT,
+            index: 73,
+            applied: 73,
+            start: Bytes::new(),
+            end: Bytes::new(),
+            generation: 3,
+            voters: vec![1, 2, 3],
+            state: RangeState::Live,
+        };
+        let hosted = [SINGLE_GROUP];
+        payload_is_well_formed(
+            &[
+                record(ms(1), ms(1), Some(1), truncate(RIGHT)),
+                record(ms(1), ms(1), Some(1), descriptor),
+            ],
+            &hosted,
+        )
+        .expect("the restatement names it");
+        let named_nowhere =
+            payload_is_well_formed(&[record(ms(1), ms(1), Some(1), truncate(RIGHT))], &hosted);
+        assert!(
+            named_nowhere.is_err_and(|why| why.contains("carries range 28")),
+            "a range no record of the run names is a stamp from nowhere"
+        );
+    }
+
+    /// A replica's creation on `server`'s node, for the cases below.
+    // PROPOSED(D-113)
+    fn created_on(server: u64, at: u64, range: u64, cause: ananke_env::RangeCause) -> TraceRecord {
+        record(
+            ms(at),
+            ms(at),
+            Some(server),
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                parent: None,
+                start: Bytes::new(),
+                end: Bytes::new(),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                floor_index: 0,
+                floor_term: 0,
+                incarnation: 2,
+            },
+        )
+    }
+
+    /// SHARD.md §8: every replica on a refused node counts as refused in the per-range
+    /// majority rule. A right half is named by no `RaftReplicaRefused`, since configuration
+    /// never names it (#178), so it is read from the node's own creations; configuration's
+    /// ranges go on being read from the events the node traces of them, which a node that
+    /// names too few (`RefuseOneRangeOnly`) gets wrong and this must not paper over.
+    // PROPOSED(D-113)
+    #[test]
+    fn a_refused_nodes_right_half_is_refused_though_no_event_names_it() {
+        use ananke_env::RangeCause::{Bootstrap, Snapshot, Split};
+        const RIGHT: u64 = 19;
+        let refusal = |server: u64, at: u64| record(ms(at), ms(at), Some(server), refused(server));
+        let live =
+            |records: Vec<TraceRecord>| report(records, Vec::new()).ranges_with_a_majority_up();
+        let on_all = || {
+            (1..=3)
+                .map(|server| created_on(server, 1, RIGHT, Split))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(live(on_all()), BTreeSet::from([RIGHT]), "whole");
+        // One node refused: one replica impaired, a majority left.
+        let mut records = on_all();
+        records.push(refusal(1, 2));
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "one refused node");
+        // Two: no majority, with no per-replica event naming either. This is what the
+        // reading of the per-replica events alone counted live (#178), and what the write
+        // bound then asked of a range that could not elect.
+        let mut records = on_all();
+        records.extend([refusal(1, 2), refusal(2, 3)]);
+        assert_eq!(live(records), BTreeSet::new(), "two refused nodes");
+        // A voter on a re-seeded engine that holds nothing of the range: a placeholder
+        // grants no vote (Q22), and the install that ends it quarantines (PROPOSED D-109).
+        let records = vec![
+            refusal(1, 1),
+            created_on(2, 2, RIGHT, Split),
+            created_on(3, 2, RIGHT, Split),
+            refusal(2, 3),
+        ];
+        assert_eq!(live(records), BTreeSet::new(), "refused, then never held");
+        // But one that made the range by its own apply after its refusal holds it, and
+        // no quarantine comes with a split (Q26).
+        let records = vec![
+            refusal(1, 1),
+            created_on(1, 2, RIGHT, Split),
+            created_on(2, 2, RIGHT, Split),
+            created_on(3, 2, RIGHT, Split),
+            refusal(2, 3),
+        ];
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "its own apply");
+        // A refused replica that comes back by an install is lifted, as any is, and stays
+        // impaired only by the quarantine that install states.
+        let back = |server: u64, at: u64| {
+            record(
+                ms(at),
+                ms(at),
+                Some(server),
+                TraceEvent::RaftRecovered {
+                    server,
+                    range: RIGHT,
+                    term: 1,
+                    applied: 1,
+                    last_index: 1,
+                    incarnation: 3,
+                    state: ananke_env::RecoveredAs::Neither,
+                },
+            )
+        };
+        let mut records = on_all();
+        records.extend([
+            refusal(1, 2),
+            refusal(2, 3),
+            created_on(1, 4, RIGHT, Snapshot),
+            back(1, 5),
+        ]);
+        assert_eq!(live(records), BTreeSet::from([RIGHT]), "one came back");
+        // Configuration's range is not read this way: refused without its per-replica
+        // events it is what `RefuseOneRangeOnly` traces, and it stays asked of.
+        let records = vec![
+            created_on(1, 1, SINGLE_GROUP, Bootstrap),
+            created_on(2, 1, SINGLE_GROUP, Bootstrap),
+            created_on(3, 1, SINGLE_GROUP, Bootstrap),
+            refusal(1, 2),
+            refusal(2, 3),
+        ];
+        assert_eq!(
+            live(records),
+            BTreeSet::from([SINGLE_GROUP]),
+            "configuration's range reads the node's own events"
+        );
+    }
+
+    /// The write bound per range the run ended with (SHARD.md §8).
+    // PROPOSED(D-113)
+    #[test]
+    fn the_write_bound_is_asked_of_the_range_serving_a_key_where_the_run_stopped() {
+        use ananke_env::RangeCause::{Bootstrap, Split};
+        const RIGHT: u64 = 19;
+        let split = record(
+            ms(1),
+            ms(1),
+            Some(1),
+            TraceEvent::RangeSplit {
+                range: SINGLE_GROUP,
+                right: RIGHT,
+                key: user_key(b"k5"),
+                index: 1,
+            },
+        );
+        let mut records = Vec::new();
+        for server in 1..=3 {
+            records.push(created_on(server, 0, SINGLE_GROUP, Bootstrap));
+            records.push(created_on(server, 1, RIGHT, Split));
+        }
+        records.push(split);
+        let with = |records: &Vec<TraceRecord>, ops| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ended: ms(9000),
+            ..report(records.clone(), Vec::new())
+        };
+        let run = with(
+            &records,
+            vec![put_at("k1", 100, Some(110)), put_at("k7", 100, Some(110))],
+        );
+        assert_eq!(run.final_range_of(&Bytes::from_static(b"k1")), SINGLE_GROUP);
+        assert_eq!(run.final_range_of(&Bytes::from_static(b"k7")), RIGHT);
+        run.liveness_by_final_range().expect("both halves answer");
+        // A wedged right half beside a live left half: every post-heal write to its key
+        // stays pending.
+        assert_eq!(
+            with(
+                &records,
+                vec![put_at("k1", 100, Some(110)), put_at("k7", 100, None)]
+            )
+            .liveness_by_final_range(),
+            Err(
+                "liveness: no client write to k7 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+        // The per-range reading sees what the per-key one reads past: a key with one quick
+        // write and one left pending, on a log that completed nothing for over the bound
+        // after that write was called.
+        let late = with(
+            &records,
+            vec![
+                put_at("k1", 100, Some(110)),
+                put_at("k7", 100, None),
+                put_at("k7", 2500, Some(2510)),
+            ],
+        );
+        assert_eq!(
+            late.writes_after_heal_by_key()[&Bytes::from_static(b"k7")],
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            late.liveness_by_final_range(),
+            Err(format!(
+                "liveness: range {RIGHT} took 2.41s from its first client write after the last \
+                 heal to complete one, over {:?}",
+                election_max() * LIVENESS_TIMEOUTS
+            ))
+        );
+        // And it is read from the range's first call, not from the heal: a right half no
+        // client wrote until 2.5 s after the heal answered at once.
+        with(
+            &records,
+            vec![put_at("k1", 100, Some(110)), put_at("k7", 2500, Some(2510))],
+        )
+        .liveness_by_final_range()
+        .expect("the time until a client's write reaches a leader is not the cluster's");
+        // The keyspace is read from the heal beside it (D-076's recovery time proper): no
+        // write anywhere completed until 2.1 s after the heal. Each final range's first call
+        // is 2.09 s after the heal, so the arm from the first call is satisfied, 10 ms each,
+        // and only this one says so.
+        let stalled = with(
+            &records,
+            vec![
+                put_at("k1", 2090, Some(2100)),
+                put_at("k7", 2090, Some(2100)),
+            ],
+        );
+        for (range, recovery) in stalled.recoveries_by_final_range() {
+            assert_eq!(
+                recovery
+                    .first_completed
+                    .map(|at| at.duration_since(recovery.first_call)),
+                Some(Duration::from_millis(10)),
+                "range {range} is quick from its first call"
+            );
+        }
+        assert_eq!(
+            stalled.liveness_by_final_range(),
+            Err(format!(
+                "liveness: range {SINGLE_GROUP} took 2.1s after the last heal to complete a \
+                 client write, over {:?}",
+                election_max() * LIVENESS_TIMEOUTS
+            ))
+        );
+        // And the first completion anywhere is what it asks: one range answering in time
+        // says the keyspace came back, however late the other's first write was.
+        with(
+            &records,
+            vec![
+                put_at("k1", 1990, Some(2000)),
+                put_at("k7", 2500, Some(2510)),
+            ],
+        )
+        .liveness_by_final_range()
+        .expect("the keyspace's first completion is within the bound of the heal");
+        // A range without a majority is asked nothing: two refused nodes hold it.
+        let refusal = |server: u64, at: u64| record(ms(at), ms(at), Some(server), refused(server));
+        let mut wedged = records.clone();
+        wedged.extend([refusal(1, 50), refusal(2, 60)]);
+        for server in [1, 2] {
+            wedged.push(record(
+                ms(60),
+                ms(60),
+                Some(server),
+                TraceEvent::RaftReseeded {
+                    server,
+                    range: SINGLE_GROUP,
+                },
+            ));
+        }
+        let none = with(
+            &wedged,
+            vec![put_at("k1", 100, None), put_at("k7", 100, None)],
+        );
+        assert_eq!(none.ranges_with_a_majority_up(), BTreeSet::new());
+        none.liveness_by_final_range()
+            .expect("the keys of a range with no majority are not asked of");
+        // Every range live and nothing written after the heal is the clients stopped.
+        let idle = with(&records, Vec::new());
+        assert_eq!(
+            idle.liveness_by_final_range(),
+            Err(
+                "liveness: no client write completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+        // Some live, no write of theirs in the history: a live range with none says nothing,
+        // whether no client drew its keys or no leader proposed what they asked (#197). The
+        // first range's replicas are gone; the right half, made by the nodes' own applies
+        // after their refusals, is whole.
+        let mut after = Vec::new();
+        for server in 1..=3 {
+            after.push(created_on(server, 0, SINGLE_GROUP, Bootstrap));
+        }
+        after.extend([refusal(1, 1), refusal(2, 1)]);
+        for server in [1, 2] {
+            after.push(record(
+                ms(1),
+                ms(1),
+                Some(server),
+                TraceEvent::RaftReseeded {
+                    server,
+                    range: SINGLE_GROUP,
+                },
+            ));
+        }
+        for server in 1..=3 {
+            after.push(created_on(server, 2, RIGHT, Split));
+        }
+        after.push(record(
+            ms(2),
+            ms(2),
+            Some(3),
+            TraceEvent::RangeSplit {
+                range: SINGLE_GROUP,
+                right: RIGHT,
+                key: user_key(b"k5"),
+                index: 1,
+            },
+        ));
+        let some = with(&after, vec![put_at("k1", 100, None)]);
+        assert_eq!(some.ranges_with_a_majority_up(), BTreeSet::from([RIGHT]));
+        some.liveness_by_final_range()
+            .expect("no key of a live range was written");
+    }
+
     // PROPOSED(D-102): the exemption asks for the range shown live.
     #[test]
     fn a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live() {

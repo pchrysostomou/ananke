@@ -169,6 +169,20 @@ pub enum Variant {
     /// leader still traces the state: only the refusal and the drop are gone.
     // PROPOSED(D-129): a leader refuses a read it can never confirm.
     UnconfirmableReadKept,
+    /// A re-seeded replica of the **root**, range 0, grants votes and pre-votes past
+    /// its quarantine, where every other replica of the node keeps D-035. It still
+    /// never campaigns and still makes no lease promise: the one rule broken is "grants
+    /// no vote". The cut then elects whoever is left on the root, where the keeper alone
+    /// is no majority. Until PROPOSED D-119 this passed ten thousand seeds of the sharded
+    /// quorum scenario, which asked its hold of the user ranges alone (issue #143). A
+    /// server of one group runs range 2 (`node::SINGLE_GROUP`), so this changes nothing
+    /// there: it is a bug a node hosting the root can have and one group cannot.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    ReseededRootReplicaVotes,
+    /// [`Variant::ReseededRootReplicaVotes`] on the **meta range**, range 1, and on no
+    /// other: the second of the two ranges where the cluster's routing lives.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    ReseededMetaReplicaVotes,
 }
 
 impl Variant {
@@ -195,6 +209,8 @@ impl Variant {
         Variant::RefusedNeverCounts,
         Variant::FollowerNeverCompacts,
         Variant::UnconfirmableReadKept,
+        Variant::ReseededRootReplicaVotes,
+        Variant::ReseededMetaReplicaVotes,
     ];
 
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
@@ -222,6 +238,8 @@ impl Variant {
             Variant::RefusedNeverCounts => 1 << 15,
             Variant::FollowerNeverCompacts => 1 << 16,
             Variant::UnconfirmableReadKept => 1 << 17,
+            Variant::ReseededRootReplicaVotes => 1 << 18,
+            Variant::ReseededMetaReplicaVotes => 1 << 19,
         }
     }
 }
@@ -2731,11 +2749,29 @@ impl Raft {
         }
     }
 
+    /// Whether D-035's quarantine refuses this replica a vote or a pre-vote: it does
+    /// on every re-seeded replica, but for the one range a known-buggy variant names.
+    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    fn quarantine_refuses_votes(&self) -> bool {
+        let votes_anyway = match self.config.range {
+            0 => self
+                .config
+                .variants
+                .contains(Variant::ReseededRootReplicaVotes),
+            1 => self
+                .config
+                .variants
+                .contains(Variant::ReseededMetaReplicaVotes),
+            _ => false,
+        };
+        self.quarantined && !votes_anyway
+    }
+
     /// A pre-vote is granted only by a server that has not heard from a leader within
     /// its minimum election timeout and whose log the candidate's is at least as up
     /// to date as; it changes nothing here.
     fn on_pre_vote(&mut self, from: ServerId, term: Term, last_index: Index, last_term: Term) {
-        let granted = !self.quarantined
+        let granted = !self.quarantine_refuses_votes()
             && term > self.term
             && !self.heard_from_leader()
             && self.log_up_to_date(last_index, last_term);
@@ -2781,7 +2817,7 @@ impl Raft {
     /// up to date; the vote is persisted before the response leaves, and granting it
     /// resets the election timer (moirae rule 5).
     fn on_request_vote(&mut self, from: ServerId, last_index: Index, last_term: Term) {
-        let granted = !self.quarantined
+        let granted = !self.quarantine_refuses_votes()
             && self.vote.is_none_or(|v| v == from)
             && self.log_up_to_date(last_index, last_term);
         if granted {

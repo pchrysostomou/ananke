@@ -2690,15 +2690,16 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // queue alone the catch was 16 of the first thousand seeds, none of them below seed
     // 100 (the first at 119); with the key layout and the store's format record
     // (D-059, D-060) it was 9, the first at seed 158. Since D-078 moved every
-    // schedule again it is **58 of the first thousand, 5.8 %**, the first at seed 20,
-    // and every one of the 58 is the `match starts` oracle's rather than state
-    // machine safety's — D-078's own entry says so and D-079 re-measured it, on that
-    // branch and on `main` alike. The 0.7 % this comment argued from, and the seven
-    // seeds it named, are the figures of the tree before D-078.
+    // schedule again it was 58 of the first thousand, 5.8 %, every one of the 58 the
+    // `match starts` oracle's rather than state machine safety's — D-078's own entry
+    // says so and D-079 re-measured it, on that branch and on `main` alike. On the tree
+    // of PROPOSED D-113 it is **54 of the first thousand, 5.4 %**, still the first at
+    // seed 20 and still every one the oracle's. The 0.7 % this comment argued from, and
+    // the seven seeds it named, are the figures of the tree before D-078.
     //
-    // At 5.8 % a hundred seeds catch none about once in four hundred
-    // (0.942^100 = 2.5e-3) and the gate's twenty about three times in ten
-    // (0.942^20 = 0.30). So the hundred-seed tier is now comfortably above D-061's
+    // At 5.4 % a hundred seeds catch none about once in two hundred and sixty
+    // (0.946^100 = 3.9e-3) and the gate's twenty about one time in three
+    // (0.946^20 = 0.33). So the hundred-seed tier is now comfortably above D-061's
     // 5 % rule rather than the coin-flip it was, and only the gate's twenty still
     // needs the pin. **Where the assertion sits is the owner's** (D-056): it stays at
     // the thousand-seed tier until the owner moves it, and this note records that the
@@ -2710,6 +2711,77 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     if released_seeds() >= 1000 {
         assert!(!caught.is_empty(), "RefusalNotDurable was never caught");
     }
+}
+
+/// `RefusalNotDurable` tripping the match-starts fold for its own reason, at every tier: the
+/// sweep above asserts the catch only from the thousand (D-056), and PROPOSED D-113 §5 made the
+/// fold read a reset to 0 as a window where the follower holds a store. Here it does not: node 2
+/// has refused its store, its answer stamped 0 is its own, and the number comes back only because
+/// its refusal did not survive the crash after it, so the second rise is a store that lost its
+/// state and opened again as if whole. With the trace's `RaftRefused` records taken out, the 0
+/// reads as a delayed answer and the fold says nothing: the refusal is what the catch rests on.
+#[test]
+fn seed_21_a_refused_followers_zero_opens_no_window() {
+    let (leader, follower, incarnation) = (1, 2, 1);
+    let report = raft::run(21, Variant::RefusalNotDurable);
+    let records = &report.records;
+    let why = raft::match_starts_are_first_rises(records)
+        .expect_err("seed 21 is no longer caught by the fold: read its trace");
+    assert!(
+        why.contains("leader 1 of term 11 of group 2 traced a second first rise of 2's match under incarnation 1"),
+        "the violation seed 21 is pinned for: {why}"
+    );
+    let on =
+        |record: &TraceRecord, node: u64| record.node.map(|at| u64::from(at.get())) == Some(node);
+    let rise = |record: &TraceRecord| {
+        on(record, leader)
+            && matches!(record.event, TraceEvent::RaftMatchStarted { follower: f, incarnation: of, .. }
+                if f == follower && of == incarnation)
+    };
+    let second = records
+        .iter()
+        .position(|record| {
+            rise(record)
+                && matches!(
+                    record.event,
+                    TraceEvent::RaftMatchStarted { matched: 293, .. }
+                )
+        })
+        .expect("the second rise the violation names");
+    let first = records[..second]
+        .iter()
+        .rposition(rise)
+        .expect("the first rise of that key");
+    let between = &records[first..second];
+    let refused = between
+        .iter()
+        .position(|record| matches!(&record.event, TraceEvent::RaftRefused { server, .. } if *server == follower))
+        .expect("node 2 refused its store between the two rises");
+    let zero = between[refused..]
+        .iter()
+        .position(|record| {
+            on(record, leader)
+                && matches!(record.event, TraceEvent::RaftProgressReset { follower: f, incarnation: 0, .. } if f == follower)
+        })
+        .expect("the leader read node 2's 0 after the refusal");
+    assert!(
+        between[refused + zero..].iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftRecovered { server, incarnation: of, .. }
+                if server == follower && of == incarnation
+        )),
+        "node 2 did not open the same number again after the 0"
+    );
+    let without: Vec<TraceRecord> = records
+        .iter()
+        .filter(|record| !matches!(record.event, TraceEvent::RaftRefused { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        raft::match_starts_are_first_rises(&without),
+        Ok(()),
+        "with the refusal unread, the 0 reads as a delayed answer: the refusal is the catch"
+    );
 }
 
 /// Seed 102, which pinned `RefusalNotDurable`'s own mechanism at every tier from
