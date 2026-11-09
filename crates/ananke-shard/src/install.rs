@@ -465,8 +465,9 @@ fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDe
 /// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
 /// node whose initialised replicas' descriptors are `held`.
 // PROPOSED(D-110): one decision for both install paths, failing closed.
+// PROPOSED(D-114): read by the split's test in `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admission {
+pub(crate) enum Admission {
     /// Install it.
     Install,
     /// Refuse it with `Overlaps`: its span overlaps another initialised replica on the
@@ -493,7 +494,9 @@ enum Admission {
 /// node meanwhile, which is the same replica made twice rather than an overlap, and it
 /// keeps the refusal of a snapshot that names no span.
 // PROPOSED(D-110): one decision for both install paths, failing closed.
-fn admission(
+// PROPOSED(D-114): read by the split's test in `server.rs`, which holds what a reader of
+// the host's table sees at a split against this rule.
+pub(crate) fn admission(
     range: RangeId,
     streamed: Option<&RangeDescriptor>,
     held: &BTreeMap<RangeId, RangeDescriptor>,

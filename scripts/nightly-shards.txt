@@ -509,6 +509,14 @@
 # with other slices' builds beside it (load averages 86 to 100, so the figure is if anything
 # high): 34.7 cpu s, the median (30.78 + 1.03, 33.73 + 0.92, 34.24 + 0.97). Into the lightest
 # shard, shard 6 at 2168.1 -> 2202.8.
+# PROPOSED D-113 (`sim/shard.rs`, the sharded sweep) added one `shard` row, the correct system's
+# sweep, weighed on its tree from the built release binary (`shard-<hash> <test> --exact`) at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores beside two
+# other slices' builds and sweeps (load averages 97 to 118, so the figure is if anything high):
+# 191.3 cpu s (185.07 + 6.26, 81.6 s real). Into the lightest shard, shard 6 at 1832.3 -> 2023.6.
+# The merge of `main` at 7b02530 (#185, D-110's review) into D-113's branch takes the union of both
+# sides' rows and places D-113's again, longest-first into the merged tree's lightest shard, its
+# weight kept: #185 took shard 6 to 2168.1, so the sweep goes to shard 1 at 1977.1 -> 2168.4.
 # PROPOSED D-128 (an install onto a replica with no descriptor replaces the snapshot's span)
 # added three rows and re-weighed two, all at the same settings, three runs each, on the same
 # machine with other slices' builds beside them (load averages 350 to 960, so the figures are if
@@ -522,8 +530,16 @@
 # now carries a second writer and reads its engine back at the end: the quarantine row 27.8 ->
 # 36.9 (39.4, 36.9, 36.4) and D-115's row 34.7 -> 35.2 (35.6, 34.6, 35.2), both in shard 6 in
 # place, 2202.8 -> 2212.4.
+# The merge of `main` at 8a4cdad (#188, D-113's sharded sweep; #191) into D-128's branch takes
+# the union of both sides' rows. Both sides weighed from the same shard 1 at 1977.1 and both
+# placed into it, so neither figure above is the merged total: shard 1 holds D-128's re-seed row
+# at 38.3 and D-113's sweep at 191.3 and comes to 2206.7. Neither row is re-placed, because the
+# nightly's wall clock is its heaviest shard and that is shard 3 at 2237.4 either way; moving the
+# sweep to the lightest shard would leave the spread where it is (221.7 against 222.0). Every
+# weight is its own side's, re-summed and not re-measured.
 # shard	binary	cpu_s	test
-# shard 1: 2015.4 cpu s
+# shard 1: 2206.7 cpu s
+1	shard	191.3	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
 # this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
