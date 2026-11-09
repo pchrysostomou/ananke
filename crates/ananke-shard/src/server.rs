@@ -2110,7 +2110,8 @@ impl<E: Environment> ServerApplier<E> {
     /// asker is told why. Otherwise one synced batch holds the applied index, both
     /// halves' descriptors at the next generation and, on a voter of that
     /// configuration, the right half's Raft state at the floor `(index, 1)` with a
-    /// fresh incarnation and no quarantine (Q20, Q26); a replica that is not a voter
+    /// fresh incarnation and, where this replica of the parent is quarantined, its
+    /// quarantine (Q20, Q26, D-130); a replica that is not a voter
     /// gets the shrunk descriptor and a range delete of the right span instead, in the
     /// same atomic step (`RaftStore::apply_removing`, PROPOSED D-107). Then
     /// the right half's store is opened beside the parent's, its core restored from
@@ -2192,11 +2193,26 @@ impl<E: Environment> ServerApplier<E> {
             self.env.rng().next_u64()
         }
         .max(FIRST_INCARNATION + 1);
+        // A quarantined replica of P has lost its engine (D-035), and this apply cannot
+        // tell a first apply of the split from a replay of one the lost engine held, which
+        // would make R a second time with its votes gone. R takes the quarantine.
+        // PROPOSED(D-130): the owner's ruling of 2026-11-09 on #175.
+        let quarantined = store.quarantined()
+            && !self
+                .node_variants
+                .contains(NodeVariant::SplitLeavesQuarantineBehind);
         let mut batch = WriteBatch::new();
         batch.put(prefix.descriptor_key(), left.encode());
         if voter {
             batch.put(right_prefix.descriptor_key(), created.encode());
-            split_state_into(&right_prefix, &config, index, incarnation, &mut batch);
+            split_state_into(
+                &right_prefix,
+                &config,
+                index,
+                incarnation,
+                quarantined,
+                &mut batch,
+            );
             store.apply(index, batch).await?;
         } else {
             // Not a voter of the parent's configuration at the split: no right half
@@ -2286,6 +2302,25 @@ impl<E: Environment> ServerApplier<E> {
         // the node's tables for it; the `raft` task puts the core in place.
         let (right_store, recovered) = store.open_sibling(right_prefix).await?;
         let right_store = Arc::new(right_store);
+        // The quarantine R took from P, stated as a placeholder's install states the one
+        // it wrote (`created_by_install`), so that the checks that read a replica's
+        // quarantine from the trace read this one too.
+        // PROPOSED(D-130)
+        if recovered.quarantined {
+            self.env.trace(TraceEvent::RaftReseeded {
+                server: self.id.0,
+                range: right,
+            });
+            self.env.trace(TraceEvent::RaftRecovered {
+                server: self.id.0,
+                range: right,
+                term: right_store.term(),
+                applied: index,
+                last_index: index,
+                incarnation: right_store.incarnation(),
+                state: RecoveredAs::Quarantined,
+            });
+        }
         lock(&self.stores).insert(right_id, right_store.clone());
         lock(&self.replicas).insert(right_id, Arc::new(Mutex::new(Replica::new())));
         lock(&self.applied).insert(

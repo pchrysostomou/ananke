@@ -12773,7 +12773,8 @@ mod tests {
         ];
         assert_eq!(live(records), BTreeSet::new(), "refused, then never held");
         // But one that made the range by its own apply after its refusal holds it, and
-        // no quarantine comes with a split (Q26).
+        // no quarantine comes with a split unless its parent is quarantined, which a split's
+        // apply then states (Q26, D-130), and this trace states none.
         let records = vec![
             refusal(1, 1),
             created_on(1, 2, RIGHT, Split),

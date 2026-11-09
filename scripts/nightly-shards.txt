@@ -666,6 +666,17 @@
 # seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_ 0.1 (0.12) into shard 5, 2169.3 -> 2169.4.
 # Merge note (#216, PROPOSED D-113 §6, onto the seven PRs): shard 5 was the lightest on #220's tree, not here; rows kept, headers recomputed.
 # shard	binary	cpu_s	test
+# D-130 (#175: a right half made on a quarantined parent takes the quarantine) renamed two `shard`
+# rows in place and added three, weighed on its tree from the built release binaries (`<binary>-<hash>
+# <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the median,
+# on an Apple M2 of 8 cores under load averages of 16 to 23. Seed 986's pin is seed 463's, 0.2 -> 0.1,
+# and the absence of (b) names 128, 643 and 986 and runs the variant too, 0.3 -> 0.6, both in shard 5.
+# Longest-first into the lightest shard: `a_right_half_made_after_a_reseed_...` 9.6 (9.10 + 0.52), shard
+# 4 at 2176.8 -> 2186.4; the pair on seeds 3870 and 5303, 0.3, shard 6 at 2179.9 -> 2180.2; seed 2097's
+# restart, 0.2, shard 6 -> 2180.4. Every header is recomputed.
+# D-130's review added one `shard` row, seed 9's pin on a chain of right halves, weighed the same way
+# on the same machine on AC power under a load average of 9: 0.2 (0.17 + 0.00, 0.16 + 0.00, 0.16 + 0.00,
+# the median rounded up to a tenth). Into the lightest shard, shard 6 at 2180.4 -> 2180.6.
 # shard 1: 2580.8 cpu s
 1	shard	203.5	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -745,7 +756,7 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2176.8 cpu s
+# shard 4: 2186.4 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -781,16 +792,17 @@
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
-# shard 5: 2252.5 cpu s
+4	reseed	9.6	a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes
+# shard 5: 2252.7 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
 5	shard	0.1	seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 5	shard	0.1	seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split
 5	shard	0.1	seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh
-5	shard	0.2	seed_986_a_leader_refuses_the_reads_it_can_never_confirm
+5	shard	0.1	seed_463_a_leader_refuses_the_reads_it_can_never_confirm
 5	shard	0.2	seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands
 5	shard	0.2	seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant
-5	shard	0.3	seeds_128_and_643_no_longer_reach_a_leader_that_cannot_confirm_a_read
+5	shard	0.6	seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read
 5	shard	0.3	seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it
 5	shard	0.6	a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep
 5	shard	4.6	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_sweep
@@ -839,7 +851,7 @@
 5	reseed	6.6	a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm
 5	reseed	22.7	a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs
 5	node	60.4	a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario
-# shard 6: 2179.9 cpu s
+# shard 6: 2180.6 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -887,3 +899,6 @@
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
 6	split	335.8	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed
 6	node	0.7	seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second
+6	shard	0.3	seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries
+6	shard	0.2	seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split
+6	shard	0.2	seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too

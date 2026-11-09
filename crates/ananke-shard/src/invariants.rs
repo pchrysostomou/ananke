@@ -1855,8 +1855,8 @@ pub enum Fold {
     RangeIds,
     /// Check 18's split clause ([`SplitLineage`]).
     SplitLineage,
-    /// Check 8's overlap clause ([`OneOwnerPerKey::overlap_verdict`]): asked last by
-    /// [`Checker::verdict`].
+    /// Check 8's overlap clause ([`OneOwnerPerKey::overlap_verdict`]): asked third from
+    /// last by [`Checker::verdict`], before the install and created-twice clauses.
     // PROPOSED(D-107)
     Overlap,
     /// Check 8's right half's clause ([`OneOwnerPerKey::right_half_verdict`]): folded
@@ -3874,12 +3874,13 @@ mod tests {
     }
 
     /// Check 8's two clauses in the checker (PROPOSED D-107): the overlap clause is the
-    /// verdict's last fold, so a violation another fold reports on the same records is
-    /// the one the verdict names; the right half's clause is its own verdict and not
-    /// the checker's, which a correct node trips until placeholders exist.
+    /// verdict's third fold from last, after every fold but the install and created-twice
+    /// clauses (PROPOSED D-128, D-116), so a violation an earlier fold reports on the same
+    /// records is the one the verdict names; the right half's clause is its own verdict
+    /// and not the checker's, which a correct node trips until placeholders exist.
     // PROPOSED(D-107)
     #[test]
-    fn check_8s_overlap_clause_is_the_verdicts_last_and_its_right_half_clause_is_not_in_it() {
+    fn check_8s_overlap_clause_is_third_from_last_and_its_right_half_clause_is_not_in_it() {
         // Node 2 applies the split node 1 created R at, and creates no R itself.
         let mut right = Checker::new(true);
         right.extend(&before_a_split());

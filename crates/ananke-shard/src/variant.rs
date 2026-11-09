@@ -428,6 +428,14 @@ pub enum NodeVariant {
     /// the keys gone from the engine (PROPOSED D-128).
     // PROPOSED(D-128)
     InstallReplacesHostedSpan,
+    /// A split's apply on a quarantined replica of its parent makes the right half with
+    /// no quarantine, the node as it stood before D-130. The node re-seeded from a
+    /// checkpoint below a split it had already applied replays that split, makes the
+    /// right half again and votes in it, with the votes of the replica it lost gone
+    /// with the engine that held them (D-035; #175). Seeds 3870 and 5303 of the sharded
+    /// sweep lose committed entries that way.
+    // PROPOSED(D-130)
+    SplitLeavesQuarantineBehind,
 }
 
 impl NodeVariant {
@@ -483,6 +491,7 @@ impl NodeVariant {
         NodeVariant::ApplyWaitsForEveryRange,
         NodeVariant::RetakeNeverAfterOverlap,
         NodeVariant::InstallReplacesHostedSpan,
+        NodeVariant::SplitLeavesQuarantineBehind,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -680,13 +689,15 @@ impl NodeVariant {
             // left.
             // PROPOSED(D-110): the overlap rule's fresh take never made. Bits 25 and 49
             // to 53 are free, and sixteen bits are left.
-            // PROPOSED(D-117): bit 25 taken above; bits 49 to 53 are free, and fifteen
-            // bits are left.
+            // PROPOSED(D-117): bit 25 taken above; the free bits are named below.
             NodeVariant::RetakeNeverAfterOverlap => 1 << 48,
             // PROPOSED(D-128): a span-less replica's install replacing what it is hosted
             // at. Bit 25 is D-117's, above; bits 50 to 53 are free, and fourteen bits are
             // left.
             NodeVariant::InstallReplacesHostedSpan => 1 << 49,
+            // PROPOSED(D-130): a right half made on a quarantined parent with no
+            // quarantine. Bits 51 to 53 are free, and thirteen bits are left.
+            NodeVariant::SplitLeavesQuarantineBehind => 1 << 50,
         }
     }
 
@@ -744,6 +755,7 @@ impl NodeVariant {
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
             NodeVariant::RetakeNeverAfterOverlap => "RetakeNeverAfterOverlap",
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
+            NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
         }
     }
 }
@@ -840,12 +852,14 @@ mod tests {
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
         // D-110's one is the overlap rule's fresh take never made, and D-128's one a
         // replica with no descriptor whose install replaces what it is hosted at.
-        // D-117's one, the start's tasks on the refused directory, is Q15's sixth.
+        // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
+        // one is a right half made on a quarantined parent with no quarantine.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
-        assert_eq!(NodeVariant::BUGS.len(), 50);
+        // PROPOSED(D-130)
+        assert_eq!(NodeVariant::BUGS.len(), 51);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

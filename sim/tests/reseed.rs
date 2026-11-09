@@ -21,9 +21,10 @@
 //!   (D-041, PROPOSED D-117);
 //! - `TasksOnTheRefusedDir`, the start that re-seeded handing its tasks the refused
 //!   directory, is caught there on every seed (PROPOSED D-117);
-//! - a node that leads a right half made after its re-seed takes and sweeps in the directory
-//!   it runs on, and the variant is caught there too (`reseed::run_split_after_reseed`,
-//!   PROPOSED D-117);
+//! - a right half made after a re-seed takes the parent's quarantine, so its node neither
+//!   leads it nor takes a checkpoint of it (`reseed::run_split_after_reseed`, D-130), and a
+//!   node that does lead one, under `SplitLeavesQuarantineBehind`, takes and sweeps in the
+//!   directory it runs on, and the variant is caught there too (PROPOSED D-117);
 //! - the same run's install of the parent is created at the split's generation and agrees
 //!   with check 7's map at its floor (issue #172; PROPOSED D-107 §2, D-115);
 //! - the same run's right half keeps its keys, whichever of the node's two installs lands
@@ -33,6 +34,7 @@
 //!   on committing, and the leader as it was is caught by the read bound
 //!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
 
+use ananke_env::{RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_shard::invariants::Fold;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -735,15 +737,21 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 
 /// A node that leads a right half made after its re-seed takes its checkpoints and sweeps
 /// them in the directory it runs on (D-041, PROPOSED D-117): `reseed::run_split_after_reseed`,
-/// on [`HIGH_RATE_SHARE`] seeds, correct and under `TasksOnTheRefusedDir`.
+/// on [`HIGH_RATE_SHARE`] seeds, under `SplitLeavesQuarantineBehind`, alone and with
+/// `TasksOnTheRefusedDir`.
 ///
 /// `run_after_split` reaches no take and no sweep: every replica of its re-seeded node is
 /// quarantined and never campaigns, so its `apply` task writes nothing and its `snapshot`
-/// task sweeps nothing. A right half the node makes after its re-seed may lead. Here P's left
+/// task sweeps nothing. Since D-130 that is every replica a re-seeded node holds, a right half
+/// made after the re-seed too, and the correct node reaches no take here either
+/// (`a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes`).
+/// Where the tasks' directories are read at all is on a node that may lead one, so this test
+/// asks what it asked with `SplitLeavesQuarantineBehind` standing in for that node: the split
+/// writes the right half no quarantine, as it did when this test was written. Here P's left
 /// half is split, whichever other node leads the new right half is crashed until `x` does,
 /// and `x` is written to past the threshold several times over.
 ///
-/// On the correct node, on every seed: every check of the trace passes, `x` leads and takes
+/// On such a node, on every seed: every check of the trace passes, `x` leads and takes
 /// at least two checkpoints, each take's version directory is in the directory the re-seed
 /// built and none is in the refused one, a sweep has emptied an earlier one there, and the
 /// refused directory is untouched. Measured on 200 seeds: the split applied and every clause
@@ -758,23 +766,25 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 /// It splits P's left half and not a range the log rebuilt, whose split fails state machine
 /// safety on the re-seeded node, which is #199's.
 // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+// PROPOSED(D-130): on a node that may lead a right half made after its re-seed, the variant's.
 #[test]
 fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs() {
     let run = HIGH_RATE_SHARE;
-    tier("the split after a re-seed", run);
+    let may_lead = NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]);
+    tier(&format!("the split after a re-seed, {may_lead}"), run);
     let verdicts = sweep(run, |seed| {
-        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct());
+        let report = reseed::run_split_after_reseed(seed, may_lead);
         report.check()?;
         report.reached()?;
         report.refused_untouched()?;
         report.took_where_it_runs()
     });
-    verdict(&verdicts).expect("the correct node takes and sweeps where it runs on every seed");
+    verdict(&verdicts).expect("a node that leads it takes and sweeps where it runs on every seed");
 
     let variant = NodeVariant::TasksOnTheRefusedDir;
     tier(&format!("the split after a re-seed, {variant}"), run);
     let verdicts = sweep(run, |seed| {
-        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct().with(variant));
+        let report = reseed::run_split_after_reseed(seed, may_lead.with(variant));
         report.check()?;
         report.reached()?;
         let right = report
@@ -796,4 +806,56 @@ fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs()
         Ok(())
     });
     verdict(&verdicts).expect("the variant's takes are all in the refused directory on every seed");
+}
+
+/// What the run above can no longer reach on the correct node: a right half made after a
+/// re-seed takes the parent's quarantine (D-130), so the node that made it does not lead it
+/// and takes no checkpoint of it, and nothing on a re-seeded node does.
+/// `reseed::run_split_after_reseed` on [`HIGH_RATE_SHARE`] seeds: on every one the run passes
+/// every check of the trace, reaches its re-seed and leaves the refused directory untouched,
+/// `x` applies the split, states the right half quarantined, grants nothing in it, and is
+/// never its leader, for all the leaders the run crashes to make it one. The day a re-seeded
+/// node can lead again this fails, and the test above can ask its question of the correct
+/// node once more.
+// PROPOSED(D-130): the situation D-117's run reached is absent on the correct node.
+#[test]
+fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes() {
+    let run = HIGH_RATE_SHARE;
+    tier("the split after a re-seed, correct", run);
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_after_reseed(seed, NodeVariants::correct());
+        report.check()?;
+        report.reached()?;
+        report.refused_untouched()?;
+        let x = report.x;
+        let right = report
+            .second_right
+            .ok_or_else(|| format!("seed {seed}: node {x} applied no split after its re-seed"))?;
+        let stated = report.records.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftRecovered {
+                server,
+                range,
+                state: RecoveredAs::Quarantined,
+                ..
+            } if server == x && range == right)
+        });
+        let granted = report.records.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftVote { server, range, granted: true, .. }
+                if server == x && range == right)
+        });
+        let led = report.records.iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftLeader { server, range, .. }
+                if server == x && range == right)
+        });
+        let takes = report.takes_of(right);
+        if !stated || granted || led || takes != 0 {
+            return Err(format!(
+                "seed {seed}: node {x}'s right half {right}, made after its re-seed: stated \
+                 quarantined {stated}, granted a vote {granted}, led {led}, {takes} takes: it \
+                 should be quarantined and do none of it (D-130)"
+            ));
+        }
+        Ok(())
+    });
+    verdict(&verdicts).expect("a right half made after a re-seed is quarantined on every seed");
 }

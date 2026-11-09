@@ -759,6 +759,70 @@ fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> 
     })
 }
 
+/// A right half made on a quarantined replica of its parent takes the quarantine in the
+/// split's own batch, where one made on a replica with no quarantine takes none (PROPOSED
+/// D-130). `RaftStore::quarantined` reads the flag with no I/O, as the store opened or as
+/// the re-seed's mark set it, and both halves' flags are the disk's at the next open, which
+/// is what a restart restates.
+// PROPOSED(D-130)
+#[test]
+fn a_right_half_takes_its_parents_quarantine_in_the_splits_batch() {
+    use ananke_raft::store::split_state_into;
+    use ananke_raft::types::Configuration;
+    use ananke_storage::WriteBatch;
+
+    const PARENT: u64 = 2;
+    const RIGHT: u64 = 19;
+    let voters = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+    for (seed, reseeded) in [(31, false), (32, true)] {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let node = sim.add_node();
+        let voters = voters.clone();
+        on_node(&mut sim, node, move |env| {
+            Box::pin(async move {
+                let (mut parent, recovered) =
+                    RaftStore::open_dir(env, config(), KeyPrefix::group(PARENT))
+                        .await
+                        .unwrap();
+                assert!(!parent.quarantined() && !recovered.quarantined);
+                if reseeded {
+                    parent.mark_reseeded(7, true).await.unwrap();
+                }
+                assert_eq!(parent.quarantined(), reseeded, "the mark sets the flag");
+                let mut batch = WriteBatch::new();
+                split_state_into(
+                    &KeyPrefix::group(RIGHT),
+                    &voters,
+                    40,
+                    9,
+                    parent.quarantined(),
+                    &mut batch,
+                );
+                parent.engine().write(batch, true).await.unwrap();
+                let (right, recovered) =
+                    parent.open_sibling(KeyPrefix::group(RIGHT)).await.unwrap();
+                assert_eq!(recovered.quarantined, reseeded, "the batch's key");
+                assert_eq!(right.quarantined(), reseeded, "and the store's own read");
+                assert_eq!(right.incarnation(), 9);
+            })
+        });
+        on_node(&mut sim, node, move |env| {
+            Box::pin(async move {
+                let (parent, recovered) =
+                    RaftStore::open_dir(env, config(), KeyPrefix::group(PARENT))
+                        .await
+                        .unwrap();
+                assert_eq!(recovered.quarantined, reseeded, "the parent, reopened");
+                assert_eq!(parent.quarantined(), reseeded);
+                let (right, recovered) =
+                    parent.open_sibling(KeyPrefix::group(RIGHT)).await.unwrap();
+                assert_eq!(recovered.quarantined, reseeded, "the right half, reopened");
+                assert_eq!(right.quarantined(), reseeded);
+            })
+        });
+    }
+}
+
 /// **Issue #139**: a split's apply on a node that is not a voter of the parent at the
 /// split writes the parent's shrunk descriptor and removes the right span's keys in
 /// **one** atomic step (SHARD.md §5): after a crash at any point the store holds the
