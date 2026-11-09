@@ -1656,3 +1656,617 @@ fn leadership_transfer_makes_the_target_leader_without_a_pre_vote() {
         "server 3 voted although it had heard from server 1"
     );
 }
+
+// A leader refuses a read it can never confirm (RAFT.md §1, the owner's ruling in D-129).
+// Each answer below is written by hand, as the check-quorum tests above write theirs,
+// because each differs from the next in the one field the rule reads.
+
+/// A leader of three with its no-op and a write committed and applied, no message in
+/// flight and no lease: the guard trusts a follower only from its second window.
+// PROPOSED(D-129)
+fn reading_leader(variants: impl Into<Variants>) -> Cluster {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(variants), &[]);
+    cluster.elect(s(1));
+    cluster.propose(s(1), "x");
+    cluster.settle();
+    let commit = cluster.commit(s(1));
+    cluster.step(s(1), Input::Applied(commit));
+    assert!(!cluster.cores[&s(1)].lease_holds(cluster.now));
+    cluster
+}
+
+/// What a follower says of an AppendEntries that left it holding everything the
+/// leader has: a success from `incarnation`'s store with `echo`.
+// PROPOSED(D-129)
+fn answered(cluster: &mut Cluster, from: ServerId, echo: u64, incarnation: u64) -> Vec<Output> {
+    let term = cluster.term(s(1));
+    let now = cluster.local_clock(s(1));
+    let match_index = cluster.log(s(1)).last().map_or(0, |entry| entry.index);
+    cluster.step(
+        s(1),
+        Input::Message {
+            from,
+            now,
+            message: Message::AppendEntriesResponse {
+                term,
+                success: true,
+                prev_index: match_index,
+                match_index,
+                hint: 0,
+                echo,
+                local: 0,
+                incarnation,
+                refused: false,
+            },
+        },
+    )
+}
+
+/// What a refused server or a placeholder says of every AppendEntries (RAFT.md §3): a
+/// rejection, an echo of 0, a hint of 1 and the mark.
+// PROPOSED(D-129)
+fn answered_refused(cluster: &mut Cluster, from: ServerId) -> Vec<Output> {
+    let term = cluster.term(s(1));
+    let now = cluster.local_clock(s(1));
+    let prev_index = cluster.log(s(1)).last().map_or(0, |entry| entry.index);
+    cluster.step(
+        s(1),
+        Input::Message {
+            from,
+            now,
+            message: Message::AppendEntriesResponse {
+                term,
+                success: false,
+                prev_index,
+                match_index: 0,
+                hint: 1,
+                echo: 0,
+                local: 0,
+                incarnation: 0,
+                refused: true,
+            },
+        },
+    )
+}
+
+/// A read at the harness's clock.
+// PROPOSED(D-129)
+fn read(cluster: &mut Cluster, id: u64) -> Vec<Output> {
+    let now = cluster.local_clock(s(1));
+    cluster.step(s(1), Input::Read { id, now })
+}
+
+/// Whether the step refused the read, naming nobody.
+// PROPOSED(D-129)
+fn refused(outputs: &[Output]) -> bool {
+    outputs
+        .iter()
+        .any(|output| matches!(output, Output::Rejected { leader: None }))
+}
+
+/// The leader's changes of side, as the trace says them: confirmable, follower, dropped.
+// PROPOSED(D-129)
+fn sides(cluster: &Cluster) -> Vec<(bool, u64, u64)> {
+    cluster
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            TraceEvent::RaftReadsConfirmable {
+                server: 1,
+                confirmable,
+                follower,
+                dropped,
+                ..
+            } => Some((*confirmable, *follower, *dropped)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ruling itself, on the shape seeds 128 and 643 of `sim/shard.rs` reached: both
+/// followers' latest answers echo 0. The read is refused with **no** leader, at the step:
+/// no registration, no round. Naming itself would send a hint-following client straight
+/// back with no sleep. Writes still commit and check quorum still holds, which is what
+/// D-035's asymmetry leaves standing, and that is the state nothing else ends.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_leader_refuses_a_read_it_can_never_confirm_and_names_nobody() {
+    let mut cluster = reading_leader(Variant::Correct);
+    answered(&mut cluster, s(2), 0, 0);
+    assert_eq!(
+        sides(&cluster),
+        Vec::new(),
+        "one follower left is a majority"
+    );
+    answered(&mut cluster, s(3), 0, 0);
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0)],
+        "the second one shows it"
+    );
+
+    cluster.inbox.clear();
+    let out = read(&mut cluster, 1);
+    assert!(refused(&out), "the read is refused, naming nobody: {out:?}");
+    assert!(
+        !out.iter().any(|o| matches!(o, Output::Send { .. })),
+        "a read no round can confirm starts no round: {out:?}"
+    );
+    assert!(
+        cluster
+            .events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::RaftReadRefused { server: 1, .. })),
+        "the refusal is traced: it is the only thing a client of the node sees of it"
+    );
+
+    // Writes commit through the same two followers.
+    let before = cluster.commit(s(1));
+    cluster.propose(s(1), "y");
+    cluster.inbox.clear();
+    answered(&mut cluster, s(2), 0, 0);
+    assert!(
+        cluster.commit(s(1)) > before,
+        "quarantined acks still commit"
+    );
+
+    // And nothing ends it: check quorum counts them, for as many windows as we care to
+    // run, and every read in it is refused the same way.
+    let windows = 5 * cluster.cores[&s(1)].config().election_ticks.0;
+    for tick in 0..windows {
+        cluster.tick(s(1), 1);
+        cluster.inbox.clear();
+        answered(&mut cluster, s(2), 0, 0);
+        answered(&mut cluster, s(3), 0, 0);
+        assert!(refused(&read(&mut cluster, 100 + tick)), "tick {tick}");
+    }
+    assert_eq!(cluster.role(s(1)), Role::Leader);
+    assert_eq!(sides(&cluster).len(), 1, "one change of side, traced once");
+    assert!(cluster.reads.is_empty(), "nothing was served");
+    assert!(
+        cluster.dropped.is_empty(),
+        "nothing was ever registered to drop"
+    );
+    invariants::all(&cluster.events).unwrap();
+}
+
+/// A crashed, partitioned or silent follower counts as able: that transient is what D-076
+/// measured its bound over, and a follower that has said nothing has not said it never
+/// will. The read waits on it. The moment its first answer says otherwise the read is
+/// dropped, which is what stops the reads registered between the second follower's crash
+/// and its first answer after it from waiting for ever (three of them on `sim/shard.rs`'s
+/// seed 128).
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_silent_follower_counts_as_able_until_an_answer_says_otherwise() {
+    let mut cluster = reading_leader(Variant::Correct);
+    answered(&mut cluster, s(2), 0, 0);
+    // Server 3 is down. It answered before, without an echo of 0, and it answers no more.
+    cluster.down.push(s(3));
+    cluster.inbox.clear();
+    let out = read(&mut cluster, 1);
+    assert!(
+        !refused(&out),
+        "the silent follower may yet answer: {out:?}"
+    );
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            Output::Send {
+                message: Message::AppendEntries { .. },
+                ..
+            }
+        )),
+        "a round starts as for any read: {out:?}"
+    );
+    cluster.inbox.clear();
+    let out = read(&mut cluster, 2);
+    assert!(!refused(&out));
+    assert!(cluster.dropped.is_empty());
+
+    // It comes back quarantined.
+    cluster.down.clear();
+    answered(&mut cluster, s(3), 0, 0);
+    assert_eq!(
+        cluster.dropped,
+        vec![(s(1), 1), (s(1), 2)],
+        "both reads waiting on it are dropped at the answer that shows it"
+    );
+    assert_eq!(sides(&cluster), vec![(false, 3, 2)]);
+    assert!(refused(&read(&mut cluster, 3)), "and the next is refused");
+}
+
+/// The flag is about the latest answer. Any other echo clears it, whoever sends it and
+/// however it answered, and the leader confirms again by that follower's round.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn an_echo_that_is_not_zero_makes_a_follower_able_again() {
+    let mut cluster = reading_leader(Variant::Correct);
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    assert!(refused(&read(&mut cluster, 1)));
+    cluster.inbox.clear();
+
+    let echo = cluster.local_clock(s(1));
+    answered(&mut cluster, s(3), echo, 0);
+    assert_eq!(sides(&cluster), vec![(false, 3, 0), (true, 3, 0)]);
+    cluster.now += 1_000_000;
+
+    let out = read(&mut cluster, 2);
+    assert!(!refused(&out), "it can confirm again: {out:?}");
+    cluster.inbox.clear();
+    cluster.now += 1_000_000;
+    let echo = cluster.local_clock(s(1));
+    answered(&mut cluster, s(3), echo, 0);
+    assert!(
+        cluster
+            .reads
+            .iter()
+            .any(|(_, id, _, lease)| *id == 2 && !*lease),
+        "served by that follower's round: {:?}",
+        cluster.reads
+    );
+}
+
+/// A new store forgets what the old one said (D-042), which is what lets a store an
+/// operator replaces confirm again. On an AppendEntries answer the answer itself decides
+/// straight after, so an install's answer is the case the reset is for: it carries an
+/// incarnation and no echo, and the follower counts as able until it next answers.
+///
+/// The install is a change of side like an answer's and is traced like one (#198's
+/// review, B1): `sides()` below is the whole sequence, and the install's `true` is the
+/// third assertion's second element. Without the call in `on_snapshot_installed` the
+/// able window is invisible in both directions — the `true` goes untraced, and because
+/// `reads_confirmable` is then left stale at `false` the next echo of 0 can find
+/// `confirmable == self.reads_confirmable` and return early too, so neither edge of the
+/// window is in the trace. The install drops nothing, which is the other half of the
+/// claim: it only ever clears `echoed_zero`, so the able set only widens.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_new_incarnation_forgets_what_the_old_store_said() {
+    let mut cluster = reading_leader(Variant::Correct);
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    assert!(refused(&read(&mut cluster, 1)));
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0)],
+        "server 2's answer left a majority, server 3's did not; the refused read \
+         registered nothing to drop"
+    );
+
+    let index = cluster.commit(s(1));
+    cluster.step(
+        s(1),
+        Input::SnapshotInstalled {
+            to: s(3),
+            index,
+            incarnation: 9,
+        },
+    );
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0), (true, 3, 0)],
+        "the install is traced as the answer was: it can confirm again, and the able \
+         window is visible in the trace"
+    );
+    assert!(
+        cluster.dropped.is_empty(),
+        "an install only widens what can confirm, so it drops nothing: {:?}",
+        cluster.dropped
+    );
+    cluster.inbox.clear();
+    let out = read(&mut cluster, 2);
+    assert!(!refused(&out), "a store nobody has heard from yet: {out:?}");
+
+    // A re-seed's store answers quarantined, so it is back where it was.
+    answered(&mut cluster, s(3), 0, 9);
+    assert_eq!(cluster.dropped, vec![(s(1), 2)]);
+    assert!(refused(&read(&mut cluster, 3)));
+
+    // An operator's replacement answers with a new number and a promise.
+    cluster.inbox.clear();
+    let echo = cluster.local_clock(s(1));
+    answered(&mut cluster, s(3), echo, 11);
+    let out = read(&mut cluster, 4);
+    assert!(!refused(&out), "the replaced store can confirm: {out:?}");
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0), (true, 3, 0), (false, 3, 1), (true, 3, 0)],
+        "every edge of the window is traced: refused, the install, quarantined again \
+         with read 2 dropped, and the replacement"
+    );
+}
+
+/// A refused server's answer counts the same as a quarantined one's, which is the decision
+/// PROPOSED D-129 records: its store is on its way to the quarantine, which is for good, so
+/// the read was never going to be confirmed through it; a stream to it can stall for as
+/// long as the leader's other follower keeps it in office; and a registration that waits
+/// out a re-seed is the leak over again. A placeholder answers the same bytes. It alone can
+/// later confirm, and an install's answer and its next echo say so when it does.
+// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
+#[test]
+fn a_refused_followers_echo_of_zero_counts_as_a_quarantined_ones() {
+    let mut both = reading_leader(Variant::Correct);
+    answered_refused(&mut both, s(2));
+    answered_refused(&mut both, s(3));
+    assert!(refused(&read(&mut both, 1)), "two refused");
+
+    let mut mixed = reading_leader(Variant::Correct);
+    answered(&mut mixed, s(2), 0, 0);
+    answered_refused(&mut mixed, s(3));
+    assert!(
+        refused(&read(&mut mixed, 1)),
+        "one of each: D-035's seed 60"
+    );
+
+    let mut one = reading_leader(Variant::Correct);
+    answered_refused(&mut one, s(2));
+    assert!(
+        !refused(&read(&mut one, 1)),
+        "one refused leaves a majority"
+    );
+}
+
+/// What the drop leaves: a read the lease or a majority confirmed waits only for its
+/// state, and a read whose acknowledgements still make a majority was sent back while it
+/// was this leader's to confirm. Only a read no round can confirm goes.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn the_drop_takes_only_a_read_no_round_can_confirm() {
+    // Unapplied, so a confirmed read has something to wait for.
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.elect(s(1));
+    cluster.propose(s(1), "x");
+    cluster.settle();
+    cluster.inbox.clear();
+
+    // Read 1 is confirmed by server 2's round and waits to be applied.
+    cluster.now += 1_000_000;
+    read(&mut cluster, 1);
+    cluster.inbox.clear();
+    cluster.now += 1_000_000;
+    let echo = cluster.local_clock(s(1));
+    answered(&mut cluster, s(2), echo, 0);
+
+    // Read 2 has nothing behind it.
+    cluster.now += 1_000_000;
+    read(&mut cluster, 2);
+    cluster.inbox.clear();
+
+    // Both followers now say they never will.
+    answered(&mut cluster, s(2), 0, 0);
+    assert!(cluster.dropped.is_empty(), "server 3 may yet answer");
+    answered(&mut cluster, s(3), 0, 0);
+    assert_eq!(
+        cluster.dropped,
+        vec![(s(1), 2)],
+        "only the read with nothing behind it"
+    );
+    assert!(
+        cluster.reads.is_empty(),
+        "the confirmed read waits for its state"
+    );
+    let commit = cluster.commit(s(1));
+    cluster.step(s(1), Input::Applied(commit));
+    assert_eq!(
+        cluster.reads.len(),
+        1,
+        "and has it now: {:?}",
+        cluster.reads
+    );
+    assert_eq!(cluster.reads[0].1, 1);
+
+    // A read with an acknowledgement behind it and its leader's no-op not committed yet,
+    // so nothing has confirmed it: a leader nothing else has answered.
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.block_appends(s(1), &members);
+    cluster.elect(s(1));
+    cluster.inbox.clear();
+    read(&mut cluster, 1);
+    cluster.inbox.clear();
+    cluster.now += 1_000_000;
+    let rejection = |cluster: &mut Cluster, from: ServerId, echo: u64| {
+        let term = cluster.term(s(1));
+        let now = cluster.local_clock(s(1));
+        cluster.step(
+            s(1),
+            Input::Message {
+                from,
+                now,
+                message: Message::AppendEntriesResponse {
+                    term,
+                    success: false,
+                    prev_index: 0,
+                    match_index: 0,
+                    hint: 1,
+                    echo,
+                    local: 0,
+                    incarnation: 0,
+                    refused: false,
+                },
+            },
+        );
+    };
+    let echo = cluster.local_clock(s(1));
+    rejection(&mut cluster, s(2), echo);
+    read(&mut cluster, 2);
+    cluster.inbox.clear();
+    rejection(&mut cluster, s(2), 0);
+    rejection(&mut cluster, s(3), 0);
+    assert_eq!(
+        cluster.dropped,
+        vec![(s(1), 2)],
+        "server 2 confirmed read 1 while it could, and only the no-op stands in its way"
+    );
+    // Commit the no-op through the same two followers.
+    answered(&mut cluster, s(2), 0, 0);
+    let commit = cluster.commit(s(1));
+    assert!(commit >= 1);
+    cluster.step(s(1), Input::Applied(commit));
+    assert_eq!(cluster.reads.len(), 1, "served: {:?}", cluster.reads);
+    assert_eq!(cluster.reads[0].1, 1);
+    assert!(!cluster.reads[0].3, "by the round it had, and not a lease");
+}
+
+/// While a change is joint each voter set is counted, as for every other majority (thesis
+/// §4.3): one merged majority of the union would keep a read neither set can confirm.
+/// A leader outside `C_new` counts nothing for itself there.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn while_joint_each_voter_set_must_be_able_to_confirm() {
+    let joint = |new: &[u64]| {
+        let cfg = config(Variant::Correct);
+        let members = five();
+        let mut cluster = Cluster::new(&members, &cfg, &[]);
+        let membership = Configuration {
+            voters: vec![s(1), s(2), s(3)],
+            new_voters: Some(new.iter().map(|&n| s(n)).collect()),
+            learners: Vec::new(),
+        };
+        for &id in &members {
+            cluster.cores.insert(
+                id,
+                Raft::restore(
+                    id,
+                    membership.clone(),
+                    cfg.clone(),
+                    id.0 * 7919,
+                    0,
+                    None,
+                    Vec::new(),
+                ),
+            );
+        }
+        cluster.elect(s(1));
+        cluster.inbox.clear();
+        cluster
+    };
+    let with = |cluster: &mut Cluster, quiet: &[u64]| {
+        for &n in quiet {
+            answered(cluster, s(n), 0, 0);
+        }
+        cluster.inbox.clear();
+        refused(&read(cluster, 1))
+    };
+
+    // C_old's two others: three of the five remain, and a merged count would keep the
+    // read, with no majority of C_old behind it.
+    assert!(with(&mut joint(&[1, 4, 5]), &[2, 3]));
+    // C_new's two others.
+    assert!(with(&mut joint(&[1, 4, 5]), &[4, 5]));
+    // One of each leaves a majority of both.
+    assert!(!with(&mut joint(&[1, 4, 5]), &[2, 4]));
+    // The leader outside C_new: {2, 3, 4} with server 1 leading. Server 2 alone of it
+    // is one of three, and the leader is no help.
+    assert!(with(&mut joint(&[2, 3, 4]), &[3, 4]));
+    assert!(!with(&mut joint(&[2, 3, 4]), &[4]));
+}
+
+/// A lease read is confirmed by promises already made, whatever a follower has said since:
+/// the rule refuses non-lease reads, and a read the lease covers is served. Once the lease
+/// has run out, it is refused like any other.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_lease_still_serves_until_it_runs_out() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    leader_with_lease(&mut cluster, s(1));
+    let lease_end = cluster.cores[&s(1)].lease_end();
+    assert!(lease_end > cluster.now);
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    let out = read(&mut cluster, 1);
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            Output::ReadReady {
+                id: 1,
+                lease: true,
+                ..
+            }
+        )),
+        "served by the lease: {out:?}"
+    );
+    cluster.down = vec![s(2), s(3)];
+    while cluster.now < lease_end {
+        cluster.tick(s(1), 1);
+    }
+    assert!(refused(&read(&mut cluster, 2)), "and then refused");
+}
+
+/// A new term starts over: no follower has said anything to this leader yet, so all count
+/// as able until they answer it (RAFT.md §1), and its first answers settle it.
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn a_new_leader_starts_with_every_follower_able() {
+    // A leader nothing has answered: its AppendEntries go nowhere and its votes came in.
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.block_appends(s(1), &members);
+    cluster.elect(s(1));
+    cluster.inbox.clear();
+    let out = read(&mut cluster, 1);
+    assert!(!refused(&out), "nobody has said they never will: {out:?}");
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    assert_eq!(cluster.dropped, vec![(s(1), 1)]);
+
+    let mut cluster = reading_leader(Variant::Correct);
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    assert!(refused(&read(&mut cluster, 1)));
+
+    // Deposed and elected again by servers that answer properly.
+    let term = cluster.term(s(1));
+    let now = cluster.local_clock(s(1));
+    cluster.step(
+        s(1),
+        Input::Message {
+            from: s(2),
+            now,
+            message: Message::RequestVoteResponse {
+                term: term + 1,
+                granted: false,
+            },
+        },
+    );
+    assert_eq!(cluster.role(s(1)), Role::Follower);
+    cluster.inbox.clear();
+    cluster.elect(s(1));
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0)],
+        "taking office is no change of side to trace"
+    );
+    cluster.inbox.clear();
+    assert!(
+        !refused(&read(&mut cluster, 2)),
+        "every follower able again"
+    );
+}
+
+/// The variant is the leader as it was: the same state, traced, and the read kept. It is
+/// what the bound on the node has to catch (`sim/tests/reseed.rs`).
+// PROPOSED(D-129): a leader refuses a read it can never confirm.
+#[test]
+fn the_variant_keeps_the_read_it_can_never_confirm() {
+    let mut cluster = reading_leader(Variant::UnconfirmableReadKept);
+    answered(&mut cluster, s(2), 0, 0);
+    answered(&mut cluster, s(3), 0, 0);
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0)],
+        "the state is the same"
+    );
+    for id in 0..20 {
+        cluster.inbox.clear();
+        assert!(!refused(&read(&mut cluster, id)), "read {id} is kept");
+        answered(&mut cluster, s(2), 0, 0);
+        answered(&mut cluster, s(3), 0, 0);
+    }
+    assert!(cluster.dropped.is_empty(), "and never dropped");
+    assert!(cluster.reads.is_empty(), "and never served");
+}

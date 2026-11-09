@@ -101,6 +101,20 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-refuse-unconfirmable-reads` (2026-11-06), off `main` at de9f4d7, PR #198,
+  PROPOSED **D-129**, the owner's ruling on S10's finding (b): a leader refuses reads it can never
+  confirm and drops the pending ones, and `READS_OUTSTANDING` stays 38. Per follower, the latest
+  answer echoed 0; a silent follower counts as able and a refused one as unable (D-129 says why). The
+  pair is `Variant::UnconfirmableReadKept` on `reseed::run_unconfirmable_reads`, caught by the bound on
+  every seed. No pinned hash moved; the one-group sweep's schedules moved on 13 % of seeds. Seeds 128
+  and 643 of S10's scenario clear the bound; 128 lands in S10's own finding (c). The relaxed read rule
+  and leader-side read expiry are left as questions. **#198's review** (D-129's "#198's review"): B1,
+  a completed install now looks at the side too, so the able window is traced in both directions,
+  pinned on `sides()` in `a_new_incarnation_forgets_what_the_old_store_said`; `adopt` needs no such
+  call and the entry says why; N2's counterfactual revert and figure written into the stalled run's
+  own doc rather than built as a core variant; N6's three `ananke-shard` doc comments amended, since a
+  *leading* core now refuses reads at the step as well. No behaviour and no figure moved. N1, N3, N4
+  and N5 are the owner's issues.
 - **S10, `sim/shard.rs` (D-113, PR #188), merged 2026-11-07** as `1d3f0a0`, with #191 at
   `8a4cdad`. Five nodes, three bootstrap nodes writing ranges 0, 1 and 2 (range 2 over
   `[k, l)`), nodes 4 and 5 holding nothing (asserted per seed); the driver on stream `shard`

@@ -537,8 +537,19 @@
 # nightly's wall clock is its heaviest shard and that is shard 3 at 2237.4 either way; moving the
 # sweep to the lightest shard would leave the spread where it is (221.7 against 222.0). Every
 # weight is its own side's, re-summed and not re-measured.
+# PROPOSED D-129 (a leader refuses a read it can never confirm) added three `reseed` rows. The
+# correct half runs the binary's TIER_CAP of 200 seeds at the nightly and the other two its
+# HIGH_RATE_SHARE of 20 at every tier. Weighed on its tree from the built release binary
+# (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three
+# runs each, the median, on an Apple M2 of 8 cores with other slices' builds beside them (load
+# averages 360 to 530, so the figures are if anything high): the correct half at 106.3 (84.21 +
+# 12.88, 89.84 + 16.43, 89.34 + 17.68), the stalled run at 6.6 (6.24 + 0.39, 6.17 + 0.39, 6.12 +
+# 0.42), the variant at 6.3 (5.76 + 0.38, 5.90 + 0.44, 6.05 + 0.52). Longest-first into the
+# lightest shard: shard 1 at 1977.1 -> 2083.4, then shard 5 at 1981.0 -> 1987.6 -> 1993.9.
+# Merge note (D-129 onto D-128): every row stays in the shard its own side placed it in, and
+# every header is recomputed from the rows beneath it.
 # shard	binary	cpu_s	test
-# shard 1: 2206.7 cpu s
+# shard 1: 2313.0 cpu s
 1	shard	191.3	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
@@ -563,6 +574,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+1	reseed	106.3	a_leader_that_can_confirm_no_read_refuses_it_and_goes_on_committing
 1	reseed	38.3	a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
@@ -643,7 +655,7 @@
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
-# shard 5: 2031.2 cpu s
+# shard 5: 2044.1 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -677,6 +689,8 @@
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
 5	reseed	31.8	a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so
 5	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span
+5	reseed	6.3	a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound
+5	reseed	6.6	a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm
 # shard 6: 2212.4 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

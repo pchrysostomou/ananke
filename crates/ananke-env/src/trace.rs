@@ -723,6 +723,36 @@ pub enum TraceEvent {
         /// The reads it holds registered now, more than it ever held before.
         outstanding: u64,
     },
+    /// A leader's reads changed sides, at an answer that showed it (RAFT.md §1): it and
+    /// the followers able to confirm a read stopped, or started again, to form a majority
+    /// of every voter set in force. A follower is able unless its latest AppendEntries
+    /// answer echoed 0. Traced too where the answer dropped reads with no change of side.
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    RaftReadsConfirmable {
+        /// The leader.
+        server: u64,
+        /// The range the replica is of.
+        range: u64,
+        /// The leader's term.
+        term: u64,
+        /// Whether the leader can confirm a read now.
+        confirmable: bool,
+        /// The follower whose answer showed it.
+        follower: u64,
+        /// The pending unconfirmed reads this answer dropped.
+        dropped: u64,
+    },
+    /// A leader refused a read no round can ever confirm: no lease held, and it and the
+    /// followers able to confirm form no majority of some voter set in force (RAFT.md §1).
+    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    RaftReadRefused {
+        /// The leader.
+        server: u64,
+        /// The range the replica is of.
+        range: u64,
+        /// The leader's term.
+        term: u64,
+    },
     /// One replica of a node whose shared engine was refused whole (Q15; SHARD.md
     /// §11, storage 8, §12's "A loss in the shared engine").
     ///

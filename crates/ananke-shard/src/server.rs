@@ -419,14 +419,19 @@ enum InFlight {
         client: u64,
         seq: u64,
     },
-    /// A read, by the id the core was given. A core that leads answers it later,
-    /// through `read_ready` or `read_dropped`, and the entry in [`Replica::reads`]
-    /// is taken there; a core that does not lead answers [`Output::Rejected`] and
-    /// nothing else, so the id it refused is only knowable here — and without it
-    /// the entry would be left behind for the life of the node.
+    /// A read, by the id the core was given. A core that *registers* the read answers
+    /// it later, through `read_ready` or `read_dropped`, and the entry in
+    /// [`Replica::reads`] is taken there; a core that refuses it at the step answers
+    /// [`Output::Rejected`] and nothing else, so the id it refused is only knowable
+    /// here — and without it the entry would be left behind for the life of the node.
+    ///
+    /// Two cores refuse at the step: one that does not lead, and — since PROPOSED
+    /// D-129 — a *leading* one with no lease that can confirm no read. Both return
+    /// before `core::on_read` pushes the read, so no `ReadDropped` ever follows for it.
     ///
     /// [`Output::Rejected`]: ananke_raft::core::Output::Rejected
     // PROPOSED(D-076): a refused read's registration is taken back at the step.
+    // PROPOSED(D-129): a leading core refuses at the step too.
     Read { id: u64 },
 }
 
@@ -538,11 +543,17 @@ const PROPOSED_REMEMBERED: usize = 4096;
 /// bound's tail and the nightly is the measurement that holds it. What passing it
 /// means is not a slow node but a registration nobody will ever take back — which is
 /// exactly the standing failure D-076 fixed and D-076's review found nothing
-/// asserting (CLAUDE.md:58-67). The high-water mark is traced
+/// asserting (CLAUDE.md:58-67) — or, the second way a run found, a leader holding reads
+/// nothing can answer. S10's sweep reached that on seeds 128 and 643: a leader with both
+/// followers quarantined commits and keeps its office, confirms no read, and its clients'
+/// registrations only rise. The owner's ruling (D-129) keeps this bound at 38 and in the
+/// same meaning, and has the core refuse those reads and drop the ones it holds, so what
+/// stands here is again what clients have in flight. The high-water mark is traced
 /// (`TraceEvent::RaftReadsOutstanding`) so a tier reads its worst.
 // PROPOSED(D-076): a replica's outstanding read registrations are bounded, and the
 // node fails when they are not.
 // PROPOSED(D-086): re-measured with the stream arms on the node, by D-076's rule.
+// PROPOSED(D-129): the bound stays; the leader refuses what it could never answer.
 const READS_OUTSTANDING: usize = 38;
 
 /// What the host hands the node's `meta` task: a descriptor to tell the meta range
@@ -858,7 +869,9 @@ impl<E: Environment> ServerHost<E> {
         if outstanding > READS_OUTSTANDING {
             self.failed(format!(
                 "range {} holds {outstanding} registered reads, over the {READS_OUTSTANDING} \
-                 its clients can have in flight with it: a read's registration was left behind",
+                 its clients can have in flight with it: nothing is answering or refusing them, \
+                 whether a registration was left behind or the core is holding reads it cannot \
+                 confirm",
                 range.get()
             ));
         }
@@ -1942,11 +1955,16 @@ impl<E: Environment> Host for ServerHost<E> {
         let Some(replica) = self.replica(range) else {
             return;
         };
-        // A read this replica does not lead takes the `None` arm: the core refused
-        // it with `Rejected` and will never name its id again, so `Replica::refuse`
+        // A read the core refused at the step takes the `None` arm: it answered
+        // `Rejected` and will never name the id again, so `Replica::refuse`
         // takes the registration `local_input` made — nothing else ever would, and a
         // node that refuses reads for a living would otherwise carry a
-        // `(SocketAddr, Request)` for every one of them until it stopped.
+        // `(SocketAddr, Request)` for every one of them until it stopped. Two cores
+        // refuse at the step: one that does not lead this range, and — since PROPOSED
+        // D-129 — a leading one with no lease that can confirm no read, which is
+        // exactly the node that refuses reads for a living. Either way the core
+        // returned before it registered the read, so no `ReadDropped` follows and
+        // `answer_read` is never reached for it.
         //
         // Its client is not answered at the step and waits for its own timeout:
         // answering here queues a packet inside the round, which moves every
@@ -4679,14 +4697,20 @@ mod tests {
 
     /// A read a replica refuses leaves nothing behind (D-076).
     ///
-    /// `local_input` registers every read it hands a core, because a core that
-    /// leads answers it later by id and the answer has to find the client again. A
-    /// core that does **not** lead answers `Output::Rejected` and never names the id
-    /// (`core::on_read`): no `ReadDropped` follows, so `answer_read` — the only other
-    /// place a registration is taken back — is never reached for it. The step's own
-    /// refusal is therefore the last moment the id is known, and taking the
-    /// registration there is what keeps a follower's `reads` map from growing for
-    /// the life of the node.
+    /// `local_input` registers every read it hands a core, because a core that takes
+    /// the read answers it later by id and the answer has to find the client again. A
+    /// core that refuses the read at the step answers `Output::Rejected` and never
+    /// names the id (`core::on_read`): no `ReadDropped` follows, so `answer_read` —
+    /// the only other place a registration is taken back — is never reached for it.
+    /// The step's own refusal is therefore the last moment the id is known, and taking
+    /// the registration there is what keeps the `reads` map from growing for the life
+    /// of the node.
+    ///
+    /// Two cores refuse at the step, and the reasoning covers both: one that does
+    /// **not** lead, and — since PROPOSED D-129 — a *leading* one with no lease that
+    /// can confirm no read. `core::on_read` returns before it pushes the read in each
+    /// case, so neither is ever named again, and the second is the case that makes this
+    /// a live path rather than a follower's housekeeping.
     ///
     /// The pair (CLAUDE.md:52-57) is the second half: the replica as it was, which
     /// leaves an entry behind for every read it refuses — and this same check sees
