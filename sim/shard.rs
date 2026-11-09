@@ -162,6 +162,9 @@ const STALE_ADMIN: u64 = 200;
 /// What a split's asker adds to its request's number when it asks anew, past every admin
 /// number (PROPOSED D-131).
 const ASK_ANEW: u64 = 1 << 16;
+/// How many times a split's asker asks before it stops: round the bootstrap nodes four times.
+/// Its first `NoRangeId` starts the count again (PROPOSED D-131).
+const ASKS: u64 = BOOTSTRAP * 4;
 /// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
 /// correct system before it is asserted (Q39; D-113 §6).
 pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
@@ -903,6 +906,13 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// not seen, which the leader answers at once: the split done, or refused `KeyOutsideSpan`
 /// where it has already landed. Seed 992 found it: the split took effect 130 ms after its
 /// first refusal and its asker was answered 3.2 s later (PROPOSED D-131).
+///
+/// The asks before the first `NoRangeId` and the retries after it are counted apart. D-092's
+/// check is about the retries, and it reports an asker still asking at the last heal that ends
+/// with no answer. An asker whose tries went on `NotLeader` bounces and whose first `NoRangeId`
+/// came on its last one has made no retry, and the check would be reading the bounces. So the
+/// first `NoRangeId` gives the asker [`ASKS`] again, and only the first, so an asker every
+/// node keeps refusing still stops and is still reported. Seed 18925 found it (PROPOSED D-131).
 #[allow(clippy::too_many_arguments)]
 async fn split_admin<E: Environment>(
     env: E,
@@ -921,7 +931,7 @@ async fn split_admin<E: Environment>(
     if !delay.is_zero() {
         env.clock().sleep(delay).await;
     }
-    let mut tries = BOOTSTRAP * 4;
+    let mut tries = ASKS;
     let mut done = false;
     let mut first_refused: Option<Instant> = None;
     let mut seq = n;
@@ -976,6 +986,10 @@ async fn split_admin<E: Environment>(
                     }
                 }
                 if reason == SplitRefusal::NoRangeId {
+                    // PROPOSED(D-131): the retries get the budget whole; see above.
+                    if first_refused.is_none() {
+                        tries = ASKS;
+                    }
                     first_refused.get_or_insert(now);
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
@@ -1156,8 +1170,14 @@ async fn load_burst<E: Environment>(
 
 /// One of the two stale-cache shape's clients (PROPOSED D-131): asks `op` of `range` at
 /// `generation` through `target`, following `NotLeader` round the bootstrap nodes, and traces
-/// its call and its answer as a client's. The operation is sent as (client, seq) once per
-/// node asked. Whether it was answered with an outcome.
+/// its call and its answer as a client's. Whether it was answered with an outcome.
+///
+/// `NotLeader` is a refusal at the step, so the operation goes on to the next node. A silence
+/// is not: a get can be asked again elsewhere, and a write cannot, as the sweep's own client
+/// has it (`raft::client_over`). The node that went silent may have proposed it, and a leader's
+/// record of (client, seq) is that leader's alone, so a second leader would propose it again
+/// and it would apply twice, while the history closes the call at its first apply. A write
+/// that hears nothing stays open in the history (Q10). Seed 16725 found it.
 async fn ask_once<E: Environment, S: Socket>(
     env: &E,
     sock: &S,
@@ -1221,6 +1241,8 @@ async fn ask_once<E: Environment, S: Socket>(
             // A `RangeMismatch` is the correct server's answer to the reader, and its call
             // leaves the history as one never proposed (SHARD.md §9).
             Some(Reply::RangeMismatch { .. }) => return false,
+            // PROPOSED(D-131): one try for a write, as above.
+            None if op.is_write() => return false,
             Some(Reply::NotLeader { leader: None }) | None => target = target % BOOTSTRAP + 1,
         }
     }
