@@ -1913,6 +1913,15 @@ fn an_echo_that_is_not_zero_makes_a_follower_able_again() {
 /// operator replaces confirm again. On an AppendEntries answer the answer itself decides
 /// straight after, so an install's answer is the case the reset is for: it carries an
 /// incarnation and no echo, and the follower counts as able until it next answers.
+///
+/// The install is a change of side like an answer's and is traced like one (#198's
+/// review, B1): `sides()` below is the whole sequence, and the install's `true` is the
+/// third assertion's second element. Without the call in `on_snapshot_installed` the
+/// able window is invisible in both directions — the `true` goes untraced, and because
+/// `reads_confirmable` is then left stale at `false` the next echo of 0 can find
+/// `confirmable == self.reads_confirmable` and return early too, so neither edge of the
+/// window is in the trace. The install drops nothing, which is the other half of the
+/// claim: it only ever clears `echoed_zero`, so the able set only widens.
 // PROPOSED(D-129): a leader refuses a read it can never confirm.
 #[test]
 fn a_new_incarnation_forgets_what_the_old_store_said() {
@@ -1920,6 +1929,12 @@ fn a_new_incarnation_forgets_what_the_old_store_said() {
     answered(&mut cluster, s(2), 0, 0);
     answered(&mut cluster, s(3), 0, 0);
     assert!(refused(&read(&mut cluster, 1)));
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0)],
+        "server 2's answer left a majority, server 3's did not; the refused read \
+         registered nothing to drop"
+    );
 
     let index = cluster.commit(s(1));
     cluster.step(
@@ -1929,6 +1944,17 @@ fn a_new_incarnation_forgets_what_the_old_store_said() {
             index,
             incarnation: 9,
         },
+    );
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0), (true, 3, 0)],
+        "the install is traced as the answer was: it can confirm again, and the able \
+         window is visible in the trace"
+    );
+    assert!(
+        cluster.dropped.is_empty(),
+        "an install only widens what can confirm, so it drops nothing: {:?}",
+        cluster.dropped
     );
     cluster.inbox.clear();
     let out = read(&mut cluster, 2);
@@ -1945,6 +1971,12 @@ fn a_new_incarnation_forgets_what_the_old_store_said() {
     answered(&mut cluster, s(3), echo, 11);
     let out = read(&mut cluster, 4);
     assert!(!refused(&out), "the replaced store can confirm: {out:?}");
+    assert_eq!(
+        sides(&cluster),
+        vec![(false, 3, 0), (true, 3, 0), (false, 3, 1), (true, 3, 0)],
+        "every edge of the window is traced: refused, the install, quarantined again \
+         with read 2 dropped, and the replacement"
+    );
 }
 
 /// A refused server's answer counts the same as a quarantined one's, which is the decision

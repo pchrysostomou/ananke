@@ -23528,9 +23528,13 @@ RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with 
    could confirm it, and needs only the no-op's commit. So this is not `drop_reads`, which drops
    them all because the server stopped leading.
 6. *The trace* (**PROPOSED**; CLAUDE.md, every transition that matters). `RaftReadsConfirmable {
-   confirmable, follower, dropped }`, at an answer that changed sides or dropped a read, and
-   `RaftReadRefused` per refusal, which is all a client of the node sees of it. Both appear only
-   in the state, so a run that never reaches it traces what it traced.
+   confirmable, follower, dropped }`, at a follower's latest word that changed sides or dropped a
+   read, and `RaftReadRefused` per refusal, which is all a client of the node sees of it. Both
+   appear only in the state, so a run that never reaches it traces what it traced. Two words change
+   what a follower can confirm, and `note_reads_confirmable` is called at both: an AppendEntries
+   answer, which sets or clears `echoed_zero`, and a completed install, which forgets what the old
+   store said (D-042). The install was missed as first written and added at #198's review; see
+   "#198's review" below, which also says why `adopt` is not a third.
 7. *The bound.* `READS_OUTSTANDING` stays 38. Its failure message no longer presumes the
    refused-read leak: "nothing is answering or refusing them, whether a registration was left
    behind or the core is holding reads it cannot confirm". "registered reads" stays in it, which
@@ -23661,6 +23665,87 @@ refusing; the state not looked at on an answer. Two survived the first pass (sta
 acknowledgements), because the test's followers answered first and its read was confirmed by the very
 answer meant to show the state. Both tests were rewritten and now catch them. The runs' own clauses
 are direct: no refusal leaves `refused_from` under its floor, and no drop leaves `dropped` at 0.
+The sixteenth plant, "the state not looked at on an answer", is the measure of what the set missed:
+it planted the *answer* and not the install, which is the gap below. Removing the install's call is
+now the seventeenth, and `a_new_incarnation_forgets_what_the_old_store_said` catches it.
+
+**#198's review.** B1 and the two notes this slice carried out; N1, N3, N4 and N5 are the owner's
+issues and are not touched here, and nothing below changes behaviour.
+
+*B1: the install emitted no event, and the staleness swallowed the next one.* `on_snapshot_installed`
+cleared `echoed_zero` through `note_incarnation` (point 1) and never called `note_reads_confirmable`,
+so a follower's re-seed install could make a leader confirmable again with nothing traced — and with
+`reads_confirmable` then left stale at `false`, that follower's next echo of 0 could find
+`confirmable == self.reads_confirmable` with nothing dropped and return early as well, leaving the
+able window invisible in both directions. The behaviour was right throughout, since `on_read` asks
+the question afresh and never reads the field, so this was CLAUDE.md's trace rule alone.
+`on_snapshot_installed` now calls `note_reads_confirmable(to)`, after `note_incarnation` has cleared
+the flag and the borrow of `progress` has ended, and *before* `maybe_commit`: through `after_commit`
+that can take a configuration entry into force, or, where the leader is no longer a voter,
+`become_follower`, which clears `progress` and drops every read — and a side traced from there would
+be a non-leader's word about reads it no longer holds. It is the order
+`on_append_entries_response` already uses.
+
+*The install drops nothing*, verified rather than assumed. An install only ever *clears*
+`echoed_zero`, so the able set only widens; `Configuration::has_majority` counts the members of fixed
+voter sets and is monotone in what it is given; and every read still held either survived the last
+look's drop pass or was registered while `can_confirm(&[])` held, so a wider able set cannot strand
+one. The drop loop can still *run* — an install need not carry the leader over the threshold, as in a
+group of seven with five unable — and finds nothing when it does. The one way an install drops a read
+is a configuration entry taken into force since that look, which is the next paragraph.
+
+*The membership path needs no call.* `adopt`'s `self.membership = config` can change what
+`can_confirm` answers with no recompute, and is left alone: it runs on every server that stores a
+configuration entry, where `reads` is empty and `reads_confirmable` is a leader's field; it has no
+follower to name in the event; and a leader asks the question afresh at every `on_read` and at the
+next answer or install, so all a configuration change can leave behind is a read already held that
+has become unconfirmable, dropped at the next look and no later than the next round's answers. Whether
+that wait should be closed at the change itself is the read-expiry question above, not a defect here.
+
+*The pin.* `paper.rs`'s `a_new_incarnation_forgets_what_the_old_store_said` now asserts `sides()`
+three times, so the absence of the install's event fails it rather than passing green:
+`[(false, 3, 0)]` once server 3's answer takes the majority away, `[(false, 3, 0), (true, 3, 0)]` at
+the install with `cluster.dropped` still empty, and
+`[(false, 3, 0), (true, 3, 0), (false, 3, 1), (true, 3, 0)]` at the end — every edge of the window,
+in both directions.
+
+*No figure above moves.* `trace` is `outputs.push(Output::Trace(..))` and both nodes hand it to
+`trace_decided` with no await and no draw, so the extra record adds no yield and moves no schedule.
+`UnconfirmableReads` indexes the trace by live positions (`hold_from` is `sim.trace_len()`), the new
+records carry `dropped: 0`, and `state_at` looks for the first `confirmable: false`, so the tables,
+the Phase 2 rows and S10's seeds stand as measured. `SEED_42_BODY_HASH` runs no Raft and is
+untouched. Re-run on the change at twenty seeds, the gate row reproduces to the figure: the correct
+half holds at most 9 and refuses 2 043 (at least 101 on a seed) with 161 dropped, the stalled run
+holds at most 9 and refuses 1 923 (at least 94), and the variant is caught 20 of 20 holding at most
+113. The twelve `reseed` tests, `ananke-raft`'s `--lib`, `paper.rs` and `node.rs` all pass.
+
+*What `reached()` asserts is weaker than it reads* (second-order, recorded not fixed).
+`UnconfirmableReads::reached`'s `last_side != Some(false)` clause reads the traced flag as the state,
+so it can be satisfied while the leader is in fact confirmable at the end: it asserts the leader's
+last *word*, not its last state. It holds on these runs for a reason outside the clause — the second
+follower's install is followed by its quarantined echo of 0, which traces `false` again — and the
+stalled run has no install at all. Left as it is, with the weakness written down here.
+
+*N2: the clause two verifiers split on now carries its counterfactual.*
+`a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm` hardcodes `Variants::default()`
+and no variant plants "echo 0 and no refused mark", so point 2's deciding 20-of-20 figure was not
+reproducible from the tree. A core variant for a reading the owner did not take would widen this
+slice, so the test's own doc carries the exact revert instead — in `on_append_entries_response`,
+`progress.echoed_zero = echo == 0` becomes `progress.echoed_zero = echo == 0 && !refused` — with the
+figure, the failure it produces and the unit case that also catches it, as
+`a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it` carries its
+own. The figure is the one measured for this entry, at twenty seeds in release; it was not
+re-measured at the review.
+
+*N6: three doc comments were explaining the design on a premise this slice makes false.*
+`ananke-shard`'s `server.rs` described `InFlight::Read`, `rejected` and
+`a_read_a_replica_refuses_leaves_nothing_behind` as though only a core that does **not** lead answers
+`Output::Rejected` to a read. Since point 4 a *leading* core with no lease that can confirm nothing
+does too — and it is the case that makes the path live rather than a follower's housekeeping. The
+conclusion held either way, since `on_read` returns before it registers the read and no `ReadDropped`
+can follow, but the reasoning as written did not; all three now name both cores. RAFT.md's
+`RaftReadsConfirmable` row and the `reads_confirmable` field's doc said "an answer" and now name the
+install as well.
 
 **The nightly's rows (D-064).** Three `reseed` rows, weighed on this tree from the built release binary,
 three runs each, the median, with other slices' builds beside them (load 360 to 530): the correct half

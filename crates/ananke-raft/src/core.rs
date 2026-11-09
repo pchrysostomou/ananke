@@ -910,11 +910,12 @@ pub struct Raft {
     /// The index of the current term's first entry, the no-op, on a leader: a read
     /// waits for it to commit (thesis §6.4).
     first_of_term: Index,
-    /// Whether, at the leader's last look at an answer, it and the followers able to
-    /// confirm a read formed a majority of every voter set in force, so a change of
-    /// side is traced once ([`TraceEvent::RaftReadsConfirmable`]). `on_read` does not
-    /// read this: it asks the question afresh, since a configuration entry can change
-    /// the answer between two answers.
+    /// Whether, at the leader's last look — an AppendEntries answer or a completed
+    /// install — it and the followers able to confirm a read formed a majority of
+    /// every voter set in force, so a change of side is traced once
+    /// ([`TraceEvent::RaftReadsConfirmable`]). `on_read` does not read this: it asks
+    /// the question afresh, since a configuration entry can change the answer between
+    /// two looks.
     // PROPOSED(D-129): a leader refuses a read it can never confirm.
     reads_confirmable: bool,
     reads: Vec<PendingRead>,
@@ -1382,12 +1383,24 @@ impl Raft {
         self.membership.has_majority(&on)
     }
 
-    /// What an answer from `follower` just showed about the reads: traces a change of
-    /// side, and drops every pending read no round can now confirm, so its client hears
-    /// `NotLeader` at once rather than never. A read the lease or a majority confirmed
-    /// stays, waiting only for its state; so does a read whose acknowledgements still
-    /// make a majority with those able, since they were sent while it was this leader's
-    /// to confirm, and only the no-op's commit stands between them and a confirmation.
+    /// What the latest word from `follower` just showed about the reads: traces a change
+    /// of side, and drops every pending read no round can now confirm, so its client
+    /// hears `NotLeader` at once rather than never. A read the lease or a majority
+    /// confirmed stays, waiting only for its state; so does a read whose acknowledgements
+    /// still make a majority with those able, since they were sent while it was this
+    /// leader's to confirm, and only the no-op's commit stands between them and a
+    /// confirmation.
+    ///
+    /// Called from the two places that change what a follower can confirm: an
+    /// AppendEntries answer, which sets or clears `echoed_zero`, and a completed install,
+    /// which forgets what the old store said (D-042). An install only ever *clears* the
+    /// flag, so where it changes the side it can only widen it to `true`, and its drop
+    /// pass finds nothing to drop: [`Configuration::has_majority`] counts the members of
+    /// fixed voter sets and so is monotone in what it is given, and every read still held
+    /// either survived the last look or was registered while `can_confirm(&[])` held. The
+    /// one way an install drops a read is a configuration entry taken into force since
+    /// that look, which can narrow a majority with no recompute of its own — and such a
+    /// read is one no round can confirm, which is what the drop is for.
     // PROPOSED(D-129): a leader refuses a read it can never confirm.
     fn note_reads_confirmable(&mut self, follower: ServerId) {
         let confirmable = self.can_confirm(&[]);
@@ -2142,6 +2155,14 @@ impl Raft {
         // PROPOSED(D-069): an install's answer raises `matched` under the
         // incarnation it carried, as an AppendEntries success does.
         self.note_match_started(to, before);
+        // PROPOSED(D-129): an install at a new incarnation forgot what the old store
+        // said of this follower's reads, so the side can change here and is traced
+        // here, as it is at an answer. Placed after `note_incarnation` cleared
+        // `echoed_zero` and after the borrow of `progress` ends, and *before*
+        // `maybe_commit`, which through `after_commit` can take a configuration entry
+        // into force or step this leader down — and a side traced by a server that has
+        // just stopped leading says nothing about reads it no longer holds.
+        self.note_reads_confirmable(to);
         self.maybe_commit();
         self.maybe_compact();
         self.replicate(to, false);

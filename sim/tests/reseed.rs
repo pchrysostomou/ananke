@@ -488,8 +488,20 @@ fn a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound() {
 /// confirmation and a stream can stall for as long as the leader's other follower keeps it
 /// in office. So the second follower's stream is lost for good here, it stays refused, and
 /// the correct leader refuses reads and commits on exactly as in the state's other shape.
-/// With "echo 0 and no refused mark" this run trips the bound on the correct system: the
-/// entry has the rate. On [`HIGH_RATE_SHARE`] seeds, since the state is built on each.
+/// On [`HIGH_RATE_SHARE`] seeds, since the state is built on each.
+///
+/// No variant plants the other reading, because a core variant for a reading the owner did
+/// not take would widen this slice (#198's review, N2). The counterfactual is a one-line
+/// revert instead, and this is it: in `ananke-raft`'s `core.rs`, in
+/// `on_append_entries_response`, `progress.echoed_zero = echo == 0` becomes
+/// `progress.echoed_zero = echo == 0 && !refused`. That is "echo 0 and no refused mark" —
+/// a refused follower then counts as able to confirm for the whole of its stalled
+/// re-seed, the reads wait on it, and the registrations only rise. Measured for D-129 at
+/// twenty seeds in release: the revert fails **20 of 20** on `READS_OUTSTANDING`, "range 2
+/// holds 39 registered reads"; the rule taken passes 20 of 20, holding at most 9. The
+/// figures in the entry's table were measured the same way. The revert's own unit case is
+/// `paper.rs`'s `a_refused_followers_echo_of_zero_counts_as_a_quarantined_ones`, which it
+/// also fails; this run is what holds the reading under the fault model.
 // PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
 #[test]
 fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {

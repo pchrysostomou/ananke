@@ -410,7 +410,7 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
-| `RaftReadsConfirmable` | an answer showed a leader's reads changing sides: it and the followers able to confirm stopped, or started again, to form a majority of every voter set in force, or the answer dropped reads with no change of side (PROPOSED D-129) | `term`, `confirmable`, `follower`: whose answer showed it, `dropped`: the pending reads it dropped |
+| `RaftReadsConfirmable` | a follower's latest word showed a leader's reads changing sides: it and the followers able to confirm stopped, or started again, to form a majority of every voter set in force, or that word dropped reads with no change of side (PROPOSED D-129). An AppendEntries answer is one such word; a completed install is the other, which forgets what the follower's old store said (D-042) and so can only widen the side to `true` | `term`, `confirmable`, `follower`: whose word showed it, `dropped`: the pending reads it dropped |
 | `RaftReadRefused` | a leader refused a read no round can ever confirm (PROPOSED D-129) | `term` |
 | `RaftTransfer` | a leader sent TimeoutNow | `to` |
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |

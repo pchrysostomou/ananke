@@ -108,7 +108,13 @@ _Update this section at the end of every session._
   pair is `Variant::UnconfirmableReadKept` on `reseed::run_unconfirmable_reads`, caught by the bound on
   every seed. No pinned hash moved; the one-group sweep's schedules moved on 13 % of seeds. Seeds 128
   and 643 of S10's scenario clear the bound; 128 lands in S10's own finding (c). The relaxed read rule
-  and leader-side read expiry are left as questions.
+  and leader-side read expiry are left as questions. **#198's review** (D-129's "#198's review"): B1,
+  a completed install now looks at the side too, so the able window is traced in both directions,
+  pinned on `sides()` in `a_new_incarnation_forgets_what_the_old_store_said`; `adopt` needs no such
+  call and the entry says why; N2's counterfactual revert and figure written into the stalled run's
+  own doc rather than built as a core variant; N6's three `ananke-shard` doc comments amended, since a
+  *leading* core now refuses reads at the step as well. No behaviour and no figure moved. N1, N3, N4
+  and N5 are the owner's issues.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit
