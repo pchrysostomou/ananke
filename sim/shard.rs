@@ -232,6 +232,12 @@ pub struct Schedule {
     pub drifts: Vec<i64>,
     /// Each node's clock offset in nanoseconds, by node index.
     pub skews: Vec<i64>,
+    /// How long after the liveness window opens the clients stay cut off from every node,
+    /// the window's start not moved and its length not changed: what a cluster nothing can
+    /// write to for that long looks like to the write bound read from the heal (PROPOSED
+    /// D-113 §5). `None` in every schedule [`Schedule::draw`] draws, so no run of the sweep
+    /// has one; a test sets it.
+    pub clients_held_off: Option<Duration>,
 }
 
 impl Schedule {
@@ -313,6 +319,7 @@ impl Schedule {
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
             drifts,
             skews,
+            clients_held_off: None,
         }
     }
 
@@ -640,6 +647,50 @@ pub struct Retried {
     pub answered: bool,
 }
 
+impl Retried {
+    /// Whether it was still asking when the last fault healed at `heal`, so that some retry
+    /// of its came after the heal.
+    #[must_use]
+    pub fn asking_at(&self, heal: Instant) -> bool {
+        self.ended >= heal
+    }
+
+    /// How long it took, read from `heal`, or from its first refusal if that came later.
+    #[must_use]
+    pub fn took(&self, heal: Instant) -> Duration {
+        self.ended.duration_since(self.refused.max(heal))
+    }
+
+    /// What D-092 asks of this asker, where the last fault healed at `heal` and the bound is
+    /// `bound`: "the same asker's retry after the heal takes effect within the liveness
+    /// bound". One that stopped before the heal made no retry after it and is asked nothing.
+    /// Any other is asked for an answer, within the bound of the heal, or of its first
+    /// refusal if that came after the heal. The violation, in words, if it did neither.
+    // PROPOSED(D-092): answer A; the asker retries.
+    // PROPOSED(D-113): read from the heal, §8.
+    #[must_use]
+    pub fn took_no_effect(&self, heal: Instant, bound: Duration) -> Option<String> {
+        if !self.asking_at(heal) {
+            return None;
+        }
+        let took = self.took(heal);
+        if !self.answered {
+            return Some(format!(
+                "the split of range {} refused at {:?} stopped asking at {:?}, {took:?} past the \
+                 last heal at {heal:?}, with no answer",
+                self.range, self.refused, self.ended
+            ));
+        }
+        (took > bound).then(|| {
+            format!(
+                "the split of range {} refused at {:?} was answered {took:?} past the last heal \
+                 at {heal:?}, over {bound:?}",
+                self.range, self.refused
+            )
+        })
+    }
+}
+
 type Driver = Arc<Mutex<DriverStats>>;
 
 fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -887,6 +938,10 @@ pub struct Report {
     pub driver: DriverStats,
     /// The trace under the raft sweep's checks (`raft::Report::over_a_run`).
     pub checked: raft::Report,
+    /// When the last fault healed: the heal D-092 reads its asker's retry from, where
+    /// `checked.last_heal`, the liveness window's start, is past the driver's drain and so
+    /// past every asker the drain saw finish (PROPOSED D-113 §8).
+    pub last_fault_healed: Instant,
 }
 
 /// Runs the correct system on `seed`.
@@ -1108,8 +1163,20 @@ fn run_watched(
     while watch.checks.stopped.is_none() && lock(&driver).outstanding > 0 && sim.now() < drain {
         advance(&mut sim, SLICE, &mut watch);
     }
+    let last_fault_healed = last_heal;
     last_heal = last_heal.max(sim.now());
-    advance(&mut sim, schedule.settle, &mut watch);
+    // The instrument for the bound read from the heal (PROPOSED D-113 §5): the same window,
+    // its first stretch with no client reaching any node. `last_heal` is not moved, as the
+    // cluster's own slowness would not move it.
+    if let Some(held) = schedule.clients_held_off {
+        let held = held.min(schedule.settle);
+        sim.partition(&clients, &nodes);
+        advance(&mut sim, held, &mut watch);
+        sim.heal();
+        advance(&mut sim, schedule.settle - held, &mut watch);
+    } else {
+        advance(&mut sim, schedule.settle, &mut watch);
+    }
     let ended = sim.now();
     let records = sim.trace();
     let history = History::from_trace(&records);
@@ -1149,6 +1216,7 @@ fn run_watched(
         schedule,
         driver,
         checked,
+        last_fault_healed,
     }
 }
 
@@ -1358,6 +1426,17 @@ impl MetaNames {
             .insert(end.clone(), (start.clone(), range, generation));
     }
 
+    /// Whether meta names any key of `[start, end)` at `generation` or a newer one.
+    fn holds_no_older(&self, start: &Bytes, end: &Bytes, generation: u64) -> bool {
+        self.named
+            .range::<[u8], _>((
+                std::ops::Bound::Excluded(&start[..]),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(_, (from, ..))| from < end)
+            .any(|(_, (.., at))| *at >= generation)
+    }
+
     /// Whether meta names `[start, end)` wholly as `range` at `generation`.
     fn names(&self, start: &Bytes, end: &Bytes, range: u64, generation: u64) -> bool {
         let mut cursor = start.clone();
@@ -1472,6 +1551,82 @@ pub fn meta_lags_of(records: &[TraceRecord], last_heal: Instant) -> Vec<MetaLag>
             named: since.get(&range).copied().flatten(),
         })
         .collect()
+}
+
+/// How many descriptors a split made, by the first apply of each meta index, won a key meta
+/// already named at their generation or a newer one: an update still being resent after the
+/// update it repeats had landed. SHARD.md §1's maximum by generation leaves such an update alone,
+/// so on the correct meta range this is none. `MetaOverwritesByArrival` stores it, and the
+/// update of a parent's old descriptor that arrives this way is what check 16 and the meta
+/// convergence bound then see. Generation one is left out: before the first split every update
+/// names it and the variant has no path (PROPOSED D-098).
+// PROPOSED(D-113): §10's shape for `MetaOverwritesByArrival`, asserted at every tier (D-061).
+#[must_use]
+pub fn meta_resends_stored_of(records: &[TraceRecord]) -> usize {
+    let mut names = MetaNames::default();
+    let mut found = 0;
+    for record in records {
+        let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+            continue;
+        };
+        if names.highest.is_none_or(|highest| *index > highest) {
+            found += descriptors
+                .iter()
+                .filter(|descriptor| descriptor.generation > FIRST_GENERATION)
+                .filter(|descriptor| {
+                    descriptor
+                        .won
+                        .iter()
+                        .any(|(start, end)| names.holds_no_older(start, end, descriptor.generation))
+                })
+                .count();
+        }
+        names.apply(*index, descriptors);
+    }
+    found
+}
+
+/// How many splits, each by its first `RangeSplit`, took their right half's id from a block
+/// granted before its holder's latest restart: `IdBlockResumed`'s shape (SHARD.md §5's second
+/// rule, §10). A new run of the correct node holds no id until a grant of its own lands, so
+/// there it can only be a split proposed before the restart and first applied after it.
+// PROPOSED(D-113): §10's shape for `IdBlockResumed`, asserted at every tier (D-061).
+#[must_use]
+pub fn splits_from_a_block_of_an_earlier_run_of(records: &[TraceRecord]) -> usize {
+    // Each block by its first id: its last, its holder, whether the holder has restarted since.
+    let mut blocks: BTreeMap<u64, (u64, u64, bool)> = BTreeMap::new();
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut found = 0;
+    for record in records {
+        match &record.event {
+            TraceEvent::RangeIdsLeased {
+                node, first, last, ..
+            } => {
+                blocks.entry(*first).or_insert((*last, *node, false));
+            }
+            TraceEvent::NodeRestarted { node } => {
+                let node = u64::from(node.get());
+                for (_, holder, earlier) in blocks.values_mut() {
+                    *earlier |= *holder == node;
+                }
+            }
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } if seen.insert((*range, *index)) => {
+                found += usize::from(
+                    blocks
+                        .range(..=*right)
+                        .next_back()
+                        .is_some_and(|(_, (last, _, earlier))| *earlier && *right <= *last),
+                );
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 impl Report {
@@ -1608,36 +1763,48 @@ impl Report {
         Ok(())
     }
 
-    /// D-092's assertion where a split was refused for want of a range id, per seed: on a
-    /// uniformly scheduled seed whose ranges 0 and the asked range have a majority, the
-    /// asker's retries end on an answer, and within the write bound of the last heal.
+    /// The askers [`Report::retries_take_effect`] asks of: on a uniformly scheduled seed whose
+    /// ranges 0 and the asked range have a majority, each still asking when the last fault
+    /// healed.
+    #[must_use]
+    pub fn retries_asked(&self) -> Vec<Retried> {
+        if !self.checked.uniform() {
+            return Vec::new();
+        }
+        let live = self.checked.ranges_with_a_majority_up();
+        if !live.contains(&ROOT_RANGE) {
+            return Vec::new();
+        }
+        self.driver
+            .retried
+            .iter()
+            .filter(|retried| {
+                live.contains(&retried.range) && retried.asking_at(self.last_fault_healed)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// D-092's assertion where a split was refused for want of a range id, per seed: each of
+    /// [`Report::retries_asked`] ends on an answer, and within the write bound of the last
+    /// fault's heal ([`Retried::took_no_effect`]).
+    ///
+    /// It reads [`Report::last_fault_healed`] and not `checked.last_heal`. That one opens the
+    /// liveness window, past the driver's drain, so an asker the drain waited for has ended
+    /// before it and nothing can be late of it: read from there this check could not fail
+    /// (#216's review, B6).
     ///
     /// # Errors
     ///
-    /// The first asker left without an answer.
+    /// The first asker whose retries took no effect.
     // PROPOSED(D-092): answer A; the asker retries.
+    // PROPOSED(D-113): read from the heal, §8.
     pub fn retries_take_effect(&self) -> Result<(), String> {
-        if !self.checked.uniform() {
-            return Ok(());
-        }
         let seed = self.seed;
-        let live = self.checked.ranges_with_a_majority_up();
         let bound = election_max() * LIVENESS_TIMEOUTS;
-        for retried in &self.driver.retried {
-            if !live.contains(&ROOT_RANGE) || !live.contains(&retried.range) {
-                continue;
-            }
-            let since = retried.refused.max(self.checked.last_heal);
-            let late = retried
-                .ended
-                .checked_duration_since(since)
-                .unwrap_or_default();
-            if !retried.answered && late > bound {
-                return Err(format!(
-                    "seed {seed}: NoRangeId: the split of range {} refused at {:?} was still \
-                     unanswered {late:?} past the last heal, over {bound:?}",
-                    retried.range, retried.refused
-                ));
+        for retried in self.retries_asked() {
+            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound) {
+                return Err(format!("seed {seed}: NoRangeId: {why}"));
             }
         }
         Ok(())
@@ -1872,6 +2039,43 @@ mod tests {
         )
     }
 
+    /// D-092's asker read from the last fault's heal, on what #216's review found the check
+    /// could not say when it was read from the liveness window's start.
+    // PROPOSED(D-113): read from the heal, §8.
+    #[test]
+    fn an_askers_retries_are_asked_of_from_the_heal() {
+        let (heal, bound) = (at(5000), Duration::from_secs(2));
+        let asker = |refused, ended, answered| Retried {
+            range: 2,
+            refused: at(refused),
+            ended: at(ended),
+            answered,
+        };
+        let no_effect = |of: Retried| of.took_no_effect(heal, bound);
+        assert_eq!(no_effect(asker(4900, 5300, true)), None, "answered in time");
+        assert_eq!(
+            no_effect(asker(4900, 7000, true)),
+            None,
+            "the bound is inclusive"
+        );
+        // An asker that stopped before the heal made no retry after it, however it ended.
+        assert_eq!(no_effect(asker(3000, 4900, false)), None);
+        assert_eq!(no_effect(asker(3000, 4900, true)), None);
+        // Still asking at the heal, and it stopped with no answer: the check's whole point.
+        let why = no_effect(asker(4900, 5300, false)).expect("no answer");
+        assert!(why.contains("with no answer"), "{why}");
+        // Refused only after the heal, and it never got one.
+        let why = no_effect(asker(5500, 5900, false)).expect("no answer");
+        assert!(why.contains("with no answer"), "{why}");
+        // Answered too late: from the heal for one refused before it...
+        let why = no_effect(asker(4900, 7001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+        // ...and from its refusal for one refused after it.
+        assert_eq!(no_effect(asker(6000, 7900, true)), None);
+        let why = no_effect(asker(6000, 8001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+    }
+
     /// Range 2 over `[a, z)` split at `m`: 19 is `[m, z)`, both at generation 2.
     fn split() -> Vec<TraceRecord> {
         vec![
@@ -1953,6 +2157,84 @@ mod tests {
         let lags = meta_lags_of(&records, at(100));
         assert_eq!(lag_of(&lags, 2), Some(Duration::from_millis(10)));
         assert_eq!(lag_of(&lags, 19), Some(Duration::from_millis(20)));
+    }
+
+    /// The shape of `MetaOverwritesByArrival`: a split's descriptor stored over a key meta
+    /// already names at its generation or a newer one. A win over an older one is what the
+    /// correct meta range makes, the first generation's resends have no older descriptor to
+    /// bring back, and an index already folded is not read again.
+    // PROPOSED(D-113): §10's shape.
+    #[test]
+    fn a_resend_counts_only_where_it_repeats_a_split_meta_already_names() {
+        let count = meta_resends_stored_of;
+        let mut records = vec![meta(1, 0, 2, ("a", "z"), 1), meta(2, 1, 2, ("a", "z"), 1)];
+        assert_eq!(count(&records), 0, "a resend of the first generation");
+        records.extend([meta(3, 2, 2, ("a", "m"), 2), meta(4, 3, 19, ("m", "z"), 2)]);
+        assert_eq!(count(&records), 0, "each over an older");
+        records.push(meta(5, 3, 19, ("m", "z"), 2));
+        assert_eq!(
+            count(&records),
+            0,
+            "a lagging replica's apply of an index already folded"
+        );
+        records.push(meta(6, 4, 19, ("m", "z"), 2));
+        assert_eq!(count(&records), 1, "a resend of the split's update");
+        records.push(meta(7, 5, 19, ("m", "t"), 3));
+        records.push(meta(8, 6, 19, ("m", "z"), 2));
+        assert_eq!(count(&records), 2, "and one older than meta holds");
+    }
+
+    /// The shape of `IdBlockResumed`: a right half out of a block its holder was granted before
+    /// it last restarted. Not a block of the new run, and not the other node's.
+    // PROPOSED(D-113): §10's shape.
+    #[test]
+    fn a_split_counts_only_from_a_block_granted_before_its_holders_latest_restart() {
+        let leased = |ms, node, first, last| {
+            record(
+                ms,
+                1,
+                TraceEvent::RangeIdsLeased {
+                    node,
+                    run: ms,
+                    first,
+                    last,
+                    index: ms,
+                },
+            )
+        };
+        let split = |ms, range, index, right| {
+            record(
+                ms,
+                1,
+                TraceEvent::RangeSplit {
+                    range,
+                    right,
+                    key: Bytes::from_static(b"m"),
+                    index,
+                },
+            )
+        };
+        let restarted = |ms, node| {
+            record(
+                ms,
+                node,
+                TraceEvent::NodeRestarted {
+                    node: NodeId::new(node),
+                },
+            )
+        };
+        let count = splits_from_a_block_of_an_earlier_run_of;
+        let mut records = vec![leased(1, 1, 10, 17), split(2, 2, 5, 10)];
+        assert_eq!(count(&records), 0, "granted and taken in the one run");
+        records.extend([leased(3, 2, 18, 25), restarted(4, 1), leased(5, 1, 26, 33)]);
+        records.push(split(6, 2, 9, 26));
+        assert_eq!(count(&records), 0, "from the new run's block");
+        records.push(split(7, 2, 12, 18));
+        assert_eq!(count(&records), 0, "from the other node's block");
+        records.push(split(8, 2, 12, 10));
+        assert_eq!(count(&records), 0, "that split was already read");
+        records.push(split(9, 2, 15, 10));
+        assert_eq!(count(&records), 1, "the id of the earlier run, taken again");
     }
 
     #[test]

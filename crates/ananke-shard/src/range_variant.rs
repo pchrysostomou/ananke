@@ -28,15 +28,17 @@
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
-//!   §8 has something that trips it where no protocol mistake of §10 does. Two are
-//!   built, both moved here from the node's set by PROPOSED D-108 because each
+//!   §8 has something that trips it where no protocol mistake of §10 does. Three are
+//!   built. Two were moved here from the node's set by PROPOSED D-108 because each
 //!   breaks a rule of the range layer's and not of the node's:
 //!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
 //!   the initial state and is check 7's instrument on the membership scenario
 //!   (PROPOSED D-096), and [`RangeVariant::IncarnationPerRangeStream`] draws a
 //!   replica's incarnation at its creation from the range's protocol stream instead
 //!   of the node's generator, at Q15's re-seed and at a split's right half (D-077,
-//!   PROPOSED D-100). Two more are proposed and not built: D-093's `SplitLeavesGap`
+//!   PROPOSED D-100). [`RangeVariant::RefillNotResent`] breaks D-092's refill and is
+//!   the instrument of its per-seed assertion on the sharded sweep (PROPOSED D-113).
+//!   Two more are proposed and not built: D-093's `SplitLeavesGap`
 //!   for check 19's fold, and Stage D's variant for the re-add window assertion (§12,
 //!   Stage D's question 1), which needs a stream derived anew at each creation and so
 //!   is not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
@@ -154,6 +156,17 @@ pub enum RangeVariant {
     /// §10); `sim/split.rs` (i) makes the shape on every seed.
     // PROPOSED(D-110)
     SnapshotOverlapsReplica,
+    /// A refill of a node's block of range ids is sent once and not again, where D-092 has
+    /// a node at or below its threshold keep one outstanding, sent "after a minimum election
+    /// timeout until a grant carrying its current run nonce arrives" (SHARD.md §5). That
+    /// resend is what makes the answer to an empty block enough: the split is refused
+    /// `NoRangeId` and the asker retries on the understanding that a refill is on its way.
+    /// Here a refill sent while range 0 has no leader, or lost, is the last. D-092's per-seed
+    /// assertion (`sim/shard.rs`'s `retries_take_effect`) sees an asker's retries after the
+    /// heal end unanswered. A test instrument outside §10's count: §10 has no variant for
+    /// D-092's rule, and the check needs one (CLAUDE.md's pair rule).
+    // PROPOSED(D-113)
+    RefillNotResent,
 }
 
 impl RangeVariant {
@@ -168,6 +181,7 @@ impl RangeVariant {
         RangeVariant::IncarnationPerRangeStream,
         RangeVariant::UninitialisedReplicaVotes,
         RangeVariant::SnapshotOverlapsReplica,
+        RangeVariant::RefillNotResent,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -191,6 +205,8 @@ impl RangeVariant {
             RangeVariant::UninitialisedReplicaVotes => 1 << 7,
             // PROPOSED(D-110): a node that installs every snapshot.
             RangeVariant::SnapshotOverlapsReplica => 1 << 8,
+            // PROPOSED(D-113): a refill sent once and not again.
+            RangeVariant::RefillNotResent => 1 << 9,
         }
     }
 
@@ -207,7 +223,9 @@ impl RangeVariant {
             | RangeVariant::IdBlockResumed
             | RangeVariant::UninitialisedReplicaVotes
             | RangeVariant::SnapshotOverlapsReplica => true,
-            RangeVariant::AnyFreshNodeBootstraps | RangeVariant::IncarnationPerRangeStream => false,
+            RangeVariant::AnyFreshNodeBootstraps
+            | RangeVariant::IncarnationPerRangeStream
+            | RangeVariant::RefillNotResent => false,
         }
     }
 
@@ -224,6 +242,7 @@ impl RangeVariant {
             RangeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
             RangeVariant::SnapshotOverlapsReplica => "SnapshotOverlapsReplica",
+            RangeVariant::RefillNotResent => "RefillNotResent",
         }
     }
 }
@@ -341,9 +360,9 @@ mod tests {
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
         // the range-id blocks, D-109's one for placeholders and D-110's one for the
         // overlap rule, all of them §10's; and
-        // the two instruments PROPOSED D-108 moved here from the node's set, neither of
-        // them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 9);
+        // the two instruments PROPOSED D-108 moved here from the node's set and PROPOSED
+        // D-113's one for D-092's refill, none of them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 10);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -359,7 +378,7 @@ mod tests {
         assert_eq!(counted, 7, "§10's seven built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
-        // a replica's incarnation at its creation).
+        // a replica's incarnation at its creation), and D-113's (D-092's refill).
         let instruments: Vec<&str> = RangeVariant::BUGS
             .iter()
             .filter(|variant| !variant.in_section_10())
@@ -367,7 +386,11 @@ mod tests {
             .collect();
         assert_eq!(
             instruments,
-            ["AnyFreshNodeBootstraps", "IncarnationPerRangeStream"],
+            [
+                "AnyFreshNodeBootstraps",
+                "IncarnationPerRangeStream",
+                "RefillNotResent"
+            ],
             "the range layer's instruments outside §10's count"
         );
         // No range variant is also a node variant: the two sets share no name.

@@ -3008,6 +3008,7 @@ async fn meta_sender<E: Environment>(
     ids: Arc<Mutex<IdBlocks>>,
     root: Option<Arc<RaftStore<E>>>,
     root_generation: u64,
+    resends_refill: bool,
 ) {
     let client = meta_client(id);
     let mut pending: BTreeMap<RangeId, (RangeDescriptor, u64)> = BTreeMap::new();
@@ -3129,7 +3130,9 @@ async fn meta_sender<E: Environment>(
                         if root_hint.is_none() {
                             root_turn += 1;
                         }
-                        send_refill = true;
+                        // PROPOSED(D-113): `RefillNotResent` read from the range layer's
+                        // set.
+                        send_refill = resends_refill;
                     }
                 }
             }
@@ -3719,6 +3722,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .map_or(FIRST_GENERATION, |descriptor| descriptor.generation);
         let ids = ids.clone();
         let root = lock(&stores).get(&ROOT_RANGE).cloned();
+        let resends_refill = !range_variants.contains(RangeVariant::RefillNotResent);
         async move {
             meta_sender(
                 env,
@@ -3733,6 +3737,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 ids,
                 root,
                 root_generation,
+                resends_refill,
             )
             .await;
         }

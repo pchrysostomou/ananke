@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ananke_env::TraceEvent;
+use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
+use ananke_raft::message::Message;
 use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -40,11 +42,16 @@ struct Seen {
     most_ids: usize,
     /// The meta convergence lags asked of the run, `None` a descriptor not named.
     meta_lags: Vec<Option<Duration>>,
-    /// The write bound's inclusion: whether every key the fixed map would ask is asked.
-    widening: Result<(), String>,
+    /// Whether every key the fixed map would ask is asked by the write bound.
+    keys_asked: Result<(), String>,
     slowest_write: Option<Duration>,
     recovery_from_heal: Option<Duration>,
     recovery_from_call: Option<Duration>,
+    /// The whole keyspace's first completion from the heal, where it is asked: the reading
+    /// from the heal (PROPOSED D-113 §5).
+    keyspace_from_heal: Option<Duration>,
+    /// How long each asker D-092's assertion asks of took (PROPOSED D-113 §8).
+    retries_asked: Vec<Duration>,
     right_half: bool,
     partitions: usize,
     blocks: usize,
@@ -53,12 +60,14 @@ struct Seen {
     placeholders: usize,
 }
 
-/// SHARD.md §8's write bound, as `raft::Report::liveness_by_final_range` asks it, is no
-/// narrower than the fixed map's reading (`raft::Report::liveness`, under the map that sends
-/// every key to its first range): where the first range has a majority up, the range serving
-/// every key the clients wrote after the heal has one too, so every key the old reading
-/// asks is still asked, under the same constant (PROPOSED D-113 §5).
-fn not_widened(report: &shard::Report) -> Result<(), String> {
+/// SHARD.md §8's write bound, as `raft::Report::liveness_by_final_range` asks it, keeps the
+/// fixed map's keys (`raft::Report::liveness`, under the map that sends every key to its first
+/// range): where the first range has a majority up, the range serving every key the clients wrote
+/// after the heal has one too, so every key the old reading asks is still asked, under the same
+/// constant. It is about which keys are asked and not about when a reading's clock starts; the
+/// reading from the heal, kept beside the one from each range's first call, is what answers for
+/// that (PROPOSED D-113 §5).
+fn every_key_still_asked(report: &shard::Report) -> Result<(), String> {
     let checked = &report.checked;
     let live = checked.ranges_with_a_majority_up();
     if !live.contains(&ananke_sim::ranges::FIRST_RANGE) {
@@ -112,6 +121,9 @@ fn seen_of(seed: u64) -> Seen {
                 .max()
         })
         .flatten();
+    let keyspace_from_heal = (checked.uniform() && live.contains(&ananke_sim::ranges::FIRST_RANGE))
+        .then(|| checked.time_to_write_after_heal())
+        .flatten();
     let count =
         |want: fn(&TraceEvent) -> bool| report.records().iter().filter(|r| want(&r.event)).count();
     Seen {
@@ -131,10 +143,16 @@ fn seen_of(seed: u64) -> Seen {
             .iter()
             .map(shard::MetaLag::lag)
             .collect(),
-        widening: not_widened(&report),
+        keys_asked: every_key_still_asked(&report),
         slowest_write,
         recovery_from_heal: from_heal,
         recovery_from_call: from_call,
+        keyspace_from_heal,
+        retries_asked: report
+            .retries_asked()
+            .iter()
+            .map(|retried| retried.took(report.last_fault_healed))
+            .collect(),
         right_half: invariants::folded(report.records())
             .verdict_of(Fold::RightHalf)
             .is_err(),
@@ -147,6 +165,10 @@ fn seen_of(seed: u64) -> Seen {
     }
 }
 
+/// The correct system, under every check, at every tier. At the nightly's ten thousand it fails
+/// four seeds and this test says so: 2272 and 7949, a right half with no possible majority, and
+/// 3870 and 5303, #175's committed entry lost. Each waits for an owner ruling (PROPOSED D-113
+/// §6, §11); nothing here is narrowed for them.
 #[test]
 fn every_seed_passes_on_the_correct_sharded_sweep() {
     let seen = sweep(seeds(), seen_of);
@@ -245,11 +267,27 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     );
     println!(
         "shard: the write bound of {:?}: slowest post-heal write {:?}; a range's first completion \
-         from the heal at worst {:?}, from its own first call at worst {:?}",
+         from the heal at worst {:?}, from its own first call at worst {:?}; the keyspace's first \
+         completion from the heal, asserted, asked of {} seeds, at worst {:?}",
         raft::election_max() * raft::LIVENESS_TIMEOUTS,
         seen.iter().filter_map(|s| s.slowest_write).max(),
         seen.iter().filter_map(|s| s.recovery_from_heal).max(),
         seen.iter().filter_map(|s| s.recovery_from_call).max(),
+        seen.iter()
+            .filter(|s| s.keyspace_from_heal.is_some())
+            .count(),
+        seen.iter().filter_map(|s| s.keyspace_from_heal).max(),
+    );
+    let retries: Vec<Duration> = seen
+        .iter()
+        .flat_map(|s| s.retries_asked.iter().copied())
+        .collect();
+    println!(
+        "shard: D-092's asker: {} askers refused `NoRangeId`, {} of them still asking at the last \
+         fault's heal on a uniform seed with their ranges live; the slowest of those took {:?}",
+        seen.iter().map(|s| s.driver.retried.len()).sum::<usize>(),
+        retries.len(),
+        retries.iter().max(),
     );
     println!(
         "shard: check 8's right-half clause, folded and not asserted (PROPOSED D-107), trips on \
@@ -282,7 +320,7 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         );
     }
 
-    let inclusion: Vec<Result<(), String>> = seen.iter().map(|s| s.widening.clone()).collect();
+    let inclusion: Vec<Result<(), String>> = seen.iter().map(|s| s.keys_asked.clone()).collect();
     verdict(&inclusion).unwrap();
     let verdicts: Vec<Result<(), String>> = seen.into_iter().map(|s| s.verdict).collect();
     verdict(&verdicts).unwrap();
@@ -299,6 +337,8 @@ struct Under {
     why: Option<String>,
     tripped: BTreeSet<Fold>,
     splits: usize,
+    /// The splits that took an id from a block of an earlier run of its holder.
+    from_an_earlier_run: usize,
 }
 
 /// `high_rate_share` of `sim/tests/node.rs`: a tenth of the tier, at least the gate's twenty.
@@ -332,6 +372,7 @@ fn under(
                 .filter_map(|(fold, verdict)| verdict.is_err().then_some(fold))
                 .collect(),
             splits: report.splits(),
+            from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
         }
     });
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
@@ -383,7 +424,7 @@ fn said(found: &[Under], words: &str) -> usize {
         .count()
 }
 
-/// §10's `ClientIgnoresMismatch` on any split with load: 98 of 100 seeds.
+/// §10's `ClientIgnoresMismatch` on any split with load: 99 of 100 seeds.
 #[test]
 fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep() {
     let found = range_variant(
@@ -395,6 +436,64 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep()
         tripped(&found, Fold::ClientRefreshes) > 0,
         "no client's resend after a mismatch reached check 17"
     );
+}
+
+/// §10's second catch of `ClientIgnoresMismatch`, "the liveness bound a client that never
+/// converges": the write bound read on the uniform seeds, each run taken to its end since check
+/// 17 would otherwise stop it first. A client that resends to the range it knew gets nothing
+/// through while its cache is stale. On 14 of 500 uniform seeds no write of any key completed
+/// after the heal, and on 8 more the first completion anywhere came later than the bound from
+/// the heal, which the arm from each range's first call passes and only the reading from the heal
+/// says (PROPOSED D-113 §5). Each is under D-061's 5 %, so each is asserted over the thousand and
+/// printed below it.
+// PROPOSED(D-113): §10's second catch, and the reading from the heal on a variant.
+#[test]
+fn a_client_that_ignores_a_mismatch_trips_the_write_bound_on_the_sharded_sweep() {
+    let run = if seeds() >= 1000 {
+        seeds().min(1000)
+    } else {
+        share()
+    };
+    let found = sweep(run, |seed| {
+        let report = shard::run_to_the_end(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::ClientIgnoresMismatch]),
+        );
+        let uniform = report.checked.uniform();
+        (
+            uniform,
+            uniform
+                .then(|| report.checked.liveness_by_final_range().err())
+                .flatten(),
+        )
+    });
+    let uniform = found.iter().filter(|f| f.0).count();
+    let caught: Vec<&String> = found.iter().filter_map(|f| f.1.as_ref()).collect();
+    let by = |words: &str| caught.iter().filter(|why| why.contains(words)).count();
+    let nothing = by("no client write completed");
+    let late = by("after the last heal to complete a client write");
+    println!(
+        "shard: ClientIgnoresMismatch, each run to its end: the write bound on {}/{uniform} uniform \
+         seeds of {run}, {nothing} with no write completed after the heal and {late} with the first \
+         completion later than the bound from the heal",
+        caught.len()
+    );
+    assert!(
+        caught.iter().all(|why| why.starts_with("liveness: ")),
+        "the write bound names itself: {caught:?}"
+    );
+    if seeds() >= 1000 {
+        assert!(
+            nothing > 0,
+            "no client that ignores a mismatch left the cluster unwritten over the thousand"
+        );
+        assert!(
+            late > 0,
+            "no client that ignores a mismatch tripped the reading from the heal over the thousand"
+        );
+    }
 }
 
 /// §10's `TrustStaleDescriptor`: 99 of 100 seeds, every client stale after the first split.
@@ -411,7 +510,7 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_s
     );
 }
 
-/// §10's `ApplyIgnoresSpan`: 59 of 100 seeds by check 9, and 10 of them by check 10 too.
+/// §10's `ApplyIgnoresSpan`: 57 of 100 seeds by check 9, and 10 of them by check 10 too.
 #[test]
 fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_sweep() {
     let found = range_variant("ApplyIgnoresSpan", share(), RangeVariant::ApplyIgnoresSpan);
@@ -422,7 +521,7 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_s
 }
 
 /// §10's `UninitialisedReplicaVotes` off its directed shape: a re-seeded node's placeholders
-/// meet its ranges' elections on 96 of 100 seeds.
+/// meet its ranges' elections on 98 of 100 seeds.
 #[test]
 fn a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep() {
     let found = range_variant(
@@ -451,13 +550,28 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
     );
 }
 
-/// §10's `IdBlockResumed`: 7 of 100 seeds by check 18, on restarts the faults draw and
-/// splits the driver happens to land on the restarted node. Under D-061's 5 % at the shares
-/// below the premerge's, whose twenty would miss it about one time in four; S11's restart
-/// and split shape is what is meant to raise it.
+/// §10's `IdBlockResumed`: 10 of 100 seeds by check 18, on restarts the faults draw and
+/// splits the driver happens to land on the restarted node. A rate the gate's twenty would miss
+/// about one time in eight, so the catch is asserted over the thousand's share alone (D-061);
+/// S11's restart and split shape is what is meant to raise it. What every tier asserts is the
+/// shape the variant aims at: a split that took an id from a block of an earlier run of its node
+/// (`shard::splits_from_a_block_of_an_earlier_run_of`), 30 of 100 seeds and 6 of the gate's 20. The
+/// correct node's new run holds none, so that is the variant seen firing.
+// PROPOSED(D-113): §10, the shape at every tier.
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sharded_sweep() {
     let found = range_variant("IdBlockResumed", share(), RangeVariant::IdBlockResumed);
+    let reached = found.iter().filter(|u| u.from_an_earlier_run > 0).count();
+    println!(
+        "shard: IdBlockResumed: a split took an id from a block of an earlier run of its node on \
+         {reached}/{} seeds",
+        found.len()
+    );
+    assert!(
+        reached > 0,
+        "no split took an id from a block of an earlier run of its node: the restart and the \
+         split IdBlockResumed needs were not reached"
+    );
     if seeds() >= 1000 {
         assert!(
             tripped(&found, Fold::SplitLineage) > 0,
@@ -467,9 +581,14 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sh
 }
 
 /// §10's `MetaOverwritesByArrival` on what this sweep's drops and resends do by themselves:
-/// 45 of 1 000 seeds by check 16, and 7 of 1 000 by the meta convergence bound, so both are
+/// 46 of 1 000 seeds by check 16, and 8 of 1 000 by the meta convergence bound, so both are
 /// asserted over the thousand and printed below it (D-061). `Fault::MetaReorder` is S12's. The
-/// bound is asked of the run taken to its end, which check 16 would otherwise stop first.
+/// bound is asked of the run taken to its end, which check 16 would otherwise stop first. What
+/// every tier asserts is the shape the variant aims at: a split's update stored again over a key
+/// meta already named at its generation or a newer one (`shard::meta_resends_stored_of`), 985 of
+/// 1 000 seeds and 19 of the gate's 20. The correct meta range stores none, so that is the variant
+/// seen firing.
+// PROPOSED(D-113): §10, the shape at every tier.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep() {
     let run = if seeds() >= 1000 {
@@ -489,13 +608,21 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_swee
                 .verdict_of(Fold::MetaNeverGoesBack)
                 .is_err(),
             report.meta_converges().is_err(),
+            shard::meta_resends_stored_of(report.records()) > 0,
         )
     });
     let sixteen = found.iter().filter(|f| f.0).count();
     let bound = found.iter().filter(|f| f.1).count();
+    let reached = found.iter().filter(|f| f.2).count();
     println!(
-        "shard: MetaOverwritesByArrival, each run to its end: check 16 on {sixteen}/{run} seeds, \
-         the meta convergence bound on {bound}/{run}"
+        "shard: MetaOverwritesByArrival, each run to its end: a split's update stored over a key \
+         meta named at its generation or a newer one on {reached}/{run} seeds, check 16 on \
+         {sixteen}/{run}, the meta convergence bound on {bound}/{run}"
+    );
+    assert!(
+        reached > 0,
+        "no split's update was stored over a key meta named at its generation or a newer one: \
+         the resend MetaOverwritesByArrival needs was not reached"
     );
     if seeds() >= 1000 {
         assert!(
@@ -509,14 +636,14 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_swee
     }
 }
 
-/// Phase 2's pre-vote variant under this sweep's isolations: 78 of 100 seeds.
+/// Phase 2's pre-vote variant under this sweep's isolations: 80 of 100 seeds.
 #[test]
 fn a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep() {
     let found = core_variant("NoPreVote", Variant::NoPreVote);
     assert!(said(&found, "pre-vote:") > 0, "no isolation raised a term");
 }
 
-/// Phase 2's timer variant: 29 of 100 seeds by the timer check.
+/// Phase 2's timer variant: 31 of 100 seeds by the timer check, and 2 more by the write bound.
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep() {
     let found = core_variant("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
@@ -526,7 +653,7 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep(
     );
 }
 
-/// The disk's half of the fault model: Q15's whole-node refusal, which the rot reaches on 29
+/// The disk's half of the fault model: Q15's whole-node refusal, which the rot reaches on 31
 /// of 100 seeds. A node that refuses one range alone goes on serving the others over an
 /// engine that lost state: 19 of 100 seeds by state machine safety.
 #[test]
@@ -551,6 +678,63 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep() {
     assert!(
         said(&found, "commit majority:") > 0,
         "no commit outran a persist"
+    );
+}
+
+/// D-092's rule that makes answer A enough, broken: a node at or below its threshold keeps a
+/// refill outstanding, resent "until a grant carrying its current run nonce arrives". Under
+/// `RefillNotResent` a refill sent while range 0 has no leader is the last, every split on that
+/// node is refused `NoRangeId`, and an asker's retries after the heal end with no answer: 40 of
+/// 100 seeds, by this check and no other.
+// PROPOSED(D-092): answer A; the asker retries.
+// PROPOSED(D-113): §8's pair for the check read from the heal.
+#[test]
+fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered() {
+    let found = range_variant("RefillNotResent", share(), RangeVariant::RefillNotResent);
+    assert!(
+        said(&found, "with no answer") > 0,
+        "no asker's retries after the heal went unanswered"
+    );
+}
+
+/// The write bound read from the heal, D-076's "how long after the heal the range became writable
+/// at all", kept beside the arm read from each range's first call (PROPOSED D-113 §5). The clients
+/// are cut off from every node for the bound and 50 ms more of the 2.2 s window, the heal not moved:
+/// a cluster nothing can write to for longer than the bound after the heal. No range's first call
+/// in the history comes before the cut ends, so the arm from the first call is satisfied and this
+/// arm is what is left to say so; where the 150 ms left complete nothing, the clients-wrote-nothing
+/// arm speaks first. Above the 5 % of D-061 on every tier: 42 of 100 seeds, a uniform 42 of 50.
+// PROPOSED(D-113): §5's pair for the reading from the heal.
+#[test]
+fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal() {
+    let held = raft::election_max() * raft::LIVENESS_TIMEOUTS + Duration::from_millis(50);
+    let run = share();
+    let found = sweep(run, |seed| {
+        let mut schedule = shard::Schedule::draw(seed);
+        schedule.clients_held_off = Some(held);
+        shard::run_with(
+            seed,
+            schedule,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::correct(),
+        )
+        .check()
+        .err()
+    });
+    let failed = found.iter().flatten().count();
+    let from_the_heal = found
+        .iter()
+        .flatten()
+        .filter(|why| why.contains("after the last heal to complete a client write"))
+        .count();
+    println!(
+        "shard: the clients cut off for {held:?} past the heal failed {failed}/{run} seeds, \
+         {from_the_heal} of them first by the reading from the heal"
+    );
+    assert!(
+        from_the_heal > 0,
+        "no seed's first completion read as later than the bound from the heal"
     );
 }
 
@@ -609,6 +793,21 @@ fn seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split() {
         report.driver.retried.iter().all(|retried| retried.answered),
         "the asker's retry got its answer: {:?}",
         report.driver.retried
+    );
+    // The refusal came after the last fault healed, so this is an asker D-092's assertion asks
+    // of, and it is answered; `retries_take_effect` has a case, here, to read.
+    let asked = report.retries_asked();
+    assert_eq!(
+        asked.len(),
+        1,
+        "seed 368's asker is asked of: {:?}",
+        report.driver.retried
+    );
+    assert!(
+        asked[0].refused >= report.last_fault_healed,
+        "refused at {:?}, the last fault healed at {:?}",
+        asked[0].refused,
+        report.last_fault_healed
     );
 }
 
@@ -716,5 +915,221 @@ fn seed_986_a_leader_refuses_the_reads_it_can_never_confirm() {
     assert!(
         why.contains("registered reads"),
         "the violation seed 986 is pinned for: {why}"
+    );
+}
+
+/// The node that traced `record`, as the checks number it.
+fn node_of(record: &TraceRecord) -> Option<u64> {
+    record.node.map(|node| u64::from(node.get()))
+}
+
+/// Seed 3291, the sweep's first failure of check 20 on the correct system, at the nightly's ten
+/// thousand. It is the window seed 88 showed the payload oracle (PROPOSED D-113 §5): node 3
+/// commits the split of range 27 at 122, crashes with the apply's batch durable and neither
+/// `RangeSplit` nor `RangeCreated` traced, and at its restart restates a replica of the right
+/// half, 30, before any node has traced that split. It then grants for it, from a core and not
+/// from a placeholder, and no node ever hears of a creation on it. Check 20 read only
+/// `RangeCreated`, and named the grant a node's that holds no replica; with the trace's
+/// `RangesRestated` taken out, the fold says so again.
+#[test]
+fn seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant() {
+    let (node, parent, right, split) = (3, 27, 30, 122);
+    let report = shard::run(3291);
+    report.check().unwrap();
+    let records = report.records();
+    let on_node = |record: &TraceRecord| node_of(record) == Some(node);
+    let after = |from: usize, what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records[from..]
+            .iter()
+            .position(want)
+            .map(|at| from + at)
+            .unwrap_or_else(|| panic!("seed 3291 no longer reaches {what}: read its trace"))
+    };
+    let at = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| after(0, what, want);
+    let committed = at("node 3's commit of the split", &|record| {
+        on_node(record)
+            && matches!(record.event, TraceEvent::RaftCommit { range, index, .. }
+                if range == parent && index == split)
+    });
+    let crashed = after(committed, "node 3's crash", &|record| {
+        matches!(record.event, TraceEvent::NodeCrashed { node: crashed }
+            if u64::from(crashed.get()) == node)
+    });
+    let recovered = at("the restatement of the right half", &|record| {
+        matches!(record.event, TraceEvent::RaftRecovered { server, range, applied, .. }
+            if server == node && range == right && applied == split)
+    });
+    let restated = at("`RangesRestated` naming the right half", &|record| {
+        on_node(record)
+            && matches!(&record.event, TraceEvent::RangesRestated { ranges }
+                if ranges.contains(&right))
+    });
+    let first_traced = at("the split's first trace, on any node", &|record| {
+        matches!(record.event, TraceEvent::RangeSplit { right: traced, .. }
+            | TraceEvent::RangeCreated { range: traced, .. } if traced == right)
+    });
+    let granted = at("node 3's grant", &|record| {
+        on_node(record)
+            && matches!(record.event, TraceEvent::RaftVote { range, granted: true, .. }
+                if range == right)
+    });
+    assert!(
+        committed < crashed
+            && crashed < recovered
+            && recovered < restated
+            && restated < first_traced
+            && first_traced < granted,
+        "the window's order: commit {committed}, crash {crashed}, restated replica {recovered}, \
+         `RangesRestated` {restated}, the split's first trace {first_traced}, grant {granted}"
+    );
+    assert!(
+        !records[..granted].iter().any(|record| on_node(record)
+            && matches!(record.event,
+                TraceEvent::RangeSplit { right: range, .. }
+                | TraceEvent::RangeCreated { range, .. }
+                | TraceEvent::RangeReplicaCreated { range }
+                    if range == right)),
+        "node 3 traced the split, a creation or a placeholder of range 30 before the grant: \
+         the window is gone from this seed"
+    );
+    let without: Vec<TraceRecord> = records
+        .iter()
+        .filter(|record| !matches!(record.event, TraceEvent::RangesRestated { .. }))
+        .cloned()
+        .collect();
+    let old_reading = invariants::folded(&without)
+        .verdict_of(Fold::PlaceholderGrants)
+        .expect_err("the restatement is what check 20 holds this grant by");
+    assert!(
+        old_reading.contains("node 3 granted range 30's pre-vote")
+            && old_reading.contains("from a node that holds no replica of it"),
+        "the violation the old reading made of it: {old_reading}"
+    );
+}
+
+/// Seed 8934, the sweep's first failure of the match-starts fold on the correct system, at the
+/// nightly's ten thousand. Node 2's placeholder of range 43 answers leader 1 with incarnation 0,
+/// node 2 applies the split that makes the replica, and the new store's first answer overtakes
+/// the placeholder's. So the leader traces a first rise under the new store's number, a reset to
+/// 0 at the placeholder's answer, a reset back at the store's next and a first rise again. D-042
+/// names the 0 delayed past a store's first answer as a change that costs a round trip. The
+/// fold said a retired incarnation had come back; the fold never read a reset, so with the
+/// trace's `RaftProgressReset`s taken out it says so again (PROPOSED D-113 §5).
+#[test]
+fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh() {
+    let (leader, follower, range) = (1, 2, 43);
+    let report = shard::run(8934);
+    report.check().unwrap();
+    let records = report.records();
+    let on_follower = |record: &TraceRecord| node_of(record) == Some(follower);
+    let placeholder = records.iter().position(|record| {
+        on_follower(record)
+            && matches!(record.event, TraceEvent::RangeReplicaCreated { range: of } if of == range)
+    });
+    let (created, store) = records
+        .iter()
+        .enumerate()
+        .find_map(|(at, record)| match record.event {
+            TraceEvent::RangeCreated {
+                range: of,
+                incarnation,
+                ..
+            } if of == range && on_follower(record) => Some((at, incarnation)),
+            _ => None,
+        })
+        .expect("seed 8934 no longer creates range 43 on node 2: read its trace");
+    assert!(
+        placeholder.is_some_and(|made| made < created),
+        "node 2 made no placeholder of range 43 before its replica"
+    );
+
+    let tracked: Vec<(usize, &str, u64)> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| node_of(record) == Some(leader))
+        .filter_map(|(at, record)| match record.event {
+            TraceEvent::RaftProgressReset {
+                range: of,
+                follower: f,
+                incarnation,
+                ..
+            } if of == range && f == follower => Some((at, "reset", incarnation)),
+            TraceEvent::RaftMatchStarted {
+                range: of,
+                follower: f,
+                incarnation,
+                ..
+            } if of == range && f == follower => Some((at, "rise", incarnation)),
+            _ => None,
+        })
+        .collect();
+    let shape: Vec<(&str, u64)> = tracked.iter().map(|&(_, what, of)| (what, of)).collect();
+    assert_eq!(
+        shape,
+        [
+            ("reset", store),
+            ("rise", store),
+            ("reset", 0),
+            ("reset", store),
+            ("rise", store)
+        ],
+        "seed 8934's leader no longer tracks node 2 through a delayed 0: read its trace"
+    );
+    let (first_rise, zero, second_rise) = (tracked[1].0, tracked[2].0, tracked[4].0);
+
+    // A zero-stamped answer about this range, from the follower.
+    let zero_stamped = |record: &TraceRecord| match &record.event {
+        TraceEvent::MessageSent { id, payload, .. }
+            if on_follower(record)
+                && raft::messages_of(payload).iter().any(|(of, message)| {
+                    *of == range
+                        && matches!(
+                            message,
+                            Message::AppendEntriesResponse { incarnation: 0, .. }
+                        )
+                }) =>
+        {
+            Some(*id)
+        }
+        _ => None,
+    };
+    let placeholders_answers: BTreeSet<_> =
+        records[..created].iter().filter_map(zero_stamped).collect();
+    assert!(
+        records[first_rise..zero].iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::MessageDelivered { id, .. } if placeholders_answers.contains(id)
+        )),
+        "no answer the placeholder sent before the replica existed reached the leader between \
+         the first rise and the reset to 0"
+    );
+    assert!(
+        !records[created..second_rise]
+            .iter()
+            .any(|record| zero_stamped(record).is_some()),
+        "node 2 stamped 0 on an answer after its store existed, so the 0 was not a delayed one"
+    );
+    assert!(
+        !records[created..second_rise].iter().any(|record| matches!(
+            &record.event,
+            TraceEvent::RaftRefused { server, .. } if *server == follower
+        ) || (on_follower(record)
+            && matches!(record.event, TraceEvent::RangeRemoved { range: of, .. } if of == range))),
+        "node 2's store went away between the two rises: that is not this shape"
+    );
+
+    let without: Vec<TraceRecord> = records
+        .iter()
+        .filter(|record| !matches!(record.event, TraceEvent::RaftProgressReset { .. }))
+        .cloned()
+        .collect();
+    let old_reading = raft::match_starts_are_first_rises(&without)
+        .expect_err("the reset to 0 is what the fold excuses this repeat by");
+    assert!(
+        old_reading.contains(&format!(
+            "leader 1 of term 2 of group 43 traced a second first rise of 2's match under \
+             incarnation {store}"
+        )),
+        "the violation the old reading made of it: {old_reading}"
     );
 }

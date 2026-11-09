@@ -1665,17 +1665,26 @@ impl ClientRefreshes {
 }
 
 /// Check 20, a placeholder grants nothing (SHARD.md §8, Q22): a `RaftVote` granted,
-/// vote or pre-vote, of range R on node `n` when `n` has traced no `RangeCreated` of R
-/// since its last `RangeRemoved` of R is a violation. A replica outlives its node's
-/// crash, so a crash ends nothing here; a placeholder is what a node keeps for a range
-/// it holds no replica of, and the only thing on a node that could grant for such a
-/// range. `RangeReplicaCreated` is folded for the words: a grant that follows one is
-/// named a placeholder's.
+/// vote or pre-vote, of range R on node `n` when `n` has traced neither a `RangeCreated`
+/// of R nor a `RangesRestated` naming R since its last `RangeRemoved` of R is a
+/// violation. A replica outlives its node's crash, so a crash ends nothing here; a
+/// placeholder is what a node keeps for a range it holds no replica of, and the only
+/// thing on a node that could grant for such a range. `RangeReplicaCreated` is folded
+/// for the words: a grant that follows one is named a placeholder's.
+///
+/// A restatement is evidence of its own, because a creation can be durable and never
+/// traced. A node crashed with a split's batch durable and its `RangeSplit` and
+/// `RangeCreated` not yet traced restates the right half at its next start, a replica
+/// with a descriptor, a log and a core, and goes on to grant for it with no creation in
+/// the trace at all: seed 3291 of the sharded sweep, the window seed 88 showed the
+/// payload oracle (PROPOSED D-113 §5). `RangesRestated` names the initialised replicas
+/// only and no placeholder survives a restart, so it names nothing a placeholder could
+/// grant for.
 // PROPOSED(D-109)
 #[derive(Clone, Debug, Default)]
 pub struct PlaceholderGrantsNothing {
     /// The replicas each node holds: (node, range), from its `RangeCreated` of the range
-    /// to its `RangeRemoved` of it.
+    /// or a `RangesRestated` naming it, to its `RangeRemoved` of it.
     held: BTreeSet<(u64, u64)>,
     /// The placeholders each node has made: (node, range), from its
     /// `RangeReplicaCreated` to the range's creation there.
@@ -1696,6 +1705,13 @@ impl PlaceholderGrantsNothing {
             TraceEvent::RangeCreated { range, .. } => {
                 self.held.insert((node, *range));
                 self.placeholders.remove(&(node, *range));
+            }
+            // PROPOSED(D-113): a replica durable before its creation was traced.
+            TraceEvent::RangesRestated { ranges } => {
+                for range in ranges {
+                    self.held.insert((node, *range));
+                    self.placeholders.remove(&(node, *range));
+                }
             }
             TraceEvent::RangeRemoved { range, .. } => {
                 self.held.remove(&(node, *range));
@@ -3803,6 +3819,96 @@ mod tests {
         checker.push(&read(1, 1, b"q", 3));
         checker.push(&read(1, 0, b"", 3));
         checker.verdict().unwrap();
+    }
+
+    fn pre_vote_granted(node: u64, range: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RaftVote {
+                server: node,
+                range,
+                term: 2,
+                candidate: 1,
+                granted: true,
+                pre: true,
+            },
+        )
+    }
+
+    fn placeholder(node: u64, range: u64) -> TraceRecord {
+        record(node, TraceEvent::RangeReplicaCreated { range })
+    }
+
+    fn removed(node: u64, range: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RangeRemoved {
+                range,
+                generation: 4,
+                incarnation: 9,
+                cause: ananke_env::RangeRemovedCause::Collected,
+            },
+        )
+    }
+
+    /// Check 20 over `records`, the fold alone.
+    fn check_20(records: &[TraceRecord]) -> Result<(), String> {
+        let mut fold = PlaceholderGrantsNothing::default();
+        for record in records {
+            fold.push(record);
+        }
+        fold.verdict()
+    }
+
+    /// A restart's `RangesRestated` is a replica's evidence where no `RangeCreated` is in
+    /// the trace (seed 3291, PROPOSED D-113 §5), and of that node and those ranges alone.
+    // PROPOSED(D-113)
+    #[test]
+    fn check_20_takes_a_range_a_restart_restated_as_held_and_no_other() {
+        check_20(&[restated(3, &[2, 30]), pre_vote_granted(3, 30)])
+            .expect("node 3 restated a replica of 30, durable before its creation was traced");
+
+        let unnamed = check_20(&[restated(3, &[2]), pre_vote_granted(3, 30)]).unwrap_err();
+        assert!(
+            unnamed.contains("from a node that holds no replica of it"),
+            "a restatement that does not name 30 is no evidence of it: {unnamed}"
+        );
+        let elsewhere = check_20(&[restated(2, &[30]), pre_vote_granted(3, 30)]).unwrap_err();
+        assert!(
+            elsewhere.contains("node 3 granted range 30's"),
+            "another node's restatement is no evidence of this one's replica: {elsewhere}"
+        );
+    }
+
+    /// The pair's other half on hand-written records: what the variant does, a placeholder
+    /// granting, is still a violation beside a restatement, before it and after it.
+    // PROPOSED(D-113)
+    #[test]
+    fn check_20_names_a_placeholders_grant_whatever_was_restated() {
+        let after = check_20(&[
+            restated(3, &[2]),
+            placeholder(3, 30),
+            pre_vote_granted(3, 30),
+        ])
+        .unwrap_err();
+        assert!(after.contains("from its placeholder"), "{after}");
+        // Node 3 made a placeholder and then restated the replica the split left durable:
+        // the replica holds it now, and the placeholder went with the crash.
+        check_20(&[
+            placeholder(3, 30),
+            restated(3, &[30]),
+            pre_vote_granted(3, 30),
+        ])
+        .expect("the replica grants, not the placeholder before it");
+        // Nor does a restatement outlive the replica's removal.
+        let gone = check_20(&[
+            restated(3, &[30]),
+            removed(3, 30),
+            placeholder(3, 30),
+            pre_vote_granted(3, 30),
+        ])
+        .unwrap_err();
+        assert!(gone.contains("from its placeholder"), "{gone}");
     }
 
     #[test]

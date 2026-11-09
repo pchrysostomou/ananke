@@ -1336,9 +1336,12 @@ when its consequence lands.
     addressable keyspace with no gap. Where check 8 is one node, this is the cluster.
     Incremental: an interval map.
 20. **A placeholder grants nothing** (a rule fold, Q22). Fold `RangeReplicaCreated`,
-    `RangeCreated`, `RangeRemoved` and `RaftVote`. A `RaftVote` with `granted`, vote or
-    pre-vote, of range R on node `n` when `n` has traced no `RangeCreated` of R since its
-    last `RangeRemoved` of R is a violation. Cheap, exact.
+    `RangeCreated`, `RangesRestated`, `RangeRemoved` and `RaftVote`. A `RaftVote` with
+    `granted`, vote or pre-vote, of range R on node `n` when `n` has traced neither a
+    `RangeCreated` of R nor a `RangesRestated` naming R since its last `RangeRemoved` of
+    R is a violation. The restatement counts because a creation can be durable and never
+    traced: a node that crashed with a split's batch durable restates the right half at
+    its next start (D-113). Cheap, exact.
 21. **A removal is durable** (a rule fold). Fold `RangeRemoved`, `RangeCreated`,
     `RangeDescriptor` restatements and `RaftRecovered` per node. A restatement or a
     `RaftRecovered` of range X on node `n` after `n`'s `RangeRemoved` of X, with no
