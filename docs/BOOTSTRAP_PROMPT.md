@@ -101,22 +101,33 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Branch `phase-3-stage-c-shard-sim` (2026-11-01), off `main` at b1da6ec, PROPOSED D-113
-  (footer D-114), **#162's S10, `sim/shard.rs`, in progress and stopped for the owner**,
-  PR #188, merged with `main` at 7b02530 (#185).
-  Built: five nodes, three bootstrap nodes writing ranges 0, 1 and 2 (range 2 over `[k, l)`),
-  nodes 4 and 5 holding nothing (asserted per seed); the driver on stream `shard` (splits of
-  current spans, halves included, and leadership transfers); four clients over `k00`–`k15`
-  through `raft::client_over` (no schedule of `sim/raft.rs` moves); Phase 2's network, clock
-  and disk faults with bit rot at 0.02; the raft sweep's checks over the trace. At 1 000 seeds
-  21 seeds fail the correct system: **7 linearizability failures from a server bug** — an
-  install onto a re-seeded replica replaces configuration's span `[k, l)` and deletes the
-  right halves the node had installed beside it (151 of 1 000 seeds lose data that way; #172's
-  case, S8 (c)'s to fix); **2 seeds trip `READS_OUTSTANDING`** on a leader whose two followers
-  are quarantined (reads never confirm, retries accumulate, #125); 12 seeds trip a check defect
-  of the slice's own (the write bound with #178's refusal reading). Next: the owner's word on
-  the two, then the per-range write bound, the meta convergence bound, #45's losses, D-092's
-  pair, the parallel test, the variants and the pins (D-113 §3).
+- **S10, `sim/shard.rs` (D-113, PR #188), merged 2026-11-07** as `1d3f0a0`, with #191 at
+  `8a4cdad`. Five nodes, three bootstrap nodes writing ranges 0, 1 and 2 (range 2 over
+  `[k, l)`), nodes 4 and 5 holding nothing (asserted per seed); the driver on stream `shard`
+  (splits of current spans, halves included, and leadership transfers); four clients over
+  `k00`–`k15` through `raft::client_over` (no schedule of `sim/raft.rs` moves); Phase 2's
+  network, clock and disk faults with bit rot at 0.02; the raft sweep's checks over the trace.
+  At 1 000 seeds 21 seeds failed the correct system, and the three causes were each real:
+  **7 linearizability failures from a server bug**, the data loss D-128 fixes on this branch
+  (151 of 1 000 seeds lost data that way); **2 seeds tripping `READS_OUTSTANDING`** on a leader
+  whose two followers are quarantined, the owner's 2026-11-06 ruling, built as D-129 (#198,
+  open); and 12 seeds tripping a check defect of the slice's own (the write bound with #178's
+  refusal reading, D-113 §3, open).
+  It was merged before either fix landed, so `main` is red from 2026-11-07: its CI and the
+  nightlies of 11-07 and 11-08 fail `every_seed_passes_on_the_correct_sharded_sweep` on seed 41,
+  ~187 of each 10 000-seed shard. This branch is what returns it to green.
+- Branch `phase-3-stage-c-reseed-install-span` (2026-11-06), off `main` at de9f4d7, PROPOSED
+  D-128, **a correct-server data loss S10 found** (D-113, #188). A re-seeded user range has no
+  descriptor, so its plan held configuration's span, and its install replaced that, removing
+  the keys of any right half that came back first through its placeholder. The switch now
+  replaces its Raft interval and the snapshot's span, and the task re-hosts it there (amends
+  D-107 §4). The creation's read-back traces its state, over the streamed span. Check 8 has an
+  install clause, reading the engine's `SpanInstalled`, and `InstallReplacesHostedSpan` (node
+  bit 49) keeps the bug beside the fix. `reseed::run_after_split` writes right-half keys and
+  reads them back off the disk: 66 of 200 seeds lost them before, none now. S10's seven seeds
+  are green on a scratch copy of its scenario, which is not committed here. #199, a re-seeded
+  range that came back by log replay and refuses its next split, is the same family and not
+  covered: it holds no descriptor whichever way this switch goes, 40 of 40 on its probe.
 - Branch `phase-3-stage-c-overlap-rule-review` (2026-11-01), off `main` at 5e05942, **#180's
   review fixes** (PROPOSED D-110 §11): #180 merged at 820b9c5 before them. Three commits,
   each gated: B1 and N2, the fresh take read by generation as a free function, with a unit

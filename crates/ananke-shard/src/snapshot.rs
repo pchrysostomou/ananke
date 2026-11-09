@@ -377,8 +377,11 @@ pub struct Install {
     pub at: Identity,
     /// The staging directory the tables are taken from.
     pub source: PathBuf,
-    /// The range's key intervals, sorted and disjoint: its Raft state under tenant 0
-    /// and its user keys under tenant 2 (D-066, D-068).
+    /// The range's key intervals as the plan hosts them at the stream's last chunk, sorted
+    /// and disjoint: its Raft state under tenant 0 and its user keys under tenant 2 (D-066,
+    /// D-068). What the switch replaces on a replica the node holds a descriptor of; on
+    /// one with none the switch replaces the snapshot's span (`install::switched_spans`,
+    /// PROPOSED D-128).
     pub spans: Vec<KeyRange<Bytes>>,
     /// Whether the range's repair — term, vote, applied index, snapshot record, log
     /// tail, configuration, quarantine and incarnation, with tombstones for the log
@@ -604,6 +607,14 @@ impl Snapshots {
             "{range} has an empty span"
         );
         self.hosted.insert(range, spans);
+    }
+
+    /// The spans the plan hosts `range` at, which an install of it copies at its stream's
+    /// last chunk.
+    // PROPOSED(D-128): what a test of the install's re-host reads.
+    #[must_use]
+    pub fn hosted_at(&self, range: RangeId) -> Option<&[KeyRange<Bytes>]> {
+        self.hosted.get(&range).map(Vec::as_slice)
     }
 
     /// What the task is carrying.

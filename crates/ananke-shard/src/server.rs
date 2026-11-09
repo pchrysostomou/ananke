@@ -1651,21 +1651,21 @@ impl<E: Environment> Host for ServerHost<E> {
                 // And the span the `snapshot` task's plan hosts the range at, which is
                 // what an install of it replaces: an install that moved the span — P's
                 // post-split snapshot onto a replica of P that never applied the
-                // split, or a re-seeded replica, hosted at configuration's span,
-                // installed from a range that had split — re-hosts it, as a split's
-                // apply does (PROPOSED D-100), so the range's next install replaces the
-                // span it holds now and no key of a right half beside it (SHARD.md §5,
-                // Q27). A take reads the span from the descriptor put in place above.
-                // The plan holds the span the replica's descriptor held, or
-                // configuration's for a replica without one (`run`), so an install
-                // that leaves the span where it was pushes nothing.
+                // split — re-hosts it, as a split's apply does (PROPOSED D-100), so the
+                // range's next install replaces the span it holds now and no key of a
+                // right half beside it (SHARD.md §5, Q27). A take reads the span from the
+                // descriptor put in place above. The plan holds the span the replica's
+                // descriptor held, so an install that leaves the span where it was pushes
+                // nothing. A replica with no descriptor before this switch is not here:
+                // its switch replaced the snapshot's span and the task hosted it there,
+                // at the switch, before this answer existed (`install::switched_spans`).
                 // PROPOSED(D-107)
+                // PROPOSED(D-128): a span-less replica is re-hosted in the task.
                 let hosted_at = before
                     .as_ref()
-                    .map(|before| before.start.clone()..before.end.clone())
-                    .or_else(|| self.ranges.iter().find(|r| r.id == *range).map(Range::span));
+                    .map(|before| before.start.clone()..before.end.clone());
                 if let Some(descriptor) = descriptor
-                    && hosted_at.is_none_or(|span| {
+                    && hosted_at.is_some_and(|span| {
                         (&span.start, &span.end) != (&descriptor.start, &descriptor.end)
                     })
                 {
@@ -3760,8 +3760,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     for range in &hosted {
         // The span the store's descriptor holds, where the store has one: a split
         // moved it off configuration's (SHARD.md §5; PROPOSED D-100). A replica
-        // without a descriptor — a node not named at bootstrap, before its install —
-        // is hosted at configuration's span, as the install that gives it one is.
+        // without a descriptor — a node not named at bootstrap, or a re-seeded user
+        // range, before its install — is hosted at configuration's span, which its
+        // install does not replace (`install::switched_spans`, PROPOSED D-128): the
+        // plan's copy is what `InstallReplacesHostedSpan` reads, and a chunk's check
+        // that the range is hosted here.
         let span = lock(&descriptors)
             .get(&range.id)
             .map_or_else(|| range.span(), |d| d.start.clone()..d.end.clone());

@@ -517,8 +517,28 @@
 # The merge of `main` at 7b02530 (#185, D-110's review) into D-113's branch takes the union of both
 # sides' rows and places D-113's again, longest-first into the merged tree's lightest shard, its
 # weight kept: #185 took shard 6 to 2168.1, so the sweep goes to shard 1 at 1977.1 -> 2168.4.
+# PROPOSED D-128 (an install onto a replica with no descriptor replaces the snapshot's span)
+# added three rows and re-weighed two, all at the same settings, three runs each, on the same
+# machine with other slices' builds beside them (load averages 350 to 960, so the figures are if
+# anything high), medians of user + sys. New, longest first into the lightest shard:
+# `reseed` a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first at 38.3 (41.8,
+# 38.3, 37.8), shard 1 at 1977.1 -> 2015.4; `reseed`
+# a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so at
+# 31.8 (31.6, 31.8, 34.4), shard 5 at 1981.0 -> 2012.8; `node`
+# the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span at
+# 18.4 (19.4, 17.3, 18.4), shard 5 again, -> 2031.2. Re-weighed, because `reseed::run_after_split`
+# now carries a second writer and reads its engine back at the end: the quarantine row 27.8 ->
+# 36.9 (39.4, 36.9, 36.4) and D-115's row 34.7 -> 35.2 (35.6, 34.6, 35.2), both in shard 6 in
+# place, 2202.8 -> 2212.4.
+# The merge of `main` at 8a4cdad (#188, D-113's sharded sweep; #191) into D-128's branch takes
+# the union of both sides' rows. Both sides weighed from the same shard 1 at 1977.1 and both
+# placed into it, so neither figure above is the merged total: shard 1 holds D-128's re-seed row
+# at 38.3 and D-113's sweep at 191.3 and comes to 2206.7. Neither row is re-placed, because the
+# nightly's wall clock is its heaviest shard and that is shard 3 at 2237.4 either way; moving the
+# sweep to the lightest shard would leave the spread where it is (221.7 against 222.0). Every
+# weight is its own side's, re-summed and not re-measured.
 # shard	binary	cpu_s	test
-# shard 1: 2168.4 cpu s
+# shard 1: 2206.7 cpu s
 1	shard	191.3	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
@@ -543,6 +563,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+1	reseed	38.3	a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first
 # shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
@@ -622,7 +643,7 @@
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
 4	split	205.7	a_node_that_installs_every_snapshot_is_caught_by_check_8_on_every_seed_of_the_overlap_shape
-# shard 5: 1981.0 cpu s
+# shard 5: 2031.2 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -654,7 +675,9 @@
 5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
 5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
-# shard 6: 2202.8 cpu s
+5	reseed	31.8	a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so
+5	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span
+# shard 6: 2212.4 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -697,8 +720,8 @@
 6	node	28.2	the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps
 6	node	0.6	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor
 6	node	0.5	the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch
-6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
-6	reseed	34.7	a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it
+6	reseed	36.9	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
+6	reseed	35.2	a_reseed_after_a_split_creates_the_parent_at_the_splits_generation_and_check_7_holds_it
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
 6	split	335.8	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed

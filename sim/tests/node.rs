@@ -2470,8 +2470,11 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// — `AnyFreshNodeBootstraps`, D-096's instrument, trips it on the membership scenario
 /// below.
 ///
-/// **Check 8** runs here and under every pair below too, its two clauses a fold each
-/// (PROPOSED D-107). Its right half's clause trips on the correct node itself — a voter
+/// **Check 8** runs here and under every pair below too, its clauses a fold each
+/// (PROPOSED D-107, D-128). Its install clause trips on no run of the correct node; its
+/// tripping variant is `InstallReplacesHostedSpan`, on the re-seed after a split
+/// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span`).
+/// Its right half's clause trips on the correct node itself — a voter
 /// installed past a split holds no right half until placeholders exist — so it is
 /// compared and printed and not asserted absent, and its seed 45
 /// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
@@ -2846,6 +2849,48 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_over
         assert!(
             words.contains("overlaps its replica of range"),
             "seed {seed}: check 8's overlap clause tripped in other words: {words}"
+        );
+    }
+}
+
+/// Check 8's install clause against `InstallReplacesHostedSpan` (PROPOSED D-128), compared
+/// on `reseed::run_after_split`, where the right half's install lands before P's on about a
+/// third of seeds, so at every tier (D-061). The node sweep refuses a store on about one
+/// seed in ten thousand, so it almost never makes a span-less replica. On every compared seed the folds agree fold by
+/// fold; on a seed the clause trips, every descriptor is right and it alone of the folds
+/// that stop a run is in violation. The correct node's run holds the clause green on the
+/// same seeds through its verdict (`sim/tests/reseed.rs`).
+// PROPOSED(D-128)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span() {
+    let compared = range_folds_compared();
+    let found = range_folds_under(
+        "InstallReplacesHostedSpan on the re-seed after a split",
+        compared,
+        |seed| {
+            ananke_sim::reseed::run_after_split_under(
+                seed,
+                NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]),
+            )
+            .records
+        },
+    );
+    assert!(
+        tripped_on(&found, Fold::InstallSpan) > 0,
+        "check 8's install clause did not trip on any compared seed of \
+         InstallReplacesHostedSpan"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        let stopping = stopping_folds(outcome);
+        if let Some(words) = outcome.tripped.get(&Fold::InstallSpan) {
+            assert!(
+                words.contains("replaced") && words.contains("its replica of range"),
+                "seed {seed}: check 8's install clause tripped in other words: {words}"
+            );
+        }
+        assert!(
+            stopping.keys().all(|fold| *fold == Fold::InstallSpan),
+            "seed {seed}: a fold other than check 8's install clause tripped: {stopping:?}"
         );
     }
 }
