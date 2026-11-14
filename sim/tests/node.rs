@@ -408,6 +408,11 @@ struct Coverage {
     /// holds to its map.
     restatements: usize,
     descriptors_stated: usize,
+    /// The snapshots a restart restated as the replica's own take, and on how many seeds
+    /// (PROPOSED D-118): a restatement says what the record says, and until that entry
+    /// the node said an install for all of them.
+    takes_restated: usize,
+    takes_restated_seeds: u64,
     /// Check 8's right-half clause over the correct node, **folded and not asserted**
     /// (PROPOSED D-107): the seeds on which a voter of a parent at its split restated
     /// the parent at or past the split without the right half, with the violation.
@@ -512,6 +517,8 @@ impl std::fmt::Debug for Coverage {
             .field("follower_log_multiples", &self.follower_log_multiples)
             .field("restatements", &self.restatements)
             .field("descriptors_stated", &self.descriptors_stated)
+            .field("takes_restated", &self.takes_restated)
+            .field("takes_restated_seeds", &self.takes_restated_seeds)
             .field("right_half_not_restated", &self.right_half_not_restated)
             .field("placeholders_made", &self.placeholders.made)
             .field("placeholders_by_split", &self.placeholders.by_split)
@@ -546,6 +553,10 @@ impl Coverage {
         let checker = invariants::folded(&report.records);
         self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
         self.descriptors_stated += checker.descriptors().statements();
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
+        let takes_restated = report.takes_restated();
+        self.takes_restated += takes_restated;
+        self.takes_restated_seeds += u64::from(takes_restated > 0);
         // PROPOSED(D-107): check 8's right-half clause, folded over the correct node
         // and printed, not asserted.
         if let Err(violation) = checker.verdict_of(Fold::RightHalf) {
@@ -1148,6 +1159,21 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
          nothing to hold (SHARD.md §8)",
         coverage.descriptors_stated,
         coverage.restatements
+    );
+    // A restatement says what its record says (PROPOSED D-118, #167): the correct node
+    // restates a replica's own take as a take. Measured on 995 of 1 000 seeds, 13 083
+    // records, and on none where the node restated every record as an install, so every
+    // tier asserts it (D-061): a sweep this passes is one whose pre-vote check and state
+    // machine safety read the record's own flag.
+    println!(
+        "node: {} snapshots restated as the replica's own take, on {}/{seeds} seeds",
+        coverage.takes_restated, coverage.takes_restated_seeds
+    );
+    assert!(
+        coverage.takes_restated_seeds > 0,
+        "no restart restated a replica's own take over {seeds} seeds: the restatement has gone \
+         back to tracing every record as an install, or no node restarts onto a take of its \
+         own, and `SnapshotWithoutCurrentLast` has nothing to be told apart from"
     );
     // Check 8's right-half clause, folded over every seed and **not asserted** until the
     // owner rules on how it reads a voter installed past the split (PROPOSED D-107).
@@ -5025,106 +5051,387 @@ fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_ow
 // assertion was written (D-061) and is printed at every tier.
 
 /// The install that makes its switch without the range's repair (RAFT.md:694, D-066),
-/// on the node — **injected, and not yet caught at its Phase 2 tier**.
+/// on the node — **caught by state machine safety, from the thousand-seed tier**.
 ///
 /// Phase 2's standard is `is_caught`: caught on some seed at every tier
-/// (`a_server_that_installs_without_current_last_is_caught`, sim/tests/raft.rs). On the
-/// node the measured **catch** rate still does not support it, and D-061's rule is that
-/// the tier a Phase 2 variant keeps is the owner's, so the catch is **not** asserted
-/// here and the numbers go to the owner instead of a quieter assertion. What *is*
-/// asserted, and from the hundred-seed tier since PROPOSED D-089, is that the variant
-/// was **injected at the moment it is about**:
+/// (`a_server_that_installs_without_current_last_is_caught`, sim/tests/raft.rs), by
+/// state machine safety after a crash mid-install (RAFT.md §5's table; SHARD.md §12,
+/// question 2: "its catch and need stay Phase 2's"). On the node two things are
+/// asserted, each at the tier its measured rate supports (Q39, D-061):
 ///
-/// - `Fault::CrashInstalling` reaches the final chunk of the range it aims at and
-///   crashes its victim there on **14 of 100** seeds and **122 of 1 000**. Until
-///   PROPOSED D-089 the arm drew its victim and its range from two streams and reached
-///   that moment on **0 of 100** and 1 of 1 000: on a node the victim was drawn without
-///   regard to which of its four ranges it was behind on, so the arm reached its
-///   situation only where the two draws happened to coincide. The range is resolved
-///   against the trace now, after the isolation and the heal, and lands on one the
-///   victim is behind the leader's compacted prefix of — designated for it, and
-///   streamed within `INSTALL_WAIT_BUDGET`;
-/// - the catch is still **0 of 100 and 0 of 1 000**, now over 122 firings rather than
-///   one. That is the finding the aim turns up and it goes to the owner: the arm is no
-///   longer the reason. A variant injected at its own moment on a tenth of the seeds
-///   and caught on none of a thousand is either a bug this node's checks cannot see or
-///   one its install path repairs, and which of those it is belongs to the slice that
-///   owns the path, not to this one (PROPOSED D-089).
+/// - **the variant injected at the moment it is about**, from the hundred-seed tier
+///   since PROPOSED D-089: `Fault::CrashInstalling` reaches the final chunk of the range
+///   it aims at and crashes its victim there on **19 of 100** seeds and **169 of 1 000**.
+///   Until D-089 the arm drew its victim and its range from two streams and reached that
+///   moment on 0 of 100: on a node the victim was drawn without regard to which of its
+///   ranges it was behind on. At 16.9 % a hundred see none about nine times in a billion;
+///   the gate's twenty would see none about one run in forty, which is a bound the correct
+///   tree trips (D-030, D-039);
+/// - **the catch, by state machine safety and nothing else, from the thousand** (PROPOSED
+///   D-118, #126, #167): **19 of 1 000 (1.9 %)**, every one of them a recovered applied
+///   index the restated log does not hold. A switch made without the repair keeps the
+///   leader's snapshot record, `taken: true`, and the leader's applied index under the
+///   replica's prefix; a crash between the switch's durability and its trace restarts onto
+///   both, and the restatement now says so: the record's own flag, which moves no floor, and
+///   an applied index the replica's log, which the switch removed, cannot hold. Until D-118
+///   the node restated every snapshot as an install, so the floor rose to the leader's
+///   record, the applied index needed no log, and the catch was **0 of 1 000** (PROPOSED
+///   D-089). At 1.9 % a hundred see none about one run in seven and a thousand about five
+///   times in a billion, so the catch is asserted where `seeds() >= 1000` and printed at
+///   every tier (D-061). `seed_91_…` below pins one catch at every tier.
 ///
-/// So the catch is asserted nowhere and the **arm's firing is asserted from a hundred
-/// seeds**, where at 14 % a sample of a hundred sees none about three times in ten
-/// million. It is deliberately not asserted at the gate's twenty: 0.86^20 is about one
-/// run in twenty, which is a flake, and a bound the correct system trips is one to fix
-/// rather than to widen (D-030, D-039). The rate is printed at every tier, and the
-/// variant keeps its Phase 2 assertion on `Cluster::OneGroup`, which this sweep leaves
-/// running exactly as it is.
+/// A catch is the variant's only when state machine safety made it (PROPOSED D-091). Any
+/// other violation is printed by its check and is not the variant's catch.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
 // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+// PROPOSED(D-118): the restatement restates each record's `taken`, and the catch is
+// asserted from the thousand.
 #[test]
-fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
+fn a_server_that_installs_without_current_last_is_caught_on_the_node() {
     let seeds = seeds();
-    let outcomes: Vec<(Option<String>, usize, usize)> = sweep(seeds, |seed| {
+    let outcomes: Vec<(u64, Option<String>, usize, usize)> = sweep(seeds, |seed| {
         let report = buggy(seed, Variant::SnapshotWithoutCurrentLast);
         (
+            seed,
             checked(&report).err(),
             report.aimed_installs,
             report.snapshot_actions(),
         )
     });
-    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
-    let fired = outcomes.iter().filter(|(_, aimed, _)| *aimed > 0).count();
-    let actions: usize = outcomes.iter().map(|(_, _, a)| a).sum();
-    // Attributed (PROPOSED D-091): a run the node failed on its own — the read bound, an
-    // apply hole — is the node's failure and not this variant's catch, which is how
-    // `main`'s nightly on c178682 came to report one read-bound trip as five catches.
+    let fired = outcomes
+        .iter()
+        .filter(|(_, _, aimed, _)| *aimed > 0)
+        .count();
+    let actions: usize = outcomes.iter().map(|(_, _, _, a)| a).sum();
     let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
-    for violation in &caught {
-        *by_check.entry(mechanism(violation.as_str())).or_default() += 1;
+    for (_, violation, _, _) in &outcomes {
+        if let Some(violation) = violation {
+            *by_check.entry(mechanism(violation)).or_default() += 1;
+        }
     }
-    let by_the_node = by_check.get("the node failed").copied().unwrap_or(0);
-    let rate = (caught.len() - by_the_node) as f64 * 100.0 / seeds as f64;
-    println!(
-        "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%) by a check \
-         (every violation by {by_check:?}; {by_the_node} runs the node failed on its own, \
-         which are not its catch), the install crash reached the final chunk of the range \
-         it aimed at and crashed there on {fired}/{seeds} seeds, {actions} snapshot actions \
-         asked for, first: {}",
-        caught.len() - by_the_node,
-        caught.first().map_or("", |v| v.as_str())
+    // Attributed (PROPOSED D-091): the catch is state machine safety's, the check RAFT.md
+    // §5 names for the variant; a run the node failed on its own, or any other check's
+    // violation, is reported as itself and never as this variant's catch.
+    let own_seeds: Vec<u64> = outcomes
+        .iter()
+        .filter(|(_, violation, _, _)| {
+            violation
+                .as_deref()
+                .is_some_and(|v| mechanism(v) == "state machine safety")
+        })
+        .map(|(seed, _, _, _)| *seed)
+        .collect();
+    let caught = Caught::split(
+        outcomes
+            .iter()
+            .filter_map(|(_, violation, _, _)| violation.clone())
+            .collect(),
+        &["state machine safety"],
     );
-    // **The arm's own firing, from the thousand-seed tier.** This is the only thing
-    // here that can fail, and until PROPOSED D-086's review the test asserted
-    // `actions > 0` instead — which `checked()` already asserts on every seed of every
-    // sweep, so the test could not fail at all. Removing the variant's bit from
-    // `with_repair` left the node binary green at a hundred seeds and
-    // `sim/tests/install.rs` green at twenty: a bit set, carried, and read by nothing,
-    // which is the exact shape D-082 found `SendBeforePersist` in and this entry
-    // claimed to have fixed.
-    //
-    // `aimed_installs` is the discriminator, and it was **thin**: aimed at the range
-    // the schedule drew beside the victim it reached that moment on 0 of 100 seeds and
-    // 1 of 1 000, so this assertion sat at the nightly's ten thousand and below that
-    // tier the test asserted nothing about the variant at all.
-    //
-    // Aimed at a range the victim actually lags it reaches it on **14 of 100** and
-    // **122 of 1 000** (PROPOSED D-089), measured before this line was moved (Q39,
-    // D-061). At 14 % a hundred seeds see none about three times in ten million, so
-    // the assertion sits at the hundred-seed tier; the gate's twenty would see none
-    // about one run in twenty, which is a bound the correct tree trips and D-030 and
-    // D-039 forbid writing it there and widening it later.
-    //
-    // **The catch is still 0 of 1 000**, now over 122 firings rather than one, and it
-    // is asserted nowhere. The arm is no longer the reason and that is the finding to
-    // take to the owner, not to paper over with a quieter assertion.
+    let unheld = caught
+        .own
+        .iter()
+        .filter(|v| v.contains("recovered an applied index") && v.contains("its log does not hold"))
+        .count();
+    let rate = caught.own.len() as f64 * 100.0 / seeds as f64;
+    println!(
+        "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%) by state \
+         machine safety, its own check, on seeds {own_seeds:?}, {unheld} of them a recovered \
+         applied index the restated log does not hold; {} more violations came from other \
+         checks and are not its catch; every violation by {by_check:?}; the install crash \
+         reached the final chunk of the range it aimed at and crashed there on \
+         {fired}/{seeds} seeds, {actions} snapshot actions asked for; first of its own: {}",
+        caught.own.len(),
+        caught.other.len(),
+        caught.own.first().map_or("", String::as_str)
+    );
+    // **The arm's own firing, from the hundred-seed tier** (PROPOSED D-089). Until D-086's
+    // review the test asserted `actions > 0` instead, which `checked()` already asserts
+    // on every seed of every sweep, so the test could not fail at all.
     if seeds >= 100 {
         assert!(
             fired > 0,
             "`Fault::CrashInstalling` never crashed its victim at the final chunk of the \
              range it aimed at over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
-             injected at the moment it is about and its 0 catches say nothing"
+             injected at the moment it is about"
         );
     }
-    let _ = actions;
+    // **The catch, from the thousand** (PROPOSED D-118, D-061): under 5 %, so neither the
+    // gate's twenty nor CI's hundred asserts it.
+    if seeds >= 1000 {
+        assert!(
+            !caught.own.is_empty(),
+            "SnapshotWithoutCurrentLast was never caught on the node by state machine \
+             safety over {seeds} seeds, the check RAFT.md §5 names for it, where PROPOSED \
+             D-118 measured 19 of the first 1 000: the restatement no longer says \
+             the leader's record is the leader's (`taken`), or the window the crash lands in \
+             has gone: {caught:?}"
+        );
+    }
+}
+
+/// **Seed 91 of `SnapshotWithoutCurrentLast` on the node: one range's switch made without
+/// its repair, the ranges beside it live, and state machine safety at the restart**
+/// (PROPOSED D-118, #126, #167). The mechanism, asserted as this seed has it:
+///
+/// - node 1 restarted at 11.793 s and restated range 3's own take at index 39, `RaftRecovered`
+///   at applied 39;
+/// - `Fault::CrashInstalling` fired: the stream of range 3 at index 40 was durable on node 1
+///   when the arm crashed it at 12.256 s, with no record of the switch traced, and the node
+///   had applied entries of its other ranges up to 23 ms before the crash, so this is the
+///   install of one range while the range beside it is live, which a world of one range
+///   cannot have;
+/// - the next start, at 12.685 s, restates range 3's record as the store holds it: the
+///   leader's, `taken: true` at 40, and an applied index of 40, with a log that holds nothing
+///   at or below 40 because the switch removed it. The replicas beside it restate their own
+///   records at the same start: range 1 `taken: false` at 43, a compaction of its own, and
+///   range 4 `taken: true` at 183, a take of its own. Restated by one flag for the node they
+///   could not say both;
+/// - and state machine safety reports exactly that, in the words RAFT.md §5's table gives.
+///
+/// Until PROPOSED D-118 the restatement traced `taken: false`, the floor rose to 40, the
+/// applied index needed no log, and this run was green. The correct node on the same seed
+/// passes: the pair (CLAUDE.md).
+// PROPOSED(D-118): the restatement restates each record's `taken`.
+#[test]
+fn seed_91_restarts_onto_one_ranges_switch_without_its_repair_and_state_machine_safety_reports_it()
+{
+    const SEED: u64 = 91;
+    const SERVER: u64 = 1;
+    const RANGE: u64 = 3;
+    let report = buggy(SEED, Variant::SnapshotWithoutCurrentLast);
+    let violation = checked(&report).expect_err(
+        "the variant's switch is restated as the record says, a taken snapshot and an applied \
+         index past its log",
+    );
+    assert_eq!(mechanism(&violation), "state machine safety", "{violation}");
+    assert!(
+        violation.contains(
+            "server 1 recovered an applied index of 40 in group 3 but its log does not hold \
+             index 40"
+        ),
+        "seed {SEED}: the catch moved, so re-audit the pin: {violation}"
+    );
+    assert_eq!(
+        report.aimed_installs, 1,
+        "seed {SEED}: the arm no longer reaches the final chunk of the range it aims at, so \
+         re-audit the pin"
+    );
+
+    // The crash and the two starts around it, in record order.
+    let on = |record: &&TraceRecord| record.node.is_some_and(|n| u64::from(n.get()) == SERVER);
+    let crash = report
+        .records
+        .iter()
+        .position(|record| {
+            matches!(record.event, TraceEvent::NodeCrashed { node } if u64::from(node.get()) == SERVER)
+                && record.at == ananke_env::Instant::from_nanos(12_256_000_000)
+        })
+        .unwrap_or_else(|| panic!("seed {SEED}: node {SERVER} did not crash at 12.256 s"));
+    let recovered = |records: &[TraceRecord]| {
+        records.iter().rev().find_map(|record| match record.event {
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                applied,
+                last_index,
+                ..
+            } if (server, range) == (SERVER, RANGE) => Some((applied, last_index)),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        recovered(&report.records[..crash]),
+        Some((39, 39)),
+        "seed {SEED}: the incarnation the arm crashed did not start range {RANGE} at 39"
+    );
+    assert_eq!(
+        recovered(&report.records[crash..]),
+        Some((40, 40)),
+        "seed {SEED}: the restart did not come back at the leader's applied index"
+    );
+
+    // No record of the switch is traced before the crash, which is the window: the store
+    // is the leader's and the trace still says the replica's.
+    let started = report.records[..crash]
+        .iter()
+        .rposition(|record| {
+            matches!(record.event, TraceEvent::RaftRecovered { server, range, .. }
+                if (server, range) == (SERVER, RANGE))
+        })
+        .expect("the incarnation the arm crashed started this range");
+    let incarnation = &report.records[started..crash];
+    assert!(
+        !incarnation.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftSnapshot { server, range, .. }
+                | TraceEvent::RaftApply { server, range, .. }
+                if (server, range) == (SERVER, RANGE)
+        )),
+        "seed {SEED}: range {RANGE}'s switch was traced before the crash, so the crash did not \
+         land between its durability and its trace"
+    );
+    // The range beside it is live: the node went on applying its other ranges in that
+    // incarnation, the last of them 23 ms before the crash.
+    let beside: BTreeSet<u64> = incarnation
+        .iter()
+        .filter(on)
+        .filter_map(|record| match record.event {
+            TraceEvent::RaftApply { range, .. } if range != RANGE => Some(range),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        beside.len() >= 2,
+        "seed {SEED}: node {SERVER} applied only {beside:?} beside range {RANGE} before the \
+         crash, so the install was not of one range among live ones"
+    );
+
+    // The restart restates each range's record as that range's store holds it.
+    let restated = |range: u64| {
+        report.records[crash..]
+            .iter()
+            .find_map(|record| match record.event {
+                TraceEvent::RaftSnapshot {
+                    server,
+                    range: r,
+                    last_index,
+                    taken,
+                    ..
+                } if (server, r) == (SERVER, range) => Some((last_index, taken)),
+                _ => None,
+            })
+    };
+    assert_eq!(
+        restated(RANGE),
+        Some((40, true)),
+        "seed {SEED}: range {RANGE} did not restate the leader's record as the record says"
+    );
+    assert_eq!(
+        restated(1),
+        Some((43, false)),
+        "seed {SEED}: range 1's record, a compaction of its own, was not restated as such: one \
+         flag for the node reads every range's store through one range's"
+    );
+    assert_eq!(
+        restated(4),
+        Some((183, true)),
+        "seed {SEED}: range 4's record, a take of its own, was not restated as such"
+    );
+
+    // The pair.
+    checked(&correct(SEED)).expect("the correct node passes the seed the variant is caught on");
+}
+
+/// **Seed 358 of the correct node: a term taken from a frame received before an isolation
+/// and stepped inside it, on a replica restarted in that isolation, is no raise**
+/// (PROPOSED D-118, #167; the shape is D-050's). The mechanism, asserted as this seed has
+/// it:
+///
+/// - node 2 crashed at 14.06 s and restarted at 14.267 s; its `net` task receives while its
+///   start opens the engine, and it received range 4's frame of term 12 at 14.285760250 s;
+/// - its isolation began at 14.746 s, and its round first drained the inbox at 14.8768 s,
+///   after the restatement, so the change from 11 to 12 is decided inside the window;
+/// - the record carries the `net` task's stamp, and D-050's excuse reads it: every change
+///   decided inside the window was received before it.
+///
+/// Both of the entry's changes are asserted here, and each alone fails this test. Range 4's
+/// record is the replica's own take, restated `taken: true`, which is why the isolation is
+/// checked at all: until PROPOSED D-118 the restatement traced it as an install and the
+/// check's skip (`Report::reseeding_during`) read that as an install finished inside the
+/// isolation, so this change was never looked at, and the check by decision time, asserted
+/// below as flagging it, passed. With the flag alone, the receipt was the drain's, 14.8768 s,
+/// inside the window, and the correct node failed here (#167).
+// PROPOSED(D-118): the inbox carries the `net` task's receipt stamp, and the restatement
+// restates each record's `taken`.
+#[test]
+fn seed_358_takes_a_term_received_before_its_isolation_and_stepped_inside_it_and_is_not_flagged() {
+    const SEED: u64 = 358;
+    const SERVER: u64 = 2;
+    const RANGE: u64 = 4;
+    let from = ananke_env::Instant::from_nanos(14_746_000_000);
+    let until = ananke_env::Instant::from_nanos(15_752_000_000);
+    let report = correct(SEED);
+    checked(&report).expect("the correct node passes seed 358");
+    assert!(
+        report.isolations.contains(&(SERVER, from, until)),
+        "seed {SEED}: server {SERVER} is no longer isolated from {from:?} to {until:?}: the \
+         schedule moved, so re-audit the pin"
+    );
+    let restart = report
+        .records
+        .iter()
+        .position(|record| {
+            matches!(record.event, TraceEvent::NodeRestarted { node } if u64::from(node.get()) == SERVER)
+                && record.at < from
+                && from.duration_since(record.at) < Duration::from_secs(1)
+        })
+        .unwrap_or_else(|| {
+            panic!("seed {SEED}: node {SERVER} did not restart in the second before {from:?}")
+        });
+    // The restatement lands inside the isolation, and says the record's own take.
+    let snapshot = report.records[restart..]
+        .iter()
+        .find(|record| {
+            matches!(record.event, TraceEvent::RaftSnapshot { server, range, .. }
+                if (server, range) == (SERVER, RANGE))
+        })
+        .expect("the restart restates the replica's snapshot");
+    assert!(
+        from < snapshot.at
+            && snapshot.at < until
+            && matches!(
+                snapshot.event,
+                TraceEvent::RaftSnapshot {
+                    last_index: 54,
+                    last_term: 11,
+                    taken: true,
+                    ..
+                }
+            ),
+        "seed {SEED}: the restatement inside the isolation is not range {RANGE}'s own take at \
+         54: {snapshot:?}"
+    );
+    // The change: decided inside the window, from a frame received before it.
+    let changes = report.isolation_term_changes(SERVER, from, until);
+    let change = changes
+        .iter()
+        .find(|record| {
+            matches!(record.event, TraceEvent::RaftTerm { range, term: 12, role: "follower", .. }
+                if range == RANGE)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {SEED}: range {RANGE} takes no term 12 as a follower inside the isolation: \
+                 {changes:?}"
+            )
+        });
+    assert_eq!(
+        change.received(),
+        Some(ananke_env::Instant::from_nanos(14_285_760_250)),
+        "seed {SEED}: the term change does not carry the `net` task's stamp for the frame"
+    );
+    assert!(
+        from < change.decided && snapshot.at < change.decided && change.decided < until,
+        "seed {SEED}: the change was not stepped inside the isolation after the restatement: \
+         {change:?}"
+    );
+    // The check by decision time flags it; the check `Report::check` makes does not, for
+    // the receipt's reason. That the first flags it is what says the replica was read.
+    assert_eq!(
+        report.isolation_keeps_its_term_by(raft::RecordTime::Decided, SERVER, from, until),
+        Err(format!(
+            "pre-vote: server {SERVER} raised its term from 11 to 12 while isolated from \
+             {from:?} to {until:?}"
+        )),
+        "seed {SEED}: the skip took range {RANGE}'s restatement for an install, or the shape \
+         moved"
+    );
+    assert_eq!(
+        report.isolation_keeps_its_term_by_cause(SERVER, from, until),
+        Ok(()),
+        "seed {SEED}: the receipt on the record does not excuse the change"
+    );
 }
 
 /// The leader that shares one snapshot directory per index and streams one follower at
@@ -6644,13 +6951,12 @@ fn seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_mo
     );
     // 3. Node 3 takes 14 again after the reset under the pair, and not under the stream
     //    half.
+    // PROPOSED(D-118): a restart restating the record of a take is not a take.
     let takes_of_right_after = |report: &raft::Report| {
-        report.records[reset..]
+        report
+            .snapshot_takes()
             .iter()
-            .filter(|record| {
-                matches!(record.event, TraceEvent::RaftSnapshot { server, range, taken: true, .. }
-                    if server == leader && range == right)
-            })
+            .filter(|take| take.record >= reset && take.server == leader && take.range == right)
             .count()
     };
     let (taken_pair, taken_stream) = (takes_of_right_after(&pair), takes_of_right_after(&stream));
@@ -6680,9 +6986,11 @@ fn seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_mo
             .collect::<Vec<TraceRecord>>()
     };
     let late = after_heal(&pair);
-    let takes = late
+    // PROPOSED(D-118): a restart restating the record of a take is not a take.
+    let takes = pair
+        .snapshot_takes()
         .iter()
-        .filter(|record| matches!(record.event, TraceEvent::RaftSnapshot { range, taken: true, .. } if range == left))
+        .filter(|take| take.range == left && pair.records[take.record].at > pair.last_heal)
         .count();
     let streams = late
         .iter()

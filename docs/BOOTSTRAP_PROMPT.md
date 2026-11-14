@@ -101,6 +101,12 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-snapshot-current-last-check` (2026-11-14), off 0d67f99 (S11's tip, #228,
+  carrying #226), **PROPOSED D-118, #126 and #167**: the inbox carries the `net` task's receipt
+  stamp, the node's restatement restates each record's `taken`, and `SnapshotWithoutCurrentLast` is
+  caught on the node by state machine safety on 19 of 1 000 seeds (1.9 %, asserted from the
+  thousand), with the correct node green and seeds 91 and 358 pinned. Four readers that counted
+  `taken: true` as a take read `snapshot_takes_of` now, so a restated take is not counted.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
