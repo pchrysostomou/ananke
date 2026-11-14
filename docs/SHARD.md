@@ -822,7 +822,9 @@ initialised, P's post-split snapshot onto a lagging P for instance, changes that
 replica's descriptor and is traced as a `RangeDescriptor` at the snapshot's last index
 (§8). Its switch replaces the span the host's descriptor names at the switch, not the span
 the node held when the stream completed: a split applied through the log in between has moved
-it (D-132). A replica with no descriptor, a re-seeded user range for instance, is not
+it (D-132). That switch and the range's split's apply exclude each other: the split applies
+before the switch reads the table and the store, or after the switch has moved the store,
+and never between the engine's numbering of the switch and the switch (D-133). A replica with no descriptor, a re-seeded user range for instance, is not
 initialised, so the rule lets a right half in beside it: its install replaces its Raft
 interval and the snapshot's span, as a placeholder's does, and no key configuration
 names for it beyond that (D-128). A node's replica of P that already applied past a

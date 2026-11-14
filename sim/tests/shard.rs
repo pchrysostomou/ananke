@@ -2421,6 +2421,164 @@ fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_h
     );
 }
 
+/// Seed 13283, found past the nightly's range on the shaped schedule (#225): route 1 of #225, a split's
+/// apply inside an install's switch. Node 2 installs range 44's snapshot at 167, which its leader took
+/// after applying range 44's split at 167, and the install is numbered at 8.7545 s, with the split's
+/// entry and the one after it, 168, queued to node 2's `apply` task before the hold. Before D-133 the
+/// split applied at 8.7845 s, between the numbering and the switch: it made range 3 over `[k09, k14)`
+/// and narrowed the table after the switch had read it, the switch at 8.8365 s replaced `[k06, k14)`
+/// and range 3's keys with it, and 168, applied inside the switch, was taken back to 167 by it and
+/// applied a second time, which is the sweep's own verdict, state machine safety.
+///
+/// The mechanism asserted: the correct run and `SplitAppliesInsideTheSwitch`'s are one run up to the
+/// moment node 2's `apply` task reaches the split, with the install numbered and not yet switched; there
+/// the variant applies the split inside the switch, and the correct node waits. It waits out the switch
+/// and the host's `Switched` too, which restates range 44's applied index to 167: the split is then the
+/// install's, as the apply loop skips an entry the store is past, so node 2 applies no split at 167,
+/// makes no range 3 from it, applies 168 once and after the restate, and gets range 3 through its
+/// placeholder's install afterwards. The switch replaced `[k06, k14)` while node 2 held no replica of
+/// range 3, and the snapshot's left half alone came back, so the keys it removed were no replica's on
+/// the node. The variant fails with check 8's install clause on the original words, and with the
+/// sweep's verdict on them.
+// PROPOSED(D-133)
+#[test]
+fn seed_13283_a_split_inside_an_install_waits_for_switched_and_nothing_is_applied_twice() {
+    let (node, parent, right, index) = (2, 44, 3, 167);
+    let report = shard::run(13283);
+    report.check().unwrap();
+    let records = report.records();
+    let variant = shard::run_of(
+        13283,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::SplitAppliesInsideTheSwitch]),
+        RangeVariants::correct(),
+    );
+    let first = records
+        .iter()
+        .zip(variant.records())
+        .position(|(correct, buggy)| correct != buggy)
+        .expect("the variant changes the run");
+    let on_node = |record: &TraceRecord| node_of(record) == Some(node);
+    let own = {
+        let interval = ananke_raft::store::KeyPrefix::group(parent).span();
+        (interval.start, interval.end)
+    };
+    let replaces_44 = |record: &TraceRecord| {
+        on_node(record)
+            && matches!(&record.event, TraceEvent::SpanInstalled { spans, .. }
+                if spans.contains(&own)
+                    && spans.iter().any(|(from, to)| from.ends_with(b"k06") && to.ends_with(b"k14")))
+    };
+    let split_at = |record: &TraceRecord| {
+        on_node(record)
+            && matches!(record.event, TraceEvent::RangeSplit { range: of, right: made, index: at, .. }
+                if of == parent && made == right && at == index)
+    };
+    // Up to where the two runs part, node 2's install of range 44 is numbered and not switched.
+    let numbered = records[..first]
+        .iter()
+        .rposition(|record| {
+            on_node(record)
+                && matches!(record.event, TraceEvent::TaskSpawned { name, .. } if name == "span-install")
+        })
+        .unwrap_or_else(|| panic!("seed 13283 no longer numbers node 2's install before {first}"));
+    assert!(
+        !records[numbered..first]
+            .iter()
+            .any(|record| on_node(record)
+                && matches!(record.event, TraceEvent::SpanInstalled { .. })),
+        "node 2's switch was made before the runs part at {first}"
+    );
+    let switched = numbered
+        + records[numbered..]
+            .iter()
+            .position(replaces_44)
+            .unwrap_or_else(|| {
+                panic!("seed 13283 no longer switches range 44's [k06, k14) on node 2")
+            });
+    let installed = switched
+        + records[switched..]
+            .iter()
+            .position(|record| {
+                matches!(record.event, TraceEvent::RaftSnapshot {
+                    server, range: of, last_index, taken: false, ..
+                } if server == node && of == parent && last_index == index)
+            })
+            .expect("node 2's install of range 44 at 167 is traced");
+    // The variant: the split applies between the numbering and the switch.
+    let buggy = variant.records();
+    let landed = buggy
+        .iter()
+        .position(split_at)
+        .expect("the variant applies range 44's split at 167 on node 2");
+    let buggy_switch = buggy[numbered..]
+        .iter()
+        .position(replaces_44)
+        .map(|at| numbered + at)
+        .expect("the variant switches range 44 on node 2");
+    assert!(
+        first <= landed && landed < buggy_switch,
+        "the variant's split lands inside the switch: parted at {first}, split at {landed}, \
+         switch at {buggy_switch}"
+    );
+    // The correct node: no split at 167 on node 2, 168 applied once and after the restate, and
+    // range 3 made through its placeholder after the switch.
+    assert!(
+        !records.iter().any(split_at),
+        "node 2 applied range 44's split at 167: the entry is the install's"
+    );
+    let applies_168: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            matches!(record.event, TraceEvent::RaftApply { server, range: of, index: at, .. }
+                if server == node && of == parent && at == index + 1)
+        })
+        .map(|(at, _)| at)
+        .collect();
+    assert!(
+        applies_168.len() == 1 && applies_168[0] > installed,
+        "node 2 applies 168 once, after its install at 167 ({installed}): {applies_168:?}"
+    );
+    let made = records
+        .iter()
+        .position(|record| {
+            on_node(record)
+                && matches!(record.event, TraceEvent::RangeCreated { range: of, .. } if of == right)
+        })
+        .expect("node 2 makes range 3");
+    assert!(
+        made > switched
+            && matches!(
+                records[made].event,
+                TraceEvent::RangeCreated {
+                    cause: RangeCause::Snapshot,
+                    ..
+                }
+            ),
+        "range 3 made on node 2 through its placeholder, after the switch: {:?}",
+        records[made]
+    );
+
+    let clause = invariants::folded(buggy)
+        .verdict_of(Fold::InstallSpan)
+        .expect_err("check 8's install clause catches the variant on seed 13283");
+    assert!(
+        clause.contains("one owner per key")
+            && clause.contains("an install of range 44 on node 2 replaced")
+            && clause.contains("k06\", ")
+            && clause.contains("k14\"), which overlaps its replica of range 3 over")
+            && clause.contains("k09\", ")
+            && clause.contains("and removes that replica's keys"),
+        "the violation seed 13283 is pinned for: {clause}"
+    );
+    let why = variant.check().expect_err("the variant fails seed 13283");
+    assert!(
+        why.contains("state machine safety: server 2 applied index 168 of group 44 after 168"),
+        "the sweep's own verdict, the store taken back: {why}"
+    );
+}
+
 /// Seed 16725, the stale-cache shape's writer, found past the nightly's range (PROPOSED D-131). Node
 /// 1 led range 14, proposed the writer's put at index 100, applied it, and crashed before it
 /// answered. The writer heard nothing, and asked the next node under the same (client, seq). A

@@ -759,6 +759,9 @@ pub struct ServerHost<E: Environment> {
     /// (D-035, Q26).
     // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
     on_a_reseed: bool,
+    /// Shared with the `apply` task and the `snapshot` task: a switched range's hold
+    /// against its split's apply is let go here, at `Switched` (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
 }
 
 /// What [`lock`] calls first in a test of this crate, with the address of the mutex about
@@ -1721,7 +1724,7 @@ impl<E: Environment> Host for ServerHost<E> {
                         ],
                     });
                 }
-                match self.installed(
+                let work = match self.installed(
                     *range,
                     core,
                     at,
@@ -1731,7 +1734,13 @@ impl<E: Environment> Host for ServerHost<E> {
                 ) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => CoreWork::Release,
-                }
+                };
+                // The range's applied index is restated, in the store and in the `apply`
+                // task's state: the switch's hold against the range's split's apply is let
+                // go here and not at the switch, or an entry past the snapshot applied in
+                // between would be applied again after the restate (PROPOSED D-133).
+                self.switching.switched(*range);
+                work
             }
             SnapAnswer::Abandoned { .. } => CoreWork::Release,
             SnapAnswer::Taken { .. }
@@ -2099,6 +2108,9 @@ struct ServerApplier<E: Environment> {
     id_block: u64,
     /// The cores' parameters, for the right half's core at a split (PROPOSED D-100).
     raft: RaftConfig,
+    /// Shared with the `snapshot` task: a range's switch and its split's apply exclude
+    /// each other (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -2127,7 +2139,22 @@ impl<E: Environment> ServerApplier<E> {
     ///
     /// `None` is the entry left to an install: a non-voter's removal waited for the
     /// engine while P's own live install switched P past `index`, which then carries
-    /// the entry's effect, and nothing was written here (PROPOSED D-107).
+    /// the entry's effect, and nothing was written here (PROPOSED D-107); or the apply
+    /// waited out P's own switch, which moved the store to or past `index` (PROPOSED
+    /// D-133).
+    ///
+    /// **P is held against its install's switch** from the read of P's descriptor to both
+    /// halves' descriptors in the host's table: a switch of P in flight is waited out
+    /// before the read, and a switch that reaches its own reads while this apply is in
+    /// flight waits for it (`install::SwitchOrSplit`). So the apply lands before the
+    /// switch reads the table and the store, or after the host has stepped the install's
+    /// `Switched` and restated P's applied index, and never between the engine's numbering
+    /// of the switch and the switch, where it wrote its batch over the switch and narrowed
+    /// the table after the switch had read it, and the switch removed the right half's keys
+    /// (seed 13283 of the sharded sweep, #225), nor between the switch and `Switched`, where
+    /// the job's next entry applied before the restate and again after it.
+    /// `SplitAppliesInsideTheSwitch` holds nothing.
+    // PROPOSED(D-133)
     async fn split(
         &self,
         range: RangeId,
@@ -2136,6 +2163,20 @@ impl<E: Environment> ServerApplier<E> {
         right: u64,
         store: &Arc<RaftStore<E>>,
     ) -> io::Result<Option<(ApplyEffect, Outcome)>> {
+        let inside = if self
+            .node_variants
+            .contains(NodeVariant::SplitAppliesInsideTheSwitch)
+        {
+            None
+        } else {
+            let inside = self.switching.enter(&self.env, range).await;
+            // P's switch moved the store while this waited: the entry is the install's,
+            // as the apply loop skips an entry the store is past (D-083).
+            if store.applied() >= index {
+                return Ok(None);
+            }
+            Some(inside)
+        };
         let prefix = KeyPrefix::group(range.get());
         let held = store
             .engine()
@@ -2303,6 +2344,9 @@ impl<E: Environment> ServerApplier<E> {
         // awaits, so a simulated schedule is the same.
         // PROPOSED(D-114)
         put_split_descriptors(&self.descriptors, left, voter.then_some(created));
+        // The store and the table are the split's: a switch of P waiting on it reads them
+        // now (PROPOSED D-133).
+        drop(inside);
         if !voter {
             return Ok(Some((ApplyEffect::Took, Outcome::Done)));
         }
@@ -2766,8 +2810,9 @@ impl<E: Environment> Applier for ServerApplier<E> {
                             outcome
                         }
                         // The entry is P's own install's, which moved the store past it
-                        // while a non-voter's removal waited for the engine: skipped, as
-                        // one the store is past at the head of the loop (PROPOSED D-107).
+                        // while a non-voter's removal waited for the engine, or while the
+                        // apply waited out P's switch: skipped, as one the store is past at
+                        // the head of the loop (PROPOSED D-107, D-133).
                         Ok(None) => continue,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
@@ -3007,7 +3052,9 @@ fn put_split_descriptors(
 /// install's, tens of milliseconds for a live install; every range's applies wait with
 /// it (issue #169, Stage D's to measure).
 // PROPOSED(D-107)
-const INSTALL_RETRY: Duration = Duration::from_millis(1);
+// PROPOSED(D-133): and the period a range's switch and its split's apply ask again at
+// while the other holds the range (`install::SwitchOrSplit`).
+pub(crate) const INSTALL_RETRY: Duration = Duration::from_millis(1);
 
 /// Whether `error` is the engine refusing an install because another runs, which
 /// leaves nothing written and is asked again (`ananke_storage::InstallRefused`).
@@ -3735,6 +3782,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // a restart: a placeholder holds nothing durable.
     // PROPOSED(D-109)
     let placeholders: Arc<Mutex<BTreeSet<RangeId>>> = Arc::default();
+    // A range's switch and its split's apply, held against each other across the `apply`
+    // task, the `snapshot` task and the host (PROPOSED D-133).
+    let switching: Arc<install::SwitchOrSplit> = Arc::default();
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -3764,6 +3814,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         applied: applied_at.clone(),
         placeholders: placeholders.clone(),
         on_a_reseed,
+        switching: switching.clone(),
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
@@ -3848,6 +3899,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             cores: variants,
             descriptors: descriptors.clone(),
             applied: applied_at.clone(),
+            switching: switching.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -3906,6 +3958,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             anchor,
             on_a_reseed,
             range_variants,
+            switching,
         );
         async move {
             task.run().await;
@@ -4371,19 +4424,28 @@ fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, appli
     });
 }
 
+/// What [`split_applied`] is wired to: the host's table, the `snapshot` task's queue, the
+/// node's exclusion between a range's switch and its split's apply, and the node's variants.
+// PROPOSED(D-133)
+#[cfg(test)]
+pub(crate) type SplitWired = (
+    Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
+    Queue<SnapJob>,
+    Arc<install::SwitchOrSplit>,
+    NodeVariants,
+);
+
 /// A split's apply as the `apply` task makes it, for `install.rs`'s directed tests of what
 /// lands around a switch: the real [`ServerApplier::split`] of `parent` at `index`, cutting
-/// at `key`, on a voter of three, over `store`, the host's `table` and the `snapshot` task's
-/// `snaps`. Whether the split took.
+/// at `key`, on a voter of three, over `store`, the host's `table`, the `snapshot` task's
+/// `snaps` and the node's `switching`, under `variants`. Whether the split took.
 // PROPOSED(D-132)
+// PROPOSED(D-133): the exclusion shared with the task, and the node's variants.
 #[cfg(test)]
 pub(crate) async fn split_applied<E: Environment>(
     env: &E,
     store: &Arc<RaftStore<E>>,
-    (table, snaps): (
-        Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
-        Queue<SnapJob>,
-    ),
+    (table, snaps, switching, variants): SplitWired,
     (parent, right): (RangeId, RangeId),
     (index, key): (Index, &'static [u8]),
 ) -> bool {
@@ -4402,7 +4464,7 @@ pub(crate) async fn split_applied<E: Environment>(
         local: Queue::new(),
         snaps,
         engine_dir: PathBuf::from("/n1"),
-        node_variants: NodeVariants::correct(),
+        node_variants: variants,
         range_variants: RangeVariants::correct(),
         cores: Variants::default(),
         descriptors: table,
@@ -4419,6 +4481,7 @@ pub(crate) async fn split_applied<E: Environment>(
         )),
         id_block: 8,
         raft: RaftConfig::default(),
+        switching,
     };
     matches!(
         applier
@@ -4698,6 +4761,7 @@ mod tests {
                     )),
                     id_block: 8,
                     raft: RaftConfig::default(),
+                    switching: Arc::default(),
                 };
                 let outcome = applier
                     .split(
