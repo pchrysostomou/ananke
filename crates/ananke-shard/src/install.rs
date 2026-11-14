@@ -568,6 +568,107 @@ fn switched_spans(
     vec![prefix.span(), span.start.clone()..span.end.clone()]
 }
 
+/// For each range, an install's switch and that range's split's apply exclude each other:
+/// a split applies before the switch reads what it replaces, or after the installed replica
+/// is in place, and never between (PROPOSED D-133). Shared by the `snapshot` task, which
+/// holds a range from its switch's re-check, the `apply` task, which holds the parent from a
+/// split's read of its descriptor to both halves' descriptors in the host's table, and the
+/// host, which lets go of a switched range's hold when it steps `Switched`.
+///
+/// The node's hold stops a range's core and not the `apply` task, so an apply job queued
+/// before the hold still lands while the switch runs (`Task::finish`, the re-checks).
+/// `Engine::install_spans` numbers an install at the call and switches tens of milliseconds
+/// later (D-107), and a split's apply landing there wrote its batch at a higher number and
+/// narrowed the host's table after the switch had read it: the switch removed the right
+/// half's keys, and where the apply carried the store past the snapshot's index the switch
+/// took it back there (seed 13283 of the sharded sweep, #225). A split in flight at the
+/// switch's reads is the same, from the other side.
+///
+/// **The switch's hold ends at `Switched`, not at the switch.** The host restates the
+/// range's applied index, in the store and in the `apply` task's state, to the snapshot's
+/// when it steps `Switched` (`ServerHost::installed`), so an entry past the snapshot that
+/// the `apply` task applies between the switch and that step is applied again after it.
+/// Let go at the switch, seed 13283's split waited out the switch, was the install's, and
+/// the job's next entry, 168, applied before the host stepped `Switched` and again after it:
+/// "applied index 168 of group 44 after 166". Held to `Switched`, the job's next entry waits
+/// behind the split.
+///
+/// Each side asks again every `INSTALL_RETRY` (`server.rs`, a millisecond) while the
+/// other holds the range, as a non-voter's split waits out another install
+/// (`apply_removing_unless_installed`). Nothing awaits where the range is free, so a run in
+/// which the two never meet is the run it was. The `apply` task takes one job at a time and
+/// the `snapshot` task one switch, so a range is never held twice by one side.
+/// [`NodeVariant::SplitAppliesInsideTheSwitch`] holds nothing.
+// PROPOSED(D-133)
+#[derive(Debug, Default)]
+pub struct SwitchOrSplit {
+    state: std::sync::Mutex<Holds>,
+}
+
+/// The ranges a [`SwitchOrSplit`] holds, and of those the switched ones the host lets go of
+/// at `Switched`.
+#[derive(Debug, Default)]
+struct Holds {
+    held: BTreeSet<RangeId>,
+    until_switched: BTreeSet<RangeId>,
+}
+
+impl SwitchOrSplit {
+    /// Holds `range` for the caller once no one holds it, until the [`Inside`] handed back
+    /// is dropped or handed to the host ([`Inside::until_switched`]).
+    pub(crate) async fn enter<E: Environment>(self: &Arc<Self>, env: &E, range: RangeId) -> Inside {
+        loop {
+            if lock(&self.state).held.insert(range) {
+                return Inside {
+                    owner: Some(self.clone()),
+                    range,
+                };
+            }
+            env.clock().sleep(crate::server::INSTALL_RETRY).await;
+        }
+    }
+
+    /// The host stepped `range`'s `Switched`: the hold its switch handed over is let go. A
+    /// range held by anyone else, or by no one, is left as it is.
+    pub(crate) fn switched(&self, range: RangeId) {
+        let mut state = lock(&self.state);
+        if state.until_switched.remove(&range) {
+            state.held.remove(&range);
+        }
+    }
+
+    /// Whether anyone holds `range` now: what a directed test waits on.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, range: RangeId) -> bool {
+        lock(&self.state).held.contains(&range)
+    }
+}
+
+/// One hold of a range in a [`SwitchOrSplit`], let go when dropped.
+// PROPOSED(D-133)
+pub(crate) struct Inside {
+    owner: Option<Arc<SwitchOrSplit>>,
+    range: RangeId,
+}
+
+impl Inside {
+    /// A switch made: the hold is the host's to let go of, when it steps `Switched` and
+    /// the range's applied index is restated (`SwitchOrSplit::switched`).
+    pub(crate) fn until_switched(mut self) {
+        if let Some(owner) = self.owner.take() {
+            lock(&owner.state).until_switched.insert(self.range);
+        }
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            lock(&owner.state).held.remove(&self.range);
+        }
+    }
+}
+
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
 /// variant — the start-over the node answered it with before this bound existed.
 // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
@@ -666,6 +767,17 @@ pub struct Task<E: Environment> {
     #[cfg(test)]
     at_the_switch:
         std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    /// Shared with the `apply` task: a range's switch and its split's apply exclude each
+    /// other (PROPOSED D-133).
+    switching: Arc<SwitchOrSplit>,
+    /// What a directed test spawns once the switch is numbered, at `Engine::install_spans`'s
+    /// call, and before it is awaited: where a split's apply that begins inside the switch
+    /// lands. Spawned and not awaited, since on the correct node that apply waits out the
+    /// switch.
+    // PROPOSED(D-133)
+    #[cfg(test)]
+    at_the_numbering:
+        std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
 }
 
 impl<E: Environment> Task<E> {
@@ -694,6 +806,7 @@ impl<E: Environment> Task<E> {
         anchor: Arc<RaftStore<E>>,
         on_a_reseed: bool,
         range_variants: RangeVariants,
+        switching: Arc<SwitchOrSplit>,
     ) -> Self {
         Self {
             env,
@@ -719,6 +832,9 @@ impl<E: Environment> Task<E> {
             range_variants,
             #[cfg(test)]
             at_the_switch: std::sync::Mutex::new(None),
+            switching,
+            #[cfg(test)]
+            at_the_numbering: std::sync::Mutex::new(None),
         }
     }
 
@@ -1426,13 +1542,29 @@ impl<E: Environment> Task<E> {
         // the snapshot's 113 and the table held `[k03, k10)`, and here at 113 and
         // `[k03, k05)` with the right half made. So the store is asked again, which keeps a
         // snapshot at or below an entry applied meanwhile from taking the replica
-        // backwards, and the span is what the host holds now. A split's apply that lands
-        // after the numbering is D-132's window, named there and not closed here.
-        // `InstallReplacesCopiedSpan` asks neither (PROPOSED D-132).
+        // backwards, and the span is what the host holds now. `InstallReplacesCopiedSpan`
+        // asks neither (PROPOSED D-132).
+        //
+        // And from here to the host's `Switched` the range is held against its split's apply,
+        // which waits for it, as this waits for a split in flight: the engine numbers the
+        // switch at the call and makes it tens of milliseconds later, and a split's apply that
+        // landed between wrote its batch over the switch and narrowed the table after it was
+        // read, so the switch removed the right half's keys (seed 13283 of the sharded sweep,
+        // #225). `SplitAppliesInsideTheSwitch` holds nothing.
+        // PROPOSED(D-133)
+        let inside = if self
+            .variants
+            .contains(NodeVariant::SplitAppliesInsideTheSwitch)
+        {
+            None
+        } else {
+            Some(self.switching.enter(&self.env, range).await)
+        };
         let copied = self
             .variants
             .contains(NodeVariant::InstallReplacesCopiedSpan);
         if !copied && store.applied() >= install.at.last_index {
+            drop(inside);
             drop(source);
             return self
                 .caught_up(range, from, &install, repair.term, &store)
@@ -1478,11 +1610,8 @@ impl<E: Environment> Task<E> {
                 .config
                 .variants
                 .contains(ananke_raft::core::Variant::SnapshotWithoutCurrentLast);
-        let switched = if with_repair {
-            store
-                .engine()
-                .install_spans(spans.clone(), source, batch)
-                .await
+        let numbered = if with_repair {
+            store.engine().install_spans(spans.clone(), source, batch)
         } else {
             // The variant: the switch is made without the range's repair carried in it
             // (D-066), so the store comes back holding the *leader's* tenant 0 — its
@@ -1490,9 +1619,17 @@ impl<E: Environment> Task<E> {
             store
                 .engine()
                 .install_spans(spans.clone(), source, ananke_storage::WriteBatch::new())
-                .await
         };
+        #[cfg(test)]
+        {
+            let landing = lock(&self.at_the_numbering).take();
+            if let Some(landing) = landing {
+                self.env.spawn("landing", landing);
+            }
+        }
+        let switched = numbered.await;
         if switched.is_err() {
+            drop(inside);
             return self.restart(range, from, &install, &store).await;
         }
         // The switch moved this range's applied index, its term and the configuration
@@ -1512,6 +1649,13 @@ impl<E: Environment> Task<E> {
                     config: config.clone(),
                 },
             );
+        }
+        // The hold is the host's from here: it lets go when it steps `Switched` and has
+        // restated the range's applied index, so a split's apply waiting on the range goes in
+        // after that, finds an entry at or below the snapshot's index the install's, and the
+        // job's next entry applies once, after the restate (PROPOSED D-133).
+        if let Some(inside) = inside {
+            inside.until_switched();
         }
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
@@ -3158,7 +3302,35 @@ mod tests {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
-        let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(3));
+        on_a_node_of(ananke_env::sim::SimConfig::new(3), body)
+    }
+
+    /// [`on_a_node`] on a disk whose every operation takes a millisecond or two, so that a
+    /// switch takes tens of them and a task spawned beside it runs inside it.
+    // PROPOSED(D-133)
+    fn on_a_node_with_a_disk<T, F>(
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut config = ananke_env::sim::SimConfig::new(3);
+        config.fs.latency_min = Duration::from_millis(1);
+        config.fs.latency_max = Duration::from_millis(2);
+        on_a_node_of(config, body)
+    }
+
+    /// [`on_a_node`] under `config`.
+    fn on_a_node_of<T, F>(
+        config: ananke_env::sim::SimConfig,
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut sim = ananke_env::sim::Sim::new(config);
         let node = sim.add_node();
         let env = sim.env(node);
         let out: Arc<std::sync::Mutex<Option<T>>> = Arc::default();
@@ -3242,6 +3414,7 @@ mod tests {
             store.clone(),
             false,
             RangeVariants::correct(),
+            Arc::default(),
         );
         (task, store, local, follower)
     }
@@ -3671,6 +3844,8 @@ mod tests {
                     panic!("the first stream switched");
                 };
                 lock(&task.descriptors).insert(R2, *descriptor);
+                // PROPOSED(D-133): and lets go of the switch's hold on R2.
+                task.switching.switched(R2);
                 task.finish(R2, ServerId(2), r2_repair(), env.decision())
                     .await;
                 let after_second = store.engine().get(&key("k1x")).await.expect("a read");
@@ -3847,7 +4022,12 @@ mod tests {
                         .await;
                         task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
                         let split = {
-                            let wired = (task.descriptors.clone(), task.snaps.clone());
+                            let wired = (
+                                task.descriptors.clone(),
+                                task.snaps.clone(),
+                                task.switching.clone(),
+                                variants,
+                            );
                             let (env, store) = (env.clone(), store.clone());
                             async move {
                                 // The entries the job carries up to the split, then the split.
@@ -3924,6 +4104,428 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Where a split's apply meets a switch of its range inside the switch (#225).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Meets {
+        /// The apply begins once the switch is numbered, at `Engine::install_spans`'s call,
+        /// and before the switch: seed 13283's.
+        AfterTheNumbering,
+        /// The apply is in flight, its batch being written, when the switch reaches the
+        /// reads it is made of.
+        InFlightAtTheSwitch,
+    }
+
+    /// A split's apply and a switch of its range, inside the switch: route 1 of #225, which
+    /// seed 13283 of the sharded sweep reached, node 2 applying range 44's split at 167 after
+    /// its install of range 44's snapshot at 167 was numbered and before the switch, which
+    /// replaced the pre-split span and range 3's keys with it and took the store back from 168
+    /// to 167 (PROPOSED D-133). R2 over `[k0, k9)` holds `k7x`; the split, at 9 through the real
+    /// [`ServerApplier::split`](crate::server::split_applied), cuts at `k5` and makes R9. On a disk
+    /// of a millisecond or two an operation, so the switch takes tens of them.
+    ///
+    /// On the correct node the two exclude each other. An apply that begins after the numbering
+    /// waits out the switch and the host's step of `Switched`, which restates the range's applied
+    /// index, then finds the store at or past its entry and leaves it to the install, which made the node's R2 the snapshot's left half and owns no right half here: so
+    /// `k7x`, which no replica on the node owns, goes, R9 is never made here, and the job's next
+    /// entry applies after the switch, the store not taken back (the second case is seed 13283's
+    /// shape, the snapshot at the split's own index). A switch that reaches its reads with the
+    /// apply in flight waits for it, then replaces the left half the table now holds, or, the
+    /// store being at the snapshot's index, answers installed and switches nothing; R9 keeps
+    /// `k7x`. Under `SplitAppliesInsideTheSwitch`, the order before this entry, every case lands
+    /// the split between the numbering and the switch, the switch replaces `[k0, k9)` with R9
+    /// made, and check 8's install clause names it; in seed 13283's shape the store is taken back
+    /// below the entry the job applied after the split.
+    // PROPOSED(D-133)
+    #[test]
+    fn a_split_applied_inside_a_switch_of_its_range_waits_for_it_or_is_waited_for() {
+        #[derive(Clone, Copy, Debug)]
+        struct Case {
+            meets: Meets,
+            snapshot: Index,
+            /// Whether the job carries the entry after the split, as seed 13283's did.
+            next: bool,
+            /// On the correct node: the end of the span the switch replaced, if it switched,
+            /// whether the split took here, and the store's applied index after it all.
+            switched: Option<&'static str>,
+            took: bool,
+            ends_at: Index,
+        }
+        const SPLIT: Index = 9;
+        let cases = [
+            Case {
+                meets: Meets::AfterTheNumbering,
+                snapshot: 30,
+                next: false,
+                switched: Some("k9"),
+                took: false,
+                ends_at: 30,
+            },
+            Case {
+                meets: Meets::AfterTheNumbering,
+                snapshot: SPLIT,
+                next: true,
+                switched: Some("k9"),
+                took: false,
+                ends_at: SPLIT + 1,
+            },
+            Case {
+                meets: Meets::InFlightAtTheSwitch,
+                snapshot: 30,
+                next: false,
+                switched: Some("k5"),
+                took: true,
+                ends_at: 30,
+            },
+            Case {
+                meets: Meets::InFlightAtTheSwitch,
+                snapshot: SPLIT,
+                next: false,
+                switched: None,
+                took: true,
+                ends_at: SPLIT,
+            },
+        ];
+        for case in cases {
+            for buggy in [false, true] {
+                let variants = if buggy {
+                    NodeVariants::of(&[NodeVariant::SplitAppliesInsideTheSwitch])
+                } else {
+                    NodeVariants::correct()
+                };
+                let (
+                    (
+                        right_key,
+                        job,
+                        (held_in_flight, waits_for_switched, free),
+                        let_go,
+                        sent,
+                        applied,
+                    ),
+                    trace,
+                ) = on_a_node_with_a_disk(move |env| async move {
+                    let parent = described(R2, "k0", "k9", 1);
+                    let (mut task, store, local, follower) =
+                        task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                    task.variants = variants;
+                    let prefix = KeyPrefix::group(R2.get());
+                    let mut first = ananke_storage::WriteBatch::new();
+                    first.put(prefix.descriptor_key(), parent.encode());
+                    store.apply(1, first).await.expect("an apply");
+                    for index in 2..SPLIT {
+                        store
+                            .apply(index, ananke_storage::WriteBatch::new())
+                            .await
+                            .expect("an apply");
+                    }
+                    one_key(&store, "k7x").await;
+                    let at = Identity {
+                        term: 2,
+                        last_index: case.snapshot,
+                        last_term: 2,
+                    };
+                    let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                    else {
+                        panic!("the stream completes");
+                    };
+                    checkpoint_with(
+                        &env,
+                        R2,
+                        case.snapshot,
+                        Some(&described(R2, "k0", "k5", 2)),
+                        &["k0x"],
+                        &install.source,
+                    )
+                    .await;
+                    task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                    // What the job reports: whether the split took, and the store's
+                    // applied index once the job is done.
+                    let job: Arc<std::sync::Mutex<Option<(bool, Index)>>> = Arc::default();
+                    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let split = {
+                        let wired = (
+                            task.descriptors.clone(),
+                            task.snaps.clone(),
+                            task.switching.clone(),
+                            variants,
+                        );
+                        let (env, store, job, started) =
+                            (env.clone(), store.clone(), job.clone(), started.clone());
+                        async move {
+                            started.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let took = crate::server::split_applied(
+                                &env,
+                                &store,
+                                wired,
+                                (R2, R9),
+                                (SPLIT, b"k5"),
+                            )
+                            .await;
+                            // The job's next entry, skipped where the store is past it,
+                            // as the apply loop skips it.
+                            if case.next && store.applied() < SPLIT + 1 {
+                                store
+                                    .apply(SPLIT + 1, ananke_storage::WriteBatch::new())
+                                    .await
+                                    .expect("the entry after the split");
+                            }
+                            *lock(&job) = Some((took, store.applied()));
+                        }
+                    };
+                    let held_in_flight: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+                    match case.meets {
+                        Meets::AfterTheNumbering => {
+                            *lock(&task.at_the_numbering) = Some(Box::pin(split));
+                        }
+                        Meets::InFlightAtTheSwitch => {
+                            let (env, switching, held_in_flight) =
+                                (env.clone(), task.switching.clone(), held_in_flight.clone());
+                            *lock(&task.at_the_switch) = Some(Box::pin(async move {
+                                env.spawn("landing", split);
+                                while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                                    env.clock().sleep(Duration::from_micros(10)).await;
+                                }
+                                // Inside the batch's write, a disk operation of a
+                                // millisecond or more.
+                                env.clock().sleep(Duration::from_micros(100)).await;
+                                *lock(&held_in_flight) = Some(switching.holds(R2));
+                            }));
+                        }
+                    }
+                    task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                    let answer = local.remove_first(|_| true);
+                    let let_go = matches!(
+                        answer,
+                        Some(crate::server::Local::Snapshot(SnapAnswer::Abandoned { .. }))
+                    );
+                    // A little later, and before the host steps `Switched`: whether the
+                    // job is still waiting.
+                    env.clock().sleep(Duration::from_millis(5)).await;
+                    let waits_for_switched = lock(&job).is_none();
+                    // What the host does at `Switched`, once it has restated the range.
+                    if matches!(
+                        answer,
+                        Some(crate::server::Local::Snapshot(SnapAnswer::Switched { .. }))
+                    ) {
+                        task.switching.switched(R2);
+                    }
+                    let sent = answered(&env, &follower).await;
+                    while lock(&job).is_none() {
+                        env.clock().sleep(Duration::from_millis(1)).await;
+                    }
+                    let job = lock(&job).take();
+                    let right_key = store.engine().get(&key("k7x")).await.expect("a read");
+                    let held_in_flight = lock(&held_in_flight).take();
+                    let free = !task.switching.holds(R2);
+                    (
+                        right_key,
+                        job,
+                        (held_in_flight, waits_for_switched, free),
+                        let_go,
+                        sent,
+                        store.applied(),
+                    )
+                });
+                let name = format!("{case:?}, buggy: {buggy}");
+                let (took, after_job) = job.expect("the job finished");
+                assert_eq!(sent, Some(SnapshotStatus::Installed), "{name}");
+                let at = |want: &dyn Fn(&TraceEvent) -> bool| {
+                    trace.iter().position(|record| want(&record.event))
+                };
+                let numbered = at(
+                    &|event| matches!(event, TraceEvent::TaskSpawned { name, .. } if *name == "span-install"),
+                );
+                let split = at(&|event| matches!(event, TraceEvent::RangeSplit { .. }));
+                let switched = at(&|event| matches!(event, TraceEvent::SpanInstalled { .. }));
+                let clause = install_clause(&trace, None);
+                if buggy {
+                    // The shape: the split lands between the numbering and the switch.
+                    assert!(
+                        numbered < split && split < switched && numbered.is_some(),
+                        "{name}: numbered at {numbered:?}, split at {split:?}, switched at \
+                         {switched:?}"
+                    );
+                    assert!(took, "{name}: the split takes inside the switch");
+                    assert_eq!(switches(&trace), vec![r2_replaced("k9")], "{name}");
+                    assert!(right_key.is_none(), "{name}: R9's key is gone");
+                    let why = clause.expect_err("check 8's install clause catches the switch");
+                    assert!(
+                        why.contains("one owner per key") && why.contains("its replica of range 9"),
+                        "{name}: {why}"
+                    );
+                    if case.next {
+                        assert_eq!(
+                            (after_job, applied),
+                            (SPLIT + 1, case.snapshot),
+                            "{name}: the switch takes the store back below the job's entry"
+                        );
+                    }
+                } else {
+                    assert_eq!(took, case.took, "{name}: whether the split took here");
+                    match case.meets {
+                        // The apply waited out the switch, and the host's `Switched` after
+                        // it: it took nothing, and traced nothing, inside either.
+                        Meets::AfterTheNumbering => {
+                            assert!(waits_for_switched, "{name}: the job waits for `Switched`");
+                            assert_eq!(split, None, "{name}: the entry is the install's");
+                        }
+                        // The switch waited for the apply: its numbering, if it switched,
+                        // comes after the split, which held the range while in flight.
+                        Meets::InFlightAtTheSwitch => {
+                            assert_eq!(held_in_flight, Some(true), "{name}: the split held R2");
+                            assert!(
+                                split.is_some()
+                                    && numbered.is_none_or(|numbered| split < Some(numbered)),
+                                "{name}: split at {split:?}, numbered at {numbered:?}"
+                            );
+                        }
+                    }
+                    let expected = case
+                        .switched
+                        .map(r2_replaced)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        switches(&trace),
+                        expected,
+                        "{name}: what the switch replaced"
+                    );
+                    assert_eq!(
+                        right_key.is_some(),
+                        case.took,
+                        "{name}: R9's key stays where R9 is made here, and goes with the switch \
+                         where no replica here owns it"
+                    );
+                    assert_eq!(
+                        let_go,
+                        case.switched.is_none(),
+                        "{name}: the hold let go unswitched"
+                    );
+                    assert_eq!(applied, case.ends_at, "{name}: the store's applied index");
+                    if case.meets == Meets::AfterTheNumbering {
+                        assert_eq!(
+                            after_job, case.ends_at,
+                            "{name}: the job ends after the switch"
+                        );
+                    }
+                    assert_eq!(clause, Ok(()), "{name}: check 8's install clause");
+                }
+                assert!(free, "{name}: nothing holds R2 once the job is done");
+            }
+        }
+    }
+
+    /// Route 2 of #225, **which D-133 does not close, asserted open**: #215's related window.
+    /// `/n1` hosts R2 at configuration's `[k0, k9)` with no descriptor. Stream A, R2's pre-split
+    /// snapshot over `[k0, k9)`, switches down D-128's path, and `finish` leaves R2 out of the
+    /// host's table until the host steps `Switched(A)`. R9's placeholder's stream completes
+    /// first: its admission reads a table with no R2 in it, sees no overlap, and R9 is made over
+    /// `[k5, k9)` with `k7x`. Then the host steps `Switched(A)`, the table holds R2's wide
+    /// descriptor, and stream B, R2's post-split snapshot over `[k0, k5)`, is admitted, since its
+    /// span overlaps nothing, and replaces the wide descriptor's span: R9's key goes, and check 8's
+    /// install clause names it.
+    ///
+    /// No split is applied on this node, so the exclusion between a switch and a split's apply
+    /// has nothing to hold: the correct node and `SplitAppliesInsideTheSwitch` run this record for
+    /// record. Closing it needs the placeholder's admission to see R2 from the switch on, which is
+    /// a change to where the table is written or read and not D-133's. The day it is closed this
+    /// test fails, and becomes that fix's directed test.
+    // PROPOSED(D-133)
+    #[test]
+    fn a_placeholder_admitted_before_the_host_steps_switched_still_loses_its_key_to_the_next_install()
+     {
+        let run = |variants: NodeVariants| {
+            on_a_node(move |env| async move {
+                let wide = described(R2, "k0", "k9", 1);
+                let left = described(R2, "k0", "k5", 2);
+                let right = described(R9, "k5", "k9", 2);
+                let (mut task, store, local, _follower) = task_on(&env, R2, &[]).await;
+                task.variants = variants;
+                let stream = |index: Index| Identity {
+                    term: 2,
+                    last_index: index,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) =
+                    task.plan.on_chunk(R2, FOLLOWER, stream(30), 16, true)
+                else {
+                    panic!("stream A completes");
+                };
+                checkpoint_with(&env, R2, 30, Some(&wide), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let Some(crate::server::Local::Snapshot(SnapAnswer::Switched {
+                    descriptor: Some(switched_a),
+                    ..
+                })) = local.remove_first(|_| true)
+                else {
+                    panic!("stream A switched");
+                };
+                let r2_in_the_table = lock(&task.descriptors).contains_key(&R2);
+                // R9's placeholder's stream completes before the host steps `Switched(A)`.
+                let source = PathBuf::from("/n1/staging-r9-s3");
+                checkpoint_with(&env, R9, 40, Some(&right), &["k7x"], &source).await;
+                let placeholder = Install {
+                    range: R9,
+                    from: FOLLOWER,
+                    at: stream(40),
+                    source,
+                    spans: vec![KeyPrefix::group(R9.get()).span()],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.install_placeholder(R9, FOLLOWER, placeholder).await;
+                let made = lock(&task.stores).contains_key(&R9);
+                let after_r9 = store.engine().get(&key("k7x")).await.expect("a read");
+                // What the host does at `Switched(A)`, then stream B.
+                lock(&task.descriptors).insert(R2, *switched_a);
+                task.switching.switched(R2);
+                let Landing::Complete(install) =
+                    task.plan.on_chunk(R2, ServerId(2), stream(50), 16, true)
+                else {
+                    panic!("stream B completes");
+                };
+                checkpoint_with(&env, R2, 50, Some(&left), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, ServerId(2))).or_default().pending = Some(install);
+                task.finish(R2, ServerId(2), r2_repair(), env.decision())
+                    .await;
+                let after_b = store.engine().get(&key("k7x")).await.expect("a read");
+                (r2_in_the_table, made, after_r9.is_some(), after_b.is_some())
+            })
+        };
+        let (seen, trace) = run(NodeVariants::correct());
+        assert_eq!(
+            seen,
+            (false, true, true, false),
+            "R2 out of the table at A's switch, R9 made with its key, and the key gone after B"
+        );
+        let raft9 = KeyPrefix::group(R9.get()).span();
+        assert_eq!(
+            switches(&trace),
+            vec![
+                r2_replaced("k9"),
+                vec![(raft9.start, raft9.end), (key("k5"), key("k9"))],
+                r2_replaced("k9"),
+            ],
+            "A's switch, R9's creation, and B's switch over the wide descriptor"
+        );
+        let why = install_clause(&trace, None).expect_err("check 8's install clause fires");
+        assert!(
+            why.contains("one owner per key")
+                && why.contains("an install of range 2 on node")
+                && why.contains("its replica of range 9"),
+            "B's switch, and not R9's creation: {why}"
+        );
+        let (under, variant) = run(NodeVariants::of(&[
+            NodeVariant::SplitAppliesInsideTheSwitch,
+        ]));
+        assert_eq!(under, seen, "the exclusion changes nothing on this route");
+        assert_eq!(
+            variant, trace,
+            "the correct node and the variant run one run"
+        );
     }
 
     /// An install onto a replica the host holds a descriptor of replaces that descriptor's

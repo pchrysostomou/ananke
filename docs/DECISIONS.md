@@ -26339,6 +26339,84 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 3. Bit 51, and the variant restoring both halves of the old switch.
 4. The window in section 5, left open and named, reached past the nightly's range on seed 13283. #225 tracks it and #215's related window, so this entry's "Closes #215" does not end the second's record.
 
+## PROPOSED D-133 — A range's install and its split's apply exclude each other, from the switch's reads to the host's `Switched`: a split applies before the switch reads the table and the store, or after the installed replica is in place, never between; `SplitAppliesInsideTheSwitch` keeps the old order and check 8's install clause catches it; route 1 of #225 closed, route 2 named and left open
+
+**The number.** Off 0d67f99, S11's tip (#228), which carries D-132 (#226), and whose footer reads D-133. Every code site carries `// PROPOSED(D-133)`.
+
+**This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps one owner per key per node, §11, storage 5, has an install remove "the span's keys", and check 8's install clause (D-128 §3) forbids a switch removing another replica's; Raft's state machine safety forbids an entry applied twice. D-132 §5 named the window this closes and recommended the shape built here, and #225 tracks it. SHARD.md's install rule says so in one sentence.
+
+**The bug, on a correct server (route 1 of #225).** Seed 13283 of the sharded sweep, past the nightly's range, on 0d67f99: node 2 installs range 44's snapshot at 167, which its leader took after applying range 44's split at 167. The install is numbered at 8.7545 s (`Engine::install_spans` numbers at the call), with the split's entry and the next, 168, queued to node 2's `apply` task before the hold, which stops the core and not that task. The split applies at 8.7845 s, between the numbering and the switch: it writes its batch over the switch, makes range 3 over `[k09, k14)` and narrows the host's table after the switch read it, and 168 applies after it. The switch at 8.8365 s replaces `[k06, k14)`, range 3's keys with it (check 8's install clause), and `installed_at` takes the store back from 168 to 167, so 168 applies again: "state machine safety: server 2 applied index 168 of group 44 after 168", the sweep's verdict.
+
+### 1. What is built
+
+- **`install::SwitchOrSplit`**, one per node, a set of ranges held, shared by the `snapshot` task, the `apply` task and the host. A side that finds the range held asks again every `INSTALL_RETRY` (1 ms), as a non-voter's split waits out another install (`apply_removing_unless_installed`, D-107). Where the range is free nothing awaits, so a run in which the two never meet is the run it was (section 6).
+- **The switch** (`Task::finish`) holds its range from just before D-132's second re-check, so the re-check, the read of the host's table and the numbering are inside, to the switch made and the store's applied index moved (`installed_at`); there the hold is handed to the host (`Inside::until_switched`), which lets go of it when it steps `Switched`, after `ServerHost::installed` has restated the range's applied index in the store and in the `apply` task's state (`SwitchOrSplit::switched`). A switch answered installed at the re-check, or refused by the engine, lets go at once.
+- **The split's apply** (`ServerApplier::split`) holds the parent from before its read of P's descriptor to both halves' descriptors in the host's table (`put_split_descriptors`): the voter's batch, the non-voter's `apply_removing` and a refusal's empty apply are all inside. Having waited, it asks the store: at or past its index, the entry is the install's, `None`, which the apply loop skips as it skips the non-voter's (D-107).
+
+**Why the switch's side ends at `Switched` and not at the switch.** That was the first build, and seed 13283 showed it short. The split waited out the switch at 8.8437 s, found the store at 167 and was the install's; the job's next entry, 168, applied at 8.8587 s; the host stepped `Switched` and restated range 44's applied index to 167 (the install's `RaftSnapshot` traced at 8.8725 s); and 168 applied again at 8.9067 s: "server 2 applied index 168 of group 44 after 166". An entry past the snapshot applied between the switch and the host's restate is applied twice, so the install is not over until the restate, and the split, which the job's next entries wait behind, waits for it. Held to `Switched`, seed 13283 passes: node 2 applies no split at 167, applies 168 once, at 8.8732 s, after the install's `RaftSnapshot` at 8.8673 s, and gets range 3 through its placeholder's install at 9.0176 s.
+
+### 2. Where a split now lands against a switch, for a snapshot at `L` and a split at `I`
+
+| the split's apply | before this entry | now |
+|---|---|---|
+| begins after the numbering, `L >= I` (seed 13283's at `L == I`) | lands inside: the right half is made and its keys removed; an entry past `L` it carries the store to is taken back | waits for `Switched`, is the install's, and the right half comes through its placeholder; the node held no replica of it when the switch removed its span's keys |
+| begins after the numbering, `L == I - 1` (argued; no test drives it) | the same | waits for `Switched`, then applies on the installed replica, the snapshot's wide descriptor, and makes the right half from it |
+| in flight at the switch's reads, `L > I` | the switch reads the table before the split narrows it, and replaces the wide span | the switch waits for it, then replaces the left half the table holds |
+| in flight at the switch's reads, `L <= I` | the same | the switch waits for it, finds the store at or past `L`, and answers installed |
+| before the switch's reads, after the stream's last chunk | D-132's re-check and table read | unchanged |
+
+A split that begins after the numbering with `L < I - 1` has had a non-split entry past `L` applied inside the switch first, which this does not hold (section 5).
+
+### 3. `NodeVariant::SplitAppliesInsideTheSwitch`, the pair
+
+Neither side holds: the tree before this entry. It is the node's, at **bit 52**, the next free on this tree; bit 53 stays free. The catch is check 8's install clause: on the directed test's four cases it trips with "one owner per key: an install of range 2 ... overlaps its replica of range 9", and on seed 13283 the variant fails with the original words, "an install of range 44 on node 2 replaced [... k06, ... k14), which overlaps its replica of range 3 over [... k09, ... k14) and removes that replica's keys", and with the sweep's own verdict on them. The overlap is rare: on seeds 0 to 1 999 no switch met a split (section 6), and seed 13283 is past the nightly's range; so per D-061 no tier asserts a sweep's catch of it; the directed test and the pin assert it every run.
+
+### 4. What says so
+
+**Directed** (`install.rs`), at every tier, in the crate's lib, where the nightly's `rest` job runs them (D-064 needs no row):
+
+- `a_split_applied_inside_a_switch_of_its_range_waits_for_it_or_is_waited_for`, route 1, through the task and the real `ServerApplier::split` (`server::split_applied`, which now takes the node's `SwitchOrSplit` and variants), on a disk of a millisecond or two an operation. Four cases: the apply beginning after the numbering, spawned from a new `#[cfg(test)]` seam on the task (`at_the_numbering`), with the snapshot past the split and at it (seed 13283's shape, the job's next entry after the split); and the apply in flight at the switch's reads, from D-132's seam, past the split and at it. On the correct node: the apply that begins after the numbering is still waiting after `finish` returns and until the test steps `Switched` as the host does, then is the install's, and the job's next entry applies once; the switch that meets an apply in flight waits and replaces `[k0, k5)` or answers installed. Under the variant each case lands the split between the numbering and the switch, which the test asserts off the trace (the switch's task spawned, then `RangeSplit`, then `SpanInstalled`), the switch replaces `[k0, k9)` with R9 made, check 8's install clause names it, and in seed 13283's shape the store ends below the entry the job applied.
+- `a_placeholder_admitted_before_the_host_steps_switched_still_loses_its_key_to_the_next_install`, route 2, asserted open (section 5).
+- D-132's two tests that step a second `finish` of a range now step the host's `switched` before it, as the host does at `Switched`.
+
+Plants, each applied alone to this tree in debug and reverted, against the route 1 test:
+
+| plant | caught by |
+|---|---|
+| the switch holds nothing | the first case: the split takes, where it is the install's |
+| the split holds nothing | the same |
+| the split does not ask the store after waiting | the first case: the split's apply fails "applying 9 after 30" |
+| the variant's bit inverted on both sides | the same |
+| the switch's hold let go at the switch, not at `Switched` | the first case: the job no longer waits for `Switched` |
+
+**The pin**, `seed_13283_a_split_inside_an_install_waits_for_switched_and_nothing_is_applied_twice` in `sim/tests/shard.rs`, on the shaped schedule the seed was found on, at every tier (a nightly row in shard 4, 0.5 cpu s). The correct run passes every check. The mechanism: the correct run and the variant's are one run up to where node 2's `apply` task reaches the split, record 84 293 at 8.78147 s, with node 2's install numbered and not switched; the variant's split lands after that and before its switch; the correct node applies no split at 167 on node 2, applies 168 once and after its install's `RaftSnapshot` at 167, and makes range 3 through its placeholder after the switch. Check 8's install clause fails the variant on the original words, and its `check()` names state machine safety at 168.
+
+### 5. What is not here
+
+- **Route 2 of #225, #215's related window, is not closed, and the directed test asserts it open.** `finish` leaves a replica with no descriptor out of the host's table until `Switched`, so a placeholder admitted between the switch and that step sees no overlap; the next install of the replica replaces the wide descriptor the host then holds and the right half's key goes. No split's apply is on that route, so this exclusion has nothing to hold: the correct node and the variant run it record for record, which the test asserts. Closing it needs the placeholder's admission to see the replica from its switch on, which changes where the table is written or read, and is not this entry's. When it is closed the test fails, and becomes that fix's. This commit's "Closes #225" ends #225's record of it, so it needs an issue of its own.
+- **An entry of the range that is not a split, applied inside the switch past `L - 1`, or between the switch and `Switched` past `L`.** The store is taken back as seed 13283's was, and the entry applied again after the restate. The exclusion holds a split's apply only, as #225 recommended; seed 13283's other entry inside the switch, 166, was below the snapshot and harmless. No run here counted how often the rest happens; D-132 §6 counted the applied index moving inside the switch on 2 of 60 226 switches at seeds 10 000 to 19 999, seed 13283's split one of them.
+- **D-132 §5's first bullet** is this entry's window. D-132 is in this tree unmerged, so it carries no correction mark here; once #226 merges, its §5 can say "closed by D-133".
+
+### 6. What moves
+
+Two release runs of `shard::run`, this tree and 0d67f99, each seed's trace hashed as `Report::jsonl`, and a scratch counter, not in this tree, of the waits either side made:
+
+| | seeds | traces identical to 0d67f99's | seeds on which a side waited | verdicts |
+|---|---|---|---|---|
+| this tree against 0d67f99 | 0 to 1 999 | **2 000 of 2 000** | **0** | every seed passes on both |
+| seed 13283 | 1 | no: the two part at record 84 293, 8.78147 s, where node 2's split waits | 1 | fails on 0d67f99, "state machine safety: server 2 applied index 168 of group 44 after 168"; passes here |
+
+So no correct node's schedule moves where a switch and its range's split never meet: the only new await is the wait, and the only new work where none waits is a lock and a set. Where they meet, the run moves from the wait on, as seed 13283's does.
+
+### 7. For the owner (PROPOSED)
+
+The outcome is settled by the documents, so what is the owner's is the shape:
+
+1. A set of held ranges asked again every millisecond, rather than a notification, matching how the non-voter's split already waits on the engine; every range's applies wait with a waiting split, as they do there (#169).
+2. The switch's hold running to the host's `Switched`, handed over by the task and let go by the host, which section 1 measured as the place the install is over; and the split's hold covering a refusal's empty apply as well.
+3. Bit 52.
+4. Route 2 left open and asserted open, and non-split entries inside the switch left named, both for issues of their own.
+
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+_Next entry: D-134. Add one before implementing anything not covered above._

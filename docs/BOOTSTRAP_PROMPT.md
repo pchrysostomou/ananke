@@ -101,6 +101,18 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-install-split-exclusion` (2026-11-14), off 0d67f99 (S11's tip, #228, with
+  #226), **PROPOSED D-133**, Closes #225: **route 1 of #225, a correct-server data loss and a double
+  apply**, a split's apply landing between an install's numbering and its switch (seed 13283 of the
+  sharded sweep, past the nightly's range). A range's install and its split's apply now exclude each
+  other through `install::SwitchOrSplit`: the switch holds the range from D-132's re-check to the host's
+  `Switched`, where the applied index is restated, and the split holds the parent from its descriptor's
+  read to both halves in the table. Held only to the switch, seed 13283 still failed, 168 applied
+  between the switch and `Switched` and again after it, so the hold runs to `Switched`. The pair is
+  `SplitAppliesInsideTheSwitch` (node bit 52), caught by check 8's install clause on a directed test of
+  four cases and on seed 13283's pin. Route 2 (#215's related window, a placeholder admitted before the
+  host steps `Switched`) is not closed: no split's apply is on it; a directed test asserts it open and
+  it needs an issue of its own. Non-split entries applied inside the switch are named in D-133 §5.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

@@ -458,6 +458,18 @@ pub enum NodeVariant {
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
     // PROPOSED(D-132)
     InstallReplacesCopiedSpan,
+    /// The tree before D-133: an install's switch and a split's apply of the same range do
+    /// not exclude each other. `Engine::install_spans` numbers the switch at the call and
+    /// makes it tens of milliseconds later, and the node's hold stops the range's core and
+    /// not the `apply` task, so a split's apply queued before the hold lands between: its
+    /// batch, written over the switch, makes the right half, and the switch, whose spans
+    /// were read before the split narrowed the host's table, removes the right half's
+    /// keys; where the apply carried the store past the snapshot's index, the switch takes
+    /// it back there. A split in flight when the switch reads the table does the same from
+    /// the other side. Check 8's install clause sees the switch's spans (seed 13283 of the
+    /// sharded sweep, #225; PROPOSED D-133).
+    // PROPOSED(D-133)
+    SplitAppliesInsideTheSwitch,
 }
 
 impl NodeVariant {
@@ -515,6 +527,7 @@ impl NodeVariant {
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
         NodeVariant::InstallReplacesCopiedSpan,
+        NodeVariant::SplitAppliesInsideTheSwitch,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -724,6 +737,9 @@ impl NodeVariant {
             // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
+            // PROPOSED(D-133): a split's apply landing inside its range's switch. Bit 53 is
+            // free, and eleven bits are left.
+            NodeVariant::SplitAppliesInsideTheSwitch => 1 << 52,
         }
     }
 
@@ -783,6 +799,7 @@ impl NodeVariant {
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
             NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
+            NodeVariant::SplitAppliesInsideTheSwitch => "SplitAppliesInsideTheSwitch",
         }
     }
 }
@@ -881,14 +898,16 @@ mod tests {
         // replica with no descriptor whose install replaces what it is hosted at.
         // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
         // one is a right half made on a quarantined parent with no quarantine. D-132's one
-        // is an initialised replica's install replacing the plan's copy of its spans.
+        // is an initialised replica's install replacing the plan's copy of its spans, and
+        // D-133's one a split's apply landing inside its range's switch.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
         // PROPOSED(D-130)
         // PROPOSED(D-132)
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        // PROPOSED(D-133)
+        assert_eq!(NodeVariant::BUGS.len(), 53);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
