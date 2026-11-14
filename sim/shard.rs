@@ -34,7 +34,14 @@
 //! Stream `shard-restart` adds one [`Fault::SplitFromRestarted`]: a node that has taken an id
 //! from its block is crashed and restarted, handed the lead of a range and asked to split it.
 //! One seed in [`PLAIN_ONE_IN`] draws none of it ([`Schedule::plain`]), which is the schedule
-//! the sweep was before them and the schedule every pinned seed was found on.
+//! the sweep was before them and the schedule most pinned seeds were found on.
+//!
+//! **`Fault::MetaReorder`** (SHARD.md §10; PROPOSED D-135), on stream `meta-reorder`, one on every
+//! seed that draws a shape, in the first half of the faults: a range that can split twice, led off
+//! the meta range's leader's node, is split with its leader's link to that node blocked one way;
+//! its left half's lead goes to the third node, which splits it again over an open link, so the
+//! first split's update, resent until acknowledged, reaches meta after the second's. That is the
+//! order `MetaOverwritesByArrival` breaks on, which the correct meta range takes nothing from.
 //!
 //! **The clients**: [`CLIENTS`] of them over [`KEYS`] keys, `k00` to `k15`, so a range
 //! keeps at least [`MIN_KEYS`] of them however the driver splits. They are the node
@@ -168,6 +175,14 @@ const ASKS: u64 = BOOTSTRAP * 4;
 /// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
 /// correct system before it is asserted (Q39; D-113 §6).
 pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
+/// [`Fault::MetaReorder`]'s hold (SHARD.md §10): how long the link from the first split's
+/// leader's node to the meta range's leader's node stays blocked. Measured on the correct
+/// system before it is asserted (Q39; PROPOSED D-135).
+pub const META_REORDER_HOLD: Duration = Duration::from_millis(700);
+/// The admin numbers a [`Fault::MetaReorder`] takes: `META_ADMIN + 3i` for its first split,
+/// `+ 1` for its transfer and `+ 2` for its second split, `i` the fault's index (PROPOSED
+/// D-135). Past the restart arm's and short of the stale-cache shape's.
+const META_ADMIN: u64 = 150;
 
 /// The meta convergence bound: how long past the last heal, or past a descriptor's first
 /// statement if that is later, meta may take to name a live range's descriptor.
@@ -230,6 +245,24 @@ pub enum Fault {
         /// From the transfer to the split.
         split_after: Duration,
     },
+    /// §10's `Fault::MetaReorder` (stream `meta-reorder`; SHARD.md §1, §10; PROPOSED D-135): a
+    /// user range that can split twice, led on a node `a` other than the meta range's leader's
+    /// node `m`, picked among them when the arm fires. The link from `a` to `m` is blocked one
+    /// way for [`META_REORDER_HOLD`], and the range is asked to split at once, so `a`'s update
+    /// of the first split cannot reach meta. `transfer_after` later the left half's lead is
+    /// handed to the third node `c` (`TimeoutNow`, D-028), and `split_after` after that `c` is
+    /// asked to split the left half again; its updates reach meta by an unblocked link. `a`
+    /// resends the first update until it is acknowledged (§1), so it arrives after the second
+    /// wherever the second split's update applies within the hold. The block also stalls `a`'s
+    /// sends to `m` of every range `a` leads, which is why it is held for a bound. Where no range
+    /// can split twice, or every one is led on `m`'s node, the arm does nothing.
+    // PROPOSED(D-135): §12, Stage C's `Fault::MetaReorder`.
+    MetaReorder {
+        /// From the block and the first split's ask to the transfer.
+        transfer_after: Duration,
+        /// From the transfer to the second split's ask.
+        split_after: Duration,
+    },
 }
 
 impl Fault {
@@ -243,6 +276,7 @@ impl Fault {
             Self::Crash { down, .. }
             | Self::CrashLeader { down }
             | Self::SplitFromRestarted { down, .. } => *down,
+            Self::MetaReorder { .. } => META_REORDER_HOLD,
         }
     }
 }
@@ -343,17 +377,57 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// The schedule the sweep runs for `seed`: [`Schedule::plain`] and, on all but one seed in
-    /// [`PLAIN_ONE_IN`], the shapes of SHARD.md §10 and §12's Stage C over it. Each from a
-    /// stream of its own (D-031), so every draw of the plain schedule falls where it fell:
-    /// stream `shard-load` gives each of the driver's splits a [`Load`], one each of the three
-    /// shaped loads and the clients' traffic alone by quarters, and stream `shard-restart` adds
-    /// one [`Fault::SplitFromRestarted`] in the second half of the faults, where a split has had
-    /// its chance to take an id. The driver's actions keep the times the plain schedule gave
-    /// them, against faults the arm may have moved later.
-    // PROPOSED(D-131): §12, Stage C's shapes.
+    /// The schedule the sweep runs for `seed`: [`Schedule::shaped`] and, on every seed that
+    /// draws its shapes, one [`Fault::MetaReorder`] from stream `meta-reorder` (D-031) in the
+    /// first half of the faults, where a range can still split twice. On the one seed in
+    /// [`PLAIN_ONE_IN`] that draws no shape it adds nothing, so that seed runs
+    /// [`Schedule::plain`] as before. The driver's actions keep the times the plain schedule
+    /// gave them, against faults the arms may have moved later.
+    // PROPOSED(D-135): §12, Stage C's `Fault::MetaReorder`.
     #[must_use]
     pub fn draw(seed: u64) -> Self {
+        let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
+            Duration::from_millis(lo + rng.below(hi - lo + 1))
+        };
+        let mut schedule = Self::shaped(seed);
+        if Self::draws_no_shape(seed) {
+            return schedule;
+        }
+        let mut reorder = moirae_sched::stream(seed, "meta-reorder");
+        let half = schedule.faults.len() / 2;
+        let at = usize::try_from(reorder.below(half as u64 + 1)).expect("small");
+        let transfer_after = ms(&mut reorder, 100, 200);
+        let split_after = ms(&mut reorder, 100, 200);
+        let quiet = ms(&mut reorder, 450, 700);
+        schedule.faults.insert(
+            at,
+            Fault::MetaReorder {
+                transfer_after,
+                split_after,
+            },
+        );
+        schedule.gaps.insert(at, quiet);
+        schedule.picks.insert(at, reorder.below(1 << 16));
+        schedule
+    }
+
+    /// Whether `seed` is the one in [`PLAIN_ONE_IN`] that draws no shape and no arm, and runs
+    /// [`Schedule::plain`].
+    fn draws_no_shape(seed: u64) -> bool {
+        moirae_sched::stream(seed, "shard-load").below(PLAIN_ONE_IN) == 0
+    }
+
+    /// The schedule the sweep ran before [`Fault::MetaReorder`] (PROPOSED D-131): [`Schedule::plain`]
+    /// and, on all but one seed in [`PLAIN_ONE_IN`], the shapes of SHARD.md §10 and §12's Stage C
+    /// over it. Each from a stream of its own (D-031), so every draw of the plain schedule falls
+    /// where it fell: stream `shard-load` gives each of the driver's splits a [`Load`], one each
+    /// of the three shaped loads and the clients' traffic alone by quarters, and stream
+    /// `shard-restart` adds one [`Fault::SplitFromRestarted`] in the second half of the faults,
+    /// where a split has had its chance to take an id. The pins found on it run it (PROPOSED
+    /// D-135).
+    // PROPOSED(D-131): §12, Stage C's shapes.
+    #[must_use]
+    pub fn shaped(seed: u64) -> Self {
         let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
             Duration::from_millis(lo + rng.below(hi - lo + 1))
         };
@@ -1365,6 +1439,10 @@ enum Step {
     RestartTransfer(usize),
     /// Fault `i`'s [`Fault::SplitFromRestarted`] asks its restarted node to split the range.
     RestartSplit(usize),
+    /// Fault `i`'s [`Fault::MetaReorder`] hands the left half's lead to the third node.
+    MetaTransfer(usize),
+    /// Fault `i`'s [`Fault::MetaReorder`] asks the third node to split the left half again.
+    MetaSplit(usize),
 }
 
 /// What a shape resolved to when it fired, as a split's [`Load`] and a restart arm do not
@@ -1390,6 +1468,29 @@ pub struct RestartArm {
     pub seq: Option<u64>,
 }
 
+/// The arm [`Fault::MetaReorder`] as it fired, read against the trace (PROPOSED D-135).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaArm {
+    /// When the block began and the first split was asked.
+    pub at: Instant,
+    /// The node `a` leading the range when the arm fired, whose link to `to` was blocked.
+    pub from: u64,
+    /// The meta range's leader's node `m` when the arm fired.
+    pub to: u64,
+    /// The third voter `c`, handed the left half's lead and asked the second split.
+    pub third: u64,
+    /// The range split twice.
+    pub range: u64,
+    /// Its generation when the first split was asked.
+    pub generation: u64,
+    /// The key the first split cuts at.
+    pub first_cut: u64,
+    /// Whether the first split had landed at the transfer's step, so the lead was handed on.
+    pub transferred: bool,
+    /// The key the second split cuts at, where it was asked.
+    pub second_cut: Option<u64>,
+}
+
 /// What one run produced.
 #[derive(Debug)]
 pub struct Report {
@@ -1413,6 +1514,8 @@ pub struct Report {
     pub last_fault_healed: Instant,
     /// Each [`Fault::SplitFromRestarted`] that found a node to crash.
     pub restart_arms: Vec<RestartArm>,
+    /// Each [`Fault::MetaReorder`] that found a range to split twice (PROPOSED D-135).
+    pub meta_arms: Vec<MetaArm>,
 }
 
 /// Runs the correct system on `seed`.
@@ -1564,6 +1667,20 @@ fn run_watched(
                 Step::RestartSplit(i),
             ));
         }
+        // PROPOSED(D-135): the reorder arm's later steps fall inside its hold.
+        if let Fault::MetaReorder {
+            transfer_after,
+            split_after,
+        } = fault
+        {
+            let began = at - fault.length();
+            steps.push((began + *transfer_after, 2, Step::MetaTransfer(i)));
+            steps.push((
+                began + *transfer_after + *split_after,
+                2,
+                Step::MetaSplit(i),
+            ));
+        }
         at += *gap;
     }
     for (j, action) in schedule.actions.iter().enumerate() {
@@ -1592,6 +1709,7 @@ fn run_watched(
     // What the shapes resolved to when they fired (PROPOSED D-131).
     let mut aimed: Vec<Option<Aimed>> = vec![None; schedule.actions.len()];
     let mut restart_arms: Vec<Option<RestartArm>> = vec![None; schedule.faults.len()];
+    let mut meta_arms: Vec<Option<MetaArm>> = vec![None; schedule.faults.len()];
     let mut last_heal = sim.now();
     for (at, _, step) in steps {
         advance_to(&mut sim, at, &mut watch);
@@ -1658,6 +1776,21 @@ fn run_watched(
                                 (victim, sim.now())
                             });
                     }
+                    // PROPOSED(D-135): a range that can split twice, led off meta's leader's
+                    // node, as the trace says when the arm fires.
+                    Fault::MetaReorder { .. } => {
+                        watch.look(&sim);
+                        meta_arms[i] = block_meta_and_split(
+                            &mut sim,
+                            &nodes,
+                            admin,
+                            i,
+                            pick,
+                            &watch.spans,
+                            &driver,
+                        );
+                        open = None;
+                    }
                 }
             }
             Step::End(i) => {
@@ -1668,7 +1801,7 @@ fn run_watched(
                             isolations.push((node, from, sim.now()));
                         }
                     }
-                    Fault::OneWay { .. } => sim.heal(),
+                    Fault::OneWay { .. } | Fault::MetaReorder { .. } => sim.heal(),
                     Fault::Crash { .. }
                     | Fault::CrashLeader { .. }
                     | Fault::SplitFromRestarted { .. } => {
@@ -1751,6 +1884,34 @@ fn run_watched(
                     );
                 }
             }
+            // PROPOSED(D-135): the reorder arm's later steps, each resolved against the trace
+            // as it stands when it fires, each doing nothing where the first split did not land.
+            Step::MetaTransfer(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = meta_arms[i].as_mut() {
+                    hand_the_left_half_to_the_third(&sim, admin, i, arm, &watch.spans, &driver);
+                }
+            }
+            Step::MetaSplit(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = meta_arms[i].as_mut() {
+                    split_the_left_half_through_the_third(
+                        &sim,
+                        admin,
+                        i,
+                        arm,
+                        schedule.picks[i],
+                        &watch.spans,
+                        &driver,
+                    );
+                }
+            }
         }
     }
     // The driver's admins still asking finish before the liveness window opens: the
@@ -1814,6 +1975,7 @@ fn run_watched(
         checked,
         last_fault_healed,
         restart_arms: restart_arms.into_iter().flatten().collect(),
+        meta_arms: meta_arms.into_iter().flatten().collect(),
     }
 }
 
@@ -1991,6 +2153,195 @@ fn split_from_restarted(
             n,
             arm.victim,
             range,
+            span.generation,
+            key(at),
+            driver.clone(),
+            Duration::ZERO,
+        ),
+    );
+}
+
+/// The keys a first split of `span` may cut at so that its left half can split again: those
+/// that leave twice [`MIN_KEYS`] of the clients' keys on the left and [`MIN_KEYS`] on the right
+/// (PROPOSED D-135).
+fn twice_split_keys(span: &Span) -> Vec<u64> {
+    let held = keys_in(span);
+    let min = usize::try_from(MIN_KEYS).expect("small");
+    if held.len() < 3 * min {
+        return Vec::new();
+    }
+    held[2 * min..=held.len() - min].to_vec()
+}
+
+/// [`Fault::MetaReorder`]'s first step (SHARD.md §10; PROPOSED D-135): picks a user range that
+/// can split twice and is led on a node other than the meta range's leader's, blocks that node's
+/// link to meta's leader's node one way, and asks the range's leader to split it. No range
+/// qualifies, and the arm does nothing.
+// PROPOSED(D-135)
+fn block_meta_and_split(
+    sim: &mut Sim,
+    nodes: &[NodeId],
+    admin: NodeId,
+    i: usize,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+) -> Option<MetaArm> {
+    let to = raft::leader_of_range(sim, META_RANGE);
+    let candidates: Vec<(u64, &Span, u64, Vec<u64>)> = spans
+        .user()
+        .map(|(range, span)| {
+            (
+                range,
+                span,
+                raft::leader_of_range(sim, range),
+                twice_split_keys(span),
+            )
+        })
+        .filter(|(_, span, from, cuts)| {
+            *from != to
+                && !cuts.is_empty()
+                && span.voters.contains(from)
+                && span.voters.contains(&to)
+        })
+        .collect();
+    let (range, span, from, cuts) =
+        candidates.get(usize::try_from(pick % candidates.len().max(1) as u64).expect("small"))?;
+    let third = span
+        .voters
+        .iter()
+        .copied()
+        .find(|voter| voter != from && *voter != to)?;
+    let first_cut = cuts[usize::try_from(pick % cuts.len() as u64).expect("small")];
+    sim.block(
+        nodes[usize::try_from(*from).expect("small") - 1],
+        nodes[usize::try_from(to).expect("small") - 1],
+    );
+    {
+        let mut stats = lock(driver);
+        stats.splits_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small");
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-split",
+        split_admin(
+            inner,
+            n,
+            *from,
+            *range,
+            span.generation,
+            key(first_cut),
+            driver.clone(),
+            Duration::ZERO,
+        ),
+    );
+    Some(MetaArm {
+        at: sim.now(),
+        from: *from,
+        to,
+        third,
+        range: *range,
+        generation: span.generation,
+        first_cut,
+        transferred: false,
+        second_cut: None,
+    })
+}
+
+/// Whether the trace's latest descriptor of the arm's range is the first split's left half:
+/// the first split landed and nothing has split the left half since.
+fn left_half_of_the_first(arm: &MetaArm, spans: &Spans) -> Option<Span> {
+    spans
+        .latest()
+        .get(&arm.range)
+        .filter(|span| span.end == user_key(&key(arm.first_cut)))
+        .cloned()
+}
+
+/// [`Fault::MetaReorder`]'s second step (PROPOSED D-135): where the first split has landed, asks
+/// the left half's leader to hand it to the third node, whose link to meta's leader's node is
+/// open.
+// PROPOSED(D-135)
+fn hand_the_left_half_to_the_third(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut MetaArm,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    let Some(span) = left_half_of_the_first(arm, spans) else {
+        return;
+    };
+    arm.transferred = true;
+    let leader = raft::leader_of_range(sim, arm.range);
+    if leader == arm.third {
+        return;
+    }
+    {
+        let mut stats = lock(driver);
+        stats.transfers_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small") + 1;
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-transfer",
+        transfer_admin(
+            inner,
+            n,
+            leader,
+            arm.range,
+            span.generation,
+            arm.third,
+            driver.clone(),
+        ),
+    );
+}
+
+/// [`Fault::MetaReorder`]'s last step (PROPOSED D-135): asks the third node to split the left
+/// half again, where the lead was handed on and nothing has split the left half since.
+// PROPOSED(D-135)
+fn split_the_left_half_through_the_third(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut MetaArm,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    if !arm.transferred {
+        return;
+    }
+    let Some(span) = left_half_of_the_first(arm, spans) else {
+        return;
+    };
+    let keys = split_keys(&span);
+    let Some(&at) = keys.get(usize::try_from(pick % keys.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    arm.second_cut = Some(at);
+    {
+        let mut stats = lock(driver);
+        stats.splits_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small") + 2;
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-split",
+        split_admin(
+            inner,
+            n,
+            arm.third,
+            arm.range,
             span.generation,
             key(at),
             driver.clone(),
@@ -2594,6 +2945,69 @@ pub fn meta_resends_stored_of(records: &[TraceRecord]) -> usize {
     found
 }
 
+/// What one [`Fault::MetaReorder`] came to on the trace (SHARD.md §10; PROPOSED D-135).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaReorder {
+    /// The arm as it fired.
+    pub arm: MetaArm,
+    /// How long after the block began meta first applied an update of the second split: its
+    /// left half's or its right half's. `None` where it applied none, or none was asked.
+    pub second_applied: Option<Duration>,
+    /// Whether meta applied an update of the first split's left half after one of the second's:
+    /// the order `MetaOverwritesByArrival` needs, a record of a lower generation arriving over
+    /// one of a higher. The correct meta range takes nothing from it.
+    pub reordered: bool,
+}
+
+/// What each [`Fault::MetaReorder`] of `arms` came to on the trace `records`, by the first apply
+/// of each meta index, as the meta convergence bound reads them ([`MetaReorder`]). The first
+/// split's update is its left half's, the range with the first cut as its end; the second's is
+/// the range with the second cut as its end, or the right half from the second cut to the first.
+// PROPOSED(D-135): §10, the seeds on which meta applied the second split's update first.
+#[must_use]
+pub fn meta_reorders_of(records: &[TraceRecord], arms: &[MetaArm]) -> Vec<MetaReorder> {
+    arms.iter()
+        .map(|arm| {
+            let mut found = MetaReorder {
+                arm: *arm,
+                second_applied: None,
+                reordered: false,
+            };
+            let Some(second_cut) = arm.second_cut else {
+                return found;
+            };
+            let first = user_key(&key(arm.first_cut));
+            let second = user_key(&key(second_cut));
+            let mut highest: Option<u64> = None;
+            let mut second_at: Option<u64> = None;
+            for record in records {
+                let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+                    continue;
+                };
+                if highest.is_some_and(|highest| *index <= highest) {
+                    continue;
+                }
+                highest = Some(*index);
+                let of_first = descriptors
+                    .iter()
+                    .any(|d| d.range == arm.range && d.end == first);
+                let of_second = descriptors.iter().any(|d| {
+                    (d.range == arm.range && d.end == second)
+                        || (d.start == second && d.end == first)
+                });
+                if of_second && second_at.is_none() {
+                    second_at = Some(*index);
+                    found.second_applied = record.at.checked_duration_since(arm.at);
+                }
+                if of_first && second_at.is_some_and(|at| *index > at) {
+                    found.reordered = true;
+                }
+            }
+            found
+        })
+        .collect()
+}
+
 /// How many splits, each by its first `RangeSplit`, took their right half's id from a block
 /// granted before its holder's latest restart: `IdBlockResumed`'s shape (SHARD.md §5's second
 /// rule, §10). A new run of the correct node holds no id until a grant of its own lands, so
@@ -2748,6 +3162,13 @@ impl Report {
     #[must_use]
     pub fn shapes(&self) -> Shapes {
         shapes_of(self.records(), &self.restart_arms)
+    }
+
+    /// What each [`Fault::MetaReorder`] came to ([`meta_reorders_of`]).
+    // PROPOSED(D-135)
+    #[must_use]
+    pub fn meta_reorders(&self) -> Vec<MetaReorder> {
+        meta_reorders_of(self.records(), &self.meta_arms)
     }
 
     /// The trace as records.
@@ -3999,14 +4420,80 @@ mod tests {
         assert_eq!(done(proposed(102, 1)), 0, "another admin's split");
     }
 
+    /// The reorder arm's reading (PROPOSED D-135): range 2 split first at `k08` and its left half
+    /// again at `k04`, into `[.., k04)` and range 20 over `[k04, k08)`. Meta's order is read by
+    /// the first apply of each index, as the meta convergence bound reads it.
+    // PROPOSED(D-135)
+    #[test]
+    fn an_update_of_the_first_split_applied_after_one_of_the_second_is_the_reorder() {
+        let arm = MetaArm {
+            at: at(1000),
+            from: 1,
+            to: 2,
+            third: 3,
+            range: 2,
+            generation: 1,
+            first_cut: 8,
+            transferred: true,
+            second_cut: Some(4),
+        };
+        let applied = |ms: u64, index: u64, range: u64, from: u64, to: u64| {
+            let (start, end) = (user_key(&key(from)), user_key(&key(to)));
+            record(
+                ms,
+                2,
+                TraceEvent::MetaApplied {
+                    index,
+                    descriptors: vec![MetaDescriptor {
+                        range,
+                        start: start.clone(),
+                        end: end.clone(),
+                        generation: 0,
+                        voters: vec![1, 2, 3],
+                        won: vec![(start, end)],
+                    }],
+                },
+            )
+        };
+        let first = |ms, index| applied(ms, index, 2, 0, 8);
+        let left = |ms, index| applied(ms, index, 2, 0, 4);
+        let right = |ms, index| applied(ms, index, 20, 4, 8);
+        let read = |records: &[TraceRecord]| meta_reorders_of(records, &[arm])[0];
+
+        // In order: the first split's update, then the second's two.
+        let in_order = [first(1100, 10), left(1300, 11), right(1310, 12)];
+        let found = read(&in_order);
+        assert_eq!(found.second_applied, Some(Duration::from_millis(300)));
+        assert!(!found.reordered);
+        // The first's update resent past the block and applied after the second's.
+        let mut late = in_order.to_vec();
+        late.push(first(1800, 13));
+        assert!(read(&late).reordered);
+        // The second's right half alone before it is the second's update too.
+        let found = read(&[right(1300, 11), first(1400, 12)]);
+        assert_eq!(found.second_applied, Some(Duration::from_millis(300)));
+        assert!(found.reordered);
+        // Another replica's apply of an earlier index is not a later update.
+        assert!(!read(&[first(1100, 10), left(1300, 11), first(1320, 10)]).reordered);
+        // No second split asked: nothing to read.
+        let none = MetaArm {
+            second_cut: None,
+            ..arm
+        };
+        let found = meta_reorders_of(&late, &[none])[0];
+        assert_eq!((found.second_applied, found.reordered), (None, false));
+    }
+
     /// A shape is a schedule the sweep can take: a drawn schedule keeps every draw of the plain
     /// one (D-031's stream of its own), adds the shapes, and on one seed in [`PLAIN_ONE_IN`]
-    /// adds nothing.
+    /// adds nothing. Over the shaped schedule it adds the reorder arm and nothing else (PROPOSED
+    /// D-135).
     // PROPOSED(D-131)
     #[test]
     fn the_shapes_are_drawn_over_the_plain_schedule_from_streams_of_their_own() {
         let mut none = 0;
         let (mut clients, mut writes, mut reads, mut stale, mut arms) = (0, 0, 0, 0, 0);
+        let mut reorders = 0;
         for seed in 0..512 {
             let plain = Schedule::plain(seed);
             assert!(
@@ -4043,15 +4530,44 @@ mod tests {
                 .faults
                 .iter()
                 .copied()
-                .filter(|f| !matches!(f, Fault::SplitFromRestarted { .. }))
+                .filter(|f| {
+                    !matches!(
+                        f,
+                        Fault::SplitFromRestarted { .. } | Fault::MetaReorder { .. }
+                    )
+                })
                 .collect();
             assert_eq!(rest, plain.faults);
-            arms += usize::from(rest.len() + 1 == drawn.faults.len());
+            let count = |want: fn(&Fault) -> bool| drawn.faults.iter().filter(|f| want(f)).count();
+            arms += count(|f| matches!(f, Fault::SplitFromRestarted { .. }));
+            // PROPOSED(D-135): one reorder arm in the first half of the faults, over the
+            // schedule D-131 drew, every other draw where it fell.
+            let at = drawn
+                .faults
+                .iter()
+                .position(|f| matches!(f, Fault::MetaReorder { .. }))
+                .expect("a shaped seed draws the reorder arm");
+            assert_eq!(count(|f| matches!(f, Fault::MetaReorder { .. })), 1);
+            assert!(
+                at <= (drawn.faults.len() - 1) / 2,
+                "in the first half: {at}"
+            );
+            let mut shaped = drawn.clone();
+            shaped.faults.remove(at);
+            shaped.gaps.remove(at);
+            shaped.picks.remove(at);
+            assert_eq!(shaped, Schedule::shaped(seed));
+            reorders += 1;
         }
         assert!(
             none > 0 && none < 512 / 4,
             "about one seed in {PLAIN_ONE_IN} draws none: {none} of 512"
         );
         assert!(writes > 0 && reads > 0 && stale > 0 && clients > 0 && arms > 0);
+        assert_eq!(
+            reorders + none,
+            512,
+            "every shaped seed draws the reorder arm"
+        );
     }
 }

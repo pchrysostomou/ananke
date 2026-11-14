@@ -2860,7 +2860,8 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
 /// sweep's own trace, since it is that sweep's read burst that reaches the variant: a read let in
 /// at receipt, served past the split that took its key. Compared fold by fold on the tier's first
 /// hundred at most, as every pair here is; caught on 57 of the hundred and 13 of the gate's
-/// twenty, so asserted at every tier.
+/// twenty, so asserted at every tier. `Fault::MetaReorder` moved the schedule: 63 of the hundred
+/// and 12 of the twenty since (PROPOSED D-135).
 // PROPOSED(D-131)
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only() {
@@ -2878,6 +2879,38 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at
     assert!(
         tripped_on(&found, Fold::ServingWithinSpan) > 0,
         "check 9 tripped on no compared seed of ReadCheckAtReceiptOnly's {seeds}"
+    );
+}
+
+/// Check 16 against `MetaOverwritesByArrival` over the sharded sweep's own trace (SHARD.md §12,
+/// Stage C's exit), where `Fault::MetaReorder` builds what the variant breaks: the first split's
+/// update held back from meta while the left half splits again through a third node, and applied
+/// after the second's. Compared fold by fold on the tier's first hundred at most; caught on 30 of
+/// the hundred and 6 of the gate's twenty, so asserted at every tier, where the node sweep's
+/// comparison below sees the variant on two pinned seeds of a hundred.
+// PROPOSED(D-135)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_the_sharded_meta_reorder() {
+    let seeds = range_folds_compared();
+    let found = range_folds_under("MetaOverwritesByArrival, sharded", seeds, |seed| {
+        ananke_sim::shard::run_of(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::MetaOverwritesByArrival]),
+        )
+        .records()
+        .to_vec()
+    });
+    println!(
+        "range folds: MetaOverwritesByArrival on the sharded sweep: check 16 tripped on {} of \
+         the {seeds} compared",
+        tripped_on(&found, Fold::MetaNeverGoesBack)
+    );
+    assert!(
+        tripped_on(&found, Fold::MetaNeverGoesBack) > 0,
+        "check 16 tripped on no compared seed of MetaOverwritesByArrival's {seeds} on the sharded \
+         sweep, where `Fault::MetaReorder` reorders meta's updates"
     );
 }
 

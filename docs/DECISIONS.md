@@ -26341,4 +26341,190 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+## PROPOSED D-135 — `Fault::MetaReorder` on the sharded sweep: a split's update held from meta while its left half splits again through a third node, the hold measured, and `MetaOverwritesByArrival` caught under it by check 16 at every tier and by the meta convergence bound (S12)
+
+**The number.** Off 0d67f99, S11's tip (#228), which carries D-132 (#226) and whose footer reads
+D-133. D-133 and D-134 are held for slices beside this one and are absent from this tree, so this
+entry is D-135, after D-132 in ascending order, and the footer moves to D-136. Every code site
+carries `// PROPOSED(D-135)`. Issue #162's S12, on `sim/shard.rs` (D-113), for SHARD.md §10, §11
+(item 10) and §12's Stage C list: "`Fault::MetaReorder` on stream `meta-reorder`", its firing
+asserted at every tier, the seeds on which meta applied the second split's update before the first
+printed, its hold measured before it is asserted (Q39), and check 16 against
+`MetaOverwritesByArrival`.
+
+### 1. The arm as built
+
+`Fault::MetaReorder { transfer_after, split_after }`, on stream `meta-reorder` (D-031), read into the
+sweep's terms from SHARD.md §10:
+
+1. **When it fires**, the arm takes the meta range's leader's node `m`, the latest `RaftLeader` of
+   range 1, and picks by its own draw among the user ranges that can split twice — a first cut with
+   at least twice `MIN_KEYS` of the clients' keys on its left and `MIN_KEYS` on its right, so the left
+   half has a cut of its own — and are led on a node `a` other than `m`. The range's third voter is
+   `c`. It blocks `a → m` one way (`Sim::block`) for `META_REORDER_HOLD` and asks `a` to split the
+   range at once. `a` commits the split through `c`, and its update of the first split, the left half
+   at the new generation, cannot reach `m`.
+2. **`transfer_after`** (100 to 200 ms) later, where the trace's latest descriptor of the range is
+   still the first split's left half, it asks the left half's leader to hand it to `c`
+   (`Command::Transfer`, `TimeoutNow`, D-028).
+3. **`split_after`** (100 to 200 ms) after that, where the left half is still the first split's, it
+   asks `c` to split it again. `c`'s update on taking office and the second split's two go to `m` by
+   an open link. `a`'s update of the first split stays pending in its `meta` task, sent again every
+   minimum election timeout until acknowledged (§1), and reaches `m` after the heal.
+
+Each step is resolved against the trace when it fires, and the stream's draws never depend on the
+run. Where no range qualifies, the arm does nothing, and its hold keeps its place in the timeline. It
+is drawn once on every seed that draws a shape (D-131), in the first half of the faults, where a range
+can still split twice; the one seed in eight that draws no shape draws no arm, so `Schedule::plain` is
+unchanged. `Schedule::shaped` is the sweep's schedule as D-131 drew it, kept for the pins found on it
+(§5); `Schedule::draw` is it with the arm. The arm's admins take numbers 150 to 176, past the restart
+arm's and short of the stale-cache shape's (`META_ADMIN`).
+
+Where this reads §10 rather than repeats it: §10 has "the driver splits the left half again through
+`c`"; here the arm's own admin asks the second split, as the restart arm asks its own (D-131), counted
+in the driver's figures, so no drawn action is spent on it and the second split is always the arm's
+left half. §10's "at a split of a range led on node `a`" is a split the arm asks, not one it waits for
+the driver to draw.
+
+**What the arm's reading is** (`shard::meta_reorders_of`, `Report::meta_reorders`). By the first apply
+of each meta index, as the meta convergence bound reads them: the first split's update is the record
+of the range whose end is the first cut, the second's is the range whose end is the second cut or the
+right half from the second cut to the first. The arm *reordered* meta where an update of the first
+split applied at an index above the first one of the second's: the order `MetaOverwritesByArrival`
+breaks on. Unit cases in `sim/shard.rs` hold the reading on hand-written records.
+
+### 2. Measured on the correct system
+
+By seeds, each count a subset of the one before it:
+
+| Seeds | drew the arm | fired | the left half handed on | the second split asked | meta applied the second's update | and a first's update after it |
+|---|---|---|---|---|---|---|
+| 100 | 93 | 40 | 36 | 35 | 35 | 27 |
+| 1 000 | 861 | 482 | 414 | 389 | 383 | 293 |
+| 10 000 | 8 747 | 4 790 | 4 061 | 3 840 | 3 790 | 2 924 |
+
+On the 379 of the thousand that drew it and did not fire, no user range could split twice led off
+meta's leader's node when the arm began. The correct system passes every seed at 20, 100, 1 000 and
+10 000 (§7). Both the firing and the reorder are well above D-061's 5 %, so the sweep asserts each at
+every tier and prints both.
+
+### 3. The hold, measured before it was asserted (Q39)
+
+How long after the block meta applied the second split's update, over the thousand's 383: median
+366 ms, p75 440 ms, p90 867 ms, p99 2.195 s, worst 5.740 s; 298 within 700 ms. Over the ten thousand's 3 790: median 371 ms, p75 436 ms, p90 817 ms, p99 1.551 s,
+worst 5.949 s; 2 990 within 700 ms. Two modes: the arm's own path, `transfer_after + split_after` (200 to 400 ms), then the
+second split's commit and meta's apply, which the hold covers; and a tail where a step went slow — a
+`NoRangeId` retry, a transfer not done, a fault of the run beside it — so the second's update comes
+after the heal and `a`'s arrives first. Those seeds do not reorder, which is why the 293 seeds
+reordered sit at the 298 updates within the hold. **`META_REORDER_HOLD` is 700 ms**: it covers the
+direct path past its p75; it lies inside the 300 to 900 ms the sweep's own one-way blocks already hold
+(`Fault::OneWay`), so it stalls no link longer than the sweep already did; and the correct system
+passes every seed under it. What is asserted on it is the arm's firing and its reorder, at every
+tier.
+
+### 4. The pair
+
+`MetaOverwritesByArrival`, each run taken to its end (`shard::run_to_the_end`), the test that had the
+pair on the sweep's drops and resends alone (D-113 §6):
+
+| | check 16 | the meta convergence bound | the arm reordered meta | of those, check 16 | of those, the bound |
+|---|---|---|---|---|---|
+| before, 1 000 seeds (the test's comment, on S11's tree) | 68 | 12 | — | — | — |
+| this tree, 1 000 seeds | 351 | 29 | 294 | 294 | 24 |
+| this tree, the gate's 20 | 6 | 1 | 6 | 6 | 1 |
+
+Check 16 trips on every seed the arm reordered, since the first split's left half, applied over the
+second's records, lowers the generation meta names; so the test asserts, at every tier, the arm's
+reorder, check 16 on each reordered seed, and check 16's catch, which at 35 % no longer waits for the
+thousand. The bound is still under 5 % and stays asserted over the thousand and printed below it
+(D-061). It sees the regressed record only where nothing writes over it before the run ends: the arm
+sits in the first half of the faults, and a later leader of either half taking office, or a split of
+either, sends an update that the variant also stores as it arrives, putting meta right. §10's "when the
+regressed record names a range that no longer exists" is not this stage's shape, since no range ceases
+to exist before Stage E's merge; what the bound sees here is the left half named at the first split's
+generation over the second's span, the second's right half gone from meta, which `meta_lags_of` reads
+as not named.
+
+**Fold by fold on this sweep's trace** (SHARD.md §12, Stage C's exit, "check 16 against
+`MetaOverwritesByArrival`"). The node sweep's comparison sees the variant on two pinned seeds of a
+hundred (D-109) and is unchanged. The new
+`the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_the_sharded_meta_reorder`
+compares the folds one by one on the sharded sweep's trace under the variant: check 16 on 30 of the
+hundred and 6 of the gate's twenty, so asserted at every tier. No fold is added, so no new fold
+owes the test.
+
+### 5. Pins (CLAUDE.md's rule)
+
+The arm is drawn only over the shaped schedule, so the pins that run `Schedule::plain` — fifteen,
+D-131's list — did not move: that schedule and every step of its run are unchanged. The five found on
+the shaped schedule moved, and each was re-read:
+
+- **16725** still reaches its situation on the sweep's schedule (the arm, fourth of nine, found no
+  range) and runs it unchanged; its comment now says the run's verdict, which named `timers` (#227),
+  is green there, still not the pin's to assert.
+- **707, 5620, 992 and 18925** do not. The arm, second of nine on 707, split range 20 and moved every
+  later step, and node 1's log of range 19 is never compacted to 119; on 5620 (first of seven) and 992
+  (third of six) it found no range and did nothing, but its hold still moved every later step, so
+  node 1 takes no snapshot of range 3 at 113 on 5620 and the restart arm's split is never refused
+  `NoRangeId` on 992; on 18925 (first of eight) it split range 2 twice and reordered meta, and the
+  restart arm then finds no range that can split and asks nothing. Each runs the schedule it was found
+  on, `Schedule::shaped`, byte for byte the run it was pinned on, and asserts its situation absent from
+  the sweep's schedule (`absent_from_the_sweep`), so that the day the schedule reaches it again the
+  test says so and the pin can run there. Seed 5620's variant run moves with it.
+
+The node sweep's pins (seeds 48 and 66 under check 16's comparison) run `raft::run_on_the_node` and
+did not move.
+
+### 6. What moved on the sweep's other tests
+
+Every variant test of the sharded sweep runs `Schedule::draw`, so each moved. Each still holds at the
+gate's twenty and CI's hundred on this tree, all 35 of the binary's tests green at 100. The rates in
+their comments are D-131's, on the shaped schedule; the premerge's printed rates are this tree's
+record. Two that moved and are printed at CI's tier: `ReadCheckAtReceiptOnly`'s fold-by-fold row,
+check 9 on 57 of the hundred before and 63 now (13 and 12 of the gate's twenty); at the gate's twenty, `ClientIgnoresMismatch` 19,
+`TrustStaleDescriptor` 20, `ApplyIgnoresSpan` check 9 17 and check 10 15, `IdBlockResumed` 6 (an
+earlier run's id on 10), `UninitialisedReplicaVotes` 19, `SnapshotOverlapsReplica` 7.
+
+### 7. The ten thousand
+
+`every_seed_passes_on_the_correct_sharded_sweep` at ANANKE_SEEDS=10000 in release: **0 of 10 000 seeds
+failed**, 5 666 s of wall under load averages of 200 to 320. The binary was built from this tree's
+`sim/shard.rs` and server before the pins were re-read and the sweep's reorder assertion was added;
+what changed after is the test files, doc comments and rustfmt's layout, and the run's printed
+reorder, 2 924, meets the assertion. Meta convergence was asked of 27 770 descriptors, none left unnamed, worst 853 ms
+against the bound's 2 s; the keyspace's first completion from the heal, asked of 4 656 seeds, worst
+998 ms against 2 s. #220's exception excused 45 descriptors on 35 seeds, 4 of them never named, where
+D-113 §6 counted 18 on 17 seeds before S11's shapes and this arm; its three conditions are unchanged
+and the sweep prints each as (seed, range, generation). Three shapes reached as D-131 has them within a
+few per cent (write burst 4 933, gets 3 781, stale cache 4 272) and any split with load on 9 974; the
+restart arm's split on 3 053 against D-131's 3 673, the one that moved: two more splits earlier in the
+run leave fewer ranges that can still split when the restart arm comes, as on seed 18925 (§5). It is
+still asserted at every tier.
+
+### 8. D-064's rows
+
+One new row, `node`'s fold-by-fold comparison above, weighed from the built release binary at
+ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100 as user + sys, three runs, the median, under load averages
+past 250 from other slices' sweeps, so if anything high: 22.6 (20.49 + 3.29, 19.76 + 2.53, 19.99 + 2.55,
+the median rounded up to a tenth), into the lightest shard, shard 4 at 2231.2 -> 2253.8.
+`every_seed_passes_on_the_correct_sharded_sweep` and the variant's test keep their rows and shards; the
+arm adds a fault of 700 ms and its quiet to seven seeds in eight, and their re-weigh is owed to the
+owner's next one, on a quiet machine.
+
+### 9. Questions for the owner, each with this entry's recommendation
+
+1. *The arm in the first half of the faults.* It fires on about half the seeds that draw it because a
+   range can still split twice there; later, the bound would see more of what check 16 sees, since
+   fewer updates follow to put meta right, and the arm would fire less. Recommended: keep; check 16 is
+   §10's first catch, and the bound is caught over the thousand.
+2. *The second split asked by the arm, not drawn by the driver.* Recommended: keep, as D-131 does for
+   the restart arm's split.
+3. *A hold of 700 ms.* Recommended: keep, for §3's reasons.
+4. *Four pins on `Schedule::shaped`, which the sweep no longer takes for any seed.* D-131's plain pins
+   run a schedule the sweep takes on one seed in eight; these run one it took before this entry. The
+   alternative is the arm drawn on a share of the shaped seeds, which would cost firing. Recommended:
+   keep, the absence on the sweep's schedule asserted.
+
+---
+
+_Next entry: D-136. Add one before implementing anything not covered above._

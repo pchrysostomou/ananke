@@ -101,6 +101,21 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-meta-reorder` (2026-11-14), off 0d67f99 (S11's tip, #228, carrying #226),
+  **PROPOSED D-135, #162's S12.** `Fault::MetaReorder` on `sim/shard.rs`, stream `meta-reorder`, one
+  on every seed that draws a shape, in the first half of the faults: a range that can split twice, led
+  off the meta range's leader's node, is split with its leader's link to that node blocked one way for
+  `META_REORDER_HOLD` (700 ms, measured: the second split's update applies at median 366 ms, 298 of
+  383 within it at a thousand seeds); its left half's lead goes to the third node, which splits it
+  again over an open link, so the first split's update reaches meta after the second's. Fired on 482
+  and reordered meta on 293 of 1 000 seeds, both asserted at every tier; the correct system passes
+  10 000 seeds under it. `MetaOverwritesByArrival`
+  under it: check 16 on 351 of 1 000 (68 before), on every reordered seed, now asserted at every tier;
+  the meta convergence bound on 29 of 1 000 (12 before), asserted over the thousand. A fold-by-fold row
+  for check 16 on the sharded sweep's trace, 30 of 100. Pins: the plain schedule's fifteen did not
+  move; seed 16725 still reaches its situation; 707, 5620, 992 and 18925 run `Schedule::shaped`, the
+  schedule they were found on, with their situations asserted absent from the sweep's.
+
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
