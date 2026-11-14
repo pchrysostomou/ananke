@@ -43,6 +43,7 @@
 //! | `RaftProgressReset`                      | `log` `ananke.raft.progress-reset`            |
 //! | `RaftSnapshotDeleted` / `RaftSnapshotReused` / `RaftSnapshotStreams` | `log` `ananke.raft.snapshot-deleted` / `.snapshot-reused` / `.snapshot-streams` |
 //! | `RaftSnapshotStartOver` / `RaftSnapshotState` | `log` `ananke.raft.snapshot-start-over` / `.snapshot-state` |
+//! | `RaftSnapshotReleased`                   | `log` `ananke.raft.snapshot-released`         |
 //! | `RaftSnapshotOverlapped` / `RaftSnapshotRestream` | `log` `ananke.raft.snapshot-overlapped` / `.snapshot-restream` |
 //! | `RaftMatchStarted` / `RaftLearnerRound` / `RaftChangeAccepted` | `log` `ananke.raft.match-started` / `.learner-round` / `.change-accepted` |
 //! | `RangeCreated` / `RangeDescriptor` / `RangesRestated` / `RangeReplicaCreated` | `log` `ananke.range.created` / `.descriptor` / `.restated` / `.replica-created` |
@@ -1215,6 +1216,14 @@ fn convert(
                 ("user_keys", int(*user_keys)),
                 ("user_digest", int(*user_digest)),
                 ("log_keys", int(*log_keys)),
+            ])),
+        ),
+        // PROPOSED(D-134): a hold let go with no switch is traced.
+        TraceEvent::RaftSnapshotReleased { server, range } => log(
+            "ananke.raft.snapshot-released",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
             ])),
         ),
         // PROPOSED(D-110): the leader's half of the overlap rule.

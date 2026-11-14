@@ -2435,12 +2435,16 @@ fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_h
 /// asked once, so node 1 is the only proposal of it and its entry applies at one place; the writer
 /// stays open, so the shape's reader asks nothing; and linearizability holds over the history.
 ///
-/// This is not a bare green: the run's verdict names `timers`, which is not what this seed is pinned
-/// for and not this pin's to assert. A hold on range 2 of node 3, taken at 7.681 s for an install
-/// that ended in `Unusable` at 8.222 s with no switch, is measured against the timer's bound, since
-/// the replay's exemption opens only on the switch's read-back (`reads_back`). The review named that
-/// schedule; D-131 records it.
+/// The run passes every check, and that is asserted beside the mechanism, not instead of it. Until
+/// PROPOSED D-134 its verdict was `timers` (issue #227): a hold on range 2 of node 3, taken at
+/// 7.681 s for an install that ended in `Unusable` at 8.222 s with no switch, was measured against
+/// the timer's bound, since the replay's exemption opened only on the switch's read-back
+/// (`reads_back`). The node now traces that release, decided at the hold (`RaftSnapshotReleased`),
+/// and the replay holds the replica from the one to the other. Asserted too: the check as it stood,
+/// `TimerResets::WITHOUT_RELEASED_HOLD`, still flags exactly #227's gap, and it falls inside that
+/// hold, so the day the schedule moves off it this says so.
 // PROPOSED(D-131)
+// PROPOSED(D-134): the timer check exempts a hold however it ends.
 #[test]
 fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice() {
     const WRITER: u64 = (95 << 32) | (1 << 16) | 5;
@@ -2533,6 +2537,52 @@ fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value
     );
     lin::check(&report.checked.history)
         .expect("seed 16725's history, every call placed: nothing reads a value applied twice");
+
+    // Issue #227's mechanism (PROPOSED D-134): the check as it stood on 0d67f99 flags server 3's
+    // replica of range 2 with #227's words, inside a hold its node let go with no switch, and the
+    // check as it stands holds the replica over it.
+    let without = report
+        .checked
+        .timer_gaps(raft::TimerResets::WITHOUT_RELEASED_HOLD);
+    assert_eq!(
+        without
+            .iter()
+            .map(raft::TimerGap::violation)
+            .collect::<Vec<_>>(),
+        vec![
+            "timers: server 3's replica of range 2 heard from no leader of its term and granted no \
+             vote since Instant(7.89247536s) and had not campaigned by Instant(8.193818102s)"
+                .to_owned()
+        ],
+        "seed 16725: the check without D-134's arm flags #227's gap, and only it"
+    );
+    let gap = without[0];
+    let hold = records
+        .iter()
+        .find(|record| {
+            matches!(
+                record.event,
+                TraceEvent::RaftSnapshotReleased {
+                    server: 3,
+                    range: 2
+                }
+            ) && record.decided < gap.at
+                && gap.at <= record.at
+        })
+        .expect("seed 16725: #227's gap falls inside a hold node 3 let go with no switch");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftSnapshot { server: 3, range: 2, taken: false, .. }
+                if record.decided == hold.decided
+        )),
+        "seed 16725: the hold on range 2 of node 3 ended in no switch"
+    );
+    assert_eq!(
+        report.check(),
+        Ok(()),
+        "seed 16725 passes every check once the hold is held to its release"
+    );
 }
 
 /// Seed 18925, D-092's check on an asker that had not asked, found past the nightly's range (PROPOSED

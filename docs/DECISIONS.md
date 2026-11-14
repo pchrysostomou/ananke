@@ -26341,4 +26341,61 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+## PROPOSED D-134 — The timer check exempts a live install's hold however it ends: the node traces a hold it lets go with no switch, `RaftSnapshotReleased`, decided at the hold, and the replica must campaign within its bound of the release (#227)
+
+**The number.** Off 0d67f99, S11's tip (#228), whose highest entry is D-132. This entry was given D-134; D-133 is not in this tree, and the footer names the number after the highest entry here, D-135. Every code site carries `// PROPOSED(D-134)`.
+
+**The defect, of the check.** D-091 exempts a replica whose core the node holds for a live install, from the install's decision to the restatement its switch traces. It opens on the switch's completion, `RaftSnapshot { taken: false }` paired with its read-back (`reads_back`) and decided at the hold (D-098). A hold that ends with no switch has no completion. `Task::finish` lets it go with `SnapAnswer::Abandoned` on every path short of the switch: the stream gone, the store gone, the store caught up (twice), the staged record unreadable, no descriptor, the overlap rule, the engine refusing the source, the switch's write failing. None of them traced the hold at either end, so the replay read the core as running through it. Seed 16725 of the sharded sweep, past the nightly's range (issue #227, D-131): node 3 took range 2's hold at 7.681476944 s, behind three other installs on the node; the replay flagged the replica at 8.193818102 s, "heard from no leader of its term and granted no vote since 7.89247536 s", its clock's last reset being a message delivered to the held core; and at 8.221968505 s the install gave up, the staged record unreadable (`StartOver::Unusable`), with no switch. The three `pre-candidate` records at that instant are its first steps once let go. The core took no tick for 540 ms and was measured as if it had. D-131 read it from a scratch trace and left it, since closing it needs the trace to say where such a hold began.
+
+**Nothing is widened.** `TIMER_TIMEOUTS` and `timer_bound` are unchanged, no seed is excluded, and no schedule moves (below). What changes is what the node traces and the check's model of the hold.
+
+### Decision
+
+1. **The node traces the release.** New `TraceEvent::RaftSnapshotReleased { server, range }`, moirae `ananke.raft.snapshot-released`. The `raft` task's host traces it where it hands the node `CoreWork::Release` for an install's answer (`released`, `crates/ananke-shard/src/server.rs`): at `Abandoned`, and at a `Switched` whose host rebuilt no replica (`installed` returning `None`). It is **decided at the install's decision**, the step that took the hold, so the one record carries both ends of the hold: its decision time is where the core stopped taking ticks and its durability time where it took them again (D-047). `SnapAnswer::Abandoned` and `Switched` carry that decision as `decided`, which `finish` already had as `held`. The one-group server never runs this path.
+2. **The replay holds the replica between the record's two times.** At its decision time it takes a running replica out of the running set into `held`, as D-091's open does. At its durability time, its own place in the trace's order, it puts the replica back and resets its clock, as D-091's close does at the restatement: so **a replica released by an abandoned install must campaign within its bound of the release**. Read by durability time the two places are one and the exemption is empty, the narrower reading, as D-091's is. The close answers any hold the replay took out, so a switch that rebuilt no replica, which D-091's arm opened on its completion and nothing closed but the replica's next `RaftTerm`, now closes at its release. Nothing is checked at the second place, so every gap is still reported at a record's own time.
+3. **Who leads is left as it stood.** D-091's open drops the replica from the leaders, since the switch restores a fresh follower. A release keeps the core the range had, and its role with it.
+4. **`TimerResets::released_hold`**, on in `ALL`; `WITHOUT_RELEASED_HOLD` is the check exactly as it stood on 0d67f99, and every older constant has it off. `timer_removal` reads the record as a status record, as it reads a completed install.
+
+### Alternatives
+
+- *A record where the hold is taken, at `Ready`, and another at the release.* Two events where one carries both ends, and the hold's start would then be read off a second record for a switch too, moving D-091's open fence and its reading by durability time with it.
+- *Opening on `RaftSnapshotStartOver`.* It is traced on some abandon paths (`Unusable`, `Overlaps`) and not on others (the stream gone, the store caught up), and it says what the stream does, not the hold. A fence read off it would be a timing coincidence, which D-091 rules out.
+- *Measuring from the replica's last contact with the held interval subtracted.* Tighter than a reset at the release, but D-091's close resets at the restatement, and the check reads both holds the same way. Nothing in the hold resets the kept core's timer, so a correct core hears from a leader or campaigns within one election timeout of the release, inside a bound of two from it.
+- *Widening the bound, or excluding the seed.* Forbidden (D-030, D-039, D-063, D-091).
+
+### What says so
+
+**The check's own pair, on records written by hand** (`sim/raft.rs`, `mod tests`), where a wrong rule is a different answer and not a different rate:
+
+- `a_hold_let_go_with_no_switch_is_held_between_its_decision_and_its_release`: seed 16725's shape, decided at 300 ms, released at 520 ms, flagged at 450 ms against a 400 ms bound. No gap under `ALL`; the gap under `WITHOUT_RELEASED_HOLD`; the gap again by durability time. The pair: a released replica that pre-votes 380 ms after the release passes, and one that never campaigns is caught at 970 ms, measured from the release.
+- `the_released_hold_exempts_the_hold_and_nothing_else`: an install decided after the flag excuses nothing before it; the node's other range is still measured; a switch that rebuilt no replica closes at its release (caught at 970 ms from 520 ms, where `WITHOUT_RELEASED_HOLD` never measures it again); a leader held and let go is not measured as a silent follower.
+
+Plants, each applied alone and reverted:
+
+| plant | caught by |
+|---|---|
+| no close: the release puts nothing back | the first test, the replica that never campaigns not caught (no gap where 520 ms to 970 ms is due); the second, case 3, the same |
+| the open drops the replica from the leaders, as D-091's does | the second test, case 4: the released leader measured as a silent follower, 520 ms to 970 ms |
+| no open | the first test, the gap at 450 ms inside the hold; the second, case 2, the held range flagged beside the other |
+
+**The timer check's variant still trips at its rate.** `ResetTimerOnAnyRpc` on the sharded sweep, share of 100 (`a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep`): 35 of 100 seeds fail, 30 of them by the timer check and 5 by the write bound, which is the rate its doc comment records; over the same hundred a timer gap on a range with a majority up is on 64 seeds both with D-134's arm and without it (a scratch reading of `timer_gaps` under `ALL` and `WITHOUT_RELEASED_HOLD`), so the arm takes no catch from the variant.
+
+**Seed 16725's pin** (`seed_16725_a_write_that_heard_nothing_is_asked_once_...`) keeps its mechanism and now asserts `report.check()` beside it, which D-131 could not: `WITHOUT_RELEASED_HOLD` flags exactly #227's gap, word for word, it falls inside a `RaftSnapshotReleased` of range 2 on node 3 with no switch at that decision, and the check passes.
+
+### What moves
+
+The trace gains one record per hold let go with no switch, on the node only; tracing draws nothing and waits on nothing, so no schedule moves: seed 16725's flag is the same record at the same instant under `WITHOUT_RELEASED_HOLD`. Over the sharded sweep's seeds 0 to 999, in release, a scratch count over the correct node's traces: **116** holds let go with no switch, on **84** seeds, every one of them an abandoned install and **none** a switch that rebuilt no replica; the number of timer gaps under `ALL` and under `WITHOUT_RELEASED_HOLD` is the same on every seed, and every seed passes. So inside the nightly's range the arm moves no verdict, and seed 16725 is the first seen where a hold let go with no switch outlasts the bound.
+
+Seeds 0 to 19 999 of the sharded sweep, in release, ran on this tree beside its gate, as #227 asks; what they reported is in the commit that carries this entry.
+
+**Tiers (D-061, D-064).** No sweep and no tier assertion is added. The two hand-built tests are in the crate's lib, which the `rest` job runs; seed 16725's pin already has its nightly row. `scripts/check-nightly-shards.sh` passes.
+
+### For the owner (PROPOSED)
+
+1. A new trace event, decided at the hold, rather than reading the hold off records the node already writes.
+2. The reset at the release, which matches D-091's close rather than subtracting the held interval.
+3. The close also ending D-091's hold where a switch rebuilt no replica, a path no seed of the thousand above reached, closed by the same record rather than left with one fence.
+
+---
+
+_Next entry: D-135. Add one before implementing anything not covered above._

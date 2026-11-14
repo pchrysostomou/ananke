@@ -887,6 +887,27 @@ pub enum TraceEvent {
         /// the kept tail's length and nothing else (D-083).
         log_keys: u64,
     },
+    /// A range's live install let the range's hold go with no replica restored
+    /// (D-066): the install was abandoned (the staged bytes unusable, the snapshot
+    /// overlapping, the store caught up, the stream gone) or its switch rebuilt no
+    /// replica, and the range goes on with the core it had, which now steps the work
+    /// held meanwhile.
+    ///
+    /// Traced by the node's `raft` task where it lets the hold go, and **decided at the
+    /// install's decision**, the step that took the hold (D-047). So the one record
+    /// carries both ends of the hold: its decision time is where the core stopped
+    /// taking ticks and its durability time where it took them again. A hold that ends
+    /// in a switch says the same with two records, the switch's completion
+    /// (`RaftSnapshot`, decided at the hold) and the restored replica's
+    /// `RaftRecovered`. Without this record a hold that ended with no switch could not
+    /// be told from a core that was running.
+    // PROPOSED(D-134): a hold let go with no switch is traced.
+    RaftSnapshotReleased {
+        /// The server.
+        server: u64,
+        /// The range whose hold was let go.
+        range: u64,
+    },
     /// A snapshot stream was resumed (RAFT.md §1): the sender re-sent from the last
     /// acknowledged offset of the last file after loss, rather than from zero.
     RaftSnapshotResumed {
