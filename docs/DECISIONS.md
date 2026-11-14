@@ -24749,6 +24749,144 @@ Giving them `audit_tree` moves that shape's schedules and its pins, which is #19
 
 ---
 
+## PROPOSED D-118 — The inbox carries the `net` task's receipt stamp, the node's restatement restates each record's `taken`, and state machine safety catches `SnapshotWithoutCurrentLast` on the node, asserted from the thousand
+
+**The number.** Off S11's tip at 0d67f99 (#228, which carries #226), whose footer reads D-133.
+D-118 was reserved for #126 and #167 and is the lowest free number, so this entry sits after
+D-117 in ascending order and the footer stays D-133, the highest entry plus one. Every code site
+carries `// PROPOSED(D-118)`. Closes #126 and #167.
+
+**Context.** PROPOSED D-089 aimed `Fault::CrashInstalling` per range, and
+`SnapshotWithoutCurrentLast` was then injected at its moment on the node and caught by nothing
+(#126). PROPOSED D-107 §6 measured why and shipped nothing: the node's `restate` traced
+`RaftSnapshot { taken: false }` for every record, so a restart onto a switch made without its
+repair read as an install, the floor rose to the leader's record and the applied index needed no
+log. Restating the flag alone caught the variant and failed the correct node on seed 358, because
+the node stamped a message's receipt where its round drained the inbox. #167 gives the order; this
+entry builds it. An earlier attempt at it sat uncommitted on a tree off de9f4d7; this is that
+work carried onto 0d67f99 and measured again there.
+
+**1. The inbox carries the `net` task's receipt** (D-073, item 4's owed half; D-050).
+`Received` gains `received: Decision`. The `net` task stamps a frame after decoding it and before
+admitting any of its messages, as the one-group server's does, and every message of the frame
+carries that stamp through the inbox and through a core's held queue. `node::received` hands the
+round the carried stamp and takes none of its own. `Tagged`'s `From` conversion becomes
+`Received::stamped`, so no message reaches the inbox without one. Snapshot chunks, which the `net`
+task diverts to the `snapshot` task before the inbox (D-083), carry no stamp: no term change is
+traced from them on the round.
+
+**2. The restatement restates each record's `taken`.** `server::restate` traces the record's own
+flag, as the one-group server does (`ananke-raft`'s `node.rs`, `incarnation`). What that says, per
+range and per start:
+- a replica's own take restates `taken: true`, which moves no floor;
+- a follower's compaction restates `taken: false`, since its record is written so (D-078);
+- an install restates `taken: false`, since the repair the correct switch carries writes that
+  record;
+- a switch made without the repair keeps the leader's record, `taken: true`, and the leader's
+  applied index under the replica's prefix.
+
+**Why this order: seed 358, which is still the seed on 0d67f99.** Node 2 crashed at 14.06 s and
+restarted at 14.267 s. Its `net` task received range 4's frame of term 12 at 14.285760250 s, while
+the start was opening the engine. Its isolation began at 14.746 s, the restatement ran at
+14.871899248 s inside it, and the round first drained the inbox at 14.876799988 s, stepping range 4
+from term 11 to 12. Range 4's record is its own take, so with the flag restated the check no
+longer skips it (`Report::reseeding_during`), and the change is decided inside the window. With
+the drain's stamp it read as received inside the window too, and the correct node failed. With the
+`net` task's stamp it is received 460 ms before the window, D-050's excuse holds it, and the check
+by decision time still flags it, which says the replica was read.
+
+**What the catch is.** State machine safety at the restart, in RAFT.md §5's words: "server 1
+recovered an applied index of 40 in group 3 but its log does not hold index 40". Measured on
+0d67f99 over the first thousand seeds of the raft sweep's arms, in release:
+
+| | the flag reverted | this tree |
+|---|---|---|
+| `SnapshotWithoutCurrentLast` caught, all by state machine safety | 0 of 1 000 | **19 of 1 000 (1.9 %)**, 5 of the first 100, seeds 26, 27, 29, 63, 91, 134, 205, 223, 246, 391, 445, 554, 579, 581, 594, 604, 617, 766, 776 |
+| of those, a recovered applied index the restated log does not hold | — | 19 of 19 |
+| `Fault::CrashInstalling` crashed at the final chunk of the range it aimed at | 176 of 1 000 | 169 of 1 000 (16.9 %), 19 of the first 100, 5 of the gate's 20; a run caught stops at the violation |
+| violations from any other check under the variant | none | none |
+| the correct node's sweep | green, every night on `main` | **green at 1 000** |
+| snapshots the correct node restated as a replica's own take | none, on 0 of the gate's 20 seeds | 13 083, on 995 of 1 000 seeds; 255 on 20 of the gate's 20 |
+
+These are the counts the slice first measured on de9f4d7 (19, 169, and 13 083 on 995): the node
+sweep's schedules on these arms did not move between the two trees. With the flag restated and
+the drain's stamp kept, the correct node fails seed 358 (the plants below). The ten thousand is the
+nightly's, dispatched on this slice's tip, with its run recorded on the PR, as #167 asks.
+
+Most of the catches are the sweep's other crashes landing in the window, as D-107 §6 found; two
+are the aimed arm's (seeds 91 and 581). #167 predicted 19 of 1 000 on an older tree, and the
+figure holds.
+
+**Tiers (D-061).** The catch at 1.9 % is asserted where `seeds() >= 1000`: a hundred see none
+about one run in seven, a thousand about five times in a billion. It is attributed to state machine
+safety and printed at every tier. The arm's firing keeps its hundred-seed assertion (D-089): at
+16.9 % a hundred see none about nine times in a billion and twenty about one run in forty. That a
+restart restated a replica's own take is asserted at every tier, on the correct node's sweep, from
+the measured rate above.
+
+**No schedule moved.** A stamp reads the time and nothing else (D-047, `SimEnv::decision`), and
+the flag is a field of a record no arm reads to time a fault: `install_completed` reads
+`taken: false` only of a victim that has not restarted since the heal. Every pin of the node
+binary that predates this entry, seed 57's among them, passes at the gate's tier, and the variant's
+catches and the arm's firings are the counts measured on de9f4d7. The trace-hash comparison with
+both changes blanked was made on de9f4d7's first 200 seeds and not repeated here. The node's JSONL gains `receivedNs` on the term
+records whose message waited for its step, as D-050's did for one group.
+
+**The pair and the pins.** The correct node's sweep and the variant's run the same seeds under the
+same arms. Pinned, each at every tier:
+- `seed_91_restarts_onto_one_ranges_switch_without_its_repair_and_state_machine_safety_reports_it`:
+  the aimed arm's crash at 12.256 s, range 3's switch at 40 durable and untraced, the node having
+  applied other ranges in that incarnation, the last 23 ms before the crash. The restart restates
+  range 3 `taken: true` at 40, range 1 `taken: false` at 43 and range 4 `taken: true` at 183, then
+  the violation above. The correct node passes the seed.
+- `seed_358_takes_a_term_received_before_its_isolation_and_stepped_inside_it_and_is_not_flagged`:
+  the shape above, to the nanosecond of the receipt, with the check by decision time flagging the
+  isolation and the check by cause passing it.
+- `a_term_change_carries_the_nets_receipt_and_not_the_rounds_drain`, a unit test in `node.rs`: a
+  frame admitted to a node whose `raft` task starts 30 ms later carries a receipt at least 30 ms
+  before its decision.
+
+**A restated take is not a take.** The flag restated, four readers on the node that read
+`RaftSnapshot { taken: true }` as a take that happened would count a restart's restatement as one:
+seed 57's two counts (D-111), the resplit run's fresh take (D-110), which a restart could have
+satisfied with an older take, and the re-seed shape's `takes_of` (D-117), whose count of takes is
+held against the version directories it finds. All four now read `snapshot_takes_of`, the fold
+`Report::snapshot_takes` already was, whose pairing of a checkpoint written with its record says a
+restatement is not a take (D-047's table), over bare records. `sim/install.rs`'s `takes` asks only
+whether a (server, range) ever took, and a restated take did, so it stays. The readers of
+`taken: false` as an install (`installs`, the split shape's `x_parent_installed_at`, the sharded
+sweep's `right_halves_of`, the membership scenario's joiners) now read installs and no restated
+take, which is what each says it reads.
+
+**What #126 asked to be shown, the mutation a world of one range could not catch.** Seed 91 is the
+install of one range with the ranges beside it live. The mutation is one flag for the node: every
+replica restated with the flag of the node's first record. On one group there is one record, so it
+is the identity; here it restates a take as a compaction, or the reverse. Seed 91 asserts range 1
+restated `taken: false` and range 4 `taken: true` at the one start, which no flag for the node can
+say; that mutation was reasoned from the pin and not run.
+
+**Plants.** Each applied to this tree behind a scratch switch, built in release and run, and none
+in a commit.
+
+| Plant | What fails |
+|---|---|
+| `restate` traces `taken: false` again | seed 91 (the run is green, so its `expect_err` fails); seed 358 (range 4 restated as an install); the correct sweep at the gate's 20, on its assertion that a restart restated a take (0 on 0 of 20); the catch at 1 000, 0 caught over 176 firings, on its `seeds() >= 1000` assertion |
+| `node::received` stamps at the drain again | seed 358 (the correct node fails it, on `checked`); `a_term_change_carries_…` (receipt and decision both at 30 ms). Seed 91 stays green. The correct sweep at 1 000 under this plant was not run here; #167 reports it failing on seed 358 alone |
+
+**What this leaves.** With the flag restated, a follower's compaction still reads `taken: false`,
+and `Report::reseeding_during` still reads that record, restated inside an isolation, as an install
+finished there. Seed 358 shows it: ranges 2 and 6 restated compactions inside the window, took terms
+from frames received before it, and were skipped. The one-group server's check reads the same record
+the same way, so the node's check is now no weaker than one group's, which is what #167 asked, and
+narrowing the skip is its own change: #193.
+
+**The nightly's rows (D-064).** One `node` row renamed in place, `…_is_injected_on_the_node` to
+`…_is_caught_on_the_node`, keeping its shard and its weight. Two pins added, 0.6 and 0.4 cpu s, longest-first into the lightest
+shard, shard 4 at 2231.2 -> 2232.2.
+**PROPOSED.**
+
+---
+
 ## PROPOSED D-119 — The sharded quorum scenario asks its hold of the root and the meta range: a re-seeded replica of either that votes is caught on nearly one seed in two, where it passed ten thousand (#143)
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-118 are held by

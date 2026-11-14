@@ -2022,16 +2022,16 @@ impl AfterSplit {
         Ok(())
     }
 
-    /// The checkpoints `x` took of `range`, by their trace.
+    /// The checkpoints `x` took of `range`, by their trace: each a checkpoint written and
+    /// its `RaftSnapshot { taken: true }` ([`crate::raft::snapshot_takes_of`]), so a
+    /// restart restating the record of a take, which says `taken: true` too, is not one.
     // PROPOSED(D-117)
+    // PROPOSED(D-118): a restart restating the record of a take is not a take.
     #[must_use]
     pub fn takes_of(&self, range: u64) -> usize {
-        self.records
+        crate::raft::snapshot_takes_of(&self.records)
             .iter()
-            .filter(|record| {
-                matches!(record.event, TraceEvent::RaftSnapshot { server, range: r, taken: true, .. }
-                    if server == self.x && r == range)
-            })
+            .filter(|take| take.server == self.x && take.range == range)
             .count()
     }
 }

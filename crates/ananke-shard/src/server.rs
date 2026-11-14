@@ -3393,6 +3393,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 let Ok(decoded) = decode(&bytes) else {
                     continue;
                 };
+                // D-050: when the frame reached the node, a stamp that reads the time
+                // and nothing else (D-047), so it moves no schedule. It rides the
+                // inbox entry of every message of the frame, and the step that takes
+                // the message puts it on a term change, however long the message
+                // waited in the inbox — behind the node's start, a flush or a held
+                // core — before a round drained it, as the one-group server's `net`
+                // task stamps its inbox events (node.rs, `run`).
+                // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
+                let received = env.decision();
                 for tagged in decoded.messages {
                     // Issue #96. `Raft::on_message`'s arm for `InstallSnapshot` and
                     // its response is empty, because "the server routes these to it
@@ -3431,12 +3440,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                         });
                         continue;
                     }
-                    let admission = inbox.admit(Received {
-                        range: tagged.range,
-                        from: tagged.frame.from,
-                        message: tagged.frame.message,
-                        bytes: tagged.bytes,
-                    });
+                    let admission = inbox.admit(Received::stamped(tagged, received));
                     for dropped in admission.dropped() {
                         env.trace(TraceEvent::RaftInboxDropped {
                             server,
@@ -3637,6 +3641,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
             .map_or((0, 0), |record| (record.last_index, record.last_term));
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
+        let snap_taken = snapshot_record.as_ref().is_some_and(|record| record.taken);
         let recovered_quarantined = recovered.quarantined;
         // A re-seeded replica is not fresh: its `RangeCreated` is the install's, with
         // `cause: snapshot`, and not a bootstrap's (§8; Q15).
@@ -3706,7 +3712,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             id_of,
             &core,
             &store,
-            (snap_index, snap_term),
+            (snap_index, snap_term, snap_taken),
             recovered_quarantined,
         );
         // §8: the replica's log restated, then its descriptor at its applied index. A
@@ -4206,28 +4212,46 @@ struct Reseeded<E: Environment> {
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the
 /// disk holds it, the snapshot it records, the configuration in force and the term,
 /// each naming the range (§8), and then its descriptor (`state_descriptor`).
+///
+/// `snapshot` is the record's last index and term and its own `taken`: whether the
+/// record is one this replica's take wrote or one an install's repair or a follower's
+/// compaction wrote (RAFT.md §2), restated as the record says, as the one-group server
+/// restates it (ananke-raft node.rs, `incarnation`).
 fn restate<E: Environment>(
     env: &E,
     server: u64,
     range: RangeId,
     core: &Raft,
     store: &RaftStore<E>,
-    snapshot: (Index, Term),
+    snapshot: (Index, Term, bool),
     quarantined: bool,
 ) {
-    let (snap_index, snap_term) = snapshot;
+    let (snap_index, snap_term, taken) = snapshot;
     env.trace(TraceEvent::RaftTruncate {
         server,
         range: range.get(),
         from_index: core.last_index() + 1,
     });
     if snap_index > 0 {
+        // The record's own flag. Until PROPOSED D-118 every restated snapshot was
+        // traced `taken: false`, an install, whatever the record said. A store
+        // switched to without its repair (`SnapshotWithoutCurrentLast` on the node's
+        // switch, PROPOSED D-086) keeps the leader's record, `taken: true`, and the
+        // leader's applied index; a crash between the switch's durability and its
+        // trace restarts onto both, and restated as an install the floor rose to the
+        // record and the applied index needed no log, so state machine safety had
+        // nothing to see (#126, #167). Restated as the record says, a taken snapshot
+        // moves no floor and the applied index its log cannot hold is reported. The
+        // pre-vote check's skip reads an install restated inside an isolation as an
+        // install (`Report::reseeding_during`), and a replica's own take restated
+        // there is now checked, which is why the receipt rides the inbox first (D-050).
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
         env.trace(TraceEvent::RaftSnapshot {
             server,
             range: range.get(),
             last_index: snap_index,
             last_term: snap_term,
-            taken: false,
+            taken,
         });
     }
     // The durable per-replica refused mark, restated per replica and carrying its range

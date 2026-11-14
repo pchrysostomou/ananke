@@ -3576,6 +3576,26 @@ impl Report {
         (installed, restated)
     }
 
+    /// How many snapshots a restart re-stated as the replica's own take: the
+    /// `RaftSnapshot { taken: true }` records `Restating` reads as a restatement's.
+    ///
+    /// The one-group server restates each record's own `taken`. The node did not until
+    /// PROPOSED D-118: it traced every restated record as an install, so on its trace
+    /// this was 0 whatever its stores held.
+    // PROPOSED(D-118): the restatement restates each record's `taken`.
+    #[must_use]
+    pub fn takes_restated(&self) -> usize {
+        let mut restating = Restating::default();
+        self.records
+            .iter()
+            .filter(|record| {
+                restating.saw(record);
+                restating.restated()
+                    && matches!(record.event, TraceEvent::RaftSnapshot { taken: true, .. })
+            })
+            .count()
+    }
+
     /// How many records satisfy `f`.
     pub fn count(&self, f: impl Fn(&TraceEvent) -> bool) -> usize {
         self.records.iter().filter(|r| f(&r.event)).count()
@@ -6669,52 +6689,7 @@ impl Report {
     /// truncation between the two discards it (D-047's table).
     #[must_use]
     pub fn snapshot_takes(&self) -> Vec<SnapshotTake> {
-        let mut written: BTreeMap<u64, (Instant, PathBuf)> = BTreeMap::new();
-        let mut takes = Vec::new();
-        for (index, record) in self.records.iter().enumerate() {
-            match &record.event {
-                TraceEvent::CheckpointWritten { dir, .. } => {
-                    if let Some(node) = record.node {
-                        written.insert(u64::from(node.get()), (record.at, dir.clone()));
-                    }
-                }
-                TraceEvent::RaftTruncate { server, .. } => {
-                    written.remove(server);
-                }
-                TraceEvent::RaftSnapshot {
-                    server,
-                    range,
-                    last_index,
-                    taken: true,
-                    ..
-                } => {
-                    if let Some((at, dir)) = written.remove(server) {
-                        takes.push(SnapshotTake {
-                            server: *server,
-                            // The take's range, from its own record. Pairing the
-                            // checkpoint with the node's next `RaftSnapshot` stays
-                            // sound on a node of four ranges because a take is the
-                            // `apply` task's and that task runs one job at a time
-                            // (Q14, D-083), so two ranges' takes cannot interleave
-                            // on one node. What is *not* sound without this field is
-                            // asking whether a server took at an index it had taken
-                            // at before: four ranges cross the threshold at about one
-                            // index (PROPOSED D-086).
-                            range: *range,
-                            index: *last_index,
-                            dir,
-                            at,
-                            record: index,
-                        });
-                    }
-                }
-                TraceEvent::NodeCrashed { node } => {
-                    written.remove(&u64::from(node.get()));
-                }
-                _ => {}
-            }
-        }
-        takes
+        snapshot_takes_of(&self.records)
     }
 
     /// The most registered reads any one replica held at once in this run, with the
@@ -7471,6 +7446,61 @@ struct SentMessage {
     /// batch frame's own tag on the node (PROPOSED D-086).
     range: u64,
     message: Message,
+}
+
+/// Every snapshot a server took on `records`: [`Report::snapshot_takes`], for a scenario
+/// whose report is not this one's. A restatement says `taken: true` where its record does
+/// and takes nothing, so a reader asking whether a take happened reads this and not the
+/// event's flag.
+// PROPOSED(D-118): the restatement restates each record's `taken`.
+#[must_use]
+pub fn snapshot_takes_of(records: &[TraceRecord]) -> Vec<SnapshotTake> {
+    let mut written: BTreeMap<u64, (Instant, PathBuf)> = BTreeMap::new();
+    let mut takes = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        match &record.event {
+            TraceEvent::CheckpointWritten { dir, .. } => {
+                if let Some(node) = record.node {
+                    written.insert(u64::from(node.get()), (record.at, dir.clone()));
+                }
+            }
+            TraceEvent::RaftTruncate { server, .. } => {
+                written.remove(server);
+            }
+            TraceEvent::RaftSnapshot {
+                server,
+                range,
+                last_index,
+                taken: true,
+                ..
+            } => {
+                if let Some((at, dir)) = written.remove(server) {
+                    takes.push(SnapshotTake {
+                        server: *server,
+                        // The take's range, from its own record. Pairing the
+                        // checkpoint with the node's next `RaftSnapshot` stays
+                        // sound on a node of four ranges because a take is the
+                        // `apply` task's and that task runs one job at a time
+                        // (Q14, D-083), so two ranges' takes cannot interleave
+                        // on one node. What is *not* sound without this field is
+                        // asking whether a server took at an index it had taken
+                        // at before: four ranges cross the threshold at about one
+                        // index (PROPOSED D-086).
+                        range: *range,
+                        index: *last_index,
+                        dir,
+                        at,
+                        record: index,
+                    });
+                }
+            }
+            TraceEvent::NodeCrashed { node } => {
+                written.remove(&u64::from(node.get()));
+            }
+            _ => {}
+        }
+    }
+    takes
 }
 
 /// One snapshot taken ([`Report::snapshot_takes`]).
