@@ -7,9 +7,10 @@
 //! check `sim/shard.rs`'s `Report::check` makes — checks 1 to 4 keyed by range, the range
 //! layer's folds (7, 8, 9, 10, 16, 17, 18, 20), linearizability of every key across every
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
-//! and per range the run ended with and the meta convergence bound — and that nodes 4 and
-//! 5 hold nothing. It prints the driver's work, the refusals by the loss that made them
-//! (#45), the empty blocks a split finds (D-092) and the bounds' margins.
+//! and per range the run ended with and the meta convergence bound — that nodes 4 and 5
+//! hold nothing, and that each of the workload's shapes reached its window (PROPOSED D-131).
+//! It prints the driver's work, the refusals by the loss that made them (#45), the empty blocks
+//! a split finds (D-092), the shapes' rates and the bounds' margins.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,8 +24,8 @@ use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::raft;
-use ananke_sim::shard::{self, DriverStats, DroppedTable, Loss, NoRangeId};
-use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_sim::shard::{self, DriverStats, DroppedTable, Load, Loss, NoRangeId};
+use ananke_sim::{lin, seeds, sweep, verdict, write_trace};
 
 /// What one seed of the sweep hands back: its verdict and its coverage.
 struct Seen {
@@ -60,6 +61,10 @@ struct Seen {
     crashes: usize,
     lease_reads: usize,
     placeholders: usize,
+    /// What the workload's shapes reached on this seed (PROPOSED D-131).
+    shapes: shard::Shapes,
+    /// Which shapes this seed drew: a write burst, a read burst, the stale cache, the restart.
+    drawn: [bool; 4],
 }
 
 /// SHARD.md §8's write bound, as `raft::Report::liveness_by_final_range` asks it, keeps the
@@ -168,6 +173,29 @@ fn seen_of(seed: u64) -> Seen {
         crashes: count(|e| matches!(e, TraceEvent::NodeCrashed { .. })),
         lease_reads: count(|e| matches!(e, TraceEvent::RaftRead { lease: true, .. })),
         placeholders: count(|e| matches!(e, TraceEvent::RangeReplicaCreated { .. })),
+        shapes: report.shapes(),
+        drawn: [
+            report
+                .schedule
+                .actions
+                .iter()
+                .any(|a| matches!(a.load, Load::WriteBurst { .. })),
+            report
+                .schedule
+                .actions
+                .iter()
+                .any(|a| matches!(a.load, Load::ReadBurst { .. })),
+            report
+                .schedule
+                .actions
+                .iter()
+                .any(|a| matches!(a.load, Load::StaleCache { .. })),
+            report
+                .schedule
+                .faults
+                .iter()
+                .any(|f| matches!(f, shard::Fault::SplitFromRestarted { .. })),
+        ],
         verdict,
     }
 }
@@ -318,6 +346,30 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         seen.iter().filter(|s| s.right_half).count()
     );
 
+    // PROPOSED(D-131): each shape, seeds that drew it and seeds that reached its window, each
+    // reached well above D-061's 5 % over the seeds that draw it.
+    let drawn = |i: usize| seen.iter().filter(|s| s.drawn[i]).count();
+    let reached =
+        |of: fn(&shard::Shapes) -> usize| seen.iter().filter(|s| of(&s.shapes) > 0).count();
+    let reached_writes = reached(|s| s.writes_refused_at_apply);
+    let reached_gets = reached(|s| s.gets_refused_at_serving);
+    let reached_stale = reached(|s| s.stale_reads_refused);
+    let reached_restart = reached(|s| s.splits_from_a_restarted_node);
+    let reached_load = reached(|s| s.clients_mismatched_by_a_split);
+    println!(
+        "shard: the workload's shapes over {count} seeds, drew it -> reached its window: a split \
+         under a right-half write burst {} -> {reached_writes}; under right-half gets {} -> \
+         {reached_gets}; while a client's cache names the parent {} -> {reached_stale}; a \
+         restart, then a split from that node {} -> {reached_restart}; any split with load -> \
+         {reached_load} (a sweep client answered `RangeMismatch` by a range that had split); no \
+         shape drawn on {}",
+        drawn(0),
+        drawn(1),
+        drawn(2),
+        drawn(3),
+        seen.iter().filter(|s| !s.drawn.iter().any(|d| *d)).count(),
+    );
+
     // The firings, each far above D-061's 5 % over the seeds that see them.
     assert!(splits > 0, "no split took effect");
     assert!(halves > 0, "no half split again");
@@ -342,6 +394,28 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
             "no split found an empty block over the thousand (PROPOSED D-092; D-061)"
         );
     }
+    // PROPOSED(D-131): the shapes, each asserted reached at every tier, each well above D-061's
+    // 5 % of the seeds that draw it.
+    assert!(
+        reached_writes > 0,
+        "no split's apply check refused a burst's write: the write burst's window was not reached"
+    );
+    assert!(
+        reached_gets > 0,
+        "no check at serving refused a burst's get: the read burst's window was not reached"
+    );
+    assert!(
+        reached_stale > 0,
+        "no stale reader was refused at receipt: the stale-cache shape's window was not reached"
+    );
+    assert!(
+        reached_restart > 0,
+        "no restarted node split a range: the restart arm's window was not reached"
+    );
+    assert!(
+        reached_load > 0,
+        "no client was answered `RangeMismatch` by a split range: no split had load"
+    );
 
     let inclusion: Vec<Result<(), String>> = seen.iter().map(|s| s.keys_asked.clone()).collect();
     verdict(&inclusion).unwrap();
@@ -350,9 +424,8 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
 }
 
 // --- The pair rule on this sweep (CLAUDE.md; SHARD.md §10): the correct system above, and
-// below the variants the sweep's own faults and driver reach, each caught by the check that
-// names it. S11 re-homes §10's routing variants with their shapes, and S12 brings
-// `Fault::MetaReorder`; what is asserted here is what this sweep reaches without them.
+// below the variants the sweep's own faults, driver and workload shapes (PROPOSED D-131) reach,
+// each caught by the check that names it. S12 brings `Fault::MetaReorder`.
 
 /// A variant's run of one seed: what the verdict said, and what each of the range layer's
 /// folds found on its own (PROPOSED D-106), since the verdict names only the first.
@@ -464,8 +537,8 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep()
 /// §10's second catch of `ClientIgnoresMismatch`, "the liveness bound a client that never
 /// converges": the write bound read on the uniform seeds, each run taken to its end since check
 /// 17 would otherwise stop it first. A client that resends to the range it knew gets nothing
-/// through while its cache is stale. On 14 of 500 uniform seeds no write of any key completed
-/// after the heal, and on 8 more the first completion anywhere came later than the bound from
+/// through while its cache is stale. On 12 of 500 uniform seeds no write of any key completed
+/// after the heal, and on 6 more the first completion anywhere came later than the bound from
 /// the heal, which the arm from each range's first call passes and only the reading from the heal
 /// says (PROPOSED D-113 §5). Each is under D-061's 5 %, so each is asserted over the thousand and
 /// printed below it.
@@ -519,7 +592,7 @@ fn a_client_that_ignores_a_mismatch_trips_the_write_bound_on_the_sharded_sweep()
     }
 }
 
-/// §10's `TrustStaleDescriptor`: 99 of 100 seeds, every client stale after the first split.
+/// §10's `TrustStaleDescriptor`: 100 of 100 seeds, every client stale after the first split.
 #[test]
 fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_sweep() {
     let found = range_variant(
@@ -533,7 +606,8 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_s
     );
 }
 
-/// §10's `ApplyIgnoresSpan`: 57 of 100 seeds by check 9, and 10 of them by check 10 too.
+/// §10's `ApplyIgnoresSpan`: 81 of 100 seeds by check 9, the run stopped there and 11 of them
+/// by check 10 too on the part of the run the stop left it (each run to its end, below).
 #[test]
 fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_sweep() {
     let found = range_variant("ApplyIgnoresSpan", share(), RangeVariant::ApplyIgnoresSpan);
@@ -543,8 +617,117 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_s
     );
 }
 
+/// §10's `ReadCheckAtReceiptOnly`, the pair's buggy half (the correct half is the sweep above,
+/// which reaches this window and refuses every such read at serving: PROPOSED D-131): 57 of 100
+/// seeds and 13 of the gate's 20 by check 9, the variant's named catch, at a `RaftRead` served for a right-half key at
+/// or past the split it let in. Every failure is that catch, and none trips first on anything else,
+/// so the words are asserted of every one.
+// PROPOSED(D-131)
+#[test]
+fn a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep() {
+    let found = range_variant(
+        "ReadCheckAtReceiptOnly",
+        share(),
+        RangeVariant::ReadCheckAtReceiptOnly,
+    );
+    let failed: Vec<&str> = found.iter().filter_map(|u| u.why.as_deref()).collect();
+    assert!(
+        tripped(&found, Fold::ServingWithinSpan) > 0,
+        "no read served past the split that let it in reached check 9: the read burst's window was \
+         not reached under the variant"
+    );
+    assert!(
+        failed.iter().all(|why| why.contains("at serving")),
+        "the variant is caught by check 9 at serving and by nothing else first: {failed:?}"
+    );
+}
+
+/// §10's `ApplyIgnoresSpan`, the rest of what its row names: a write P applied out of its span
+/// over one R had already written is check 10 (72 of 100 seeds and 13 of the gate's 20), asserted at
+/// every tier (D-061); each run taken to its end, since check 9 would otherwise stop it first. §10's third
+/// catch, linearizability, is measured and printed and asserted of no tier: the keys of every
+/// range on a node share one engine, so R's readers do see a write P made outside its span,
+/// and the row's "a write P acknowledged that R's readers never see" has been reached on no
+/// seed (PROPOSED D-131, the owner's question).
+// PROPOSED(D-131)
+#[test]
+fn a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep() {
+    let run = share();
+    let found = sweep(run, |seed| {
+        let report = shard::run_to_the_end(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::ApplyIgnoresSpan]),
+        );
+        let folded = invariants::folded(report.records());
+        (
+            folded.verdict_of(Fold::ServingWithinSpan).is_err(),
+            folded.verdict_of(Fold::GenerationsRise).is_err(),
+            ananke_sim::lin::check(&report.checked.history).is_err(),
+        )
+    });
+    let (nine, ten, lin) = (
+        found.iter().filter(|f| f.0).count(),
+        found.iter().filter(|f| f.1).count(),
+        found.iter().filter(|f| f.2).count(),
+    );
+    println!(
+        "shard: ApplyIgnoresSpan, each run to its end over {run}: check 9 on {nine}, check 10 on \
+         {ten}, linearizability on {lin} (measured, not asserted: PROPOSED D-131)"
+    );
+    assert!(nine > 0, "no write applied out of its span reached check 9");
+    assert!(
+        ten > 0,
+        "no key was written by two owners at one generation"
+    );
+}
+
+/// §10's `TrustStaleDescriptor`, the rest of its row: the stale-cache shape's reader served by the
+/// parent, and linearizability's catch, a read through P returning what a write through R has
+/// replaced: 28 of 1 000 seeds, under D-061's 5 %, so asserted over the thousand and printed
+/// below it, on the sweep's own seeds taken to their ends as check 9 would otherwise stop them
+/// first (as the write bound's catch does for `ClientIgnoresMismatch`).
+// PROPOSED(D-131)
+#[test]
+fn a_server_that_trusts_a_stale_descriptor_serves_what_a_write_through_r_replaced() {
+    let run = if seeds() >= 1000 {
+        seeds().min(1000)
+    } else {
+        share()
+    };
+    let found = sweep(run, |seed| {
+        let report = shard::run_to_the_end(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::TrustStaleDescriptor]),
+        );
+        (
+            shard::stale_reads_served_of(report.records()) > 0,
+            ananke_sim::lin::check(&report.checked.history).is_err(),
+        )
+    });
+    let served = found.iter().filter(|f| f.0).count();
+    let lin = found.iter().filter(|f| f.1).count();
+    println!(
+        "shard: TrustStaleDescriptor, each run to its end over {run}: the stale reader served by the \
+         parent on {served}, linearizability on {lin}"
+    );
+    assert!(
+        served > 0,
+        "no stale reader was served by the parent: the stale-cache shape did not reach the variant"
+    );
+    if seeds() >= 1000 {
+        assert!(
+            lin > 0,
+            "no read through the parent returned what a write through the right half replaced"
+        );
+    }
+}
+
 /// §10's `UninitialisedReplicaVotes` off its directed shape: a re-seeded node's placeholders
-/// meet its ranges' elections on 98 of 100 seeds.
+/// meet its ranges' elections on 99 of 100 seeds.
 #[test]
 fn a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep() {
     let found = range_variant(
@@ -558,7 +741,7 @@ fn a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep() 
     );
 }
 
-/// §10's `SnapshotOverlapsReplica` off its directed shape: 19 of 100 seeds by check 8's
+/// §10's `SnapshotOverlapsReplica` off its directed shape: 25 of 100 seeds by check 8's
 /// overlap clause.
 #[test]
 fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep() {
@@ -573,14 +756,16 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
     );
 }
 
-/// §10's `IdBlockResumed`: 10 of 100 seeds by check 18, on restarts the faults draw and
-/// splits the driver happens to land on the restarted node. A rate the gate's twenty would miss
-/// about one time in eight, so the catch is asserted over the thousand's share alone (D-061);
-/// S11's restart and split shape is what is meant to raise it. What every tier asserts is the
-/// shape the variant aims at: a split that took an id from a block of an earlier run of its node
-/// (`shard::splits_from_a_block_of_an_earlier_run_of`), 30 of 100 seeds and 6 of the gate's 20. The
-/// correct node's new run holds none, so that is the variant seen firing.
+/// §10's `IdBlockResumed`: 42 of 100 seeds and 4 of the gate's 20 by check 18, on the restart arm's shape
+/// (`Fault::SplitFromRestarted`, PROPOSED D-131), where it was 10 of 100 on the restarts the faults
+/// drew and the splits that landed on them by chance before the arm. So the catch is asserted at
+/// every tier, in the words of §12's "wrong if": a tier that runs this and catches nothing says
+/// the sweep does not reach the variant. The shape the variant aims at is asserted too: a split that
+/// took an id from a block of an earlier run of its node
+/// (`shard::splits_from_a_block_of_an_earlier_run_of`), on 62 of 100 seeds and 8 of the gate's 20. The correct node's new run
+/// holds none, so that is the variant seen firing.
 // PROPOSED(D-113): §10, the shape at every tier.
+// PROPOSED(D-131): §12's "wrong if", at every tier the arm reaches it.
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sharded_sweep() {
     let found = range_variant("IdBlockResumed", share(), RangeVariant::IdBlockResumed);
@@ -595,20 +780,19 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sh
         "no split took an id from a block of an earlier run of its node: the restart and the \
          split IdBlockResumed needs were not reached"
     );
-    if seeds() >= 1000 {
-        assert!(
-            tripped(&found, Fold::SplitLineage) > 0,
-            "no id was taken twice over the thousand's share"
-        );
-    }
+    assert!(
+        tripped(&found, Fold::SplitLineage) > 0,
+        "IdBlockResumed was caught by check 18 on no seed: the sharded sweep does not reach it \
+         (SHARD.md §12's \"wrong if\")"
+    );
 }
 
 /// §10's `MetaOverwritesByArrival` on what this sweep's drops and resends do by themselves:
-/// 46 of 1 000 seeds by check 16, and 8 of 1 000 by the meta convergence bound, so both are
+/// 68 of 1 000 seeds by check 16, and 12 of 1 000 by the meta convergence bound, so both are
 /// asserted over the thousand and printed below it (D-061). `Fault::MetaReorder` is S12's. The
 /// bound is asked of the run taken to its end, which check 16 would otherwise stop first. What
 /// every tier asserts is the shape the variant aims at: a split's update stored again over a key
-/// meta already named at its generation or a newer one (`shard::meta_resends_stored_of`), 985 of
+/// meta already named at its generation or a newer one (`shard::meta_resends_stored_of`), 988 of
 /// 1 000 seeds and 19 of the gate's 20. The correct meta range stores none, so that is the variant
 /// seen firing.
 // PROPOSED(D-113): §10, the shape at every tier.
@@ -659,14 +843,14 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_swee
     }
 }
 
-/// Phase 2's pre-vote variant under this sweep's isolations: 80 of 100 seeds.
+/// Phase 2's pre-vote variant under this sweep's isolations: 81 of 100 seeds.
 #[test]
 fn a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep() {
     let found = core_variant("NoPreVote", Variant::NoPreVote);
     assert!(said(&found, "pre-vote:") > 0, "no isolation raised a term");
 }
 
-/// Phase 2's timer variant: 31 of 100 seeds by the timer check, and 2 more by the write bound.
+/// Phase 2's timer variant: 30 of 100 seeds by the timer check, and 5 more by the write bound.
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep() {
     let found = core_variant("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
@@ -676,9 +860,9 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep(
     );
 }
 
-/// The disk's half of the fault model: Q15's whole-node refusal, which the rot reaches on 31
-/// of 100 seeds. A node that refuses one range alone goes on serving the others over an
-/// engine that lost state: 19 of 100 seeds by state machine safety.
+/// The disk's half of the fault model: Q15's whole-node refusal, which the rot reaches on 401
+/// of 1 000 seeds. A node that refuses one range alone goes on serving the others over an
+/// engine that lost state: 18 of 100 seeds by state machine safety.
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_by_the_disks_rot_on_the_sharded_sweep() {
     let found = under(
@@ -707,7 +891,7 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep() {
 /// D-092's rule that makes answer A enough, broken: a node at or below its threshold keeps a
 /// refill outstanding, resent "until a grant carrying its current run nonce arrives". Under
 /// `RefillNotResent` a refill sent while range 0 has no leader is the last, every split on that
-/// node is refused `NoRangeId`, and an asker's retries after the heal end with no answer: 40 of
+/// node is refused `NoRangeId`, and an asker's retries after the heal end with no answer: 32 of
 /// 100 seeds, by this check and no other.
 // PROPOSED(D-092): answer A; the asker retries.
 // PROPOSED(D-113): §8's pair for the check read from the heal.
@@ -726,7 +910,7 @@ fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered()
 /// a cluster nothing can write to for longer than the bound after the heal. No range's first call
 /// in the history comes before the cut ends, so the arm from the first call is satisfied and this
 /// arm is what is left to say so; where the 150 ms left complete nothing, the clients-wrote-nothing
-/// arm speaks first. Above the 5 % of D-061 on every tier: 42 of 100 seeds, a uniform 42 of 50.
+/// arm speaks first. Above the 5 % of D-061 on every tier: 41 of 100 seeds, a uniform 41 of 50.
 // PROPOSED(D-113): §5's pair for the reading from the heal.
 #[test]
 fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal() {
@@ -762,6 +946,62 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 }
 
 // --- The first Phase 3 seeds pinned, each asserting its mechanism (CLAUDE.md).
+//
+// PROPOSED(D-131): the workload's shapes moved every seed's schedule but the one seed in eight that
+// draws none. Of these pins, seeds 128, 8934 and 7949 draw none and did not move; 286, 368, 41, 643,
+// 986, 463, 3291, 3870, 5303, 2097, 9 and 2272 moved. Each was found on a schedule with no shape on
+// it, so each runs that one (`shard::Schedule::plain`, the schedule of the one seed in eight that
+// draws no shape, and not the one the sweep runs for the twelve seeds that moved), byte for byte the
+// trace it was pinned on, which D-131 measured by the traces' hashes. On the shaped schedule most of
+// these pins fail, a shape having landed elsewhere in the run; seed 286's passes unchanged, its
+// situation reached there as well. The rule's own case, read: what these pins were pinned for is
+// kept, by running the schedule that reaches it. Seeds 707, 992, 5620, 16725 and 18925, at the end,
+// are the first found on the shaped schedule, and run it.
+
+/// A pin's correct run, on the schedule it was found on ([`shard::Schedule::plain`]).
+// PROPOSED(D-131)
+fn pinned(seed: u64) -> shard::Report {
+    pinned_of(
+        seed,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    )
+}
+
+/// A pin's run under the three sets, on the schedule it was found on.
+// PROPOSED(D-131)
+fn pinned_of(
+    seed: u64,
+    cores: impl Into<Variants>,
+    node: NodeVariants,
+    range: RangeVariants,
+) -> shard::Report {
+    shard::run_with(
+        seed,
+        shard::Schedule::plain(seed),
+        cores.into(),
+        node,
+        range,
+    )
+}
+
+/// [`pinned_of`], taken to its schedule's end with no check stopping it.
+// PROPOSED(D-131)
+fn pinned_to_the_end(
+    seed: u64,
+    cores: impl Into<Variants>,
+    node: NodeVariants,
+    range: RangeVariants,
+) -> shard::Report {
+    shard::run_to_the_end_with(
+        seed,
+        shard::Schedule::plain(seed),
+        cores.into(),
+        node,
+        range,
+    )
+}
 
 /// Seed 286, no store refused, so D-128 and D-129 leave it where it is: node 1 restarts, leads
 /// a range the driver then asks it to split, and holds no id, since a new run holds none until
@@ -770,7 +1010,7 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 /// gets its answer. What the block's size cannot change (PROPOSED D-113 §8).
 #[test]
 fn seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands() {
-    let report = shard::run(286);
+    let report = pinned(286);
     report.check().unwrap();
     assert!(report.refusals().is_empty(), "no store refused");
     let empties = report.no_range_ids();
@@ -798,7 +1038,7 @@ fn seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands() {
 /// (PROPOSED D-113 §8).
 #[test]
 fn seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split() {
-    let report = shard::run(368);
+    let report = pinned(368);
     report.check().unwrap();
     assert!(report.refusals().is_empty(), "no store refused");
     assert!(report.checked.uniform(), "uniformly scheduled");
@@ -844,7 +1084,7 @@ fn seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split() {
 /// is the first and the one this pins.
 #[test]
 fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
-    let report = shard::run(41);
+    let report = pinned(41);
     report.check().unwrap();
     let refused = report.refusals();
     assert_eq!(refused.len(), 2, "two stores refused: {refused:?}");
@@ -865,7 +1105,7 @@ fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
         right.is_some() && right < parent,
         "the right half's install comes first: {right:?}, {parent:?}"
     );
-    let why = shard::run_to_the_end(
+    let why = pinned_to_the_end(
         41,
         Variants::default(),
         NodeVariants::of(&[NodeVariant::InstallReplacesHostedSpan]),
@@ -890,7 +1130,7 @@ fn seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it() {
 #[test]
 fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
     for seed in [128, 643, 986] {
-        let report = shard::run(seed);
+        let report = pinned(seed);
         report.check().unwrap();
         assert_eq!(
             report.refusals().len(),
@@ -909,7 +1149,7 @@ fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
             )),
             "seed {seed} reaches a read no round can confirm again: pin it on its mechanism"
         );
-        shard::run_of(
+        pinned_of(
             seed,
             Variant::UnconfirmableReadKept,
             NodeVariants::correct(),
@@ -926,7 +1166,7 @@ fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
 /// the clients' retries pile up and the node fails itself at `READS_OUTSTANDING`.
 #[test]
 fn seed_463_a_leader_refuses_the_reads_it_can_never_confirm() {
-    let report = shard::run(463);
+    let report = pinned(463);
     report.check().unwrap();
     assert_eq!(report.refusals().len(), 2, "two stores refused");
     let refused = report
@@ -945,7 +1185,7 @@ fn seed_463_a_leader_refuses_the_reads_it_can_never_confirm() {
         )),
         "no leader was traced unable to confirm a read"
     );
-    let why = shard::run_of(
+    let why = pinned_of(
         463,
         Variant::UnconfirmableReadKept,
         NodeVariants::correct(),
@@ -975,7 +1215,7 @@ fn node_of(record: &TraceRecord) -> Option<u64> {
 #[test]
 fn seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant() {
     let (node, parent, right, split) = (3, 27, 30, 122);
-    let report = shard::run(3291);
+    let report = pinned(3291);
     report.check().unwrap();
     let records = report.records();
     let on_node = |record: &TraceRecord| node_of(record) == Some(node);
@@ -1059,7 +1299,7 @@ fn seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant() {
 #[test]
 fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh() {
     let (leader, follower, range) = (1, 2, 43);
-    let report = shard::run(8934);
+    let report = pinned(8934);
     report.check().unwrap();
     let records = report.records();
     let on_follower = |record: &TraceRecord| node_of(record) == Some(follower);
@@ -1183,9 +1423,11 @@ fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracki
 /// grants no vote, leads nothing, and the entries committed on node 3 before its loss are on
 /// the next leader and applied at their own term. Under `SplitLeavesQuarantineBehind` it makes
 /// the right half with no quarantine, and votes. On 3870 it leads term 4 from last index 106
-/// and applies a 107 of its own: state machine safety. On 5303 it grants node 1 term 5 with
-/// last index 88 against a committed 89: leader completeness. Two seeds of ten thousand are far
-/// below D-061's 5 %, so the pair lives on these pins, at every tier.
+/// without the 107 committed before its loss: leader completeness, which since PROPOSED D-131
+/// reads the store the re-made replica holds, where it had read the store it lost, and so caught
+/// this no later than state machine safety did at the apply of a 107 of its own. On 5303 it grants
+/// node 1 term 5 with last index 88 against a committed 89: leader completeness. Two seeds of ten
+/// thousand are far below D-061's 5 %, so the pair lives on these pins, at every tier.
 // PROPOSED(D-130)
 #[test]
 fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries() {
@@ -1208,7 +1450,8 @@ fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_com
             103,
             107..=115,
             108..=115,
-            "state machine safety: index 107 of group 19 was applied as term 2",
+            "leader completeness: index 107 of group 19 (term 2) was committed in term 2 but \
+             server 3, leader of term 4, does not hold it",
         ),
         (
             5303,
@@ -1224,7 +1467,7 @@ fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_com
     ];
     let node = 3;
     for (seed, parent, right, split, below, committed, reapplied, named) in pins {
-        let report = shard::run(seed);
+        let report = pinned(seed);
         report.check().unwrap();
         let records = report.records();
         let on_node = |record: &TraceRecord| node_of(record) == Some(node);
@@ -1378,7 +1621,7 @@ fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_com
         }
 
         // The buggy half: the seed's named failure, and the vote that made it.
-        let variant = shard::run_of(
+        let variant = pinned_of(
             seed,
             Variants::default(),
             NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
@@ -1432,7 +1675,7 @@ fn seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_com
 #[test]
 fn seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() {
     let (node, parent, right, split) = (2, 2, 27, 143);
-    let correct = shard::run(2097);
+    let correct = pinned(2097);
     correct.check().unwrap();
     let records = correct.records();
     assert_eq!(correct.refusals().len(), 1, "one store refused");
@@ -1505,7 +1748,7 @@ fn seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() 
         "the quarantined replica granted a vote"
     );
 
-    let variant = shard::run_of(
+    let variant = pinned_of(
         2097,
         Variants::default(),
         NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
@@ -1570,7 +1813,7 @@ fn seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too
         matches!(record.event, TraceEvent::RaftVote { server, range, granted: true, .. }
             if server == node && range == right)
     };
-    let correct = shard::run(9);
+    let correct = pinned(9);
     correct.check().unwrap();
     let records = correct.records();
     assert_eq!(correct.refusals().len(), 1, "one store refused");
@@ -1657,7 +1900,7 @@ fn seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too
         "range 4 took an install before its split"
     );
 
-    let variant = shard::run_of(
+    let variant = pinned_of(
         9,
         Variants::default(),
         NodeVariants::of(&[NodeVariant::SplitLeavesQuarantineBehind]),
@@ -1718,7 +1961,7 @@ fn seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_th
             ],
         ),
     ] {
-        let report = shard::run(seed);
+        let report = pinned(seed);
         report.check().unwrap();
         report.meta_converges().unwrap();
         assert!(
@@ -1790,7 +2033,7 @@ fn seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_th
 #[test]
 fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken() {
     let (range, parent, split) = (36, 2, 119);
-    let mut report = shard::run(2272);
+    let mut report = pinned(2272);
     report.meta_converges().unwrap();
     let whole = report.checked.records.clone();
     let heal = report.last_fault_healed;
@@ -1883,6 +2126,470 @@ fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
         "a placeholder an apply should have ended",
         records,
         &|half| half.others == BTreeSet::from([1]),
+    );
+}
+
+/// Seed 707, the first shape-drawn seed the correct system failed on, and a defect of the log
+/// view and not of the system (PROPOSED D-131). Node 1 restarted with its log of range 19 compacted
+/// to 119 and one entry at 120, and its next restart was refused: the re-seed's floor is 112, below
+/// both. The store that held 120 is gone, but the view kept that entry with nothing under it, so
+/// node 2's restated 120 read as agreeing with a log that differs at 119, though every entry any
+/// node traced at 119 and at 120 carries the same hash. The view now forgets a replica's entries at
+/// its creation; with node 1's creation taken out of the trace it says what it said before.
+// PROPOSED(D-131)
+#[test]
+fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view() {
+    let (node, range) = (1, 19);
+    let report = shard::run(707);
+    report.check().unwrap();
+    let records = report.records();
+    let find = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records
+            .iter()
+            .position(want)
+            .unwrap_or_else(|| panic!("seed 707 no longer reaches {what}: read its trace"))
+    };
+    let compacted = find(
+        "node 1's restart with its log compacted to 119",
+        &|record| {
+            matches!(record.event, TraceEvent::RaftSnapshot {
+            server, range: of, last_index: 119, taken: false, ..
+        } if server == node && of == range)
+        },
+    );
+    let refused = find(
+        "node 1's refusal",
+        &|record| matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == node),
+    );
+    let created = find("node 1's re-seed at 112", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeCreated {
+                range: of, cause: RangeCause::Snapshot, floor_index: 112, ..
+            } if of == range)
+    });
+    let restated = find("node 2's 120 restated after the re-seed", &|record| {
+        matches!(record.event, TraceEvent::RaftAppend {
+            server: 2, range: of, index: 120, ..
+        } if of == range)
+            && record.at > records[created].at
+    });
+    assert!(
+        compacted < refused && refused < created && created < restated,
+        "the shape's order: compacted {compacted}, refused {refused}, re-seeded {created}, \
+         restated {restated}"
+    );
+    let hashes_at = |index: u64| -> BTreeSet<u64> {
+        records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftAppend {
+                    range: of,
+                    index: at,
+                    hash,
+                    ..
+                } if of == range && at == index => Some(hash),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(hashes_at(119).len(), 1, "every copy of 119 is one entry");
+    assert_eq!(hashes_at(120).len(), 1, "every copy of 120 is one entry");
+    let without: Vec<ananke_raft::invariants::Traced<'_>> = records
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != created)
+        .map(|(_, record)| ananke_raft::invariants::Traced::new(node_of(record), &record.event))
+        .collect();
+    let old_reading = ananke_raft::invariants::log_matching(without)
+        .expect_err("the creation is what the view forgets the lost store by");
+    assert!(
+        old_reading.contains(
+            "servers 2 and 1 agree at index 120 of group 19 term 3 but differ at index 119"
+        ),
+        "the violation the old reading made of it: {old_reading}"
+    );
+}
+
+/// Seed 992, the other shape-drawn seed the correct system failed on, and a defect of the asker
+/// and not of the system (PROPOSED D-131). The restart arm's split is refused `NoRangeId` on node
+/// 1's new run, and its retry is proposed and applied 130 ms later, but the answer to the retry is
+/// dropped by the network. A leader answers a split's entry once, at its apply, and a copy with
+/// silence, so an asker that sent the same copy heard nothing for 3.2 s and D-092's bound said so
+/// (`Report::retries_take_effect`). The bound is unchanged. The asker now asks anew after a silent
+/// wait, is refused `KeyOutsideSpan` at once since the split has landed, and stops within it.
+// PROPOSED(D-131)
+#[test]
+fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound() {
+    let report = shard::run(992);
+    report.check().unwrap();
+    assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
+    let arm = report.restart_arms[0];
+    let seq = arm.seq.expect("the arm asked its split");
+    assert_eq!(
+        report.driver.retried.len(),
+        1,
+        "{:?}",
+        report.driver.retried
+    );
+    let retried = report.driver.retried[0];
+    let empties = report.no_range_ids();
+    assert_eq!(empties.len(), 1, "one `NoRangeId`: {empties:?}");
+    assert_eq!(empties[0].node, arm.victim);
+    assert!(
+        empties[0].restarted.is_some(),
+        "its node restarted before it"
+    );
+    assert!(
+        retried.answered && retried.asking_at(report.last_fault_healed),
+        "the asker is asked of, and got an answer: {retried:?}"
+    );
+    let records = report.records();
+    let index_of_the_proposal = records
+        .iter()
+        .find_map(|record| match record.event {
+            TraceEvent::RaftProposed {
+                server,
+                client,
+                seq: of,
+                index,
+                ..
+            } if server == arm.victim && client == 96 << 32 && of == seq => Some(index),
+            _ => None,
+        })
+        .expect("seed 992's retry was proposed on the restarted node");
+    assert!(
+        records.iter().any(|record| matches!(&record.event,
+            TraceEvent::RangeSplit { index, range, .. }
+                if *index == index_of_the_proposal && Some(*range) == arm.range)),
+        "the split took effect"
+    );
+    let admin = raft::admin_addr(seq);
+    assert!(
+        records.iter().any(|record| matches!(&record.event,
+            TraceEvent::MessageDropped { from, to, .. }
+                if *from == raft::server_addr(arm.victim) && *to == admin)),
+        "seed 992's answer was not dropped on the way to its asker: pin it on its mechanism"
+    );
+    assert_eq!(
+        report.driver.refused.get("key-outside-span"),
+        Some(&1),
+        "the asker asked anew and was refused at once: {:?}",
+        report.driver.refused
+    );
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    assert!(
+        retried.took(report.last_fault_healed) <= bound,
+        "answered within D-092's bound: {retried:?}"
+    );
+}
+
+/// Seed 5620, the third shape-drawn seed the correct system failed on, and this one a defect of the
+/// system: a data loss D-132 fixes (PROPOSED D-131, D-132). The restart arm leaves node 3 behind on
+/// range 3, node 1 takes a snapshot at 113, the index of its split of range 3 at `k05`, and streams
+/// it to node 3; and node 3's apply of that split, which makes range 20, lands while the stream's
+/// switch is being prepared. The old switch replaced the copy of the span it took at the stream's
+/// last chunk, `[k03, k10)`, and range 20's keys went with it.
+///
+/// **A switch that replaces only the left half is not what this seed shows, and the pin does not
+/// claim it.** The fix has two halves and this seed reaches the first: the snapshot is at the
+/// split's own index, so at the switch the store holds everything the snapshot carries, and the
+/// install is answered installed and switches nothing (`Task::finish`'s second re-check). Replacing
+/// `[k03, k05)` is the case of a snapshot past the split, which `a_split_applied_through_the_log_...`
+/// in `install.rs` asserts. What stands for the mechanism on the trace, since an answer without a
+/// switch traces nothing of its own: the correct run and the variant's are one run, record for
+/// record, up to the variant's switch being spawned, and by then range 20 is made, so the correct
+/// node stood at that switch with the split landed and did not make it. Range 20's keys stay because
+/// nothing on node 3 replaces its span but range 20's own install, at 115.
+// PROPOSED(D-131)
+// PROPOSED(D-132)
+#[test]
+fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys() {
+    let (node, parent, right, index) = (3, 3, 20, 113);
+    let report = shard::run(5620);
+    report.check().unwrap();
+    assert!(
+        report.restart_arms.iter().any(|arm| arm.victim == node),
+        "the restart arm crashed node 3: {:?}",
+        report.restart_arms
+    );
+    let records = report.records();
+    let find = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records
+            .iter()
+            .position(want)
+            .unwrap_or_else(|| panic!("seed 5620 no longer reaches {what}: read its trace"))
+    };
+    let taken = find("node 1's snapshot of range 3 at the split", &|record| {
+        matches!(record.event, TraceEvent::RaftSnapshot {
+            server: 1, range: of, last_index, taken: true, ..
+        } if of == parent && last_index == index)
+    });
+    let streamed = find("node 1's stream of range 3 to node 3", &|record| {
+        matches!(record.event, TraceEvent::RaftSnapshotStreams {
+            server: 1, range: of, to, ..
+        } if of == parent && to == node && record.at >= records[taken].at)
+    });
+    let split = find("node 3's apply of the split", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeSplit {
+                range: of, right: made, index: at, ..
+            } if of == parent && made == right && at == index)
+    });
+    let created = find("node 3's replica of range 20", &|record| {
+        node_of(record) == Some(node)
+            && matches!(record.event, TraceEvent::RangeCreated {
+                range: of, cause: RangeCause::Split, ..
+            } if of == right)
+    });
+    assert!(
+        taken < streamed && streamed < split && split < created,
+        "the shape's order: taken {taken}, streamed {streamed}, split {split}, created {created}"
+    );
+    let variant = shard::run_of(
+        5620,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::InstallReplacesCopiedSpan]),
+        RangeVariants::correct(),
+    );
+    let first = records
+        .iter()
+        .zip(variant.records())
+        .position(|(correct, buggy)| correct != buggy)
+        .expect("the variant changes the run");
+    let switch = &variant.records()[first];
+    assert!(
+        created < first
+            && node_of(switch) == Some(node)
+            && matches!(switch.event, TraceEvent::TaskSpawned { name, .. } if name == "span-install"),
+        "the two runs are one until the variant's switch on node 3, with range 20 made \
+         (at {created}): they part at {first}, {switch:?}"
+    );
+
+    let (start, end) = match &records[created].event {
+        TraceEvent::RangeCreated { start, end, .. } => (start.clone(), end.clone()),
+        other => unreachable!("{other:?}"),
+    };
+    let own = |range: u64| {
+        let interval = ananke_raft::store::KeyPrefix::group(range).span();
+        (interval.start, interval.end)
+    };
+    let mut own_installs = 0;
+    for record in &records[created..] {
+        if node_of(record) != Some(node) {
+            continue;
+        }
+        match &record.event {
+            TraceEvent::SpanInstalled { spans, .. } => {
+                assert!(
+                    !spans.contains(&own(parent)),
+                    "seed 5620 switched range 3 on node 3 after the split: {spans:?}"
+                );
+                if spans.contains(&own(right)) {
+                    own_installs += 1;
+                } else {
+                    assert!(
+                        !spans.iter().any(|(from, to)| *from < end && start < *to),
+                        "a switch that was not range 20's replaced its keys: {spans:?}"
+                    );
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                assert_ne!(*range, right, "node 3 removed its replica of range 20");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(own_installs, 1, "range 20's own install on node 3, at 115");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::RaftSnapshotStartOver { server, range: of, .. }
+                if server == node && of == parent
+        )),
+        "the stream was answered, not refused: an install answered installed starts nothing over"
+    );
+
+    let why = variant.check().expect_err("the variant fails seed 5620");
+    assert!(
+        why.contains("one owner per key")
+            && why.contains("an install of range 3 on node 3 replaced")
+            && why.contains("k03\", ")
+            && why.contains("k10\"), which overlaps its replica of range 20 over")
+            && why.contains("k05\", ")
+            && why.contains("and removes that replica's keys"),
+        "the violation seed 5620 is pinned for: {why}"
+    );
+}
+
+/// Seed 16725, the stale-cache shape's writer, found past the nightly's range (PROPOSED D-131). Node
+/// 1 led range 14, proposed the writer's put at index 100, applied it, and crashed before it
+/// answered. The writer heard nothing, and asked the next node under the same (client, seq). A
+/// leader's record of an applied (client, seq) is that leader's, so node 3, leading next, proposed
+/// it at 103 and it applied a second time, over a write the history had between the two. The history
+/// closes the call at its first apply and never models the second, so a get of the twice-applied
+/// value could not be placed, and linearizability failed a correct system.
+///
+/// A write now gets one try, as the sweep's own client gives it (`raft::client_over`: a get can be
+/// asked again elsewhere, a write cannot). The mechanism asserted: up to the silence the run is what
+/// it was, node 1 proposing it at 100 and crashing with it applied and unanswered; the write is
+/// asked once, so node 1 is the only proposal of it and its entry applies at one place; the writer
+/// stays open, so the shape's reader asks nothing; and linearizability holds over the history.
+///
+/// This is not a bare green: the run's verdict names `timers`, which is not what this seed is pinned
+/// for and not this pin's to assert. A hold on range 2 of node 3, taken at 7.681 s for an install
+/// that ended in `Unusable` at 8.222 s with no switch, is measured against the timer's bound, since
+/// the replay's exemption opens only on the switch's read-back (`reads_back`). The review named that
+/// schedule; D-131 records it.
+// PROPOSED(D-131)
+#[test]
+fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice() {
+    const WRITER: u64 = (95 << 32) | (1 << 16) | 5;
+    const READER: u64 = (95 << 32) | (2 << 16) | 5;
+    let (range, index) = (14, 100);
+    let report = shard::run(16725);
+    let records = report.records();
+
+    let proposed: Vec<(u64, u64, u64)> = records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEvent::RaftProposed {
+                server,
+                range,
+                client,
+                index,
+                ..
+            } if client == WRITER => Some((server, range, index)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        proposed,
+        vec![(1, range, index)],
+        "seed 16725's write was proposed by node 1 at index 100 of range 14, and by no one else"
+    );
+    let (at, hash) = records
+        .iter()
+        .enumerate()
+        .find_map(|(at, record)| match record.event {
+            TraceEvent::RaftApply {
+                server: 1,
+                range: of,
+                index: i,
+                hash,
+                ..
+            } if of == range && i == index => Some((at, hash)),
+            _ => None,
+        })
+        .expect("seed 16725: node 1 applied the write");
+    assert!(
+        records[at..].iter().any(|record| matches!(
+            record.event,
+            TraceEvent::NodeCrashed { node } if Some(node) == node_id(1)
+        )),
+        "seed 16725: node 1 crashed with the write applied: pin it on its mechanism"
+    );
+    assert!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::ClientReturn { client, .. } if client == WRITER
+        )),
+        "seed 16725: the writer heard nothing, so its call stays open"
+    );
+
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(&record.event,
+                TraceEvent::MessageSent { from, .. } if *from == raft::burst_addr(5)))
+            .count(),
+        1,
+        "the write is asked once, and the reader, which asks after the writer's answer, not at all"
+    );
+    assert!(
+        !records.iter().any(|record| matches!(
+            record.event,
+            TraceEvent::ClientInvoke { client, .. } if client == READER
+        )),
+        "the shape's reader asked with no answer to the writer"
+    );
+
+    let elsewhere: Vec<(u64, u64, u64)> = records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEvent::RaftApply {
+                server,
+                range,
+                index,
+                hash: of,
+                ..
+            } if of == hash => Some((server, range, index)),
+            _ => None,
+        })
+        .filter(|&(_, of, i)| (of, i) != (range, index))
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "the write's entry applied at a second place: {elsewhere:?}"
+    );
+    lin::check(&report.checked.history)
+        .expect("seed 16725's history, every call placed: nothing reads a value applied twice");
+}
+
+/// Seed 18925, D-092's check on an asker that had not asked, found past the nightly's range (PROPOSED
+/// D-131). Right after the restart arm's transfer the split's asker bounced between nodes on
+/// `NotLeader`; its twelve asks went on those bounces, and its first `NoRangeId` came on the last, so
+/// it made no retry and the check reported it as stopping with no answer: a report of the asker's
+/// count, not of the system. Its first `NoRangeId` now starts the count again, so a retry is made.
+/// The mechanism asserted: the arm's split's asker sent all twelve asks before its first refusal, the
+/// retry came after it, and the answer came within D-092's bound, which is unchanged.
+// PROPOSED(D-131)
+#[test]
+fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id() {
+    let report = shard::run(18925);
+    report.check().unwrap();
+    assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
+    let arm = report.restart_arms[0];
+    let seq = arm.seq.expect("the arm asked its split");
+    assert_eq!(
+        report.driver.retried.len(),
+        1,
+        "{:?}",
+        report.driver.retried
+    );
+    let retried = report.driver.retried[0];
+    assert_eq!(
+        Some(retried.range),
+        arm.range,
+        "the asker is the arm's: {retried:?}"
+    );
+    let admin = raft::admin_addr(seq);
+    let records = report.records();
+    let asks = |before: bool| {
+        records
+            .iter()
+            .filter(|record| {
+                matches!(&record.event, TraceEvent::MessageSent { from, .. } if *from == admin)
+                    && (record.at < retried.refused) == before
+            })
+            .count()
+    };
+    assert_eq!(
+        asks(true),
+        usize::try_from(shard::BOOTSTRAP * 4).expect("small"),
+        "seed 18925's asker spent its asks before its first `NoRangeId`: pin it on its mechanism"
+    );
+    assert!(
+        asks(false) >= 1,
+        "the asker made its retry after its first `NoRangeId`"
+    );
+    assert!(
+        retried.answered && retried.asking_at(report.last_fault_healed),
+        "the asker is asked of, and got an answer: {retried:?}"
+    );
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    assert!(
+        retried.took(report.last_fault_healed) <= bound,
+        "answered within D-092's bound: {retried:?}"
     );
 }
 

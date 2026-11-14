@@ -26048,16 +26048,216 @@ test keeps its 22.7: it runs the runs it ran, and one weighing here read 23.9.
 
 ---
 
+## D-131 — The workload's shapes on the sharded sweep, and `ReadCheckAtReceiptOnly` (S11)
+
+PROPOSED. **The number.** Off aa5e46c, #224's tip, whose footer reads D-131. D-132, which seed 5620
+below needed, is merged into this branch after this entry, so the one footer reads D-133. Every code site carries `// PROPOSED(D-131)`. Issue #162's S11, on `sim/shard.rs` (D-113),
+for SHARD.md §10, §11 and §12's Stage C list.
+
+**The shapes (§10's "the workload itself", as the Figure 8 driver's burst is, D-031).** Each draws
+from the seed and is a schedule the sweep can take: `Schedule::draw` is `Schedule::plain`, the
+schedule the sweep ran before this entry, and two streams of their own over it. Stream
+`shard-load` gives each of the driver's splits a `Load`, by quarters: `Clients` (§10's "any split
+with load"); `WriteBurst`, six to fourteen writes of right-half keys at the parent's leader, one
+every 1 to 3 ms, the split asked after the first few of them, so some are proposed after the split
+and before its apply, which is what §3's apply check refuses; `ReadBurst`, the same with gets, so
+some are let in at receipt and still waiting on the read-index round or the apply when the split
+applies; `StaleCache`, the split, then the right half's lead moved off the parent's leader's node,
+then one client writing a right-half key through the right half and another, whose cache still
+names the parent, reading that key through the parent at the generation it had. Stream
+`shard-restart` adds one `Fault::SplitFromRestarted` in the second half of the faults: a node some
+split has taken an id from is crashed, restarted, handed the lead of a range that can still split
+and asked to split it. Its transfer and split sit in the quiet after it, every fault still healing
+before the next. One seed in `PLAIN_ONE_IN` (eight) draws none of it. Every shape is drawn before
+the run and resolved against the trace when it fires, so a stream's consumption never depends on
+what the run did. The clients are the admin's, on sockets of their own, each taking its answers,
+so a write a variant acknowledges and a read it serves are in the history.
+
+**Each shape shown reached, at every tier (D-061).** Read off the correct system's trace (`shard::Shapes`,
+`Report::shapes`), each something the correct system does only because the window was reached. Over
+ten thousand seeds, drew it -> reached it, and asserted at every tier since each is well above 5 %:
+
+| Shape | Reading on the trace | Drew | Reached |
+|---|---|---|---|
+| Split under a pending right-half write burst | a burst's write refused at apply | 5 652 | 4 873 |
+| Split under pending right-half gets | a burst's get refused at serving | 5 679 | 3 785 |
+| Split while a client's cache names the parent | the stale reader refused at receipt after the writer's put | 5 678 | 4 242 |
+| A restart, then a split from that node | the arm's split proposed on the restarted node, and done | 8 747 | 3 673 |
+| Any split with load | a sweep client answered `RangeMismatch` by a split range | — | 9 947 |
+
+**`ReadCheckAtReceiptOnly` (new, bit 10).** Keeps §3's receipt check and skips the check at the
+read's serving. The pair: the correct sweep above, whose check at serving refuses the reads this
+variant serves (3 785 seeds of ten thousand reach it), and the variant caught by check 9 at
+serving on 57 of 100 seeds and 13 of the gate's 20, every failure that one and none first on
+anything else. Under `the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only`
+on the sharded sweep's trace, 57 of 100 compared seeds.
+
+**What was already on this sweep (#216) and what S11 added, each measured on the shaped schedule.**
+`ClientIgnoresMismatch` had its pair on any split with load: check 17 99 of 100, the write bound 18
+of 500 uniform, unchanged in shape. `TrustStaleDescriptor` had check 9 and now has the shape §10
+names: check 9 100 of 100, the stale reader served by the parent 377 of 1 000, and linearizability
+28 of 1 000, under D-061's 5 %, asserted over the thousand and printed below it. Most of that
+linearizability catch is the variant meeting the sweep's own clients, not the shape: on
+`Schedule::plain`, which has no stale-cache reader, the same run fails linearizability on 20 of
+1 000 (the review had 20 and 32 at 1895240, every stuck op a get and the stale-cache reader the
+stuck op on 1 of the 32). What the shape adds is the served-reader counter: 377 of 1 000 against
+0 on the plain schedule, and at the review 0 of 1 000 under the correct server. `ApplyIgnoresSpan`
+had check 9 and now has the write burst: check 9 81 of 100, check 10 72 of 100 and 13 of the gate's
+20 when each run is taken to its end, asserted at every tier. `IdBlockResumed` had 10 of 100 by
+check 18 on restarts the faults happened to draw; the arm takes it to 42 of 100 and 4 of the
+gate's 20 (and an earlier-run id on 62 of 100), so §12's "wrong if" is asserted at every tier.
+
+**Pins (CLAUDE.md's rule).** Adding the draws moved every seed but the one in eight that draws none.
+Of the pins, 128, 8934 and 7949 draw none and did not move; 286, 368, 41, 643, 986, 463, 3291, 3870,
+5303, 2097, 9 and 2272 moved on the sweep's schedule. What each was pinned for is kept by running
+the schedule it was found on, `Schedule::plain`, which the sweep takes for the one seed in eight
+that draws no shape and not for those twelve: the traces of all fifteen are byte-identical to this
+tree's before the change, by their hashes. With the pins' runs switched to the shaped schedule (a
+plant, at this entry's review), 10 of the 12 pin tests it ran fail, so most would not reach their
+situations there; seed 286's passes unchanged, its schedule moved and its situation reached on it
+as well, and seed 8934's passes, drawing no shape. One pin's words changed, and for a reason of its
+own, below. Seeds 707, 992, 5620, 16725 and 18925 are the first found on the shaped schedule and
+run it.
+
+**Three correct-system failures the shapes found, at ten thousand before the commit.** The first two
+are defects of a check and of the harness, shown from the trace; the third is a defect of the
+system, a data loss, and D-132 fixes it.
+
+- *Seed 707, log matching, a defect of the view.* Node 1's log of range 19 is compacted to 119 with
+  one entry at 120; its next restart is refused; the re-seed's floor is 112. `Logs` kept the 120
+  of the store that was lost with nothing below it, and node 2's restated 120 then read as agreeing
+  with a log that differs at 119, though every copy of each entry carries the same hash. A
+  `RangeCreated` is a new store: the view now forgets the replica's entries at it (`Logs::replay`;
+  `a_creation_forgets_the_entries_of_the_store_it_replaced`, and seed 707's pin, which reproduces
+  the old words with the creation taken out). The same correction makes check 3 see what the
+  re-made store holds: seed 3870's pin under `SplitLeavesQuarantineBehind` now reads leader
+  completeness, at the election, where it read state machine safety at the apply of a 107 of its
+  own. That is no weakening: the variant is caught earlier by a stricter reading of what node 3
+  holds, and 3870's correct half is unchanged.
+- *Seed 992, D-092's bound, a defect of the asker.* The restart arm's split is refused `NoRangeId` on
+  the new run, the retry is proposed and applied 130 ms later, and the network drops the answer. A
+  leader answers a split's entry once and a copy with silence (§5), so an asker that resent the
+  same copy heard nothing for 3.2 s, over the 2 s bound. The bound is unchanged. After a silent
+  wait, an asker that heard `NoRangeId` asks anew under a number the leader has not seen
+  (`ASK_ANEW`), and is refused `KeyOutsideSpan` at once since the split landed (seed 992's pin).
+  The change is only reached after a `NoRangeId` and a silence, so no other schedule moved.
+- *Seed 5620, check 8's install clause: not a defect of the check; a data loss, fixed by D-132.* "An install of
+  range 3 on node 3 replaced [k03, k10), which overlaps its replica of range 20 over [k05, k10) and
+  removes that replica's keys." Node 3 restarts behind its leader (the arm's crash, `down` 66 ms, at
+  5.089 s, restarted at 5.155 s), node 1 splits range 3 at k05 at index 113 (5.285 s), node 3
+  applies that split through its log at 5.611 s and creates range 20, and at 5.713 s the install
+  of range 3's snapshot at 113, whose stream began before node 3 applied the split, switched
+  `SpanInstalled` over `[k03, k10)`: the spans `Install::spans` captured from the plan before the
+  split's `Host` job. That was the engine really removing the right half's keys on node 3, D-128's shape by a
+  different road, and a correct-system data loss the check named correctly. S11 makes it reachable
+  (the arm's restart); it does not cause it. D-132 fixes it, and this branch carries D-132. The
+  snapshot is at the split's own index, so D-132's second re-check answers the install installed and
+  this seed switches nothing; node 3 replaces range 20's span only at range 20's own install, at 115.
+  Seed 5620's pin (`seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys`)
+  asserts that on the shaped schedule, and that `InstallReplacesCopiedSpan` (D-132 §3) still fails
+  the seed with the words above.
+
+**Two more, past the nightly's range, found at this entry's review.** Each is a defect of the
+harness, shown from the trace, and each is fixed there; no bound moved.
+
+- *Seed 16725, linearizability, a defect of the stale-cache shape's writer.* Node 1, leading range
+  14, proposed the writer's put at index 100 in term 3 at 4.475 s, applied it at 4.499 s and crashed
+  at 4.515 s before it answered. The writer heard nothing and asked the next node under the same
+  (client, seq). A leader's record of an applied (client, seq) is that leader's alone, so node 3,
+  leading term 5, proposed it again at 103 and it applied a second time, right after 102, the slot
+  of a sweep client's put already answered `Done`. The history closes the call at its first apply and
+  never models the second, so every later get returned a value the history could not place. Adding
+  the second apply to the history as a second put makes `lin::check` pass, so the duplicate is the
+  whole violation. The sweep's own client forbids this (`raft::client_over`: a get can be asked again
+  elsewhere, a write cannot), and SHARD.md's Q10 names one operation taking effect twice as the
+  D-026 class. So `ask_once` gives a write one try: `NotLeader`, a refusal at the step, still moves
+  it on, and a silence leaves its call open in the history, and the shape's reader, which asks after
+  the writer's answer, does not ask. The stale-cache shape stays reached, its rate printed and
+  asserted at every tier as before. The writer's put applied at more than one entry on 3 of the
+  first 1 000 seeds before this (52, 278, 454), where the history was wrong though no check tripped.
+  Seed 16725's pin (`seed_16725_a_write_that_heard_nothing_is_asked_once_...`) asserts the write is
+  proposed once, by node 1 at 100, node 1 crashed with it applied and unanswered, one message from
+  the writer's socket, its entry applied at one place, and `lin::check` over the history.
+- *That pin does not assert the run's verdict, and here is why.* Once the writer no longer re-asks,
+  seed 16725's schedule moves and the run fails `timers`: "server 3's replica of range 2 heard from
+  no leader of its term and granted no vote since 7.892 s and had not campaigned by 8.194 s". The
+  replica's core was held. A scratch trace at `finish` shows its hold taken at 7.681 s, the install
+  of that stream queued behind others on the node, and then given up at 8.222 s with no switch (the
+  staged record could not be read), `Abandoned` releasing the hold; the three `pre-candidate`
+  records at that instant are its first steps once let go. The timer replay's exemption for a held core
+  (D-091, D-098) opens only on the switch's read-back (`reads_back`, "no read-back, no exemption"),
+  so a hold that ends with no switch is measured against the bound. Reading it, that is the check's
+  gap and not a missed election, but closing it needs the trace to say where such a hold began, and
+  this entry changes neither the check nor the trace. So it is left named here, the bound
+  unchanged, seed 16725 fails the sweep past the nightly's range, and issue #227 tracks it.
+- *Seed 18925, D-092's check, a defect of the asker.* Right after the restart arm's transfer, the
+  asker of range 27's split bounced between nodes on `NotLeader`: exactly twelve messages between
+  8.545 s and 8.627 s, its whole `BOOTSTRAP * 4` budget, and its first `NoRangeId` came on the last
+  of them, so it made no retry, and "the split refused at 8.665 s stopped asking at 8.815 s, with no
+  answer" was a report of the asker's count and not of the system. The bound is unchanged. An
+  asker's first `NoRangeId` now gives it `ASKS` again, and only the first, so an asker every node
+  keeps refusing still stops and is still reported. Seed 18925's pin
+  (`seed_18925_an_asker_whose_tries_went_on_bounces_...`) asserts the twelve asks before the first
+  refusal, a retry after it, and the answer within D-092's bound; removing the refill fails it.
+
+**D-064's rows.** Weighed from the built release binaries at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+user + sys, three runs, the median, on an Apple M2 of 8 cores under load averages of 14 to 54.
+`every_seed_passes_on_the_correct_sharded_sweep` re-weighed 203.5 -> 311.8 in shard 1, which the shapes' bursts
+and the restart arm's crash add to every run; it keeps its shard, left the heaviest at 2689.1 for the owner's
+next re-weigh. New rows, longest-first into the lightest shard: `a_server_that_trusts_a_stale_descriptor_serves_what_a_write_through_r_replaced`
+181.0 into shard 6; `a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep` 17.4,
+`a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep` 13.8 and the fold-by-fold row 12.8 into shard 4;
+the pins on seeds 992 and 707, 0.1 each, into shard 4. Seed 5620's pin came with D-132's merge, weighed the same way:
+0.2 (user + sys 0.20 + 0.01, 0.17 + 0.00, 0.17 + 0.00, the median rounded up to a tenth) into shard 4. The review's two
+pins, on seeds 16725 and 18925, 0.2 each, into shard 4, 2230.8 -> 2231.2, under a load average of 3.
+
+**Questions for the owner, each with this entry's recommendation.**
+
+1. *`ApplyIgnoresSpan`'s linearizability clause.* §10 names three catches; check 9 and check 10 are
+   measured (81 of 100, 72 of 100) and asserted, and linearizability has been reached on 0 of 333
+   seeds. Every range's keys on a node share one engine, so R's readers do see a write P made out
+   of its span, and "a write P acknowledged that R's readers never see" needs an engine per range to
+   be true as written. Recommended: amend §10's row to name checks 9 and 10, and keep printing the
+   rate. The test asserts nothing of it.
+2. *`Logs`' change is a Phase 2 fold's.* It is narrow, keyed to `RangeCreated`, which only Phase 3's
+   traces carry, but it edits `ananke-raft`'s invariants and changed which check names seed 3870's
+   variant. Its cost, stated: a leader writing two payloads at one index in one term goes unreported
+   if the only other copy of the first was on a store since lost, since nothing is compared against a
+   store that no longer exists. A directed trace shows it (1 appends 13 at term 3 with one payload,
+   1 is refused, 1 is created at floor 12, 2 appends 13 at term 3 with another: `Ok(())`, where the
+   removal taken out reports "log matching: servers 2 and 1 hold index 13 of group 3 in term 3 with
+   different payloads"). No seed reaches it: 0 of 1 000 have a `RangeCreated` over a store with
+   entries and no refusal or removal between, of 1 322 creations over a refused store (1 301 by
+   snapshot, 21 by split). Recommended: keep.
+3. *The asker asking anew.* A harness change, on the path only `NoRangeId` opens, in place of
+   answering a copy of an applied split at the server, which is #21's job. Its cost, measured: a
+   fresh number gets an immediate `KeyOutsideSpan` from a server that never answered the split, so
+   D-092's check sees far less of that fault. With a server that never answers a split's apply (a
+   plant, 1 000 seeds, measured on this tree), the check fails 1 seed with `ASK_ANEW` against 3 with
+   the number held. It stays honest for what it was built for, `RefillNotResent`.
+   Recommended: keep until #21; a server that answered such a copy would let this come out.
+4. *A plain schedule kept among the sweep's.* SHARD.md does not say. One seed in eight draws no
+   shape, which keeps a control population and keeps the pins' schedule one the sweep can take.
+   Recommended: keep at eight.
+5. *`ReadBurst` waits on the read-index round, or the apply.* §10 says "waits on the parent's
+   leader's read-index round"; a leader that holds a lease serves a read with no round and only
+   waits on the applied index. The shape is the get let in at receipt and served past the split,
+   whichever waited; 1 860 530 of 2 678 753 reads took a round over ten thousand seeds, counted on this
+   entry's first commit. Recommended:
+   read it so.
+
+---
+
 ## PROPOSED D-132 — An install onto a replica the node holds a descriptor of replaces the host's descriptor's span at the switch and asks the store again there, not the plan's copy from the stream's last chunk: `InstallReplacesCopiedSpan` keeps the copy beside the fix, and check 8's install clause catches it; closes #215 and D-128 §9's window
 
-**The number.** Off aa5e46c, whose footer reads D-131. D-131 is S11's, on a local branch and absent from this tree, so this entry is D-132 and the footer moves to D-133, the next number after this tree's highest entry. At a merge the entries are a union in numerical order with one footer, the highest plus one. Every code site carries `// PROPOSED(D-132)`.
+**The number.** Off aa5e46c, whose footer reads D-131. D-131 is S11's, on a local branch and absent from the tree this was written on, so this entry is D-132. The two meet on S11's branch, in numerical order with one footer, D-133. Every code site carries `// PROPOSED(D-132)`.
 
 **This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps one owner per key per node, §11, storage 5, has an install remove "the span's keys", and check 8's install clause (D-128 §3) forbids a switch removing another replica's. D-128 closed that for one stream at a time and §9 named what it left, an initialised replica replacing the plan's copy. This entry closes it. D-128's path for a replica with no descriptor is unchanged.
 
 **The bug, on a correct server.** `Snapshots::on_chunk` copies the plan's hosted spans into `Install::spans` at the stream's last chunk, and `Task::finish` replaced that copy on any replica the host held a descriptor of. Between the chunk and the switch the span can move, and the copy then names keys a right half now owns.
 
 1. **Two senders' streams (#215).** P has no descriptor and R is held on the node. Streams A and B both complete before A's switch, so both copies hold configuration's span. A's switch is D-128's. `Ready(B)` is deferred by A's hold and stepped after `Switched(A)`, by when the host's table holds P, so P counts as initialised and B's switch replaces its stale copy.
-2. **A split applied through the log (seed 5620 of S11's sweep, D-131's local branch).** Node 3 crashes at 5.089 s and restarts at 5.155 s. Node 1 splits range 3 at `k05`, index 113, at 5.285 s. Node 3's snapshot of range 3 at 113 has its hold taken at 5.5906 s, with the split's apply job already queued behind it. Measured at the switch on that seed, by reading the table and the store at both places: at the old read's place the store stood at 111 of the snapshot's 113 and the table held `[k03, k10)`; after `open_span_source` it stood at 113 and the table held `[k03, k05)`, range 20 made. The split had landed inside that await. The switch replaced the plan's copy `[k03, k10)`, range 20's keys with it, and `SpanInstalled` names that at 5.713 s; check 8's install clause tripped it.
+2. **A split applied through the log (seed 5620 of S11's sweep, D-131).** Node 3 crashes at 5.089 s and restarts at 5.155 s. Node 1 splits range 3 at `k05`, index 113, at 5.285 s. Node 3's snapshot of range 3 at 113 has its hold taken at 5.5906 s, with the split's apply job already queued behind it. Measured at the switch on that seed, by reading the table and the store at both places: at the old read's place the store stood at 111 of the snapshot's 113 and the table held `[k03, k10)`; after `open_span_source` it stood at 113 and the table held `[k03, k05)`, range 20 made. The split had landed inside that await. The switch replaced the plan's copy `[k03, k10)`, range 20's keys with it, and `SpanInstalled` names that at 5.713 s; check 8's install clause tripped it.
 
 What the second route teaches is **where** to read. The span in the host's table at the place the switch read `initialised` was still `[k03, k10)`, so a read there would not have closed this route. The read has to come after the last await before the engine numbers the install.
 
@@ -26089,11 +26289,11 @@ So the case that needed a different answer is the one the second re-check gives 
 
 The switch replaces the plan's copy on a replica with a descriptor and does not ask the store again: the tree before this entry. It is the node's, at **bit 51**, the next free on this tree; bits 52 and 53 stay free, and a branch that adds a variant after this one takes the next. A replica with no descriptor is D-128's under it too, `InstallReplacesHostedSpan` being that one.
 
-The catch is check 8's install clause: on the directed tests' two routes and four split cases it trips with "one owner per key: an install of range 2 ... overlaps its replica of range 9". On seed 5620 of S11's sweep, with this entry's fix on a scratch copy of that branch, the variant fails it with the same words the original did, range 3's install over `[k03, k10)` and range 20's replica. The window is rare: on S11's ten thousand the re-check fired on four installs (section 6) and this tree's sweep does not reach it, so per D-061 no tier asserts a sweep's catch of it; the directed tests assert it every run.
+The catch is check 8's install clause: on the directed tests' two routes and four split cases it trips with "one owner per key: an install of range 2 ... overlaps its replica of range 9". On seed 5620 of S11's sweep the variant fails with the same words the original did, range 3's install over `[k03, k10)` and range 20's replica, and the pin (section 4) asserts it. The window is rare: on S11's ten thousand the re-check fired on four installs (section 6) and the sweep off aa5e46c does not reach it, so per D-061 no tier asserts a sweep's catch of it; the directed tests and the pin assert it every run.
 
 ### 4. What says so
 
-**Directed** (`install.rs`). The first two run through the task, on the correct node and under the variant. The third runs through the task on the correct node alone: it has no arm for the variant, and passes with the bit inverted. The fourth is the free function, the variant among its inputs:
+**Directed** (`install.rs`). The first two run through the task, on the correct node and under the variant, and check 8's install clause catches the variant on them. The third runs through the task on the correct node alone: it has no arm for the variant, and passes with the bit inverted. The fourth is the free function, the variant among its inputs:
 
 - `a_second_streams_copy_of_configurations_span_leaves_the_right_half_beside_it`, route 1, through `on_chunk` and `finish`, with the host's table updated from the first stream's `Switched`. The archived test #215 names, `~/Desktop/ananke-archive/2026-11-06-wip/review-200-two-streams-test.rs`, is not on this machine, so this is built from the issue's account of it.
 - `a_split_applied_through_the_log_before_a_switch_leaves_the_right_halfs_keys`, route 2, the real `ServerApplier::split` (`server::split_applied`, a test-only wrapper) landing after the stream's last chunk and, through a test seam, at the switch: a snapshot past the split, at it, and below it. A `#[cfg(test)]` future on the task lands the split there, because timing it by the simulator's disk would move with every read on the path.
@@ -26110,7 +26310,7 @@ Plants, each applied alone to this tree in debug and reverted:
 | the call site passes no descriptor, so an initialised replica replaces the snapshot's span | the third test above, and the two routes, by what the switch replaced |
 | the variant's bit inverted | the three tests above with an arm for the variant, the two routes and the free function's; the third test has none and passes |
 
-**The tiers.** The directed tests run at every tier, deterministically, and need no row in the nightly (D-064): they are in the crate's lib, where the `rest` job already runs them. No seed is pinned here; seed 5620 belongs to S11's schedule and its pin to S11's branch once the two meet, by the rule on pinned seeds, on the mechanism: the re-check at the switch firing at range 3's install at 113.
+**The tiers.** The directed tests run at every tier, deterministically, and need no row in the nightly (D-064): they are in the crate's lib, where the `rest` job already runs them. Seed 5620 belongs to S11's schedule and is pinned where the two meet on S11's branch, at every tier, by the rule on pinned seeds: `seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys` in `sim/tests/shard.rs`, on the mechanism, the re-check at the switch firing at range 3's install at 113. An answer at the re-check traces nothing of its own, so the pin reads it off the two runs: the correct run and the variant's are one run, record for record, up to the variant's switch being spawned on node 3 with range 20 made; the correct run then switches range 3 on node 3 no more, and nothing there replaces range 20's span but range 20's own install. No span of range 3 is replaced on this seed at all, the snapshot being at the split's own index (section 2's `L == I`); the left half alone being replaced is the directed test's case past the split.
 
 ### 5. What is not here
 
@@ -26125,10 +26325,10 @@ Two instrumented scratch copies, release, counting at the switch:
 
 | | seeds | reached the switch | re-check at the switch fired | span differed from the copy | apply during the switch |
 |---|---|---|---|---|---|
-| this tree's `every_seed_passes_on_the_correct_sharded_sweep` | 0 to 1 999 | 10 703 | **0** | **0** | **0** |
+| off aa5e46c, this entry alone, `every_seed_passes_on_the_correct_sharded_sweep` | 0 to 1 999 | 10 703 | **0** | **0** | **0** |
 | S11's, with this fix applied | 0 to 9 999 | not counted | **4**, seed 5620's among them | **0** | **0** |
 
-So on this tree nothing moves: no correct node's schedule changes at these seeds, the new reads being a lock and an atomic. On S11's schedule the four seeds whose install the re-check turned into an answer are the only ones that move. S11's sweep at 10 000 passes with the fix applied, zero failures, against the seed 5620 failure before it. D-128's own window (the first bullet of its §9) is closed on the same read, as the correction there says.
+So off aa5e46c nothing moves: no correct node's schedule changes at these seeds, the new reads being a lock and an atomic. On S11's schedule the four seeds whose install the re-check turned into an answer are the only ones that move. S11's sweep at 10 000 passes with the fix applied, zero failures, against the seed 5620 failure before it; past the nightly's range the last column is not zero (section 5). D-128's own window (the first bullet of its §9) is closed on the same read, as the correction there says.
 
 ### 7. For the owner (PROPOSED)
 
@@ -26137,7 +26337,7 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 1. Reading the host's table at the switch rather than giving `Install` a fresher copy.
 2. The second re-check at the switch, which is what the snapshot-below-a-split case rests on.
 3. Bit 51, and the variant restoring both halves of the old switch.
-4. The window in section 5, left open and named.
+4. The window in section 5, left open and named, reached past the nightly's range on seed 13283. #225 tracks it and #215's related window, so this entry's "Closes #215" does not end the second's record.
 
 ---
 

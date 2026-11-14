@@ -101,8 +101,33 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
+  #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
+  pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
+  a split while a client's cache names the parent (`Load::StaleCache`), a restart then a split from
+  that node (`Fault::SplitFromRestarted`), and any split with load (`Load::Clients`). Each is shown
+  reached on the correct system's trace and printed (ten thousand seeds: 4 873, 3 785, 4 242,
+  3 673 and 9 947), and asserted at every tier; `Schedule::plain` is the schedule from before it, one
+  seed in eight, and what every pin found on it runs, byte-identical. New variant
+  `ReadCheckAtReceiptOnly` (bit 10), caught by check 9 at serving on 57 of 100 seeds. The re-homed
+  variants fail for their named reasons at measured rates: `TrustStaleDescriptor` by check 9 on 100 of
+  100 and linearizability on 28 of 1 000, `ApplyIgnoresSpan` by check 9 on 81 of 100 and check 10 on
+  72 of 100, `IdBlockResumed` by check 18 on 42 of 100, `ClientIgnoresMismatch` by check 17 on 99 of
+  100. Seed 707 was a defect of the log view (a replica's creation forgets the store it replaced),
+  which moved seed 3870's variant catch to leader completeness; seed 992 a defect of the asker (asks
+  anew after a silence behind `NoRangeId`). Seed 5620 was a correct-system data loss, an install's
+  switch replacing the span the plan hosted before a split applied: D-132 fixes it, merged here, and
+  the seed is pinned on the shaped schedule. The review found two more past the nightly's range, both
+  of the harness: seed 16725, the stale-cache writer re-asking a write after a silence so that it
+  applied twice and linearizability failed (a write now gets one try, as the sweep's own client does;
+  pinned on the write asked once and its entry applied once), and seed 18925, an asker whose tries
+  went on `NotLeader` bounces before its first `NoRangeId`, which D-092's check read as no answer (its
+  first `NoRangeId` now starts the count again, the bound unchanged; pinned). With the writer fixed,
+  seed 16725 fails `timers` instead: a core held for an install that ended with no switch, which the
+  replay's exemption does not cover, left named in D-131 and not changed here. Owner questions in
+  D-131. Not pushed.
 - Branch `phase-3-stage-c-install-span-at-switch` (2026-11-09), off aa5e46c, PROPOSED **D-132**
-  (footer D-133; D-131 is S11's, local), Closes #215: **a correct-server data loss, an install
+  (footer D-133), merged locally into S11's branch above, Closes #215: **a correct-server data loss, an install
   replacing a span overlapping a right half the node already holds**, by two routes D-128 left
   open, a second stream's copy of configuration's span and a split applied through the log while
   a stream completes (seed 5620 of S11's sweep). An initialised replica's switch now replaces the
@@ -111,13 +136,13 @@ _Update this section at the end of every session._
   at or below an entry applied meanwhile answers installed and is not switched. `Install::spans` is
   a copy the correct switch no longer reads, and `InstallWrongRangesSpans`'s doc says so. The pair
   is `InstallReplacesCopiedSpan` (node bit 51), caught by check 8's install clause on two directed
-  tests through the task. On a scratch copy of S11's branch the fix passes its 10 000 seeds and
-  seed 5620 fails under the variant with the original words. Not closed, named in D-132 §5 and
-  tracked by #225: a split's apply landing after the install is numbered, which seed 13283 of S11's
-  sweep reaches, past the nightly's range, with and without this fix; the switch removes the right
-  half's keys and the store goes back from 168 to the snapshot's 167. #215's related window is
-  unchanged and also #225's: a directed run removes the right half's key, and no sweep has reached
-  this order.
+  tests through the task and on seed 5620's pin, which fails under the variant with the original
+  words. On a scratch copy of S11's branch the fix passes its 10 000 seeds. Not closed, named in
+  D-132 §5 and tracked by #225: a split's apply landing after the install is numbered, which seed
+  13283 of S11's sweep reaches, past the nightly's range, with and without this fix; the switch
+  removes the right half's keys and the store goes back from 168 to the snapshot's 167. #215's
+  related window is unchanged and also #225's: a directed run removes the right half's key, and no
+  sweep has reached this order.
 - Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
   open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
   that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable

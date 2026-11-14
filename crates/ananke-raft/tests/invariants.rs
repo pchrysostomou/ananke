@@ -258,6 +258,44 @@ fn a_created_replica_starts_at_the_floor_its_creation_names() {
 
 // --- Check 3: leader completeness, and commit on a majority ---
 
+/// A `RangeCreated` is a new store, and the entries the view held of the store it replaced are
+/// gone with it. Node 1 restarted with its log compacted to 19 and one entry of term 3 at 20,
+/// its store was refused, and the re-seed's floor, 12, lies below both; the view kept 20 with
+/// nothing at 19, so a neighbour's restated 20 read as agreeing with a log that differs at 19.
+/// The sharded sweep's seed 707 (PROPOSED D-131). The new store's own log is held to the rule.
+// PROPOSED(D-131)
+#[test]
+fn a_creation_forgets_the_entries_of_the_store_it_replaced() {
+    let compacted = |server, range, last_index, last_term| TraceEvent::RaftSnapshot {
+        server,
+        range,
+        last_index,
+        last_term,
+        taken: false,
+    };
+    let before = [
+        (1, compacted(1, B, 19, 3)),
+        (1, append(1, B, 20, 3, 0xaa)),
+        (1, refused(1)),
+        (1, created(B, &[1, 2, 3], 12, 3)),
+    ];
+    let mut restated = before.to_vec();
+    restated.extend([
+        (2, append(2, B, 19, 3, 0x19)),
+        (2, append(2, B, 20, 3, 0xaa)),
+    ]);
+    check_nodes(&restated).unwrap();
+    let mut diverged = before.to_vec();
+    diverged.extend([
+        (1, append(1, B, 13, 3, 0xbb)),
+        (2, append(2, B, 13, 3, 0xcc)),
+    ]);
+    assert_eq!(
+        check_nodes(&diverged).unwrap_err(),
+        "log matching: servers 2 and 1 hold index 13 of group 3 in term 3 with different payloads"
+    );
+}
+
 /// Each group's first configuration is its `RangeCreated`'s voters, not servers 1
 /// through the cluster's count (SHARD.md §8, check 3): a group created on servers
 /// 4, 5 and 6 commits on a majority of those three. A checker that takes `1..=3`

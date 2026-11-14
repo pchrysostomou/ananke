@@ -24,6 +24,18 @@
 //! - a **leadership transfer** (`Command::Transfer`, thesis §3.10) of any range, the two
 //!   system ranges included, to one of its other voters.
 //!
+//! **The workload's shapes** (SHARD.md §10, §12's Stage C; PROPOSED D-131), each aimed at the
+//! window one of §10's variants breaks and each drawn from the seed, so a shape is a schedule
+//! the sweep can take. Stream `shard-load` gives each of the driver's splits a [`Load`]: the
+//! clients' traffic alone (§10's "any split with load"), a burst of right-half writes pending
+//! on the parent's leader around the split, a burst of right-half gets waiting on that
+//! leader's read-index round around it, or a client whose cache still names the parent reading
+//! the right half through it while another client writes that key through the right half.
+//! Stream `shard-restart` adds one [`Fault::SplitFromRestarted`]: a node that has taken an id
+//! from its block is crashed and restarted, handed the lead of a range and asked to split it.
+//! One seed in [`PLAIN_ONE_IN`] draws none of it ([`Schedule::plain`]), which is the schedule
+//! the sweep was before them and the schedule every pinned seed was found on.
+//!
 //! **The clients**: [`CLIENTS`] of them over [`KEYS`] keys, `k00` to `k15`, so a range
 //! keeps at least [`MIN_KEYS`] of them however the driver splits. They are the node
 //! sweep's client (`raft::client_over`), routing by a cache merged from `RangeMismatch`
@@ -66,8 +78,8 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, Instant, Network, NodeId, RangeCause, RangeState, RecoveredAs,
-    Socket, TraceEvent, race,
+    ClientOp, Clock, Either, Environment, Instant, MismatchAt, Network, NodeId, RangeCause,
+    RangeState, RecoveredAs, Socket, TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
@@ -86,7 +98,7 @@ use bytes::Bytes;
 use crate::lin::History;
 use crate::raft::{
     self, ClientKeys, ClientStats, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, SharedStats, TICK,
-    admin_addr, election_max, server_addr,
+    admin_addr, burst_addr, election_max, server_addr,
 };
 use crate::ranges::{DIR, FIRST_RANGE, ID_BLOCK, INBOX_BYTES, META_RANGE, REFILL_AT, ROOT_RANGE};
 
@@ -127,6 +139,32 @@ const SPLIT_RETRY: Duration = Duration::from_millis(150);
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
 /// How long the run waits after the last fault for the driver's admins still asking.
 const DRIVER_DRAIN: Duration = Duration::from_secs(5);
+/// One seed in this many draws no shape at all and runs [`Schedule::plain`]: the sweep as it
+/// was before the shapes, kept among the schedules it can take (PROPOSED D-131).
+pub const PLAIN_ONE_IN: u64 = 8;
+/// The process the shapes' own clients trace under, beside the sweep's clients: a split's
+/// burst as `LOAD | j`, the stale-cache shape's writer as `LOAD | WRITER | j` and its reader as
+/// `LOAD | READER | j`, where `j` is the action's number from 1 (PROPOSED D-131).
+const LOAD: u64 = 95 << 32;
+/// See [`LOAD`].
+const WRITER: u64 = 1 << 16;
+/// See [`LOAD`].
+const READER: u64 = 2 << 16;
+/// How long a shape's client waits for its answers past its last send.
+const LOAD_WAIT: Duration = Duration::from_millis(400);
+/// How long the stale-cache shape's clients wait for each answer.
+const STALE_WAIT: Duration = Duration::from_millis(150);
+/// The admin numbers a [`Fault::SplitFromRestarted`] takes: `RESTART_ADMIN + 2i` for its
+/// transfer and one more for its split, past every action's number.
+const RESTART_ADMIN: u64 = 100;
+/// The admin number [`Load::StaleCache`]'s transfer takes, `STALE_ADMIN + j` for action `j`.
+const STALE_ADMIN: u64 = 200;
+/// What a split's asker adds to its request's number when it asks anew, past every admin
+/// number (PROPOSED D-131).
+const ASK_ANEW: u64 = 1 << 16;
+/// How many times a split's asker asks before it stops: round the bootstrap nodes four times.
+/// Its first `NoRangeId` starts the count again (PROPOSED D-131).
+const ASKS: u64 = BOOTSTRAP * 4;
 /// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
 /// correct system before it is asserted (Q39; D-113 §6).
 pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
@@ -176,6 +214,22 @@ pub enum Fault {
         /// How long it stays down.
         down: Duration,
     },
+    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; PROPOSED D-131): a node some split has
+    /// taken an id from, picked among them when the arm fires, crashes and restarts after
+    /// `down`. Then `transfer_after` later it is handed the lead of a user range that can still
+    /// split, and `split_after` after that it is asked to split it. A correct node's new run
+    /// waits for a block of its own (§5's second rule); the variant's resumes its record's and
+    /// takes the same ids again. Where no split has taken an id yet the arm does nothing: no
+    /// crash, no transfer and no split.
+    // PROPOSED(D-131): §12, Stage C's fourth shape.
+    SplitFromRestarted {
+        /// How long the node stays down.
+        down: Duration,
+        /// From the restart to the transfer.
+        transfer_after: Duration,
+        /// From the transfer to the split.
+        split_after: Duration,
+    },
 }
 
 impl Fault {
@@ -186,7 +240,9 @@ impl Fault {
             Self::Isolate { for_, .. }
             | Self::IsolateLeader { for_ }
             | Self::OneWay { for_, .. } => *for_,
-            Self::Crash { down, .. } | Self::CrashLeader { down } => *down,
+            Self::Crash { down, .. }
+            | Self::CrashLeader { down }
+            | Self::SplitFromRestarted { down, .. } => *down,
         }
     }
 }
@@ -200,6 +256,49 @@ pub enum ActionKind {
     Transfer,
 }
 
+/// The load a driver's split is drawn under (SHARD.md §10, "the workload itself"; PROPOSED
+/// D-131): which of §10's shapes it is. A transfer's is always [`Load::Clients`].
+// PROPOSED(D-131): §12, Stage C's shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Load {
+    /// The clients' traffic and nothing beside it: §10's "any split with load".
+    Clients,
+    /// A burst of `count` writes of right-half keys at the parent's leader, one every `every`,
+    /// answered as they come, and the split asked after the first `lead` of them: the writes
+    /// proposed after the split and before its apply are what §3's apply check refuses
+    /// (`ApplyIgnoresSpan`).
+    WriteBurst {
+        /// How many writes.
+        count: u64,
+        /// The time between two sends.
+        every: Duration,
+        /// How many go before the split is asked.
+        lead: u64,
+    },
+    /// A burst of `count` gets of right-half keys at the parent's leader, as
+    /// [`Load::WriteBurst`]: a get let through at receipt and still waiting on its read-index
+    /// round when the split applies is what §3's check at serving refuses
+    /// (`ReadCheckAtReceiptOnly`).
+    ReadBurst {
+        /// How many gets.
+        count: u64,
+        /// The time between two sends.
+        every: Duration,
+        /// How many go before the split is asked.
+        lead: u64,
+    },
+    /// The split, then `transfer_after` later the right half's lead moved off the parent's
+    /// leader's node, and `ask_after` after that one client writes a right-half key through
+    /// the right half and another, whose cache still names the parent, reads that key through
+    /// the parent (`TrustStaleDescriptor`).
+    StaleCache {
+        /// From the split to the transfer.
+        transfer_after: Duration,
+        /// From the transfer to the two clients.
+        ask_after: Duration,
+    },
+}
+
 /// One action of the driver, drawn before the run and resolved when it fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Action {
@@ -211,6 +310,8 @@ pub struct Action {
     pub range: u64,
     /// The draw that picks a split's key, or a transfer's target.
     pub pick: u64,
+    /// What a split is drawn under, from stream `shard-load`.
+    pub load: Load,
 }
 
 /// The faults and the driver's actions one seed runs.
@@ -242,12 +343,74 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// The schedule drawn from `seed`: four to seven faults from stream
-    /// `shard-faults`, each followed by a quiet of 450 to 700 ms; the arms' range picks
-    /// from `shard-arm-range`; the clocks from `shard-clocks`; and four to eight driver
-    /// actions from `shard`, at times spread over the faults, two in three a split.
+    /// The schedule the sweep runs for `seed`: [`Schedule::plain`] and, on all but one seed in
+    /// [`PLAIN_ONE_IN`], the shapes of SHARD.md §10 and §12's Stage C over it. Each from a
+    /// stream of its own (D-031), so every draw of the plain schedule falls where it fell:
+    /// stream `shard-load` gives each of the driver's splits a [`Load`], one each of the three
+    /// shaped loads and the clients' traffic alone by quarters, and stream `shard-restart` adds
+    /// one [`Fault::SplitFromRestarted`] in the second half of the faults, where a split has had
+    /// its chance to take an id. The driver's actions keep the times the plain schedule gave
+    /// them, against faults the arm may have moved later.
+    // PROPOSED(D-131): §12, Stage C's shapes.
     #[must_use]
     pub fn draw(seed: u64) -> Self {
+        let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
+            Duration::from_millis(lo + rng.below(hi - lo + 1))
+        };
+        let mut schedule = Self::plain(seed);
+        let mut load = moirae_sched::stream(seed, "shard-load");
+        if load.below(PLAIN_ONE_IN) == 0 {
+            return schedule;
+        }
+        for action in &mut schedule.actions {
+            if action.kind != ActionKind::Split {
+                continue;
+            }
+            let count = 6 + load.below(9);
+            let every = Duration::from_millis(1 + load.below(3));
+            let lead = load.below(count / 2 + 1);
+            action.load = match load.below(4) {
+                0 => Load::Clients,
+                1 => Load::WriteBurst { count, every, lead },
+                2 => Load::ReadBurst { count, every, lead },
+                _ => Load::StaleCache {
+                    transfer_after: ms(&mut load, 120, 240),
+                    ask_after: ms(&mut load, 80, 160),
+                },
+            };
+        }
+        let mut restart = moirae_sched::stream(seed, "shard-restart");
+        let half = schedule.faults.len() / 2;
+        let at = half
+            + usize::try_from(restart.below((schedule.faults.len() - half + 1) as u64))
+                .expect("small");
+        let down = ms(&mut restart, 50, 400);
+        let transfer_after = ms(&mut restart, 150, 300);
+        let split_after = ms(&mut restart, 150, 300);
+        let quiet = ms(&mut restart, 450, 700);
+        schedule.faults.insert(
+            at,
+            Fault::SplitFromRestarted {
+                down,
+                transfer_after,
+                split_after,
+            },
+        );
+        schedule
+            .gaps
+            .insert(at, transfer_after + split_after + quiet);
+        schedule.picks.insert(at, restart.below(1 << 16));
+        schedule
+    }
+
+    /// The schedule with no shape on it: four to seven faults from stream
+    /// `shard-faults`, each followed by a quiet of 450 to 700 ms; the arms' range picks
+    /// from `shard-arm-range`; the clocks from `shard-clocks`; and four to eight driver
+    /// actions from `shard`, at times spread over the faults, two in three a split, each under
+    /// [`Load::Clients`]. The sweep runs it on one seed in [`PLAIN_ONE_IN`], and every pinned
+    /// seed runs it, being the schedule it was found on (PROPOSED D-131).
+    #[must_use]
+    pub fn plain(seed: u64) -> Self {
         let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
             Duration::from_millis(lo + rng.below(hi - lo + 1))
         };
@@ -307,6 +470,7 @@ impl Schedule {
                 },
                 range: driver.below(1 << 16),
                 pick: driver.below(1 << 16),
+                load: Load::Clients,
             })
             .collect();
         actions.sort_by_key(|action| action.at);
@@ -502,12 +666,31 @@ pub struct Span {
 #[derive(Clone, Debug, Default)]
 pub struct Spans {
     latest: BTreeMap<u64, Span>,
+    /// Every block of range ids granted, by its first id: its last, and the node it went to.
+    blocks: BTreeMap<u64, (u64, u64)>,
+    /// The nodes some split took a right half's id from a block of.
+    takers: BTreeSet<u64>,
 }
 
 impl Spans {
     /// Folds one record.
     pub fn push(&mut self, record: &TraceRecord) {
         let (range, start, end, generation, voters) = match &record.event {
+            // PROPOSED(D-131): who has taken an id, what the restart arm picks from.
+            TraceEvent::RangeIdsLeased {
+                node, first, last, ..
+            } => {
+                self.blocks.entry(*first).or_insert((*last, *node));
+                return;
+            }
+            TraceEvent::RangeSplit { right, .. } => {
+                if let Some((_, (last, node))) = self.blocks.range(..=*right).next_back()
+                    && right <= last
+                {
+                    self.takers.insert(*node);
+                }
+                return;
+            }
             TraceEvent::RangeCreated {
                 range,
                 start,
@@ -555,6 +738,18 @@ impl Spans {
     #[must_use]
     pub fn latest(&self) -> &BTreeMap<u64, Span> {
         &self.latest
+    }
+
+    /// The nodes some split took a right half's id from a block of, in order.
+    #[must_use]
+    pub fn takers(&self) -> Vec<u64> {
+        self.takers.iter().copied().collect()
+    }
+
+    /// The range whose latest descriptor starts at `start`, if any.
+    #[must_use]
+    pub fn starting_at(&self, start: &Bytes) -> Option<(u64, &Span)> {
+        self.user().find(|(_, span)| span.start == *start)
     }
 
     /// The user ranges' latest descriptors.
@@ -701,7 +896,23 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The split's admin: asks `range`'s leader, `target` first, to split at `key`, follows
 /// `NotLeader` round the bootstrap nodes twice, retries after `NoRangeId` (PROPOSED
-/// D-092's A), and records every answer.
+/// D-092's A), and records every answer. Under a burst it asks `delay` after the action fired
+/// (PROPOSED D-131).
+///
+/// A leader answers a split's copy with silence once its entry is in the log, and answers the
+/// entry once, at its apply (SHARD.md §5): an asker that heard `NoRangeId`, then asked again,
+/// and whose answer was lost to the network would otherwise hear nothing more until its copy
+/// was forgotten. So after a silent wait such an asker asks anew, under a number the leader has
+/// not seen, which the leader answers at once: the split done, or refused `KeyOutsideSpan`
+/// where it has already landed. Seed 992 found it: the split took effect 130 ms after its
+/// first refusal and its asker was answered 3.2 s later (PROPOSED D-131).
+///
+/// The asks before the first `NoRangeId` and the retries after it are counted apart. D-092's
+/// check is about the retries, and it reports an asker still asking at the last heal that ends
+/// with no answer. An asker whose tries went on `NotLeader` bounces and whose first `NoRangeId`
+/// came on its last one has made no retry, and the check would be reading the bounces. So the
+/// first `NoRangeId` gives the asker [`ASKS`] again, and only the first, so an asker every
+/// node keeps refusing still stops and is still reported. Seed 18925 found it (PROPOSED D-131).
 #[allow(clippy::too_many_arguments)]
 async fn split_admin<E: Environment>(
     env: E,
@@ -711,14 +922,19 @@ async fn split_admin<E: Environment>(
     generation: u64,
     key: Bytes,
     stats: Driver,
+    delay: Duration,
 ) {
     let Ok(sock) = env.net().bind(admin_addr(n)).await else {
         lock(&stats).outstanding -= 1;
         return;
     };
-    let mut tries = BOOTSTRAP * 4;
+    if !delay.is_zero() {
+        env.clock().sleep(delay).await;
+    }
+    let mut tries = ASKS;
     let mut done = false;
     let mut first_refused: Option<Instant> = None;
+    let mut seq = n;
     while tries > 0 && !done {
         tries -= 1;
         let request = RangedRequest {
@@ -726,7 +942,7 @@ async fn split_admin<E: Environment>(
             generation,
             request: Request {
                 client: DRIVER,
-                seq: n,
+                seq,
                 command: Command::Split {
                     key: key.clone(),
                     right: 0,
@@ -747,12 +963,16 @@ async fn split_admin<E: Environment>(
         };
         let Either::Left(Ok((_, bytes))) = answer else {
             target = target % BOOTSTRAP + 1;
+            // PROPOSED(D-131): the copy of a split the log holds is answered once; see above.
+            if first_refused.is_some() {
+                seq += ASK_ANEW;
+            }
             continue;
         };
         let Ok(answer) = RangedResponse::decode(bytes) else {
             continue;
         };
-        if answer.response.seq != n {
+        if answer.response.seq % ASK_ANEW != n {
             continue;
         }
         match answer.response.reply {
@@ -766,6 +986,10 @@ async fn split_admin<E: Environment>(
                     }
                 }
                 if reason == SplitRefusal::NoRangeId {
+                    // PROPOSED(D-131): the retries get the budget whole; see above.
+                    if first_refused.is_none() {
+                        tries = ASKS;
+                    }
                     first_refused.get_or_insert(now);
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
@@ -857,6 +1081,218 @@ async fn transfer_admin<E: Environment>(
     lock(&stats).outstanding -= 1;
 }
 
+/// The process a burst of action `j` (from 1) traces under.
+#[must_use]
+fn burst_process(j: u64) -> u64 {
+    LOAD | j
+}
+
+/// The burst of [`Load::WriteBurst`] and [`Load::ReadBurst`]: `ops`, one every `every`, at the
+/// parent's leader `target`, under the parent's range and generation, each answered as it comes
+/// (PROPOSED D-131). Unlike the Figure 8 driver's burst (`raft::burst`, D-031), which only
+/// needs its appends, this one takes its answers, so a write a variant acknowledges and a read
+/// it serves are in the history. Each is sent once: a write it hears nothing of, or is told is
+/// not this range's, stays pending or leaves the history at its apply, as a client's does
+/// (SHARD.md §9).
+// PROPOSED(D-131): the workload's bursts (D-031's shape for a driver).
+async fn load_burst<E: Environment>(
+    env: E,
+    j: u64,
+    target: u64,
+    range: u64,
+    generation: u64,
+    ops: Vec<ClientOp>,
+    every: Duration,
+) {
+    let Ok(sock) = env.net().bind(burst_addr(j)).await else {
+        return;
+    };
+    let process = burst_process(j);
+    let mut next = 0usize;
+    let mut wake = env.clock().now();
+    let mut answered: BTreeSet<u64> = BTreeSet::new();
+    loop {
+        let recv = pin!(sock.recv());
+        let timer = pin!(env.clock().sleep_until(wake));
+        match race(&env, recv, timer).await {
+            Either::Left(Ok((_, bytes))) => {
+                let Ok(answer) = RangedResponse::decode(bytes) else {
+                    continue;
+                };
+                let (seq, reply) = (answer.response.seq, answer.response.reply);
+                if let Reply::Outcome(result) = reply
+                    && answered.insert(seq)
+                {
+                    env.trace(TraceEvent::ClientReturn {
+                        client: process,
+                        seq,
+                        result: raft::to_result(result),
+                    });
+                }
+            }
+            Either::Left(Err(_)) => return,
+            Either::Right(()) => {
+                let Some(op) = ops.get(next) else {
+                    return;
+                };
+                let seq = u64::try_from(next).expect("small");
+                env.trace(TraceEvent::ClientInvoke {
+                    client: process,
+                    seq,
+                    op: op.clone(),
+                });
+                let request = RangedRequest {
+                    range: RangeId(range),
+                    generation,
+                    request: Request {
+                        client: process,
+                        seq,
+                        command: raft::to_command(op),
+                    },
+                };
+                if sock
+                    .send(server_addr(target), request.encode())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                next += 1;
+                wake = if next == ops.len() {
+                    env.clock().now() + LOAD_WAIT
+                } else {
+                    wake + every
+                };
+            }
+        }
+    }
+}
+
+/// One of the two stale-cache shape's clients (PROPOSED D-131): asks `op` of `range` at
+/// `generation` through `target`, following `NotLeader` round the bootstrap nodes, and traces
+/// its call and its answer as a client's. Whether it was answered with an outcome.
+///
+/// `NotLeader` is a refusal at the step, so the operation goes on to the next node. A silence
+/// is not: a get can be asked again elsewhere, and a write cannot, as the sweep's own client
+/// has it (`raft::client_over`). The node that went silent may have proposed it, and a leader's
+/// record of (client, seq) is that leader's alone, so a second leader would propose it again
+/// and it would apply twice, while the history closes the call at its first apply. A write
+/// that hears nothing stays open in the history (Q10). Seed 16725 found it.
+async fn ask_once<E: Environment, S: Socket>(
+    env: &E,
+    sock: &S,
+    process: u64,
+    mut target: u64,
+    range: u64,
+    generation: u64,
+    op: ClientOp,
+) -> bool {
+    env.trace(TraceEvent::ClientInvoke {
+        client: process,
+        seq: 0,
+        op: op.clone(),
+    });
+    let command = raft::to_command(&op);
+    for _ in 0..BOOTSTRAP {
+        let request = RangedRequest {
+            range: RangeId(range),
+            generation,
+            request: Request {
+                client: process,
+                seq: 0,
+                command: command.clone(),
+            },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let deadline = env.clock().now() + STALE_WAIT;
+        let reply = loop {
+            let recv = pin!(sock.recv());
+            let timer = pin!(env.clock().sleep_until(deadline));
+            match race(env, recv, timer).await {
+                Either::Left(Ok((_, bytes))) => {
+                    let Ok(answer) = RangedResponse::decode(bytes) else {
+                        continue;
+                    };
+                    if answer.response.client == process {
+                        break Some(answer.response.reply);
+                    }
+                }
+                Either::Left(Err(_)) | Either::Right(()) => break None,
+            }
+        };
+        match reply {
+            Some(Reply::Outcome(result)) => {
+                env.trace(TraceEvent::ClientReturn {
+                    client: process,
+                    seq: 0,
+                    result: raft::to_result(result),
+                });
+                return true;
+            }
+            Some(Reply::NotLeader {
+                leader: Some(leader),
+            }) => target = leader.0,
+            // A `RangeMismatch` is the correct server's answer to the reader, and its call
+            // leaves the history as one never proposed (SHARD.md §9).
+            Some(Reply::RangeMismatch { .. }) => return false,
+            // PROPOSED(D-131): one try for a write, as above.
+            None if op.is_write() => return false,
+            Some(Reply::NotLeader { leader: None }) | None => target = target % BOOTSTRAP + 1,
+        }
+    }
+    false
+}
+
+/// [`Load::StaleCache`]'s two clients, as action `j`'s (PROPOSED D-131): the writer puts a
+/// right-half key through the right half, and once it has its answer the reader, whose cache
+/// still names the parent, gets that key through the parent at the generation it had.
+async fn stale_clients<E: Environment>(
+    env: E,
+    j: u64,
+    key: Bytes,
+    right: (u64, u64, u64),
+    parent: (u64, u64, u64),
+) {
+    let Ok(sock) = env.net().bind(burst_addr(j)).await else {
+        return;
+    };
+    let (range, generation, target) = right;
+    let value = Bytes::from(format!("l{j}"));
+    let done = ask_once(
+        &env,
+        &sock,
+        LOAD | WRITER | j,
+        target,
+        range,
+        generation,
+        ClientOp::Put {
+            key: key.clone(),
+            value,
+        },
+    )
+    .await;
+    if !done {
+        return;
+    }
+    let (range, generation, target) = parent;
+    let _ = ask_once(
+        &env,
+        &sock,
+        LOAD | READER | j,
+        target,
+        range,
+        generation,
+        ClientOp::Get { key },
+    )
+    .await;
+}
+
 /// What the sliced advance watches for: the raft sweep's watch over the incremental
 /// checkers, which stops the run at the first violation (D-046), and the latest descriptors
 /// the driver draws from.
@@ -920,6 +1356,38 @@ enum Step {
     End(usize),
     /// The driver's action `j` fires.
     Act(usize),
+    /// Action `j`'s stale-cache shape moves the right half's lead off the parent's leader's
+    /// node.
+    StaleTransfer(usize),
+    /// Action `j`'s stale-cache shape's two clients ask.
+    StaleAsk(usize),
+    /// Fault `i`'s [`Fault::SplitFromRestarted`] hands its restarted node a range's lead.
+    RestartTransfer(usize),
+    /// Fault `i`'s [`Fault::SplitFromRestarted`] asks its restarted node to split the range.
+    RestartSplit(usize),
+}
+
+/// What a shape resolved to when it fired, as a split's [`Load`] and a restart arm do not
+/// know until then (PROPOSED D-131).
+#[derive(Clone, Debug)]
+struct Aimed {
+    /// The parent.
+    parent: u64,
+    /// The parent's generation when the split was asked.
+    generation: u64,
+    /// The key the split cuts at.
+    cut: u64,
+}
+
+/// The arm [`Fault::SplitFromRestarted`] as it fired, read against the trace (PROPOSED D-131).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestartArm {
+    /// The node crashed and restarted.
+    pub victim: u64,
+    /// The range handed to it, where one could still split.
+    pub range: Option<u64>,
+    /// The sequence number of the split its admin asked, where it asked one.
+    pub seq: Option<u64>,
 }
 
 /// What one run produced.
@@ -943,6 +1411,8 @@ pub struct Report {
     /// `checked.last_heal`, the liveness window's start, is past the driver's drain and so
     /// past every asker the drain saw finish (PROPOSED D-113 §8).
     pub last_fault_healed: Instant,
+    /// Each [`Fault::SplitFromRestarted`] that found a node to crash.
+    pub restart_arms: Vec<RestartArm>,
 }
 
 /// Runs the correct system on `seed`.
@@ -989,6 +1459,25 @@ pub fn run_to_the_end(
         seed,
         Schedule::draw(seed),
         variants.into(),
+        node_variants,
+        range_variants,
+        Watch::new(false),
+    )
+}
+
+/// [`run_to_the_end`] on a schedule the caller names (PROPOSED D-131).
+#[must_use]
+pub fn run_to_the_end_with(
+    seed: u64,
+    schedule: Schedule,
+    variants: Variants,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+) -> Report {
+    run_watched(
+        seed,
+        schedule,
+        variants,
         node_variants,
         range_variants,
         Watch::new(false),
@@ -1062,10 +1551,32 @@ fn run_watched(
         steps.push((at, 1, Step::Begin(i)));
         at += fault.length();
         steps.push((at, 0, Step::End(i)));
+        if let Fault::SplitFromRestarted {
+            transfer_after,
+            split_after,
+            ..
+        } = fault
+        {
+            steps.push((at + *transfer_after, 2, Step::RestartTransfer(i)));
+            steps.push((
+                at + *transfer_after + *split_after,
+                2,
+                Step::RestartSplit(i),
+            ));
+        }
         at += *gap;
     }
     for (j, action) in schedule.actions.iter().enumerate() {
-        steps.push((begin + action.at, 2, Step::Act(j)));
+        let fires = begin + action.at;
+        steps.push((fires, 2, Step::Act(j)));
+        if let Load::StaleCache {
+            transfer_after,
+            ask_after,
+        } = action.load
+        {
+            steps.push((fires + transfer_after, 2, Step::StaleTransfer(j)));
+            steps.push((fires + transfer_after + ask_after, 2, Step::StaleAsk(j)));
+        }
     }
     steps.sort_by_key(|(at, order, _)| (*at, *order));
 
@@ -1078,6 +1589,9 @@ fn run_watched(
     let mut isolations: Vec<(u64, Instant, Instant)> = Vec::new();
     // The fault in force: its victim node, if it has one, and when it began.
     let mut open: Option<(u64, Instant)> = None;
+    // What the shapes resolved to when they fired (PROPOSED D-131).
+    let mut aimed: Vec<Option<Aimed>> = vec![None; schedule.actions.len()];
+    let mut restart_arms: Vec<Option<RestartArm>> = vec![None; schedule.faults.len()];
     let mut last_heal = sim.now();
     for (at, _, step) in steps {
         advance_to(&mut sim, at, &mut watch);
@@ -1127,6 +1641,23 @@ fn run_watched(
                         sim.crash(nodes[leader as usize - 1]);
                         open = Some((leader, sim.now()));
                     }
+                    // PROPOSED(D-131): a node some split has taken an id from, as the trace
+                    // says when the arm fires.
+                    Fault::SplitFromRestarted { .. } => {
+                        watch.look(&sim);
+                        let takers = watch.spans.takers();
+                        open = takers
+                            .get(usize::try_from(pick % takers.len().max(1) as u64).expect("small"))
+                            .map(|&victim| {
+                                sim.crash(nodes[victim as usize - 1]);
+                                restart_arms[i] = Some(RestartArm {
+                                    victim,
+                                    range: None,
+                                    seq: None,
+                                });
+                                (victim, sim.now())
+                            });
+                    }
                 }
             }
             Step::End(i) => {
@@ -1138,7 +1669,9 @@ fn run_watched(
                         }
                     }
                     Fault::OneWay { .. } => sim.heal(),
-                    Fault::Crash { .. } | Fault::CrashLeader { .. } => {
+                    Fault::Crash { .. }
+                    | Fault::CrashLeader { .. }
+                    | Fault::SplitFromRestarted { .. } => {
                         if let Some((node, _)) = open.take() {
                             sim.restart(nodes[node as usize - 1]);
                             spawn(&sim, node, variants, node_variants, range_variants);
@@ -1154,7 +1687,69 @@ fn run_watched(
                 if watch.checks.stopped.is_some() {
                     break;
                 }
-                act(&sim, admin, j, &schedule.actions[j], &watch.spans, &driver);
+                aimed[j] = act(&sim, admin, j, &schedule.actions[j], &watch.spans, &driver);
+            }
+            // PROPOSED(D-131): the shapes' later steps, each resolved against the trace as
+            // it stands when it fires, each doing nothing where its split did not land.
+            Step::StaleTransfer(j) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(aim) = &aimed[j] {
+                    move_right_half_off(
+                        &sim,
+                        admin,
+                        j,
+                        aim,
+                        schedule.actions[j].pick,
+                        &watch.spans,
+                        &driver,
+                    );
+                }
+            }
+            Step::StaleAsk(j) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(aim) = &aimed[j] {
+                    ask_through_both(&sim, admin, j, aim, schedule.actions[j].pick, &watch.spans);
+                }
+            }
+            Step::RestartTransfer(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = restart_arms[i].as_mut() {
+                    hand_restarted_a_range(
+                        &sim,
+                        admin,
+                        i,
+                        arm,
+                        schedule.picks[i],
+                        &watch.spans,
+                        &driver,
+                    );
+                }
+            }
+            Step::RestartSplit(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = restart_arms[i].as_mut() {
+                    split_from_restarted(
+                        &sim,
+                        admin,
+                        i,
+                        arm,
+                        schedule.picks[i],
+                        &watch.spans,
+                        &driver,
+                    );
+                }
             }
         }
     }
@@ -1218,11 +1813,222 @@ fn run_watched(
         driver,
         checked,
         last_fault_healed,
+        restart_arms: restart_arms.into_iter().flatten().collect(),
     }
 }
 
-/// Fires the driver's action `j`, resolved against `spans` as they stand.
-fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, driver: &Driver) {
+/// [`Load::StaleCache`]'s second step (PROPOSED D-131): where the right half is led from the
+/// parent's leader's node, asks that its lead move to another voter, so that the right half's
+/// writes commit on two nodes and the parent's leader may lag them. Leaves it alone where a
+/// fault or a transfer already moved it, and where the split has not landed.
+// PROPOSED(D-131)
+fn move_right_half_off(
+    sim: &Sim,
+    admin: NodeId,
+    j: usize,
+    aim: &Aimed,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    let Some((right, span)) = spans.starting_at(&user_key(&key(aim.cut))) else {
+        return;
+    };
+    let parent_leader = raft::leader_of_range(sim, aim.parent);
+    if raft::leader_of_range(sim, right) != parent_leader {
+        return;
+    }
+    let others: Vec<u64> = span
+        .voters
+        .iter()
+        .copied()
+        .filter(|voter| *voter != parent_leader)
+        .collect();
+    let Some(&to) = others.get(usize::try_from(pick % others.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    {
+        let mut stats = lock(driver);
+        stats.transfers_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = STALE_ADMIN + u64::try_from(j).expect("small");
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "stale-transfer",
+        transfer_admin(
+            inner,
+            n,
+            parent_leader,
+            right,
+            span.generation,
+            to,
+            driver.clone(),
+        ),
+    );
+}
+
+/// [`Load::StaleCache`]'s last step (PROPOSED D-131): one client writes a right-half key
+/// through the right half and another, whose cache still names the parent, reads it through
+/// the parent.
+// PROPOSED(D-131)
+fn ask_through_both(sim: &Sim, admin: NodeId, j: usize, aim: &Aimed, pick: u64, spans: &Spans) {
+    let Some((right, span)) = spans.starting_at(&user_key(&key(aim.cut))) else {
+        return;
+    };
+    let held = keys_in(span);
+    let Some(&at) = held.get(usize::try_from(pick % held.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    let writes_through = (right, span.generation, raft::leader_of_range(sim, right));
+    let reads_through = (
+        aim.parent,
+        aim.generation,
+        raft::leader_of_range(sim, aim.parent),
+    );
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "stale-clients",
+        stale_clients(
+            inner,
+            u64::try_from(j).expect("small") + 1,
+            key(at),
+            writes_through,
+            reads_through,
+        ),
+    );
+}
+
+/// [`Fault::SplitFromRestarted`]'s first step after the restart (PROPOSED D-131): picks a user
+/// range that can still split, and asks its leader to hand it to the restarted node. No range
+/// can, and the arm has only been a crash.
+// PROPOSED(D-131)
+fn hand_restarted_a_range(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut RestartArm,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    let candidates: Vec<(u64, &Span)> = spans
+        .user()
+        .filter(|(_, span)| !split_keys(span).is_empty())
+        .collect();
+    let Some(&(range, span)) =
+        candidates.get(usize::try_from(pick % candidates.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    arm.range = Some(range);
+    let leader = raft::leader_of_range(sim, range);
+    if leader == arm.victim {
+        return;
+    }
+    {
+        let mut stats = lock(driver);
+        stats.transfers_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = RESTART_ADMIN + 2 * u64::try_from(i).expect("small");
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "restart-transfer",
+        transfer_admin(
+            inner,
+            n,
+            leader,
+            range,
+            span.generation,
+            arm.victim,
+            driver.clone(),
+        ),
+    );
+}
+
+/// [`Fault::SplitFromRestarted`]'s last step (PROPOSED D-131): asks the restarted node to split
+/// the range it was handed.
+// PROPOSED(D-131)
+fn split_from_restarted(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut RestartArm,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    let Some(range) = arm.range else {
+        return;
+    };
+    let Some(span) = spans.latest().get(&range) else {
+        return;
+    };
+    let keys = split_keys(span);
+    let Some(&at) = keys.get(usize::try_from(pick % keys.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    let n = RESTART_ADMIN + 2 * u64::try_from(i).expect("small") + 1;
+    arm.seq = Some(n);
+    {
+        let mut stats = lock(driver);
+        stats.splits_asked += 1;
+        stats.outstanding += 1;
+    }
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "restart-split",
+        split_admin(
+            inner,
+            n,
+            arm.victim,
+            range,
+            span.generation,
+            key(at),
+            driver.clone(),
+            Duration::ZERO,
+        ),
+    );
+}
+
+/// The `count` operations of a burst of action `n`: right-half keys taken in turn from the
+/// one `pick` names, puts under distinct values or gets (PROPOSED D-131).
+fn burst_ops(n: u64, right: &[u64], count: u64, pick: u64, writes: bool) -> Vec<ClientOp> {
+    let len = right.len() as u64;
+    (0..count)
+        .map(|i| {
+            let at = usize::try_from((pick + i) % len).expect("small");
+            let of = key(right[at]);
+            if writes {
+                ClientOp::Put {
+                    key: of,
+                    value: Bytes::from(format!("l{n}.{i}")),
+                }
+            } else {
+                ClientOp::Get { key: of }
+            }
+        })
+        .collect()
+}
+
+/// Fires the driver's action `j`, resolved against `spans` as they stand. What a split aimed at,
+/// for the shape's later steps (PROPOSED D-131).
+fn act(
+    sim: &Sim,
+    admin: NodeId,
+    j: usize,
+    action: &Action,
+    spans: &Spans,
+    driver: &Driver,
+) -> Option<Aimed> {
     let n = u64::try_from(j).expect("small") + 1;
     let env = sim.env(admin);
     let inner = env.clone();
@@ -1235,7 +2041,7 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
                 .collect();
             if candidates.is_empty() {
                 lock(driver).splits_skipped += 1;
-                return;
+                return None;
             }
             let (range, span, keys) = &candidates
                 [usize::try_from(action.range % candidates.len() as u64).expect("small")];
@@ -1246,6 +2052,16 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
                 stats.splits_asked += 1;
                 stats.outstanding += 1;
             }
+            // PROPOSED(D-131): a burst starts as the action fires, and the split goes after
+            // the burst's first `lead`.
+            let burst = match action.load {
+                Load::WriteBurst { count, every, lead } => Some((true, count, every, lead)),
+                Load::ReadBurst { count, every, lead } => Some((false, count, every, lead)),
+                Load::Clients | Load::StaleCache { .. } => None,
+            };
+            let delay = burst.map_or(Duration::ZERO, |(_, _, every, lead)| {
+                every * u32::try_from(lead).expect("small")
+            });
             env.spawn(
                 "split-admin",
                 split_admin(
@@ -1256,13 +2072,29 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
                     span.generation,
                     key(at),
                     driver.clone(),
+                    delay,
                 ),
             );
+            if let Some((writes, count, every, _)) = burst {
+                let right: Vec<u64> = keys_in(span).into_iter().filter(|i| *i >= at).collect();
+                let ops = burst_ops(n, &right, count, action.pick, writes);
+                let env = sim.env(admin);
+                let inner = env.clone();
+                env.spawn(
+                    "load-burst",
+                    load_burst(inner, n, target, *range, span.generation, ops, every),
+                );
+            }
+            Some(Aimed {
+                parent: *range,
+                generation: span.generation,
+                cut: at,
+            })
         }
         ActionKind::Transfer => {
             let ranges: Vec<(u64, &Span)> = spans.latest().iter().map(|(r, s)| (*r, s)).collect();
             if ranges.is_empty() {
-                return;
+                return None;
             }
             let (range, span) =
                 ranges[usize::try_from(action.range % ranges.len() as u64).expect("small")];
@@ -1273,11 +2105,8 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
                 .copied()
                 .filter(|voter| *voter != leader)
                 .collect();
-            let Some(&to) = others
-                .get(usize::try_from(action.pick % others.len().max(1) as u64).expect("small"))
-            else {
-                return;
-            };
+            let &to = others
+                .get(usize::try_from(action.pick % others.len().max(1) as u64).expect("small"))?;
             {
                 let mut stats = lock(driver);
                 stats.transfers_asked += 1;
@@ -1287,6 +2116,7 @@ fn act(sim: &Sim, admin: NodeId, j: usize, action: &Action, spans: &Spans, drive
                 "transfer-admin",
                 transfer_admin(inner, n, leader, range, span.generation, to, driver.clone()),
             );
+            None
         }
     }
 }
@@ -1807,7 +2637,119 @@ pub fn splits_from_a_block_of_an_earlier_run_of(records: &[TraceRecord]) -> usiz
     found
 }
 
+/// What the workload's shapes reached on one run, each read off the trace and each something
+/// the correct system does only because the shape was reached (SHARD.md §10; PROPOSED D-131).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shapes {
+    /// A burst's write the split's apply check refused: `RangeMismatchSent { at: Apply }` to a
+    /// burst's client. The window of `ApplyIgnoresSpan`.
+    pub writes_refused_at_apply: usize,
+    /// A burst's get the check at serving refused: `RangeMismatchSent { at: Read }` to a burst's
+    /// client. The window of `ReadCheckAtReceiptOnly`.
+    pub gets_refused_at_serving: usize,
+    /// The stale-cache reader's get of a key the writer had just written through the right
+    /// half, refused by the parent at receipt. The window of `TrustStaleDescriptor`.
+    pub stale_reads_refused: usize,
+    /// A split the restart arm asked of its restarted node that took effect, proposed there.
+    /// The window of `IdBlockResumed`.
+    pub splits_from_a_restarted_node: usize,
+    /// A sweep client's request answered `RangeMismatch` by a range that had split: the
+    /// window of `ClientIgnoresMismatch`, §10's "any split with load".
+    pub clients_mismatched_by_a_split: usize,
+}
+
+impl Shapes {
+    /// Whether any shape's window was reached.
+    #[must_use]
+    pub fn reached_any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// What the shapes reached on the trace `records` of a run whose restart arms are `arms`
+/// ([`Shapes`]).
+// PROPOSED(D-131)
+#[must_use]
+pub fn shapes_of(records: &[TraceRecord], arms: &[RestartArm]) -> Shapes {
+    let mut shapes = Shapes::default();
+    let is_load = |client: u64| client >> 32 == LOAD >> 32;
+    let mut split: BTreeSet<u64> = BTreeSet::new();
+    // Each restart arm's split that was proposed on its restarted node, as (range, index).
+    let mut proposed: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut done: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::RangeMismatchSent {
+                range, client, at, ..
+            } => {
+                let client = *client;
+                if is_load(client) {
+                    match at {
+                        MismatchAt::Apply if client & (WRITER | READER) == 0 => {
+                            shapes.writes_refused_at_apply += 1;
+                        }
+                        MismatchAt::Read if client & (WRITER | READER) == 0 => {
+                            shapes.gets_refused_at_serving += 1;
+                        }
+                        MismatchAt::Receipt if client & READER != 0 => {
+                            shapes.stale_reads_refused += 1;
+                        }
+                        _ => {}
+                    }
+                } else if client >> 32 >= 1 && client >> 32 <= CLIENTS && split.contains(range) {
+                    shapes.clients_mismatched_by_a_split += 1;
+                }
+            }
+            TraceEvent::RaftProposed {
+                server,
+                range,
+                client,
+                seq,
+                index,
+                ..
+            } if *client == DRIVER => {
+                if arms
+                    .iter()
+                    .any(|arm| arm.victim == *server && arm.seq == Some(*seq % ASK_ANEW))
+                {
+                    proposed.insert((*range, *index));
+                }
+            }
+            TraceEvent::RangeSplit { range, index, .. } => {
+                split.insert(*range);
+                if proposed.contains(&(*range, *index)) && done.insert((*range, *index)) {
+                    shapes.splits_from_a_restarted_node += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    shapes
+}
+
+/// How many of the stale-cache reader's gets the parent answered with a value: under the
+/// correct server none, which refuses every one at receipt, and under `TrustStaleDescriptor`
+/// the shape reached (PROPOSED D-131).
+// PROPOSED(D-131)
+#[must_use]
+pub fn stale_reads_served_of(records: &[TraceRecord]) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            matches!(record.event, TraceEvent::ClientReturn { client, .. }
+                if client >> 32 == LOAD >> 32 && client & READER != 0)
+        })
+        .count()
+}
+
 impl Report {
+    /// What the workload's shapes reached ([`Shapes`]).
+    // PROPOSED(D-131)
+    #[must_use]
+    pub fn shapes(&self) -> Shapes {
+        shapes_of(self.records(), &self.restart_arms)
+    }
+
     /// The trace as records.
     #[must_use]
     pub fn records(&self) -> &[TraceRecord] {
@@ -2954,5 +3896,162 @@ mod tests {
         assert_eq!(split_keys(&span(b"k", b"l")), (2..=14).collect::<Vec<_>>());
         assert_eq!(split_keys(&span(b"k04", b"k08")), vec![6]);
         assert!(split_keys(&span(b"k04", b"k07")).is_empty());
+    }
+
+    fn mismatch(ms: u64, range: u64, client: u64, at: MismatchAt) -> TraceRecord {
+        record(
+            ms,
+            1,
+            TraceEvent::RangeMismatchSent {
+                range,
+                client,
+                seq: 0,
+                at,
+                descriptors: Vec::new(),
+            },
+        )
+    }
+
+    fn split_record(ms: u64, range: u64, index: u64) -> TraceRecord {
+        record(
+            ms,
+            1,
+            TraceEvent::RangeSplit {
+                range,
+                right: range + 1,
+                key: Bytes::from_static(b"k08"),
+                index,
+            },
+        )
+    }
+
+    /// Each shape read off the trace, and what must not count for it. A shape's rate is only
+    /// as good as this reading: a burst's refusal at receipt is the burst arriving after the
+    /// split's apply, which reaches no window; a sweep client's mismatch from a range nothing
+    /// has split is the bootstrap's stale caches; and a restart arm's split counts only where
+    /// it was proposed on the restarted node, and only once however many replicas apply it.
+    // PROPOSED(D-131)
+    #[test]
+    fn the_shapes_are_read_off_the_trace() {
+        let burst = LOAD | 3;
+        let reader = LOAD | READER | 3;
+        let writer = LOAD | WRITER | 3;
+        let sweep_client = 2 << 32;
+        // Each window, at its own place.
+        let records = [
+            mismatch(1, 2, burst, MismatchAt::Apply),
+            mismatch(2, 2, burst, MismatchAt::Read),
+            mismatch(3, 2, reader, MismatchAt::Receipt),
+        ];
+        let shapes = shapes_of(&records, &[]);
+        assert_eq!(shapes.writes_refused_at_apply, 1);
+        assert_eq!(shapes.gets_refused_at_serving, 1);
+        assert_eq!(shapes.stale_reads_refused, 1);
+        assert!(shapes.reached_any());
+        // A burst refused at receipt, or the writer's answer, is no window.
+        let shapes = shapes_of(
+            &[
+                mismatch(1, 2, burst, MismatchAt::Receipt),
+                mismatch(2, 2, writer, MismatchAt::Receipt),
+                mismatch(3, 2, reader, MismatchAt::Read),
+            ],
+            &[],
+        );
+        assert!(!shapes.reached_any(), "{shapes:?}");
+        // A sweep client's mismatch counts only from a range a split has cut.
+        let before = mismatch(1, 2, sweep_client, MismatchAt::Receipt);
+        let after = mismatch(3, 2, sweep_client, MismatchAt::Receipt);
+        assert_eq!(
+            shapes_of(&[before, split_record(2, 2, 5), after], &[]).clients_mismatched_by_a_split,
+            1
+        );
+        // The restart arm's split: proposed on the restarted node, counted once.
+        let arm = RestartArm {
+            victim: 1,
+            range: Some(2),
+            seq: Some(101),
+        };
+        let proposed = |seq: u64, server: u64| {
+            record(
+                4,
+                server as u32,
+                TraceEvent::RaftProposed {
+                    server,
+                    range: 2,
+                    client: DRIVER,
+                    seq,
+                    index: 7,
+                    term: 2,
+                },
+            )
+        };
+        let split_at_seven = || split_record(5, 2, 7);
+        let done = |p: TraceRecord| {
+            shapes_of(&[p, split_at_seven(), split_at_seven()], &[arm]).splits_from_a_restarted_node
+        };
+        assert_eq!(done(proposed(101, 1)), 1);
+        assert_eq!(
+            done(proposed(101 + ASK_ANEW, 1)),
+            1,
+            "asked anew it is the same arm"
+        );
+        assert_eq!(done(proposed(101, 2)), 0, "proposed elsewhere: not from it");
+        assert_eq!(done(proposed(102, 1)), 0, "another admin's split");
+    }
+
+    /// A shape is a schedule the sweep can take: a drawn schedule keeps every draw of the plain
+    /// one (D-031's stream of its own), adds the shapes, and on one seed in [`PLAIN_ONE_IN`]
+    /// adds nothing.
+    // PROPOSED(D-131)
+    #[test]
+    fn the_shapes_are_drawn_over_the_plain_schedule_from_streams_of_their_own() {
+        let mut none = 0;
+        let (mut clients, mut writes, mut reads, mut stale, mut arms) = (0, 0, 0, 0, 0);
+        for seed in 0..512 {
+            let plain = Schedule::plain(seed);
+            assert!(
+                plain.actions.iter().all(|a| a.load == Load::Clients),
+                "a plain schedule draws no load"
+            );
+            assert!(
+                !plain
+                    .faults
+                    .iter()
+                    .any(|f| matches!(f, Fault::SplitFromRestarted { .. }))
+            );
+            let drawn = Schedule::draw(seed);
+            if drawn == plain {
+                none += 1;
+                continue;
+            }
+            assert_eq!(drawn.drifts, plain.drifts);
+            assert_eq!(drawn.skews, plain.skews);
+            assert_eq!(drawn.actions.len(), plain.actions.len());
+            for (d, p) in drawn.actions.iter().zip(&plain.actions) {
+                assert_eq!(
+                    (d.at, d.kind, d.range, d.pick),
+                    (p.at, p.kind, p.range, p.pick)
+                );
+                match d.load {
+                    Load::Clients => clients += 1,
+                    Load::WriteBurst { .. } => writes += 1,
+                    Load::ReadBurst { .. } => reads += 1,
+                    Load::StaleCache { .. } => stale += 1,
+                }
+            }
+            let rest: Vec<Fault> = drawn
+                .faults
+                .iter()
+                .copied()
+                .filter(|f| !matches!(f, Fault::SplitFromRestarted { .. }))
+                .collect();
+            assert_eq!(rest, plain.faults);
+            arms += usize::from(rest.len() + 1 == drawn.faults.len());
+        }
+        assert!(
+            none > 0 && none < 512 / 4,
+            "about one seed in {PLAIN_ONE_IN} draws none: {none} of 512"
+        );
+        assert!(writes > 0 && reads > 0 && stale > 0 && clients > 0 && arms > 0);
     }
 }
