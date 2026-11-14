@@ -2859,7 +2859,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
 /// Check 9 against `ReadCheckAtReceiptOnly` (SHARD.md §12, Stage C's exit), over the sharded
 /// sweep's own trace, since it is that sweep's read burst that reaches the variant: a read let in
 /// at receipt, served past the split that took its key. Compared fold by fold on the tier's first
-/// hundred at most, as every pair here is; caught on 59 of the hundred and 14 of the gate's
+/// hundred at most, as every pair here is; caught on 57 of the hundred and 13 of the gate's
 /// twenty, so asserted at every tier.
 // PROPOSED(D-131)
 #[test]

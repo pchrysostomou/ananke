@@ -26189,10 +26189,10 @@ harness, shown from the trace, and each is fixed there; no bound moved.
   so a hold that ends with no switch is measured against the bound. Reading it, that is the check's
   gap and not a missed election, but closing it needs the trace to say where such a hold began, and
   this entry changes neither the check nor the trace. So it is left named here, the bound
-  unchanged, seed 16725 fails the sweep past the nightly's range, and the owner has it.
+  unchanged, seed 16725 fails the sweep past the nightly's range, and issue #227 tracks it.
 - *Seed 18925, D-092's check, a defect of the asker.* Right after the restart arm's transfer, the
   asker of range 27's split bounced between nodes on `NotLeader`: exactly twelve messages between
-  8.56 s and 8.63 s, its whole `BOOTSTRAP * 4` budget, and its first `NoRangeId` came on the last
+  8.545 s and 8.627 s, its whole `BOOTSTRAP * 4` budget, and its first `NoRangeId` came on the last
   of them, so it made no retry, and "the split refused at 8.665 s stopped asking at 8.815 s, with no
   answer" was a report of the asker's count and not of the system. The bound is unchanged. An
   asker's first `NoRangeId` now gives it `ASKS` again, and only the first, so an asker every node
@@ -26227,14 +26227,14 @@ pins, on seeds 16725 and 18925, 0.2 each, into shard 4, 2230.8 -> 2231.2, under 
    1 is refused, 1 is created at floor 12, 2 appends 13 at term 3 with another: `Ok(())`, where the
    removal taken out reports "log matching: servers 2 and 1 hold index 13 of group 3 in term 3 with
    different payloads"). No seed reaches it: 0 of 1 000 have a `RangeCreated` over a store with
-   entries and no refusal or removal between, of 1 310 creations over a refused store (1 288 by
-   snapshot, 22 by split). Recommended: keep.
+   entries and no refusal or removal between, of 1 322 creations over a refused store (1 301 by
+   snapshot, 21 by split). Recommended: keep.
 3. *The asker asking anew.* A harness change, on the path only `NoRangeId` opens, in place of
    answering a copy of an applied split at the server, which is #21's job. Its cost, measured: a
    fresh number gets an immediate `KeyOutsideSpan` from a server that never answered the split, so
    D-092's check sees far less of that fault. With a server that never answers a split's apply (a
-   plant, 1 000 seeds), the check fails 1 seed with `ASK_ANEW` (245) against 5 with the number held
-   (73, 245, 568, 860 and one more). It stays honest for what it was built for, `RefillNotResent`.
+   plant, 1 000 seeds, measured on this tree), the check fails 1 seed with `ASK_ANEW` against 3 with
+   the number held. It stays honest for what it was built for, `RefillNotResent`.
    Recommended: keep until #21; a server that answered such a copy would let this come out.
 4. *A plain schedule kept among the sweep's.* SHARD.md does not say. One seed in eight draws no
    shape, which keeps a control population and keeps the pins' schedule one the sweep can take.

@@ -537,8 +537,8 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep()
 /// §10's second catch of `ClientIgnoresMismatch`, "the liveness bound a client that never
 /// converges": the write bound read on the uniform seeds, each run taken to its end since check
 /// 17 would otherwise stop it first. A client that resends to the range it knew gets nothing
-/// through while its cache is stale. On 11 of 500 uniform seeds no write of any key completed
-/// after the heal, and on 8 more the first completion anywhere came later than the bound from
+/// through while its cache is stale. On 12 of 500 uniform seeds no write of any key completed
+/// after the heal, and on 6 more the first completion anywhere came later than the bound from
 /// the heal, which the arm from each range's first call passes and only the reading from the heal
 /// says (PROPOSED D-113 §5). Each is under D-061's 5 %, so each is asserted over the thousand and
 /// printed below it.
