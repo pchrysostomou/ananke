@@ -1747,11 +1747,12 @@ impl ClientRefreshes {
 
 /// Check 20, a placeholder grants nothing (SHARD.md §8, Q22): a `RaftVote` granted,
 /// vote or pre-vote, of range R on node `n` when `n` has traced neither a `RangeCreated`
-/// of R nor a `RangesRestated` naming R since its last `RangeRemoved` of R is a
-/// violation. A replica outlives its node's crash, so a crash ends nothing here; a
-/// placeholder is what a node keeps for a range it holds no replica of, and the only
-/// thing on a node that could grant for such a range. `RangeReplicaCreated` is folded
-/// for the words: a grant that follows one is named a placeholder's.
+/// of R nor a `RangesRestated` naming R since its last `RangeRemoved` of R or its last
+/// `RaftRefused`, whichever came later, is a violation. A replica outlives its node's
+/// crash, so a crash ends nothing here; a placeholder is what a node keeps for a range
+/// it holds no replica of, and the only thing on a node that could grant for such a
+/// range. `RangeReplicaCreated` is folded for the words: a grant that follows one is
+/// named a placeholder's.
 ///
 /// A restatement is evidence of its own, because a creation can be durable and never
 /// traced. A node crashed with a split's batch durable and its `RangeSplit` and
@@ -1759,13 +1760,26 @@ impl ClientRefreshes {
 /// with a descriptor, a log and a core, and goes on to grant for it with no creation in
 /// the trace at all: seed 3291 of the sharded sweep, the window seed 88 showed the
 /// payload oracle (PROPOSED D-113 §5). `RangesRestated` names the initialised replicas
-/// only and no placeholder survives a restart, so it names nothing a placeholder could
-/// grant for.
+/// only and no placeholder survives a restart, so the restatement itself names nothing a
+/// placeholder could grant for at the time it is traced.
+///
+/// A refusal ends every replica its node held, created or restated (RAFT.md §3, Q15):
+/// the node's state is lost, its replicas are re-seeded empty in a fresh engine, and
+/// a re-seeded user range has no descriptor until its install, which traces its
+/// `RangeCreated` anew. So a range held before the node's `RaftRefused` is not held
+/// after it. A refused node can host a placeholder of a range it restated or created
+/// before its loss, and until PROPOSED D-136 that placeholder's grants went unseen
+/// here: 1 064 of `UninitialisedReplicaVotes`'s 10 427 placeholders' grants over 1 000
+/// sharded seeds, every one on a refused node (issue #221). The re-seed's own start
+/// traces its `RangesRestated` after its `RaftRefused`, so the system ranges the re-seed
+/// writes a descriptor for are held again from there.
 // PROPOSED(D-109)
+// PROPOSED(D-136): a refusal ends what the node held.
 #[derive(Clone, Debug, Default)]
 pub struct PlaceholderGrantsNothing {
     /// The replicas each node holds: (node, range), from its `RangeCreated` of the range
-    /// or a `RangesRestated` naming it, to its `RangeRemoved` of it.
+    /// or a `RangesRestated` naming it, to its `RangeRemoved` of it or its node's
+    /// `RaftRefused`.
     held: BTreeSet<(u64, u64)>,
     /// The placeholders each node has made: (node, range), from its
     /// `RangeReplicaCreated` to the range's creation there.
@@ -1797,6 +1811,11 @@ impl PlaceholderGrantsNothing {
             TraceEvent::RangeRemoved { range, .. } => {
                 self.held.remove(&(node, *range));
             }
+            // PROPOSED(D-136): the node's loss is every replica's; what it holds after
+            // is what its re-seed restates or an install creates.
+            TraceEvent::RaftRefused { .. } => {
+                self.held.retain(|(of, _)| *of != node);
+            }
             TraceEvent::RangeReplicaCreated { range } => {
                 self.placeholders.insert((node, *range));
             }
@@ -1817,7 +1836,8 @@ impl PlaceholderGrantsNothing {
                 self.violation = Some(format!(
                     "placeholder grants nothing: node {node} granted range {range}'s {what} \
                      in term {term} to node {candidate} from {whose}, having traced no \
-                     `RangeCreated` of range {range} since its last `RangeRemoved` of it \
+                     `RangeCreated` of range {range} and no `RangesRestated` naming it since \
+                     its last `RangeRemoved` of it or its last `RaftRefused` \
                      (SHARD.md §5, §8, check 20; Q22)"
                 ));
             }
@@ -4207,6 +4227,79 @@ mod tests {
         ])
         .unwrap_err();
         assert!(gone.contains("from its placeholder"), "{gone}");
+    }
+
+    fn refused(node: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RaftRefused {
+                server: node,
+                reason: "the store lost state".to_owned(),
+            },
+        )
+    }
+
+    /// Issue #221's plant on hand-written records: a refused node's placeholder of a range
+    /// it held before its loss, granting. Held by a restatement before the refusal and by a
+    /// creation before it, the grant is a placeholder's and caught; the fold kept the range
+    /// held across the refusal until PROPOSED D-136, and was `Ok` on both.
+    // PROPOSED(D-136)
+    #[test]
+    fn check_20_names_a_refused_nodes_placeholders_grant_for_a_range_it_held_before_its_loss() {
+        let restated_before = check_20(&[
+            restated(3, &[2, 30]),
+            refused(3),
+            restated(3, &[2]),
+            placeholder(3, 30),
+            pre_vote_granted(3, 30),
+        ])
+        .unwrap_err();
+        assert!(
+            restated_before.contains("node 3 granted range 30's pre-vote")
+                && restated_before.contains("from its placeholder"),
+            "a restatement before the refusal is no evidence of a replica after it: \
+             {restated_before}"
+        );
+        let created_before = check_20(&[
+            created(3, 30, b"m", b"z", 2, &[1, 2, 3]),
+            refused(3),
+            placeholder(3, 30),
+            pre_vote_granted(3, 30),
+        ])
+        .unwrap_err();
+        assert!(
+            created_before.contains("from its placeholder"),
+            "nor is a creation before it: {created_before}"
+        );
+        // Only the refused node's: another node's refusal ends nothing on node 3.
+        check_20(&[restated(3, &[30]), refused(2), pre_vote_granted(3, 30)])
+            .expect("node 2's loss is not node 3's");
+    }
+
+    /// The pair's other half: what the correct node does after its refusal. Its re-seed's
+    /// start restates the system ranges it writes a descriptor for, and an install traces a
+    /// re-seeded user range's `RangeCreated` anew; each is held again from there.
+    // PROPOSED(D-136)
+    #[test]
+    fn check_20_takes_what_a_refused_node_restates_or_creates_after_its_loss_as_held() {
+        check_20(&[
+            restated(3, &[0, 1, 30]),
+            refused(3),
+            restated(3, &[0, 1]),
+            pre_vote_granted(3, 1),
+        ])
+        .expect("the re-seed restated range 1 after the refusal");
+        check_20(&[
+            restated(3, &[0, 1, 30]),
+            refused(3),
+            restated(3, &[0, 1]),
+            created(3, 30, b"m", b"z", 2, &[1, 2, 3]),
+            pre_vote_granted(3, 30),
+        ])
+        .expect("the install created range 30 after the refusal");
+        // A crash, unlike a refusal, ends no replica.
+        check_20(&[restated(3, &[30]), crashed(3), pre_vote_granted(3, 30)])
+            .expect("a replica outlives its node's crash");
     }
 
     #[test]

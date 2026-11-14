@@ -1163,8 +1163,12 @@ impl NodeReport {
         // it was asserted: the correct node green on 10 000 of 10 000 seeds, no fold of the
         // seven in violation on any of seeds 0 to 999 under the correct node or
         // `RefuseOneRangeOnly`, and that variant's attribution D-101's 3 338 / 6 661 / 1 at
-        // ten thousand, to the seed (PROPOSED D-106).
+        // ten thousand, to the seed (PROPOSED D-106). Since PROPOSED D-136 check 20 forgets
+        // at a refusal what the node held, and names that variant's unrefused replicas'
+        // grants on 332 of seeds 0 to 999, ahead of the fan-out clause below; the correct
+        // node is green as before (`sim/tests/node.rs`).
         // PROPOSED(D-106): the sharded quorum scenario folds the range layer's checks.
+        // PROPOSED(D-136)
         ananke_shard::invariants::all(&self.records).map_err(|v| format!("seed {seed}: {v}"))?;
         lin::check(&self.history).map_err(|v| format!("seed {seed}: {v}"))?;
         let holds = self.holds().expect("a cast has holds");

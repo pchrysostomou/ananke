@@ -741,6 +741,163 @@ fn a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep() 
     );
 }
 
+/// What one seed of `UninitialisedReplicaVotes`, run to its end, shows of its placeholders'
+/// grants, each grant judged by check 20 on its own: the fold fed every record before it and
+/// none of the run's other grants, so a grant behind another's violation is still judged.
+/// A placeholder is folded from its node's `RangeReplicaCreated` of the range to the node's
+/// `RangeCreated` of it or the node's crash, which no placeholder survives (PROPOSED D-109).
+// PROPOSED(D-136): issue #221's plant, on the sharded sweep.
+#[derive(Debug, Default)]
+struct PlaceholderGrants {
+    /// Every placeholder's grant, vote or pre-vote.
+    granted: usize,
+    /// Those check 20 does not name.
+    unseen: usize,
+    /// Those of a range the granting node restated before its last refusal, and neither
+    /// restated nor created since: issue #221's plant.
+    planted: usize,
+    /// Of the plant, those check 20 names.
+    planted_caught: usize,
+}
+
+// PROPOSED(D-136): issue #221's plant, on the sharded sweep.
+fn placeholder_grants_judged(records: &[TraceRecord]) -> PlaceholderGrants {
+    let mut found = PlaceholderGrants::default();
+    // Check 20 fed every record but the grants, cloned at each grant to judge it alone.
+    let mut fold = invariants::PlaceholderGrantsNothing::default();
+    let mut placeholders: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut restated: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // (node, range): restated before the node's refusal, and nothing since.
+    let mut lost: BTreeSet<(u64, u64)> = BTreeSet::new();
+    for record in records {
+        let Some(node) = record.node.map(|node| u64::from(node.get())) else {
+            continue;
+        };
+        match &record.event {
+            TraceEvent::RaftVote {
+                range,
+                granted: true,
+                ..
+            } => {
+                if placeholders.contains(&(node, *range)) {
+                    let mut alone = fold.clone();
+                    alone.push(record);
+                    let seen = alone.verdict().is_err();
+                    found.granted += 1;
+                    found.unseen += usize::from(!seen);
+                    if lost.contains(&(node, *range)) {
+                        found.planted += 1;
+                        found.planted_caught += usize::from(seen);
+                    }
+                }
+                continue;
+            }
+            TraceEvent::RangeReplicaCreated { range } => {
+                placeholders.insert((node, *range));
+            }
+            TraceEvent::RangeCreated { range, .. } => {
+                placeholders.remove(&(node, *range));
+                lost.remove(&(node, *range));
+            }
+            TraceEvent::NodeCrashed { .. } => placeholders.retain(|(of, _)| *of != node),
+            TraceEvent::RangesRestated { ranges } => {
+                for range in ranges {
+                    restated.insert((node, *range));
+                    lost.remove(&(node, *range));
+                }
+            }
+            TraceEvent::RangeRemoved { range, .. } => {
+                restated.remove(&(node, *range));
+                lost.remove(&(node, *range));
+            }
+            TraceEvent::RaftRefused { .. } => {
+                let held: Vec<(u64, u64)> = restated
+                    .iter()
+                    .filter(|(of, _)| *of == node)
+                    .copied()
+                    .collect();
+                for held in held {
+                    restated.remove(&held);
+                    lost.insert(held);
+                }
+            }
+            _ => {}
+        }
+        fold.push(record);
+    }
+    found
+}
+
+/// Issue #221's plant and its catch (PROPOSED D-136): `UninitialisedReplicaVotes` run to its
+/// end, its placeholders' grants limited to the ranges the granting node had restated before
+/// its refusal, each judged by check 20 on its own. Check 20 kept a range held across its
+/// node's refusal until D-136, so a refused node's placeholder of a range it held before its
+/// loss granted unseen. Measured on this tree, release, over 1 000 seeds: placeholders granted
+/// 10 427 times on 984 seeds, and with the fold before D-136 1 064 of those grants were unseen,
+/// every one on a refused node, and the plant's 96 grants on 18 seeds all were (#221 measured
+/// 601 of 9 142 and 42 on 7 at 97b72e4). With D-136 none is unseen and all 96 are named. Every
+/// grant of the plant named, and every placeholder's grant of the run, is asserted at every
+/// tier. The plant is reached on 1.8 % of seeds, under D-061's 5 %, so its reach is asserted
+/// from the thousand, and printed at every tier. The other half of the pair is the correct
+/// system's sweep above, whose check 20 holds every seed green with the same fold.
+// PROPOSED(D-136): issue #221's plant, on the sharded sweep.
+#[test]
+fn a_refused_nodes_placeholder_of_a_range_it_restated_before_its_loss_is_caught_by_check_20() {
+    let run = if seeds() >= 1000 {
+        seeds().min(1000)
+    } else {
+        share()
+    };
+    let found = sweep(run, |seed| {
+        let report = shard::run_to_the_end(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::UninitialisedReplicaVotes]),
+        );
+        placeholder_grants_judged(report.records())
+    });
+    let sum = |of: fn(&PlaceholderGrants) -> usize| found.iter().map(of).sum::<usize>();
+    let on = |of: fn(&PlaceholderGrants) -> usize| found.iter().filter(|f| of(f) > 0).count();
+    let (granted, unseen) = (sum(|f| f.granted), sum(|f| f.unseen));
+    let (planted, caught) = (sum(|f| f.planted), sum(|f| f.planted_caught));
+    println!(
+        "shard: UninitialisedReplicaVotes, each run to its end over {run}: placeholders granted \
+         {granted} times on {} seeds, {unseen} unseen by check 20; the plant, a refused node's \
+         placeholder of a range it restated before its loss, granted {planted} times on {} \
+         seeds, {caught} named by check 20",
+        on(|f| f.granted),
+        on(|f| f.planted),
+    );
+    assert!(
+        granted > 0,
+        "no placeholder granted: UninitialisedReplicaVotes did not fire"
+    );
+    let seeds_of = |of: fn(&PlaceholderGrants) -> bool| -> Vec<usize> {
+        (0..found.len()).filter(|&seed| of(&found[seed])).collect()
+    };
+    assert_eq!(
+        caught,
+        planted,
+        "check 20 left a grant of the plant unseen on seeds {:?}: a refused node's placeholder \
+         of a range it restated before its loss granted, and the range was still held",
+        seeds_of(|f| f.planted_caught < f.planted)
+    );
+    assert_eq!(
+        unseen,
+        0,
+        "check 20 left a placeholder's grant unseen on seeds {:?}",
+        seeds_of(|f| f.unseen > 0)
+    );
+    if seeds() >= 1000 {
+        assert!(
+            planted > 0,
+            "no refused node's placeholder granted for a range it restated before its loss \
+             over the thousand: the plant was not reached (D-061)"
+        );
+    }
+}
+
 /// §10's `SnapshotOverlapsReplica` off its directed shape: 25 of 100 seeds by check 8's
 /// overlap clause.
 #[test]
@@ -862,7 +1019,11 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep(
 
 /// The disk's half of the fault model: Q15's whole-node refusal, which the rot reaches on 401
 /// of 1 000 seeds. A node that refuses one range alone goes on serving the others over an
-/// engine that lost state: 18 of 100 seeds by state machine safety.
+/// engine that lost state: 18 of 100 seeds by state machine safety until PROPOSED D-136, and
+/// since D-136, which has check 20 forget at a refusal what the node held, 37 of 100: 23 by
+/// check 20, the unrefused empty replicas' grants, and 14 by state machine safety, fewer than
+/// its 18 since a run stops at its first violation and check 20's can come first.
+// PROPOSED(D-136)
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_by_the_disks_rot_on_the_sharded_sweep() {
     let found = under(

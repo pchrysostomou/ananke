@@ -23610,7 +23610,13 @@ at 3.7788 s. It grants a pre-vote at 3.786 s, and that grant is the core's, sinc
 survives a restart and node 3 has none of 30. Check 20 took only a `RangeCreated` as evidence of a
 replica and named the grant a node's that holds none. It now also takes a `RangesRestated` naming
 the range, which is what the node traces for every initialised replica it restated, and SHARD.md §8
-says so. Nothing a placeholder could grant for is ever named there, so the trip is unmoved: before
+says so. Nothing a placeholder could grant for is ever named there, so the trip is unmoved
+(*corrected after #216 merged*, issue #221, PROPOSED D-136: too strong. Nothing a placeholder grants
+for is named there when the restatement is traced, but the fold kept the range held across a later
+`RaftRefused` of the node, and a refused node can host a placeholder of a range it restated before
+its loss: 42 such grants on 7 of 1 000 sharded seeds under `UninitialisedReplicaVotes` at 97b72e4,
+and 96 on 18 on S11's tree, all unseen.
+D-136 ends what a node held at its refusal; the counts that follow are this entry's tree's): before
 and after, `UninitialisedReplicaVotes` trips check 20 on 89 of the node sweep's 100 compared seeds
 and 98 of this sweep's 100 and grants 3 043 times on `sim/split.rs`'s thousand. A relaxation can only
 remove violations, so equal counts are the same seeds.
@@ -26341,4 +26347,42 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+## PROPOSED D-136 — A refusal ends what its node held: check 20 forgets a node's ranges at its `RaftRefused`, so a refused node's placeholder of a range it held before its loss no longer grants unseen (#221); D-113 §5 corrected
+
+**The number.** Off 0d67f99, S11's tip (PR #228, which carries #226), whose highest entry is D-132 and whose footer reads D-133. D-133 to D-135 are taken by branches open beside this one, so this entry is D-136, and the footer names D-137, the next after the highest entry in this tree. Every code site carries `// PROPOSED(D-136)`.
+
+**This is a check's defect, and the documents settle its outcome.** RAFT.md §3 and Q15: a refused node lost its state, and every replica it held is refused with it. D-077's re-seed rebuilds the ranges configuration names in a fresh engine, each empty and quarantined, a user range with no descriptor until its install traces its `RangeCreated` anew (§8). A split's right half is found in the engine at a start (SHARD.md §5), and the refused engine is one the start cannot read, so the re-seed rebuilds no store of it and the first message of that range on the refused node makes a placeholder (`unheld`, PROPOSED D-109). Check 20 (SHARD.md §8, Q22) kept a range held from a `RangeCreated` of it or a `RangesRestated` naming it to the node's `RangeRemoved` of it, and nothing cleared it at a refusal. Under `UninitialisedReplicaVotes` that placeholder grants, and check 20, still holding the range from before the loss, said nothing.
+
+**The fix.** `PlaceholderGrantsNothing` folds `RaftRefused`: every range its node held is forgotten there. What the node holds after is what its own start restates, the re-seed having written a descriptor for each system range it rebuilds and the start tracing its `RangesRestated` after its `RaftRefused`, or what an install creates. A crash still ends nothing, since a replica outlives it. SHARD.md §8's check 20 says so, and the violation's words now name both kinds of evidence and both ends. The fold stays in `Checker` and `Fold::ALL`, so the fold-by-fold equivalence test (`sim/tests/node.rs`, PROPOSED D-106) compares it as before.
+
+Forgetting at the node's `RaftRefused` rather than at each `RaftReplicaRefused` is the choice that closes #221: the ranges its placeholders are of are the split-made ones, which a re-seed neither rebuilds nor names in a `RaftReplicaRefused`.
+
+**The pair.** On hand-written records (`crates/ananke-shard/src/invariants.rs`): a refused node's placeholder of a range it restated before its loss, granting, is caught, and so is one of a range it created before; another node's refusal ends nothing on this one; and the other half, a range restated or created again after the refusal and a range across a crash, holds green. On the sharded sweep (`sim/tests/shard.rs`): `UninitialisedReplicaVotes` run to its end, every placeholder's grant judged by check 20 on its own (the fold fed every record before it and none of the run's other grants, so a grant behind another's violation is still judged), and the plant, the grants of a refused node's placeholder of a range it restated before its loss and neither restated nor created since. Measured on this tree, release, 1 000 seeds:
+
+| fold | placeholders' grants | unseen by check 20 | the plant's grants | its seeds | named |
+| --- | --- | --- | --- | --- | --- |
+| before this entry | 10 427 on 984 seeds | 1 064 | 96 | 18 | 0 |
+| this entry | 10 427 on 984 seeds | 0 | 96 | 18 | 96 |
+
+Every one of the 1 064 is on a refused node, since the fix changes nothing before a node's `RaftRefused`. The test fails on the fold before this entry, naming the plant's 18 seeds, and passes on this one. The plant is reached on 1.8 % of seeds, under D-061's 5 %, so its reach is asserted from the thousand; every grant of it named, and no placeholder's grant unseen, is asserted at every tier. The issue's figures (9 142 grants, 601 unseen, a plant of 42 grants on 7 seeds) were taken at 97b72e4. This tree is S11's, whose shapes and restart arm move every schedule, so the figures above are this tree's own. The correct system's half is its sweep: `every_seed_passes_on_the_correct_sharded_sweep` at 10 000 seeds, release, on this tree: every seed green, zero failures.
+
+The plant is judged on the variant's own trace rather than built as a variant of its own. A node after its loss cannot know which ranges it restated before it, so a variant that granted only for those would have to read the trace. A trace whose other grants are left out is what check 20 judges a grant on anyway, since no fold of its state reads a `RaftVote`.
+
+**`UninitialisedReplicaVotes`'s rates, re-measured.** Unchanged, release: the node sweep's comparison trips check 20 on 89 of 100 compared seeds, the node's catch is 89 of its share of 100, and the sharded sweep's is 99 of 100, the figures the tests' comments carry. A fold that forgets more can only add violations, so these could only rise, and at these tiers they did not.
+
+**What the fix reaches beyond the plant: `RefuseOneRangeOnly`.** D-077's variant refuses range 0 alone and leaves the node's other replicas unrefused over the fresh engine: empty, at incarnation 1, quarantine clear, with no descriptor, and so not restated. Each votes again on state its node lost (D-035), the bug D-101 named. Check 20 now names those grants "from a node that holds no replica of it", which is SHARD.md §8's check 20 read as written: the node traced no creation and no restatement of the range since its refusal. So check 20 is a fourth witness of the one bug, beside the fan-out clause, the meta range's state machine and leader completeness off group 0. Measured on this tree, release:
+
+- **The sharded quorum scenario**, 1 000 seeds: every seed caught, as before. Before this entry 345 by the fan-out clause and 655 by the meta range's state machine; now 13, 655, and 332 by check 20, leader completeness 0 both times. `NodeReport::check` asks the range layer's checks before the fan-out clause, so check 20 names what the clause named. The attribution admits check 20 on a range other than 0 from a node that holds no replica of it. Check 20 on range 0, which the variant refuses as the correct node does, fails the test as leader completeness of group 0 does. The fan-out clause's catch, now 1.3 %, is under D-061's 5 %, so it is asserted from the thousand. What every tier asserts in its place is the variant's firing, one range refused per seed where the correct node refuses six. `sim/quorum.rs`'s comment that no range fold is in violation under the variant is corrected beside it.
+- **The sharded sweep's disk rot**, 100 seeds: 18 caught before this entry, all by state machine safety; now 37, 14 by state machine safety and 23 by check 20. A run stops at its first violation, and check 20's can come first. The test asserts state machine safety's catch, which stays above zero.
+
+**D-113 §5 corrected in place.** "Nothing a placeholder could grant for is ever named there" was too strong. Nothing a placeholder grants for is named in a `RangesRestated` when it is traced, but the fold kept the range held across a later refusal. The sentence carries "corrected after #216 merged" and names this entry. The fold's doc comment says the same.
+
+**For the owner (PROPOSED).**
+
+1. Forgetting at the node's `RaftRefused`, not at each `RaftReplicaRefused` (above).
+2. Admitting check 20 as `RefuseOneRangeOnly`'s fourth witness, and moving the fan-out clause's catch to the thousand under D-061, with the variant's firing asserted at every tier in its place.
+3. The plant judged on the variant's own trace, each grant on its own, rather than as a variant of its own.
+
+---
+
+_Next entry: D-137. Add one before implementing anything not covered above._
