@@ -695,6 +695,12 @@
 # of 3: seed 16725's 0.2 (0.15 + 0.01, 0.12 + 0.00, 0.12 + 0.00, the median rounded up to a tenth), seed 18925's 0.2 (0.17 +
 # 0.00 three times), each into the lightest shard, shard 4 at 2230.8 -> 2231.0 -> 2231.2. No row moved and nothing was
 # re-weighed; the merge of D-132's text changed no row. Every header is recomputed.
+# PROPOSED D-135 (#162's S12, `Fault::MetaReorder`) added one `node` row, check 16's fold-by-fold comparison on the
+# sharded sweep's trace, weighed the same way under load averages past 250: 22.6 (20.49 + 3.29, 19.76 + 2.53, 19.99 +
+# 2.55, the median rounded up to a tenth), into the lightest shard, shard 4 at 2231.2 -> 2253.8. The arm adds a fault to
+# seven seeds in eight of the `shard` sweeps, whose rows keep their weights and shards; their re-weigh is owed, on a
+# quiet machine. The pins on seeds 707, 5620, 992 and 18925 now run the sweep's schedule beside the one they were found
+# on, two runs where they ran one, and keep their rows of a few tenths. Shard 4's header is recomputed.
 # shard 1: 2689.1 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -774,7 +780,7 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2231.2 cpu s
+# shard 4: 2253.8 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -819,6 +825,7 @@
 4	shard	0.2	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
 4	shard	0.2	seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
 4	shard	0.2	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
+4	node	22.6	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_the_sharded_meta_reorder
 # shard 5: 2252.7 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound

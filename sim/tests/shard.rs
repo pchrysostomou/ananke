@@ -8,9 +8,10 @@
 //! layer's folds (7, 8, 9, 10, 16, 17, 18, 20), linearizability of every key across every
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
 //! and per range the run ended with and the meta convergence bound — that nodes 4 and 5
-//! hold nothing, and that each of the workload's shapes reached its window (PROPOSED D-131).
-//! It prints the driver's work, the refusals by the loss that made them (#45), the empty blocks
-//! a split finds (D-092), the shapes' rates and the bounds' margins.
+//! hold nothing, that each of the workload's shapes reached its window (PROPOSED D-131), and that
+//! `Fault::MetaReorder` fired and reordered meta's updates (PROPOSED D-135). It prints the
+//! driver's work, the refusals by the loss that made them (#45), the empty blocks a split finds
+//! (D-092), the shapes' rates, the reorder arm's and its hold's, and the bounds' margins.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +66,10 @@ struct Seen {
     shapes: shard::Shapes,
     /// Which shapes this seed drew: a write burst, a read burst, the stale cache, the restart.
     drawn: [bool; 4],
+    /// Whether this seed drew `Fault::MetaReorder` (PROPOSED D-135).
+    reorder_drawn: bool,
+    /// What each reorder arm that found a range came to (PROPOSED D-135).
+    reorders: Vec<shard::MetaReorder>,
 }
 
 /// SHARD.md §8's write bound, as `raft::Report::liveness_by_final_range` asks it, keeps the
@@ -196,6 +201,12 @@ fn seen_of(seed: u64) -> Seen {
                 .iter()
                 .any(|f| matches!(f, shard::Fault::SplitFromRestarted { .. })),
         ],
+        reorder_drawn: report
+            .schedule
+            .faults
+            .iter()
+            .any(|f| matches!(f, shard::Fault::MetaReorder { .. })),
+        reorders: report.meta_reorders(),
         verdict,
     }
 }
@@ -370,6 +381,47 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         seen.iter().filter(|s| !s.drawn.iter().any(|d| *d)).count(),
     );
 
+    // PROPOSED(D-135): `Fault::MetaReorder`, by seeds: drew it, fired (found a range to split
+    // twice led off meta's leader's node), handed the left half on (the first split landed), asked
+    // the second split, meta applied the second's update, and meta applied an update of the first
+    // after it. The hold, measured: how long after the block meta applied the second's update.
+    let with = |of: fn(&shard::MetaReorder) -> bool| {
+        seen.iter().filter(|s| s.reorders.iter().any(of)).count()
+    };
+    let reorder_drawn = seen.iter().filter(|s| s.reorder_drawn).count();
+    let reorder_fired = seen.iter().filter(|s| !s.reorders.is_empty()).count();
+    let handed = with(|r| r.arm.transferred);
+    let second_asked = with(|r| r.arm.second_cut.is_some());
+    let second_applied = with(|r| r.second_applied.is_some());
+    let reordered = with(|r| r.reordered);
+    let mut second: Vec<Duration> = seen
+        .iter()
+        .flat_map(|s| s.reorders.iter().filter_map(|r| r.second_applied))
+        .collect();
+    second.sort_unstable();
+    let within = second
+        .iter()
+        .filter(|took| **took <= shard::META_REORDER_HOLD)
+        .count();
+    println!(
+        "shard: `Fault::MetaReorder` over {count} seeds: drew it {reorder_drawn} -> fired \
+         {reorder_fired} -> the left half handed on {handed} -> the second split asked \
+         {second_asked} -> meta applied the second split's update {second_applied} -> and an \
+         update of the first split after it on {reordered} seeds"
+    );
+    println!(
+        "shard: `Fault::MetaReorder`'s hold of {:?}: meta applied the second split's update {} \
+         times, {within} of them within the hold, from the block at median {:?}, p75 {:?}, p90 \
+         {:?}, p99 {:?}, worst {:?}",
+        shard::META_REORDER_HOLD,
+        second.len(),
+        second.get(second.len() / 2),
+        second.get(second.len() * 3 / 4),
+        second.get(second.len() * 9 / 10),
+        second.get(second.len() * 99 / 100),
+        second.last(),
+    );
+
     // The firings, each far above D-061's 5 % over the seeds that see them.
     assert!(splits > 0, "no split took effect");
     assert!(halves > 0, "no half split again");
@@ -416,6 +468,17 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         reached_load > 0,
         "no client was answered `RangeMismatch` by a split range: no split had load"
     );
+    // PROPOSED(D-135): `Fault::MetaReorder`'s firing, and the order it aims at, each at every
+    // tier: fired on 482 and reordered on 293 of 1 000 seeds, well above D-061's 5 %.
+    assert!(
+        reorder_fired > 0,
+        "no reorder arm found a range to split twice led off the meta range's leader's node"
+    );
+    assert!(
+        reordered > 0,
+        "meta applied no update of a reorder arm's first split after its second's: the order \
+         `MetaOverwritesByArrival` needs was not reached"
+    );
 
     let inclusion: Vec<Result<(), String>> = seen.iter().map(|s| s.keys_asked.clone()).collect();
     verdict(&inclusion).unwrap();
@@ -425,7 +488,7 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
 
 // --- The pair rule on this sweep (CLAUDE.md; SHARD.md §10): the correct system above, and
 // below the variants the sweep's own faults, driver and workload shapes (PROPOSED D-131) reach,
-// each caught by the check that names it. S12 brings `Fault::MetaReorder`.
+// each caught by the check that names it. `Fault::MetaReorder` is S12's (PROPOSED D-135).
 
 /// A variant's run of one seed: what the verdict said, and what each of the range layer's
 /// folds found on its own (PROPOSED D-106), since the verdict names only the first.
@@ -787,15 +850,21 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sh
     );
 }
 
-/// §10's `MetaOverwritesByArrival` on what this sweep's drops and resends do by themselves:
-/// 68 of 1 000 seeds by check 16, and 12 of 1 000 by the meta convergence bound, so both are
-/// asserted over the thousand and printed below it (D-061). `Fault::MetaReorder` is S12's. The
-/// bound is asked of the run taken to its end, which check 16 would otherwise stop first. What
-/// every tier asserts is the shape the variant aims at: a split's update stored again over a key
-/// meta already named at its generation or a newer one (`shard::meta_resends_stored_of`), 988 of
-/// 1 000 seeds and 19 of the gate's 20. The correct meta range stores none, so that is the variant
-/// seen firing.
+/// §10's `MetaOverwritesByArrival` on what this sweep's drops and resends do by themselves
+/// and under `Fault::MetaReorder` (PROPOSED D-135), which reorders meta's updates on 294 of 1 000
+/// seeds: check 16 on 351 of 1 000 seeds, every one of the 294 among them, where it was 68 of 1 000
+/// on the drops and resends alone; and the meta convergence bound on 29 of 1 000, 24 of them
+/// reordered by the arm, where it was 12. The arm sits in the first half of the faults, and the
+/// bound sees a regressed record only where no later update of the range, a leader taking office or
+/// a split, writes over it before the run ends. Check 16 is asserted at every tier, the bound over
+/// the thousand and printed below it (D-061). The bound is asked of the run taken to its end, which
+/// check 16 would otherwise stop first. What every tier asserts besides is the shape the variant
+/// aims at: a split's update stored again over a key meta already named at its generation or a
+/// newer one (`shard::meta_resends_stored_of`), 993 of 1 000 seeds, the correct meta range storing
+/// none; the arm's reorder; and check 16 on every seed the arm reordered, since the first split's
+/// left half, applied over the second's records, lowers the generation meta names.
 // PROPOSED(D-113): §10, the shape at every tier.
+// PROPOSED(D-135): check 16 at every tier under `Fault::MetaReorder`.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep() {
     let run = if seeds() >= 1000 {
@@ -816,26 +885,47 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_swee
                 .is_err(),
             report.meta_converges().is_err(),
             shard::meta_resends_stored_of(report.records()) > 0,
+            report.meta_reorders().iter().any(|r| r.reordered),
         )
     });
     let sixteen = found.iter().filter(|f| f.0).count();
     let bound = found.iter().filter(|f| f.1).count();
     let reached = found.iter().filter(|f| f.2).count();
+    let reordered = found.iter().filter(|f| f.3).count();
     println!(
         "shard: MetaOverwritesByArrival, each run to its end: a split's update stored over a key \
          meta named at its generation or a newer one on {reached}/{run} seeds, check 16 on \
-         {sixteen}/{run}, the meta convergence bound on {bound}/{run}"
+         {sixteen}/{run}, the meta convergence bound on {bound}/{run}; `Fault::MetaReorder` \
+         reordered meta's updates on {reordered}/{run}, and of those check 16 tripped on {} and \
+         the bound on {}",
+        found.iter().filter(|f| f.3 && f.0).count(),
+        found.iter().filter(|f| f.3 && f.1).count(),
     );
     assert!(
         reached > 0,
         "no split's update was stored over a key meta named at its generation or a newer one: \
          the resend MetaOverwritesByArrival needs was not reached"
     );
+    // PROPOSED(D-135): the arm's reorder, and check 16 on each seed of it, at every tier.
+    assert!(
+        reordered > 0,
+        "`Fault::MetaReorder` reordered meta's updates on no seed under the variant"
+    );
+    let missed: Vec<u64> = (0..run)
+        .zip(&found)
+        .filter(|(_, f)| f.3 && !f.0)
+        .map(|(seed, _)| seed)
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "seeds {missed:?}: meta applied the first split's update over the second's under the \
+         variant, and check 16 did not trip"
+    );
+    assert!(
+        sixteen > 0,
+        "no update overwrote a newer one under the variant"
+    );
     if seeds() >= 1000 {
-        assert!(
-            sixteen > 0,
-            "no update overwrote a newer one over the thousand"
-        );
         assert!(
             bound > 0,
             "meta named every live descriptor over the thousand under the variant"
@@ -957,6 +1047,59 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 // situation reached there as well. The rule's own case, read: what these pins were pinned for is
 // kept, by running the schedule that reaches it. Seeds 707, 992, 5620, 16725 and 18925, at the end,
 // are the first found on the shaped schedule, and run it.
+//
+// PROPOSED(D-135): `Fault::MetaReorder` is drawn over the shaped schedule on every seed that draws
+// a shape, so it moved those five and none of the plain schedule's. Re-read: seed 16725 still reaches
+// its situation on the sweep's schedule and runs it unchanged. Seeds 707, 5620, 992 and 18925 no
+// longer do, each for a reason its pin names, so each runs the schedule it was found on,
+// `shard::Schedule::shaped`, the sweep's before the arm, and asserts its situation absent from the
+// sweep's, so that the day the schedule reaches it again the test says so.
+
+/// A shape-drawn pin's run on the schedule it was found on, [`shard::Schedule::shaped`]: the
+/// sweep's before `Fault::MetaReorder` moved it.
+// PROPOSED(D-135)
+fn shaped_of(seed: u64, node: NodeVariants) -> shard::Report {
+    shard::run_with(
+        seed,
+        shard::Schedule::shaped(seed),
+        Variants::default(),
+        node,
+        RangeVariants::correct(),
+    )
+}
+
+/// A shape-drawn pin's situation, absent from the sweep's schedule since `Fault::MetaReorder` moved
+/// it: asserted absent, so that the day the schedule reaches it again this says so and the pin can
+/// run the sweep's schedule again (CLAUDE.md).
+// PROPOSED(D-135)
+fn absent_from_the_sweep(seed: u64, what: &str, reaches: impl Fn(&shard::Report) -> bool) {
+    let report = shard::run(seed);
+    assert!(
+        report
+            .schedule
+            .faults
+            .iter()
+            .any(|f| matches!(f, shard::Fault::MetaReorder { .. })),
+        "seed {seed} draws no reorder arm: the sweep's schedule is the one the pin was found on"
+    );
+    assert!(
+        !reaches(&report),
+        "seed {seed} reaches {what} again on the sweep's schedule: run the pin there (CLAUDE.md)"
+    );
+}
+
+/// Whether a split the restart arm asked was refused `NoRangeId` on its node's new run: the
+/// situation seeds 992 and 18925 were pinned in.
+// PROPOSED(D-135)
+fn restart_arms_split_refused_no_range_id(report: &shard::Report) -> bool {
+    report.no_range_ids().iter().any(|empty| {
+        empty.restarted.is_some()
+            && report
+                .restart_arms
+                .iter()
+                .any(|arm| arm.victim == empty.node && arm.seq.is_some())
+    })
+}
 
 /// A pin's correct run, on the schedule it was found on ([`shard::Schedule::plain`]).
 // PROPOSED(D-131)
@@ -2136,11 +2279,27 @@ fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 /// node 2's restated 120 read as agreeing with a log that differs at 119, though every entry any
 /// node traced at 119 and at 120 carries the same hash. The view now forgets a replica's entries at
 /// its creation; with node 1's creation taken out of the trace it says what it said before.
+///
+/// `Fault::MetaReorder` moved it (PROPOSED D-135): drawn second of nine faults, the arm split range
+/// 20 on the sweep's schedule and moved every later step, and node 1's log of range 19 is never
+/// compacted to 119 there. So the pin runs the schedule it was found on and asserts that absence.
 // PROPOSED(D-131)
+// PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view() {
     let (node, range) = (1, 19);
-    let report = shard::run(707);
+    absent_from_the_sweep(
+        707,
+        "node 1's restart with its log of range 19 compacted to 119",
+        |report| {
+            report.records().iter().any(|record| {
+                matches!(record.event, TraceEvent::RaftSnapshot {
+                    server, range: of, last_index: 119, taken: false, ..
+                } if server == node && of == range)
+            })
+        },
+    );
+    let report = shaped_of(707, NodeVariants::correct());
     report.check().unwrap();
     let records = report.records();
     let find = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
@@ -2217,10 +2376,21 @@ fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_
 /// silence, so an asker that sent the same copy heard nothing for 3.2 s and D-092's bound said so
 /// (`Report::retries_take_effect`). The bound is unchanged. The asker now asks anew after a silent
 /// wait, is refused `KeyOutsideSpan` at once since the split has landed, and stops within it.
+///
+/// `Fault::MetaReorder` moved it (PROPOSED D-135): drawn third of six faults, the arm found no range
+/// to split twice led off the meta range's leader's node and did nothing, but its hold still moved
+/// every later step; on the sweep's schedule the restart arm's split on node 1's new run is never
+/// refused `NoRangeId`. So the pin runs the schedule it was found on and asserts that absence.
 // PROPOSED(D-131)
+// PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound() {
-    let report = shard::run(992);
+    absent_from_the_sweep(
+        992,
+        "the restart arm's split refused `NoRangeId` on its node's new run",
+        restart_arms_split_refused_no_range_id,
+    );
+    let report = shaped_of(992, NodeVariants::correct());
     report.check().unwrap();
     assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
     let arm = report.restart_arms[0];
@@ -2300,12 +2470,25 @@ fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_b
 /// record, up to the variant's switch being spawned, and by then range 20 is made, so the correct
 /// node stood at that switch with the split landed and did not make it. Range 20's keys stay because
 /// nothing on node 3 replaces its span but range 20's own install, at 115.
+///
+/// `Fault::MetaReorder` moved it (PROPOSED D-135): drawn first of seven faults, the arm found no range
+/// to split twice led off the meta range's leader's node and did nothing, but its hold still moved
+/// every later step; on the sweep's schedule node 1 takes no snapshot of range 3 at 113. So the pin
+/// runs the schedule it was found on, the variant's run too, and asserts that absence.
 // PROPOSED(D-131)
 // PROPOSED(D-132)
+// PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys() {
     let (node, parent, right, index) = (3, 3, 20, 113);
-    let report = shard::run(5620);
+    absent_from_the_sweep(5620, "node 1's snapshot of range 3 at 113", |report| {
+        report.records().iter().any(|record| {
+            matches!(record.event, TraceEvent::RaftSnapshot {
+                server: 1, range: of, last_index, taken: true, ..
+            } if of == parent && last_index == index)
+        })
+    });
+    let report = shaped_of(5620, NodeVariants::correct());
     report.check().unwrap();
     assert!(
         report.restart_arms.iter().any(|arm| arm.victim == node),
@@ -2345,11 +2528,9 @@ fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_h
         taken < streamed && streamed < split && split < created,
         "the shape's order: taken {taken}, streamed {streamed}, split {split}, created {created}"
     );
-    let variant = shard::run_of(
+    let variant = shaped_of(
         5620,
-        Variants::default(),
         NodeVariants::of(&[NodeVariant::InstallReplacesCopiedSpan]),
-        RangeVariants::correct(),
     );
     let first = records
         .iter()
@@ -2440,7 +2621,14 @@ fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_h
 /// that ended in `Unusable` at 8.222 s with no switch, is measured against the timer's bound, since
 /// the replay's exemption opens only on the switch's read-back (`reads_back`). The review named that
 /// schedule; D-131 records it.
+///
+/// Re-read when `Fault::MetaReorder` moved it (PROPOSED D-135): the arm is drawn fourth of nine
+/// faults and found no range to split twice led off the meta range's leader's node, and this
+/// situation is still reached on the sweep's schedule, so the pin runs it. Its hold moved the later
+/// faults, and the run's verdict is green there, the hold of #227 no longer reached, which is still
+/// not this pin's to assert.
 // PROPOSED(D-131)
+// PROPOSED(D-135): re-read on the sweep's schedule; still reached.
 #[test]
 fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice() {
     const WRITER: u64 = (95 << 32) | (1 << 16) | 5;
@@ -2542,10 +2730,21 @@ fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value
 /// count, not of the system. Its first `NoRangeId` now starts the count again, so a retry is made.
 /// The mechanism asserted: the arm's split's asker sent all twelve asks before its first refusal, the
 /// retry came after it, and the answer came within D-092's bound, which is unchanged.
+///
+/// `Fault::MetaReorder` moved it (PROPOSED D-135): drawn first of eight faults, the arm split range
+/// 2 twice and reordered meta's updates, and on the sweep's schedule the restart arm finds no range
+/// that can still split and asks no split at all. So the pin runs the schedule it was found on and
+/// asserts that absence.
 // PROPOSED(D-131)
+// PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id() {
-    let report = shard::run(18925);
+    absent_from_the_sweep(
+        18925,
+        "the restart arm's split refused `NoRangeId` on its node's new run",
+        restart_arms_split_refused_no_range_id,
+    );
+    let report = shaped_of(18925, NodeVariants::correct());
     report.check().unwrap();
     assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
     let arm = report.restart_arms[0];
