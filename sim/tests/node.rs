@@ -4591,18 +4591,30 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 ///   and the harm's absence. Group 0 is excluded: the variant refuses range 0 exactly as
 ///   the correct node does, so a violation there is not this bug and fails the test.
 ///
-/// The fan-out clause is asserted seen, every catch is one of the three, and each
-/// one's share is printed at every tier.
+/// The fan-out clause is asserted seen (from the thousand since PROPOSED D-136, below), every
+/// catch is one of the three or check 20's below, and each one's share is printed at every
+/// tier.
 ///
 /// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
-/// and before the history and the fan-out clause (PROPOSED D-106, issue #140). None of
-/// their seven folds is in violation under the variant on any of seeds 0 to 999, and at
-/// ten thousand the split was D-101's to the seed (3 338 / 6 661 / 1; 3 338 / 6 662 / 0
-/// since PROPOSED D-119 moved seed 2994), so they name no catch the attribution does not
-/// admit; one that ever did would fail this test as "caught by something other than", and
-/// be read before it is admitted.
+/// and before the history and the fan-out clause (PROPOSED D-106, issue #140). Until
+/// PROPOSED D-136 none of their folds was in violation under the variant on any of seeds
+/// 0 to 999, and at ten thousand the split was D-101's to the seed (3 338 / 6 661 / 1;
+/// 3 338 / 6 662 / 0 since PROPOSED D-119 moved seed 2994). D-136 has check 20 forget at a
+/// node's refusal what the node held (issue #221), and that gives the bug a **fourth
+/// witness**: the variant's unrefused replicas, empty and with no descriptor, are neither
+/// created nor restated after the refusal, and each grant of theirs is check 20's "from a
+/// node that holds no replica of it". Measured on this tree, release, at the premerge's
+/// thousand: 655 by the meta range's state machine, as before, and 332 by check 20 of the
+/// 345 the fan-out clause named before D-136, which now names 13. Check 20 on range 0,
+/// which the variant refuses as the correct node does, is not this bug and fails the test
+/// as leader completeness of group 0 does. The fan-out clause's catch, at 1.3 %, is under
+/// D-061's 5 %, so it is asserted from the thousand; what every tier asserts is the
+/// variant's firing, one range refused per seed where the correct node refuses six. A fold
+/// that names any other catch fails this test as "caught by something other than", and is
+/// read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
+// PROPOSED(D-136): check 20 off group 0 is the fourth.
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
     let (caught, figures) = quorum_node_sweep(
@@ -4625,14 +4637,24 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         .iter()
         .filter(|v| leader_completeness_group(v) == Some(0))
         .collect();
+    let by_check_20 = caught
+        .iter()
+        .filter(|v| unheld_grant_range(v).is_some_and(|range| range != 0))
+        .count();
+    let check_20_on_the_root: Vec<&String> = caught
+        .iter()
+        .filter(|v| unheld_grant_range(v) == Some(0))
+        .collect();
     eprintln!(
         "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds ({by_fan_out} by the \
          fan-out clause, {by_meta} by state machine safety on the meta range, {by_vote} by \
-         leader completeness off group 0, {} by leader completeness of group 0), \
-         {figures:?}, first: {}",
+         leader completeness off group 0, {} by leader completeness of group 0, \
+         {by_check_20} by check 20 off group 0, {} by check 20 on group 0), {figures:?}, \
+         first: {}",
         caught.len(),
         seeds(),
         on_the_root.len(),
+        check_20_on_the_root.len(),
         caught.first().map_or("", String::as_str)
     );
     assert_eq!(
@@ -4640,21 +4662,52 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         seeds(),
         "RefuseOneRangeOnly was not caught on every seed: {caught:?}"
     );
-    assert!(
-        by_fan_out > 0,
-        "the fan-out clause caught it on no seed: {caught:?}"
+    // PROPOSED(D-136): the variant's firing at every tier, its fan-out catch from the
+    // thousand (D-061: 13 of 1 000).
+    assert_eq!(
+        figures.ranges_refused as u64, figures.seeds,
+        "RefuseOneRangeOnly refused other than one range per seed, so the fan-out the clause \
+         asks for did not fall short on every seed: {figures:?}"
     );
+    if seeds() >= 1000 {
+        assert!(
+            by_fan_out > 0,
+            "the fan-out clause caught it on no seed of the thousand: {caught:?}"
+        );
+    }
     assert!(
         on_the_root.is_empty(),
         "leader completeness failed on group 0, the range the variant refuses exactly as \
          the correct node does, so it is not the variant's amnesia: {on_the_root:?}"
     );
-    assert_eq!(
-        by_fan_out + by_meta + by_vote,
-        caught.len(),
-        "caught by something other than the fan-out, the meta range's state machine or \
-         leader completeness off group 0: {caught:?}"
+    assert!(
+        check_20_on_the_root.is_empty(),
+        "check 20 named a grant of group 0, the range the variant refuses exactly as the \
+         correct node does, so it is not the variant's unrefused replicas: \
+         {check_20_on_the_root:?}"
     );
+    assert_eq!(
+        by_fan_out + by_meta + by_vote + by_check_20,
+        caught.len(),
+        "caught by something other than the fan-out, the meta range's state machine, \
+         leader completeness off group 0 or check 20 off group 0: {caught:?}"
+    );
+}
+
+/// The range a check 20 verdict names when the grant is from a node that holds no replica
+/// of it, read off the words `PlaceholderGrantsNothing` writes — "placeholder grants
+/// nothing: node {node} granted range {range}'s {what} in term {term} to node {candidate}
+/// from a node that holds no replica of it, ..." — or `None` for any other verdict,
+/// a placeholder's grant among them.
+// PROPOSED(D-136): check 20 off group 0 is the fourth witness of the one bug.
+fn unheld_grant_range(verdict: &str) -> Option<u64> {
+    let (_, after) = verdict.split_once(": placeholder grants nothing: node ")?;
+    let (_, after) = after.split_once(" granted range ")?;
+    let (range, after) = after.split_once("'s ")?;
+    if !after.contains(" from a node that holds no replica of it,") {
+        return None;
+    }
+    range.parse().ok()
 }
 
 /// The group a leader-completeness verdict names, read off the words
