@@ -820,11 +820,14 @@ snapshot can stop overlapping, and otherwise from the same checkpoint, since the
 is the receiver's to clear (Q27). A snapshot that installs onto a replica that is already
 initialised, P's post-split snapshot onto a lagging P for instance, changes that
 replica's descriptor and is traced as a `RangeDescriptor` at the snapshot's last index
-(§8). A replica with no descriptor, a re-seeded user range for instance, is not
+(§8). Its switch replaces the span the host's descriptor names at the switch, not the span
+the node held when the stream completed: a split applied through the log in between has moved
+it (D-132). A replica with no descriptor, a re-seeded user range for instance, is not
 initialised, so the rule lets a right half in beside it: its install replaces its Raft
 interval and the snapshot's span, as a placeholder's does, and no key configuration
 names for it beyond that (D-128). A node's replica of P that already applied past a
-snapshot answers it installed without switching (RAFT.md:222-224), so a replica of P that applied `s` is never set
+snapshot answers it installed without switching (RAFT.md:222-224), asked at the switch as well
+as when the stream completes (D-132), so a replica of P that applied `s` is never set
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
 R could have been installed on the node only if no initialised replica of P covered its
 span, and then no initialised replica of P is there to apply `s`; a replica with no

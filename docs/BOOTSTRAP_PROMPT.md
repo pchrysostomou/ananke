@@ -101,6 +101,23 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-install-span-at-switch` (2026-11-09), off aa5e46c, PROPOSED **D-132**
+  (footer D-133; D-131 is S11's, local), Closes #215: **a correct-server data loss, an install
+  replacing a span overlapping a right half the node already holds**, by two routes D-128 left
+  open, a second stream's copy of configuration's span and a split applied through the log while
+  a stream completes (seed 5620 of S11's sweep). An initialised replica's switch now replaces the
+  host's descriptor's span, read after `open_span_source`, where seed 5620's split had landed and
+  a read at the old place would have missed it, and the store is asked again there, so a snapshot
+  at or below an entry applied meanwhile answers installed and is not switched. `Install::spans` is
+  a copy the correct switch no longer reads, and `InstallWrongRangesSpans`'s doc says so. The pair
+  is `InstallReplacesCopiedSpan` (node bit 51), caught by check 8's install clause on two directed
+  tests through the task. On a scratch copy of S11's branch the fix passes its 10 000 seeds and
+  seed 5620 fails under the variant with the original words. Not closed, named in D-132 §5 and
+  tracked by #225: a split's apply landing after the install is numbered, which seed 13283 of S11's
+  sweep reaches, past the nightly's range, with and without this fix; the switch removes the right
+  half's keys and the store goes back from 168 to the snapshot's 167. #215's related window is
+  unchanged and also #225's: a directed run removes the right half's key, and no sweep has reached
+  this order.
 - Branch `phase-3-stage-c-right-half-quarantine` (2026-11-09), off 91a1946, the merge of the eight
   open Stage C PRs, **D-130**, the owner's ruling on #175 and Closes #223: a replica of a right half
   that a split's apply makes on a quarantined replica of its parent takes the quarantine, durable

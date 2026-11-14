@@ -163,10 +163,22 @@ pub enum NodeVariant {
     CompleteOnRestart,
     /// An install that carries the node's *first hosted* range's spans instead of the
     /// completed range's. `Engine::install_spans` removes every key of the spans it is
-    /// given and adds the staged tables in one switch (D-068), so a re-seed of one
-    /// range then deletes another range's Raft state and user keys while that range is
+    /// given and adds the staged tables in one switch (D-068), so a switch that replaced
+    /// them would delete another range's Raft state and user keys while that range is
     /// running — silently, on a node whose ranges are otherwise correct (D-066,
     /// D-075).
+    ///
+    /// **It is the planner's alone now.** The install path this was written for no longer
+    /// reads what it corrupts: `Install::spans` is a copy the switch ignores, a replica
+    /// with no descriptor replacing the snapshot's span (D-128) and one with a descriptor
+    /// its descriptor's (D-132). So it changes [`Snapshots::on_chunk`]'s output, which is
+    /// what its test asserts (`snapshot.rs`), and no switch; `sim/` does not run it.
+    /// [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) and
+    /// [`InstallReplacesCopiedSpan`](Self::InstallReplacesCopiedSpan) are what keep a
+    /// switch's wrong span beside the fix, and check 8's install clause what catches them.
+    ///
+    /// [`Snapshots::on_chunk`]: crate::snapshot::Snapshots::on_chunk
+    // PROPOSED(D-132): what it no longer reaches, corrected.
     InstallWrongRangesSpans,
     /// A chunk naming a range the node does not host taken in and given an assembly,
     /// instead of refused on arrival. `range` is a peer's word: a leader that has not
@@ -436,6 +448,16 @@ pub enum NodeVariant {
     /// sweep lose committed entries that way.
     // PROPOSED(D-130)
     SplitLeavesQuarantineBehind,
+    /// The tree before D-132: an install onto a replica the node holds a descriptor of
+    /// replaces the plan's copy of its spans, taken at the stream's last chunk, and asks
+    /// neither the store nor the host's table again after the awaits of its switch. A split
+    /// applied through the log after that chunk, or a second stream's copy of configuration's
+    /// span stepped after the first's `Switched` (#215), then has it remove the keys of a
+    /// right half the node holds, with every descriptor right. Check 8's install clause sees
+    /// the switch's spans (PROPOSED D-132). A replica with no descriptor is D-128's and
+    /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
+    // PROPOSED(D-132)
+    InstallReplacesCopiedSpan,
 }
 
 impl NodeVariant {
@@ -492,6 +514,7 @@ impl NodeVariant {
         NodeVariant::RetakeNeverAfterOverlap,
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
+        NodeVariant::InstallReplacesCopiedSpan,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -698,6 +721,9 @@ impl NodeVariant {
             // PROPOSED(D-130): a right half made on a quarantined parent with no
             // quarantine. Bits 51 to 53 are free, and thirteen bits are left.
             NodeVariant::SplitLeavesQuarantineBehind => 1 << 50,
+            // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
+            // of its spans. Bits 52 and 53 are free, and twelve bits are left.
+            NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
         }
     }
 
@@ -756,6 +782,7 @@ impl NodeVariant {
             NodeVariant::RetakeNeverAfterOverlap => "RetakeNeverAfterOverlap",
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
+            NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
         }
     }
 }
@@ -853,13 +880,15 @@ mod tests {
         // D-110's one is the overlap rule's fresh take never made, and D-128's one a
         // replica with no descriptor whose install replaces what it is hosted at.
         // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
-        // one is a right half made on a quarantined parent with no quarantine.
+        // one is a right half made on a quarantined parent with no quarantine. D-132's one
+        // is an initialised replica's install replacing the plan's copy of its spans.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
         // PROPOSED(D-130)
-        assert_eq!(NodeVariant::BUGS.len(), 51);
+        // PROPOSED(D-132)
+        assert_eq!(NodeVariant::BUGS.len(), 52);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

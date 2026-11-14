@@ -379,9 +379,10 @@ pub struct Install {
     pub source: PathBuf,
     /// The range's key intervals as the plan hosts them at the stream's last chunk, sorted
     /// and disjoint: its Raft state under tenant 0 and its user keys under tenant 2 (D-066,
-    /// D-068). What the switch replaces on a replica the node holds a descriptor of; on
-    /// one with none the switch replaces the snapshot's span (`install::switched_spans`,
-    /// PROPOSED D-128).
+    /// D-068). A copy, and the correct node's switch reads it nowhere: a replica the node
+    /// holds a descriptor of replaces that descriptor's span as the host holds it at the
+    /// switch, and one with none the snapshot's (`install::switched_spans`, PROPOSED D-128,
+    /// D-132). `InstallReplacesHostedSpan` and `InstallReplacesCopiedSpan` read it.
     pub spans: Vec<KeyRange<Bytes>>,
     /// Whether the range's repair — term, vote, applied index, snapshot record, log
     /// tail, configuration, quarantine and incarnation, with tombstones for the log
@@ -916,8 +917,9 @@ impl Snapshots {
                 // The variant: the install carries the node's first hosted range's
                 // spans instead of the completed range's, which on a node whose ranges
                 // are a `BTreeMap` is its lowest range id. `Engine::install_spans`
-                // removes every key of the spans it is given (D-068), so a re-seed of
-                // r4 would delete r1's Raft state and user keys while r1 is running.
+                // removes every key of the spans it is given (D-068), so a switch that
+                // replaced this copy would delete r1's Raft state and user keys while r1
+                // is running. The correct switch does not read it (`Install::spans`).
                 spans = self.hosted.values().next().cloned().expect("hosted");
             }
             self.meters.installs += 1;
