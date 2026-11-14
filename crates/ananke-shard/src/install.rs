@@ -211,12 +211,21 @@ pub enum SnapAnswer {
         /// the host's receipt check reads for this range from here on (SHARD.md §3).
         // PROPOSED(D-097)
         descriptor: Option<Box<RangeDescriptor>>,
+        /// The install's decision: for a range the node held, the step that took the
+        /// hold (D-047). A switch that rebuilds no replica lets the hold go with the
+        /// core it had, and traces that decided here.
+        // PROPOSED(D-134): a hold let go with no switch is traced.
+        decided: Decision,
     },
     /// The install did not switch: the range goes on with the replica it has, and its
     /// hold is released.
     Abandoned {
         /// The range.
         range: RangeId,
+        /// The install's decision, the step that took the hold (D-047): the release
+        /// is traced decided here, so the record carries both ends of the hold.
+        // PROPOSED(D-134): a hold let go with no switch is traced.
+        decided: Decision,
     },
 }
 
@@ -231,7 +240,7 @@ impl SnapAnswer {
             | SnapAnswer::Acked { range, .. }
             | SnapAnswer::Ready { range, .. }
             | SnapAnswer::Switched { range, .. }
-            | SnapAnswer::Abandoned { range } => *range,
+            | SnapAnswer::Abandoned { range, .. } => *range,
         }
     }
 }
@@ -1309,10 +1318,10 @@ impl<E: Environment> Task<E> {
             .get_mut(&(range, from))
             .and_then(|inbound| inbound.pending.take())
         else {
-            return self.abandon(range, from).await;
+            return self.abandon(range, from, held).await;
         };
         let Some(store) = lock(&self.stores).get(&range).cloned() else {
-            return self.abandon(range, from).await;
+            return self.abandon(range, from, held).await;
         };
         // The store may have caught up while the repair was being built: the one-group
         // server cannot have this window, because it quiesces its `apply` task before
@@ -1325,7 +1334,7 @@ impl<E: Environment> Task<E> {
         // PROPOSED(D-083): the switch re-checks what the chunk path checks.
         if store.applied() >= install.at.last_index {
             return self
-                .caught_up(range, from, &install, repair.term, &store)
+                .caught_up(range, from, &install, repair.term, &store, held)
                 .await;
         }
         // D-047: the install is decided when the `raft` task hands the repair over
@@ -1359,7 +1368,11 @@ impl<E: Environment> Task<E> {
             ),
             // A stream whose bytes carry no snapshot record for this range is a stream
             // of a store that never took one; there is nothing to install from it.
-            Ok((None, _)) | Err(_) => return self.restart(range, from, &install, &store).await,
+            Ok((None, _)) | Err(_) => {
+                return self
+                    .restart(range, from, &install, &store, installing)
+                    .await;
+            }
         };
         // The overlap rule (SHARD.md §5, Q27) on an install onto a replica the node
         // holds: P's pre-split snapshot, whose span is P's whole span, on a node where R
@@ -1379,7 +1392,9 @@ impl<E: Environment> Task<E> {
             self.range_variants,
         );
         if admitted == Admission::NoSpan {
-            return self.restart(range, from, &install, &store).await;
+            return self
+                .restart(range, from, &install, &store, installing)
+                .await;
         }
         if admitted == Admission::Overlaps {
             self.clear(&install.source).await;
@@ -1394,13 +1409,15 @@ impl<E: Environment> Task<E> {
                 (install.at.last_index, install.at.last_term),
             )
             .await;
-            return self.release(range);
+            return self.release(range, installing);
         }
         // Admitted, so the descriptor names a span (`admission`): the snapshot's, which a
         // replica with no descriptor is made of, and what its switch replaces.
         // PROPOSED(D-128)
         let Some(streamed) = streamed else {
-            return self.restart(range, from, &install, &store).await;
+            return self
+                .restart(range, from, &install, &store, installing)
+                .await;
         };
         let span = streamed.start.clone()..streamed.end.clone();
         let source = match store.engine().open_span_source(&install.source).await {
@@ -1409,7 +1426,11 @@ impl<E: Environment> Task<E> {
             // half-written — and the engine's own checks are what say so. The stream
             // starts again from its first byte, which is what `Fault::CrashInstalling`
             // aims at.
-            Err(_) => return self.restart(range, from, &install, &store).await,
+            Err(_) => {
+                return self
+                    .restart(range, from, &install, &store, installing)
+                    .await;
+            }
         };
         #[cfg(test)]
         {
@@ -1435,7 +1456,7 @@ impl<E: Environment> Task<E> {
         if !copied && store.applied() >= install.at.last_index {
             drop(source);
             return self
-                .caught_up(range, from, &install, repair.term, &store)
+                .caught_up(range, from, &install, repair.term, &store, installing)
                 .await;
         }
         let in_force = lock(&self.descriptors).get(&range).cloned();
@@ -1493,7 +1514,9 @@ impl<E: Environment> Task<E> {
                 .await
         };
         if switched.is_err() {
-            return self.restart(range, from, &install, &store).await;
+            return self
+                .restart(range, from, &install, &store, installing)
+                .await;
         }
         // The switch moved this range's applied index, its term and the configuration
         // in force, without an apply: the store's cached index and the `apply` task's
@@ -1584,6 +1607,7 @@ impl<E: Environment> Task<E> {
                 at: install.at,
                 config: Box::new(config),
                 descriptor,
+                decided: installing,
             }));
     }
 
@@ -1597,13 +1621,14 @@ impl<E: Environment> Task<E> {
         install: &Install,
         term: Term,
         store: &RaftStore<E>,
+        decided: Decision,
     ) {
         self.clear(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
         let answer = snapshot::installed(term, (install.at.last_index, install.at.last_term));
         self.answer(range, from, answer, store.incarnation()).await;
-        self.release(range);
+        self.release(range, decided);
     }
 
     /// Keeps the plan's hosting of `range` in step with what the range is on this node
@@ -1854,6 +1879,7 @@ impl<E: Environment> Task<E> {
                 at,
                 config: Box::new(config),
                 descriptor: Some(Box::new(descriptor)),
+                decided: installing,
             }));
     }
 
@@ -1890,13 +1916,15 @@ impl<E: Environment> Task<E> {
     }
 
     /// The install did not switch: the staging directory starts over, the sender is
-    /// asked for the stream again, and the range's hold is released.
+    /// asked for the stream again, and the range's hold, taken at `decided`, is
+    /// released.
     async fn restart(
         &mut self,
         range: RangeId,
         from: ServerId,
         install: &Install,
         store: &RaftStore<E>,
+        decided: Decision,
     ) {
         self.clear(&install.source).await;
         self.plan.finish(range, from);
@@ -1912,23 +1940,28 @@ impl<E: Environment> Task<E> {
         self.local
             .push(crate::server::Local::Snapshot(SnapAnswer::Abandoned {
                 range,
+                decided,
             }));
     }
 
-    /// Lets a held range go without a switch.
-    fn release(&self, range: RangeId) {
+    /// Lets a held range go without a switch: the hold taken at `decided`.
+    // PROPOSED(D-134): a hold let go with no switch is traced, decided at the hold.
+    fn release(&self, range: RangeId, decided: Decision) {
         self.local
             .push(crate::server::Local::Snapshot(SnapAnswer::Abandoned {
                 range,
+                decided,
             }));
     }
 
-    /// The range was held for an install that is no longer there: let it go.
-    async fn abandon(&mut self, range: RangeId, from: ServerId) {
+    /// The range was held, at `decided`, for an install that is no longer there: let
+    /// it go.
+    async fn abandon(&mut self, range: RangeId, from: ServerId, decided: Decision) {
         self.plan.finish(range, from);
         self.local
             .push(crate::server::Local::Snapshot(SnapAnswer::Abandoned {
                 range,
+                decided,
             }));
     }
 

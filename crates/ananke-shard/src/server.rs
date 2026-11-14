@@ -1135,6 +1135,28 @@ impl<E: Environment> ServerHost<E> {
         Some(restored)
     }
 
+    /// `range`'s live install lets the range's hold go with no replica restored: the
+    /// install was abandoned, or its switch rebuilt none. The core the range had goes
+    /// on and steps the work held meanwhile ([`CoreWork::Release`]).
+    ///
+    /// The release is traced, decided at `decided`, the install's decision and so the
+    /// step that took the hold (D-047): its one record carries both ends of the hold,
+    /// as the switch's completion and the restored replica's restatement do for a hold
+    /// that ends in a switch. Untraced, a hold that ended with no switch read as a core
+    /// that ran through it, and the timer check measured a core that took no tick
+    /// (issue #227, seed 16725 of the sharded sweep).
+    // PROPOSED(D-134): a hold let go with no switch is traced, decided at the hold.
+    fn released(&self, range: RangeId, decided: Decision) -> CoreWork {
+        self.env.trace_decided(
+            decided,
+            TraceEvent::RaftSnapshotReleased {
+                server: self.id.0,
+                range: range.get(),
+            },
+        );
+        CoreWork::Release
+    }
+
     /// The replica a placeholder's install created (SHARD.md §5, §8; Q22): the store
     /// the switch wrote, which the `snapshot` task opened and entered in the node's
     /// tables, and whose creation it traced at the switch, restored as a core.
@@ -1248,6 +1270,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 at,
                 config,
                 descriptor,
+                ..
             }) if lock(&self.placeholders).contains(range) => self
                 .created_by_install(*range, at, config, descriptor.as_deref())
                 .map(|core| (Box::new(core), None)),
@@ -1682,6 +1705,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 at,
                 config,
                 descriptor,
+                decided,
             } => {
                 // The descriptor the switch put in place is what the receipt check
                 // reads from here on (SHARD.md §3).
@@ -1730,10 +1754,10 @@ impl<E: Environment> Host for ServerHost<E> {
                     before.as_ref(),
                 ) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
-                    None => CoreWork::Release,
+                    None => self.released(*range, *decided),
                 }
             }
-            SnapAnswer::Abandoned { .. } => CoreWork::Release,
+            SnapAnswer::Abandoned { range, decided } => self.released(*range, *decided),
             SnapAnswer::Taken { .. }
             | SnapAnswer::Installed { .. }
             | SnapAnswer::Failed { .. }

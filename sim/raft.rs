@@ -5168,7 +5168,10 @@ impl Report {
     /// start. A re-seeded server is exempt: it never campaigns on that store, by
     /// design (RAFT.md §3, D-035). So is a placeholder, from its `RangeReplicaCreated`
     /// to its range's `RangeCreated` on that node: it has no core and runs no timer
-    /// (SHARD.md §8, PROPOSED D-109). The first gap [`Report::replay_timers`] finds
+    /// (SHARD.md §8, PROPOSED D-109). So is a replica whose core the node holds for a
+    /// live install, from the install's decision to the restatement its switch traces
+    /// (PROPOSED D-091) or, where the hold ends with no switch, to its release, which
+    /// resets its clock (PROPOSED D-134). The first gap [`Report::replay_timers`] finds
     /// under every reset arm, in a range whose unimpaired replicas form a majority
     /// (SHARD.md §8), is the violation.
     ///
@@ -5249,9 +5252,12 @@ impl Report {
     /// arm.
     ///
     /// This is the fence the arm **opens** on, and it is a named event and not a
-    /// timing coincidence: no read-back, no exemption.
+    /// timing coincidence: no read-back, no exemption from this arm. A hold that ends
+    /// with no switch has no read-back, and opens on the release the node traces for
+    /// it instead (`RaftSnapshotReleased`, PROPOSED D-134).
     // PROPOSED(D-091): the node's live install holds one range, and the replay does
     // not measure a replica whose core is held.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
     fn reads_back(records: &[TraceRecord], index: usize, range: u64, server: u64) -> bool {
         let record = &records[index];
         let TraceEvent::RaftSnapshot {
@@ -5338,12 +5344,51 @@ impl Report {
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
         let mut probed = None;
-        // D-047: the replay's order; stable, so ties keep record order.
-        let mut order: Vec<(usize, &TraceRecord)> = self.records.iter().enumerate().collect();
-        order.sort_by_key(|(_, record)| time.of(record));
-        for (index, record) in order {
-            let at = time.of(record);
+        // D-047: the replay's order; stable, so ties keep record order. Every record is
+        // replayed at its `time`, and a hold let go with no switch once more, at its
+        // durability time, which is where the hold ended: the one record carries both
+        // ends of the hold, so it is both fences (`RaftSnapshotReleased`). That second
+        // place is the record's own in the trace's order, after the records traced
+        // before it at that instant and before those traced after it.
+        // PROPOSED(D-134): the timer check exempts a hold however it ends.
+        let mut order: Vec<(Instant, usize, bool, &TraceRecord)> = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (time.of(record), index, false, record))
+            .collect();
+        order.extend(
+            self.records
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    matches!(record.event, TraceEvent::RaftSnapshotReleased { .. })
+                })
+                .map(|(index, record)| (record.at, index, true, record)),
+        );
+        order.sort_by_key(|&(at, index, closing, _)| (at, index, closing));
+        for (at, index, closing, record) in order {
             clocks.replaying = index;
+            // PROPOSED(D-134): **the close fence of a hold let go with no switch**, at
+            // the release's durability time, where the core the range kept takes ticks
+            // again: it is back in the running set here and its clock starts here, as
+            // the restored replica's does at a switch (D-091's close), so a replica
+            // released by an abandoned install must still campaign within its bound
+            // of the release. It answers any hold this replay took out, so a switch
+            // that rebuilt no replica, which opened on its completion, closes here as
+            // well. Nothing is checked at this second place, so every gap is still
+            // reported at a record's own time: the close re-admits one replica with a
+            // fresh clock and moves no other, and the next record checks them all.
+            if closing {
+                if let TraceEvent::RaftSnapshotReleased { server, range } = record.event
+                    && resets.released_hold
+                    && held.remove(&(range, server))
+                {
+                    up.insert((range, server));
+                    clocks.reset((range, server), at);
+                }
+                continue;
+            }
             match &record.event {
                 TraceEvent::RaftReseeded { server, range } => {
                     reseeded.insert((*range, *server));
@@ -5568,6 +5613,27 @@ impl Report {
                         *clocks.adoptions.entry((*range, *server)).or_default() += 1;
                     }
                 }
+                // PROPOSED(D-134): **the open fence of a hold let go with no switch.**
+                // D-091's arm above opens on the switch's completion, so a hold that
+                // ended any other way had no fence at all and was measured as a running
+                // core: seed 16725 of the sharded sweep held server 3's replica of range
+                // 2 for an install from 7.681 s, flagged it at 8.194 s, inside the hold,
+                // and the install gave up at 8.222 s with the staged bytes unusable and
+                // no switch (issue #227). The node lets such a hold go with
+                // `RaftSnapshotReleased`, decided at the install's decision, which is
+                // the step that took the hold (`crates/ananke-shard/src/server.rs`,
+                // `released`), so the record is replayed here at the hold's start and
+                // again at its end, where the close above puts the replica back. The
+                // replica is held and not removed: the core the range keeps is the one
+                // it had, its role with it, so whether it leads is left as it stood.
+                // Read by durability time both places are one, and the exemption is
+                // empty: the narrower reading, as D-091's is.
+                TraceEvent::RaftSnapshotReleased { server, range }
+                    if resets.released_hold && up.contains(&(*range, *server)) =>
+                {
+                    up.remove(&(*range, *server));
+                    held.insert((*range, *server));
+                }
                 TraceEvent::RaftTerm {
                     server,
                     range,
@@ -5759,6 +5825,15 @@ pub struct TimerResets {
     // PROPOSED(D-091): the node's live install holds one range, and the replay does
     // not measure a replica whose core is held.
     pub live_install: bool,
+    /// The same hold, however it ends: a live install the node lets go with no
+    /// switch, abandoned or rebuilding no replica, takes the replica out of the
+    /// replay's running set at the install's decision and puts it back, its clock
+    /// reset, at the release, both read off the one `RaftSnapshotReleased` the
+    /// node traces for it (PROPOSED D-134, for seed 16725 of the sharded sweep).
+    /// A hold D-091's arm opened on a switch that rebuilt no replica closes at
+    /// that release too, where it had no close but the replica's next `RaftTerm`.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
+    pub released_hold: bool,
 }
 
 impl TimerResets {
@@ -5768,6 +5843,7 @@ impl TimerResets {
         restatement: true,
         adoption: true,
         live_install: true,
+        released_hold: true,
     };
     /// Neither arm: the check as it stood on 1373601, which read only
     /// AppendEntries as a leader's contact.
@@ -5776,6 +5852,7 @@ impl TimerResets {
         restatement: false,
         adoption: false,
         live_install: false,
+        released_hold: false,
     };
     /// Every arm but D-039's: the check as it stood on f54b468.
     pub const WITHOUT_RESTATEMENT: Self = Self {
@@ -5783,6 +5860,7 @@ impl TimerResets {
         restatement: false,
         adoption: false,
         live_install: false,
+        released_hold: false,
     };
     /// Every arm but D-063's: the check as it stood on 1a1cad2, which read the
     /// install's restatement as the leader's contact but measured the adoption
@@ -5793,10 +5871,11 @@ impl TimerResets {
         restatement: true,
         adoption: false,
         live_install: false,
+        released_hold: false,
     };
-    /// Every arm but PROPOSED D-091's: the check exactly as it stood on 1d17dcc,
-    /// which measured a replica against its bound while the node held its core for
-    /// a live install of that range.
+    /// Every arm but PROPOSED D-091's, and so but D-134's, its sequel: the check
+    /// exactly as it stood on 1d17dcc, which measured a replica against its bound
+    /// while the node held its core for a live install of that range.
     // PROPOSED(D-091): the node's live install holds one range, and the replay does
     // not measure a replica whose core is held.
     pub const WITHOUT_LIVE_INSTALL: Self = Self {
@@ -5804,6 +5883,18 @@ impl TimerResets {
         restatement: true,
         adoption: true,
         live_install: false,
+        released_hold: false,
+    };
+    /// Every arm but PROPOSED D-134's: the check exactly as it stood on 0d67f99,
+    /// which exempted a live install's hold only where it ended in a switch, and
+    /// measured a hold the node let go with no switch as a running core.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
+    pub const WITHOUT_RELEASED_HOLD: Self = Self {
+        install_snapshot: true,
+        restatement: true,
+        adoption: true,
+        live_install: true,
+        released_hold: false,
     };
 }
 
@@ -6088,6 +6179,13 @@ impl Report {
                     } => {
                         (*g, *s) == (range, server) && !Self::restates(&self.records, index, *g, *s)
                     }
+                    // PROPOSED(D-134): a hold let go with no switch takes the replica
+                    // out at its decision time and puts it back at its durability
+                    // time, so it says its status the way a completed install does.
+                    TraceEvent::RaftSnapshotReleased {
+                        server: s,
+                        range: g,
+                    } => (*g, *s) == (range, server),
                     _ => false,
                 };
                 status && (index < flag) != before_by_decision(index, r)
@@ -11040,6 +11138,192 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(ms(0), ms(450), 1)],
             "D-063's arm still answers for the staged install, and says so in its own words",
+        );
+    }
+
+    /// The record the node traces where a live install lets its range's hold go with
+    /// no switch (`server.rs`, `released`): decided at the install's decision, which
+    /// took the hold, and traced at the release, so it carries both ends of the hold.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
+    fn released(decided: Instant, at: Instant, server: u64, range: u64) -> TraceRecord {
+        record(
+            at,
+            decided,
+            Some(server),
+            TraceEvent::RaftSnapshotReleased { server, range },
+        )
+    }
+
+    /// Seed 16725's shape (issue #227), and its pair: a hold that ends with **no
+    /// switch** is held from its decision to its release, and the replica the
+    /// release gives its core back to is measured again from there, so one that
+    /// never campaigns is caught.
+    ///
+    /// The install is decided at 300 ms, which takes the hold, and is let go at
+    /// 520 ms with no switch, against a 400 ms bound: the stretch from the start to
+    /// 450 ms is past the bound and 150 ms of it is inside the hold. Written by hand,
+    /// so a wrong rule is a different answer and not a different rate.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
+    #[test]
+    fn a_hold_let_go_with_no_switch_is_held_between_its_decision_and_its_release() {
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+            released(ms(300), ms(520), 1, SINGLE_GROUP),
+        ];
+        let held = report(records.clone(), Vec::new());
+        assert_eq!(
+            held.timer_gaps(TimerResets::ALL),
+            Vec::new(),
+            "a replica whose core the node held for an install that ended with no switch is \
+             not measured over the hold",
+        );
+        assert_eq!(held.timers_fire(), Ok(()));
+        // The mechanism the other way: the check exactly as it stood on 0d67f99, whose
+        // exemption opened only on a switch's read-back, flags the stretch.
+        assert_eq!(
+            held.timer_gaps(TimerResets::WITHOUT_RELEASED_HOLD)
+                .iter()
+                .map(|gap| (gap.since, gap.at, gap.record))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450), 1)],
+            "the check as it stood on 0d67f99 measures the hold as a running core",
+        );
+        // Read by durability time the record's two places are one and the exemption
+        // is empty: the narrower reading, which can hide nothing.
+        assert_eq!(
+            held.timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
+                .iter()
+                .map(|gap| (gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450))],
+            "by durability time the hold has no extent",
+        );
+
+        // The pair. A released replica that campaigns within its bound of the release
+        // passes: its pre-vote at 900 ms is 380 ms after it.
+        let mut campaigned = records.clone();
+        campaigned.push(record(
+            ms(900),
+            ms(900),
+            Some(1),
+            term(1, 1, "pre-candidate", None),
+        ));
+        campaigned.push(silence(ms(970)));
+        assert_eq!(
+            report(campaigned, Vec::new()).timer_gaps(TimerResets::ALL),
+            Vec::new(),
+            "a released replica that campaigns within its bound of the release is correct",
+        );
+        // And one that never campaigns is caught, measured from the release and not
+        // from the start: the release is where its core took ticks again.
+        records.push(silence(ms(970)));
+        assert_eq!(
+            report(records, Vec::new())
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.server, gap.range, gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(1, SINGLE_GROUP, ms(520), ms(970))],
+            "a replica released by an abandoned install that never campaigns is caught, \
+             from its release",
+        );
+    }
+
+    /// **What the released hold does not exempt**, as D-091's own test asks of the
+    /// switch's hold, and the close it gives a hold D-091's arm opened.
+    ///
+    /// 1. *The stretch before the hold opens.* An install decided after the flag fell
+    ///    excuses nothing before it.
+    /// 2. *The node's other ranges.* The hold is one range's, so the arm takes the
+    ///    replica out of the running set and never the node.
+    /// 3. *A switch that rebuilt no replica.* Its completion opened D-091's hold, and
+    ///    nothing closed it but the replica's next `RaftTerm`, so a replica that never
+    ///    campaigned was never measured again. The release it traces closes it now.
+    /// 4. *Who leads.* The core a released range keeps is the one it had: a leader
+    ///    held and let go still leads, and is not measured as a silent follower.
+    // PROPOSED(D-134): the timer check exempts a hold however it ends.
+    #[test]
+    fn the_released_hold_exempts_the_hold_and_nothing_else() {
+        const OTHER_RANGE: u64 = SINGLE_GROUP + 1;
+
+        // 1. The flag falls at 450 ms and the install is decided at 460 ms.
+        let records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+            released(ms(460), ms(600), 1, SINGLE_GROUP),
+        ];
+        assert_eq!(
+            report(records, Vec::new())
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450))],
+            "an install decided after the flag fell excuses nothing before it",
+        );
+
+        // 2. Server 1 holds `SINGLE_GROUP`; its replica of `OTHER_RANGE` is silent
+        //    throughout and is still flagged.
+        let records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, OTHER_RANGE, 1, "follower"),
+            ),
+            silence(ms(450)),
+            released(ms(300), ms(520), 1, SINGLE_GROUP),
+        ];
+        assert_eq!(
+            report(records, Vec::new())
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.range, gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(OTHER_RANGE, ms(0), ms(450))],
+            "the hold is the released range's alone: the node's other replicas are measured",
+        );
+
+        // 3. A switch whose host rebuilt no replica: the read-back and the completion,
+        //    decided at 300 ms and durable at 520 ms, with no restatement, and the
+        //    release at the same instant. Silent to 970 ms, it is caught from the
+        //    release; the check as it stood left it out of the running set for good.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+        ];
+        records.extend(live_install(ms(300), ms(520), 1, SINGLE_GROUP));
+        records.pop();
+        records.push(released(ms(300), ms(520), 1, SINGLE_GROUP));
+        records.push(silence(ms(970)));
+        let rebuilt_none = report(records, Vec::new());
+        assert_eq!(
+            rebuilt_none
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(ms(520), ms(970))],
+            "a switch that rebuilt no replica closes its hold at the release",
+        );
+        assert_eq!(
+            rebuilt_none.timer_gaps(TimerResets::WITHOUT_RELEASED_HOLD),
+            Vec::new(),
+            "the check as it stood on 0d67f99 never closed that hold",
+        );
+
+        // 4. A leader held and let go keeps its role: no gap, though it is silent.
+        let records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "leader", None)),
+            released(ms(300), ms(520), 1, SINGLE_GROUP),
+            silence(ms(970)),
+        ];
+        assert_eq!(
+            report(records, Vec::new()).timer_gaps(TimerResets::ALL),
+            Vec::new(),
+            "a released range keeps the core it had, and a leader's timer is not checked",
         );
     }
 

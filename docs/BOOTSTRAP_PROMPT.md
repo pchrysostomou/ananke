@@ -101,6 +101,13 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
+  **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
+  ended in a switch, so a hold the node let go with no switch was measured as a running core (seed
+  16725 of the sharded sweep). The node now traces that release, `RaftSnapshotReleased`, decided at
+  the install's decision, and the replay holds the replica from the one to the other and resets its
+  clock at the release, so a released replica must still campaign within its bound. Hand-built
+  pair in `sim/raft.rs`; seed 16725's pin asserts `check()` beside its mechanism. No bound moved.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
