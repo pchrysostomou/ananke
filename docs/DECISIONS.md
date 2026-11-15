@@ -25182,7 +25182,8 @@ map's reading from the heal kept beside. It is asked by that sweep alone. On `ma
 3. **Each write is the range's that served its key when it completed**, and a pending one the
    range's serving its key where the run stopped (`Report::serving_write`, D-102's two
    readings, which `last_completion_after_heal` and `post_heal_writes` already used). This is
-   `recoveries_by_final_range`, so it holds for both readings.
+   `recoveries_by_final_range`, so it holds for both readings, and on `liveness_by_final_range` it
+   moves a verdict either way (*The direction the keying passes a run D-113's arm failed*, below).
 4. **The starting map's reading from the heal stays, asked as it was and before the halves**:
    `writes_after_heal_by_range` is renamed `writes_after_heal_by_starting_range`, for the map
    it reads, and is otherwise unchanged; so is `time_to_write_after_heal`, whose minimum over
@@ -25192,6 +25193,11 @@ map's reading from the heal kept beside. It is asked by that sweep alone. On `ma
    ranges the arm from the first call asks (every final range on `sim/shard.rs`, where a range
    is as few as two of sixteen keys; a range a split cut elsewhere) and in when "the clients
    wrote nothing" is asked.
+6. **`liveness_of_the_ranges` is `liveness`'s per-range answer**: the arms it asks of the
+   ranges, items 2 and 4, through the same code (`ranges_recovered`) and in its words, without
+   the per-key reading asked before them. In the node sweep the per-key reading reports every run
+   with a wedged half first, and `liveness` then names only the key, so the seed-69 pin and
+   `SharedSnapshotDir`'s counter read this one, and fail when `liveness` stops asking the halves.
 
 No bound, schedule or trace moves. A run with no split reads exactly as it did: the per-key
 filter is the starting map's, no range is cut, and the reading from the heal is the same code,
@@ -25229,6 +25235,43 @@ draw, so its premise still holds. Asked as it was and before the halves, no run 
 passes, by construction and not by measurement, and the rule against widening a bound is met
 without arguing how large a widening would be.
 
+### The direction the keying passes a run D-113's arm failed
+
+Keying a write by the range serving its key when it completed is stricter for a right half, and
+this branch's review named the other direction, which this entry did not. A parent goes on as its
+left half, so a completion on the parent before the split, of a key its right half serves later,
+is now the left half's evidence, where D-113's arm, keyed where the run stopped, gave it to the
+right half. That can pass a left half the arm failed: one whose own first post-heal write was
+proposed and never committed and whose key was answered again only past the bound from that write.
+`a_completion_before_a_split_is_the_left_halfs_and_one_after_it_the_right_halfs` is that run, the
+review's own probe (split at 1 s; `k0` proposed at 100 ms and lost, answered next at 2.51 s; `k1`
+completed on the parent at 250 ms): `liveness_by_final_range` failed it at c5cd18d, 2.41 s, and
+passes it here, the left half 150 ms from its first write. The same run with `k1` completed after
+the split, on the right half's log, fails under both keyings.
+
+**Why it is taken.** It is D-102's rule, which `last_completion_after_heal` already applies to the
+exemption's evidence: the parent's log, which the left half is, did commit a write at 250 ms, so a
+range that answered 150 ms after it was first asked was live. Unsplit, the one range reads the same
+150 ms and passes under either keying, so the new keying reads a left half as the range it continues
+for what that range completed before the split. What it then misses is `k0`'s lost write, which is
+#158's per-key fold, open, and not a matter of keying. `liveness` cannot move this way, since before
+this entry it asked no half and its reading from the heal is unchanged; only
+`liveness_by_final_range`, asked by `sim/shard.rs` alone, can.
+
+**Measured, from the review.** Each run once, in release, `liveness_by_final_range` and
+`recoveries_by_final_range` under both keyings from one report (a temporary switch, not committed),
+on the 17 variants `sim/tests/shard.rs` runs (`NoPreVote`, `ResetTimerOnAnyRpc`,
+`SendBeforePersist`, `UnconfirmableReadKept`; `InstallReplacesCopiedSpan`,
+`InstallReplacesHostedSpan`, `RefuseOneRangeOnly`, `SplitLeavesQuarantineBehind`;
+`ApplyIgnoresSpan`, `ClientIgnoresMismatch`, `IdBlockResumed`, `MetaOverwritesByArrival`,
+`ReadCheckAtReceiptOnly`, `RefillNotResent`, `SnapshotOverlapsReplica`, `TrustStaleDescriptor`,
+`UninitialisedReplicaVotes`), seeds 0 to 59 of each as the sweep runs them (30 uniform), and
+`ClientIgnoresMismatch` also taken to its end, as its write-bound catch is read: no verdict moved
+either way and no violation's words moved, and on none of the 1 080 runs did the keying put a
+post-heal write in a different range. With the correct sweep's 500 seeds above, no sharded run
+reached either direction; the hand-built pair is what shows each. Sixty seeds a variant is below the
+premerge's tier and is no rate.
+
 ### The pair, on records written by hand
 
 In `sim/raft.rs`, run by the `rest` job. Each is one range holding `k0`, `k1` and above, split
@@ -25236,9 +25279,9 @@ at `k1`, the heal at 0 (`split_run`):
 
 | Test | The trace | Before | After |
 |---|---|---|---|
-| `a_wedged_half_beside_a_live_sibling_is_read_as_wedged_and_the_starting_map_reads_it_live` | `k0` pending, `k1` answered in 50 ms, split at 0 | one range, 650 ms | left half no completion, right half 50 ms from its first write |
-| the same | no split | 650 ms | the same range, the same writes |
-| `a_half_slow_to_answer_its_first_write_fails_and_a_half_written_late_does_not` | `k0` proposed at 100 ms, never committed; next write 2.49 to 2.51 s; sibling answered at 250 ms | `liveness` and `liveness_by_final_range` pass | both fail, 2.41 s |
+| `a_wedged_half_beside_a_live_sibling_is_read_as_wedged_and_the_starting_map_reads_it_live` | `k0` pending, `k1` answered in 50 ms, split at 0 | one range, 650 ms | left half no completion, right half 50 ms from its first write; `liveness` names `k0`, and its per-range answer (`liveness_of_the_ranges`) the left half |
+| the same | no split | 650 ms | the same range, the same writes; the per-range answer passes |
+| `a_half_slow_to_answer_its_first_write_fails_and_a_half_written_late_does_not` | `k0` proposed at 100 ms, never committed; next write 2.49 to 2.51 s; sibling answered at 250 ms | `liveness` passes; `liveness_by_final_range` already fails, 2.41 s (the split is at 0, so keying where the run stopped and where the write completed agree) | both fail, 2.41 s |
 | the same | without the write that never committed | passes | passes, 20 ms |
 | the same | no split | passes | passes |
 | `a_write_no_leader_proposed_starts_no_halfs_clock` | two lost puts traced at 100 ms and 1.5 s | passes | passes, 20 ms |
@@ -25246,6 +25289,8 @@ at `k1`, the heal at 0 (`split_run`):
 | `a_right_half_born_after_the_heal_is_not_charged_the_time_before_it` | split at 2.2 s | a write returned before the split is the right half's | it is the parent's; the right half 20 ms from its first write |
 | `a_right_half_that_completes_nothing_fails_though_its_key_completed_on_the_parent` | split at 1 s; `k1` completes on the parent, its next write pending on the right half | both readings pass | both fail, right half no completion |
 | the same | that write answered in 20 ms | passes | passes |
+| `a_completion_before_a_split_is_the_left_halfs_and_one_after_it_the_right_halfs` (from the review) | split at 1 s; `k0` proposed at 100 ms, never committed, next answered at 2.51 s; `k1` completed on the parent at 250 ms | `liveness` passes; `liveness_by_final_range` fails, 2.41 s, the completion read as the right half's | both pass, the left half 150 ms from its first write |
+| the same | `k1` completed after the split, on the right half, at 1.25 s | `liveness` passes; `liveness_by_final_range` fails, 2.41 s | both fail, 2.41 s |
 | `a_keys_majority_is_the_one_of_the_range_serving_it_after_a_split` | either half two replicas short | a key asked on the starting map's majority | on the majority of the half serving it |
 
 `a_completion_is_the_evidence_of_the_range_serving_its_key_when_it_completed`, D-102's, gains a
@@ -25267,12 +25312,19 @@ word for word):
 
 **No sweep verdict moves at these tiers, and that is expected.** A half in the node sweep serves
 one key, so the per-key reading fails every run the halves' reading fails: each of the 12 also
-fails it. What moved is the per-range reading's own answer, blind to those halves before. Two
+fails it. What moved, on 5 of them (seeds 69, 80, 257, 277 and 293), is `liveness`'s per-range
+answer (`liveness_of_the_ranges`), which passed them before. On the other 7 the reading from the
+heal already failed another range of the run, so the per-range answer failed them before the halves
+were asked, and the halves move no verdict there at all: seed 76's is range 5, no write to which
+completed after the heal (found after the review, which asked what the pins guard). Two
 shapes are the halves' reading's alone, and none of these seeds reaches either, so each is built
-by hand above and the nightly's ten thousand will say whether a sweep does: a write a leader
+by hand above and the nightly's ten thousand will say whether a sweep does. One is a write a leader
 proposed that never committed, followed by a quick one to the same key (the per-key reading folds
-the key into the quick one, #158, and the starting map's minimum is the sibling's), and a split
-after the heal whose right half completes nothing while its key completed on the parent. On the
+the key into the quick one, #158, and the starting map's minimum is the sibling's): new to
+`liveness`, which asked no half; `liveness_by_final_range` already failed it where the split comes
+before the half's first write, as in the hand-built case, since keying where the run stopped and
+where the write completed then agree. The other is a split after the heal whose right half
+completes nothing while its key completed on the parent: new to both readings. On the
 sharded sweep the new keying moved no reading at all, so D-113 §5's measurements stand; the worst
 final range from its first write is 257 ms (seed 364). Under `SharedSnapshotDir`, five runs that
 pass have a half past the bound from the heal and answered within 45 ms of its first write in the
@@ -25299,47 +25351,63 @@ moves nothing a variant's sweep reads on the seeds it saw.
 - `seed_76_under_a_shared_snapshot_dir_reads_the_wedged_half_as_wedged_beside_its_live_sibling`:
   range 4 split at `k5`, both halves live, the starting map's reading of range 4 within the bound
   of the heal, the left half with no completion, the right half within the bound of its first
-  write; the correct node on the seed reads no such half and passes. The per-key reading still
-  reports the run first (`k4`), as D-102's pin of the seed asserts; this one pins the per-range
-  reading's own answer, blind to the half before.
+  write; the correct node on the seed reads no such half and passes. It pins the keying on a real
+  run, two logs and one of them wedged, and not `liveness`'s verdict: the per-key reading reports
+  the run first (`k4`), as D-102's pin of the seed asserts, and the per-range answer is the reading
+  from the heal's, on range 5, which failed the run before this entry too. The pin asserts both.
+- `seed_69_under_a_shared_snapshot_dir_fails_the_per_range_answer_through_a_half_alone` (from the
+  review): range 5 split at `k7`, its left half (`k6`) with no completion beside a live right half,
+  the reading from the heal passing every live range the run started with, and
+  `liveness_of_the_ranges` naming the left half, which with the halves not asked passes the run.
+  `liveness` names `k6`. The pair is the correct node on the seed, whose per-range answer passes.
 - `seeds_105_and_300_are_halves_past_the_bound_of_the_heal_and_live`: on the correct node, each
   half's first completion past the bound of the heal, its first write in the history answered
   well inside it, how many writes before it no leader proposed (0 and 1), that read from the
   invocations seed 300 is over the bound and 105 is not, and for seed 300 that the range served
   reads between the lost write and the first return.
-- `a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node` counts the runs with a half
-  the starting map reads live (`a_half_the_starting_map_reads_live`), printed at every tier.
-  Asserted above zero from the nightly's ten thousand (D-061): 12 of seeds 0 to 299, 4.0 % over
-  the seeds the assertion sees, so the thousand's share of a hundred would miss it about one run
-  in sixty. The correct node's half of the pair is its own sweep, whose `check()` asks the halves of
-  every uniform seed.
+- `a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node` counts the runs whose
+  per-range answer a half alone fails (`a_half_alone_fails_the_per_range_answer`: the reading from
+  the heal passes and `liveness_of_the_ranges` fails), printed at every tier. Asserted above zero
+  from the nightly's ten thousand (D-061): 5 of seeds 0 to 299, 1.7 % over the seeds the assertion
+  sees, so the thousand's share of a hundred would miss it about one run in five; with the halves
+  not asked it is 0 of 300. The correct node's half of the pair is its own sweep, whose `check()`
+  asks the halves of every uniform seed. As first pushed it counted 12, read off the halves'
+  recoveries beside the starting map's reading of the half's own span, a re-implementation of the
+  arm that held with `liveness`'s change reverted; the review found that, and the 7 it no longer
+  counts are the runs the reading from the heal already fails on another range.
 
 ### The plants, each temporary and reverted
 
 Each selected by a temporary switch in `sim/raft.rs`, built once in release beside the probe and
 run over `raft::tests` once per plant, then the switch taken out; with none selected all 61 pass.
-Each plant failed at least one test, and every new test fails under at least one plant:
+Each plant failed at least one test, and every new test fails under at least one plant. After the
+review the three plants marked † were built again on the final code and run over `raft::tests`,
+62 with `a_completion_before…`, and the node pins; the other seven are the first push's, run on code
+the review did not change in what they plant:
 
 | Plant | What fails |
 |---|---|
-| Each write keyed by the starting map | `a_wedged_half…`, `a_half_slow…`, `a_write_no_leader…`, `a_span_slow…`, `a_right_half_born…`, `a_right_half_that_completes…`, and D-113's `the_write_bound_is_asked_of_the_range_serving_a_key_where_the_run_stopped` |
-| Each write keyed where the run stopped (D-113 §5 as merged) | `a_right_half_born…`, `a_right_half_that_completes…` |
+| Each write keyed by the starting map † | `a_wedged_half…`, `a_half_slow…`, `a_write_no_leader…`, `a_span_slow…`, `a_right_half_born…`, `a_right_half_that_completes…`, `a_completion_before…`, and D-113's `the_write_bound_is_asked_of_the_range_serving_a_key_where_the_run_stopped` |
+| Each write keyed where the run stopped (D-113 §5 as merged) † | `a_right_half_born…`, `a_right_half_that_completes…`, `a_completion_before…` |
 | A half read from the heal | `a_half_slow…`, `a_write_no_leader…`, `a_right_half_born…`, `a_right_half_that_completes…`, D-113's |
 | A half read from its first invocation | `a_write_no_leader…`, `a_right_half_that_completes…` |
-| `liveness` does not ask the halves | `a_half_slow…`, `a_right_half_that_completes…` |
+| `liveness` does not ask the halves † | `a_wedged_half…` (its per-range answer), `a_half_slow…`, `a_right_half_that_completes…`, `a_completion_before…` |
 | `liveness` does not ask the reading from the heal | `a_span_slow…`, and D-076's `a_post_heal_write_is_measured_from_its_own_call_and_the_range_from_the_heal` |
 | A key asked on the starting map's majority | `a_keys_majority…` |
 | Only right halves read as cut | `a_half_slow…` |
 | Only parents read as cut | `a_right_half_that_completes…` |
 | A half with no completion passes | `a_right_half_that_completes…` |
 
-The pins were run under the first five, in release, and pass with none selected. Keyed by the
-starting map fails both: seed 76's left half reads its sibling's completion, and seed 105's half is
-no range of that reading. Read from the heal fails the second on seed 105, whose correct run
-`check()` then fails, and from the first invocation fails it on seed 300. Keyed where the run
-stopped, and the halves not asked by `liveness`, pass both pins, which read the halves' recoveries
-and not the arm; their catches are the hand-built cases above. Every plant was taken out and the
-tree compared clean of it before the gate.
+The pins pass with none selected. Keyed by the starting map fails all three: seed 76's and seed
+69's left halves read their siblings' completions, and seed 105's half is no range of that reading.
+`liveness` not asking the halves fails seed 69's pin, whose per-range answer then passes, and with
+it the sweep's counter, 0 of 300. Read from the heal fails the pin of seeds 105 and 300 on seed
+105, whose correct run `check()` then fails, and from the first invocation fails it on seed 300
+(both of the first push). Keyed where the run stopped fails no pin, since on none of the pinned
+seeds does the keying move a half's writes (on the correct node it moves four runs' halves, none a
+verdict, and on `SharedSnapshotDir` none); its catches are the hand-built cases above.
+As first pushed, the halves not asked failed no pin either: the review found that, and seed 69's
+pin is the answer. Every plant was taken out and the tree compared clean of it before the gate.
 
 ### What is not here
 
@@ -25359,7 +25427,15 @@ tree compared clean of it before the gate.
   every run `check()` asks; recommended and taken.
 - **PROPOSED**: a completion keyed by the range serving its key when it completed, in both
   readings, as D-102 keyed it for the exemption; recommended and taken. It amends D-113 §5's
-  per-range arm, which keyed every write where the run stopped.
+  per-range arm, which keyed every write where the run stopped, and in both directions: a right
+  half is no longer passed on its parent's completion, and a left half is now passed on it, so
+  `liveness_by_final_range` passes a left half whose own lost write was answered late after the
+  parent completed a write of its right half's key, which D-113's arm failed. **The owner's
+  question**: is the parent's completion before a split the left half's evidence, as D-102 ruled
+  for the exemption? Recommended yes, for the reasons above. The alternative is to count a
+  parent's completion of a key its right half serves later for neither half: that keeps D-113's
+  verdict on such a left half and this entry's on the right, but reads a split's left half
+  stricter than the same range unsplit, and gives D-102's reading of a completion two answers.
 - **PROPOSED**: keeping D-076's reading from the heal beside the halves rather than retiring it.
   Recommended and taken, since it is what makes "no run it failed passes" true without a
   measurement.

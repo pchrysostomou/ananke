@@ -3871,49 +3871,24 @@ fn wedged(report: &raft::Report) -> bool {
     report.uniform() && report.liveness().is_err()
 }
 
-/// Whether the per-range reading of a split's halves fails a range a split cut where
-/// the reading of the range the run started with, the span it came from, passes it or
-/// does not ask it: a half wedged or slow beside a sibling whose completion D-076's
-/// reading took for its own (#148). Read off the two readings themselves, whatever the
-/// per-key reading says of the run: each half is asked as `liveness` asks it, from its
-/// first post-heal write in the history (`raft::Report::recoveries_by_final_range`).
-// PROPOSED(D-121): the per-range readings key a write by the range serving its key.
-fn a_half_the_starting_map_reads_live(report: &raft::Report) -> bool {
+/// Whether `liveness`'s own per-range answer (`raft::Report::liveness_of_the_ranges`, the
+/// code `liveness` asks) fails a run that D-076's reading from the heal, over the map the run
+/// started with, passes: so what fails it is a range a split cut, read from its first
+/// post-heal write, wedged or slow beside a sibling whose completion the starting map took
+/// for its own (#148), on a run that reading passes on every range. Read whatever the per-key
+/// reading says of the run, which in the node sweep reports every such run first and names
+/// only the key. With the halves not asked, as `liveness` asked none before PROPOSED D-121, it
+/// holds of no run. A run whose reading from the heal fails some other range already failed
+/// the per-range answer before the halves were asked, and is not counted (seed 76).
+// PROPOSED(D-121): `liveness`'s per-range answer, where the starting map's passes.
+fn a_half_alone_fails_the_per_range_answer(report: &raft::Report) -> bool {
     let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
     let live = report.ranges_with_a_majority_up();
-    let parents: BTreeMap<u64, u64> = report
-        .records
-        .iter()
-        .filter_map(|r| match &r.event {
-            TraceEvent::RangeSplit { range, right, .. } => Some((*right, *range)),
-            _ => None,
-        })
-        .collect();
-    let cut: BTreeSet<u64> = parents
-        .iter()
-        .flat_map(|(right, parent)| [*right, *parent])
-        .collect();
-    let span_of = |mut range: u64| {
-        while let Some(parent) = parents.get(&range) {
-            range = *parent;
-        }
-        range
-    };
-    let answered = |took: Option<Duration>| took.is_some_and(|took| took <= bound);
-    let starting = report.writes_after_heal_by_starting_range();
-    report
-        .recoveries_by_final_range()
+    let from_the_heal = report
+        .writes_after_heal_by_starting_range()
         .into_iter()
-        .any(|(range, recovery)| {
-            let took = recovery.first_completed.map(|completed| {
-                completed.duration_since(recovery.first_call.max(report.last_heal))
-            });
-            let span = span_of(range);
-            cut.contains(&range)
-                && live.contains(&range)
-                && !answered(took)
-                && (!live.contains(&span) || starting.get(&span).is_some_and(|t| answered(*t)))
-        })
+        .all(|(range, took)| !live.contains(&range) || took.is_some_and(|took| took <= bound));
+    from_the_heal && report.liveness_of_the_ranges().is_err()
 }
 
 /// Whether a violation is the read bound's (`READS_OUTSTANDING`, D-076 point 12).
@@ -5274,9 +5249,9 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
         /// The read bound fired with no wedge, where the correct node passes the seed:
         /// the variant's load on a bound that counts retries (issue #125).
         load: bool,
-        /// A half the per-range reading of the halves fails and the starting map's reads
-        /// live (#148).
-        // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+        /// `liveness`'s per-range answer fails the run and the starting map's reading from
+        /// the heal passes it: a half that reading read live fails it alone (#148).
+        // PROPOSED(D-121): `liveness`'s per-range answer, where the starting map's passes.
         half: bool,
     }
     let outcomes: Vec<Shared> = sweep(share, |seed| {
@@ -5315,7 +5290,7 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
             wedged: wedged(&report),
             read_bound_on_wedge,
             load,
-            half: report.uniform() && a_half_the_starting_map_reads_live(&report),
+            half: report.uniform() && a_half_alone_fails_the_per_range_answer(&report),
         }
     });
     let caught: Vec<&String> = outcomes
@@ -5435,25 +5410,28 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
         "node: SharedSnapshotDir's liveness catch is {liveness}/{share} over a tier of \
          {tier}, asserted from ten thousand as Phase 2 asserts it and no stronger"
     );
-    // **A half the starting map reads live, from the same ten thousand** (#148). The
-    // correct node's half of the pair is its own sweep, whose `check()` asks the halves'
-    // reading of every uniform seed. **12 of 300** on this tree (seeds 0 to 299, release),
-    // every one uniform, so 4.0 % over the seeds the assertion sees and under D-061's 5 %: the
-    // thousand's share of a hundred misses it about one run in sixty, which is a flake, and the
-    // ten thousand's share of a thousand all but never does. Each of the 12 also fails the
-    // per-key reading, so this counts the per-range reading's own answer and moves no verdict
-    // of the sweep (PROPOSED D-121).
-    // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+    // **A half alone failing `liveness`'s per-range answer, from the same ten thousand**
+    // (#148). The correct node's half of the pair is its own sweep, whose `check()` asks the
+    // halves' reading of every uniform seed. **5 of 300** on this tree (seeds 0 to 299, release:
+    // 69, 80, 257, 277 and 293), every one uniform, so 1.7 % over the seeds the assertion sees and
+    // under D-061's 5 %: the thousand's share of a hundred misses it about one run in five, and the
+    // ten thousand's share of a thousand all but never does. Seven more seeds leave a half the
+    // starting map reads live on a run its reading from the heal already fails on another range
+    // (seed 76), which the per-range answer failed before the halves were asked. Each of the 12 also
+    // fails the per-key reading, so this moves no verdict of the sweep. With the halves not asked,
+    // as before PROPOSED D-121, it is 0 of 300 (PROPOSED D-121, from its review).
+    // PROPOSED(D-121): `liveness`'s per-range answer, where the starting map's passes.
     let halves = outcomes.iter().filter(|o| o.half).count();
     println!(
-        "node: SharedSnapshotDir left a half the per-range reading of the halves fails and \
-         the starting map reads live on {halves}/{share} seeds"
+        "node: SharedSnapshotDir failed `liveness`'s per-range answer through a half alone, \
+         the starting map's reading from the heal passing, on {halves}/{share} seeds"
     );
     if tier >= 10_000 {
         assert!(
             halves > 0,
-            "SharedSnapshotDir never wedged a half beside a sibling the starting map read as \
-             its own over {share} seeds, so the halves' reading was not asked of one"
+            "SharedSnapshotDir never failed `liveness`'s per-range answer through a half alone \
+             over {share} seeds, so no run asked the halves' reading what the starting map's \
+             could not answer"
         );
     }
 }
@@ -5793,10 +5771,16 @@ fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wo
 /// The map the run started with reads the two as one range and takes the right half's
 /// completion for the range's, within the bound of the heal. Keyed by the range serving
 /// each write, the left half reads no completion, the right half one within the bound of
-/// its first write, and `a_half_the_starting_map_reads_live` holds. The per-key reading
-/// still reports the run first (`k4`), as `seeds_12_and_76_...` pins; this pins the
-/// per-range reading's own answer, which before this entry was blind to the half. The pair
-/// is the correct node on the same seed, which reads no such half and passes.
+/// its first write. This pins that keying on a real run: two logs, one of them wedged.
+///
+/// **It does not pin `liveness`'s verdict, which the halves do not move here** (from
+/// D-121's review). The per-key reading reports the run first (`k4`), as
+/// `seeds_12_and_76_...` pins, and the per-range answer
+/// (`raft::Report::liveness_of_the_ranges`) is the reading from the heal's, on range 5, no
+/// write of which completed after the heal: it failed the run before this entry too, before
+/// the halves are asked. `seed_69_under_a_shared_snapshot_dir_fails_the_per_range_answer_through_a_half_alone`
+/// is the run whose per-range answer the halves alone fail. The pair is the correct node on
+/// the same seed, which reads no such half and passes.
 // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
 #[test]
 fn seed_76_under_a_shared_snapshot_dir_reads_the_wedged_half_as_wedged_beside_its_live_sibling() {
@@ -5853,14 +5837,116 @@ fn seed_76_under_a_shared_snapshot_dir_reads_the_wedged_half_as_wedged_beside_it
         answered.is_some_and(|took| took <= bound),
         "seed 76: the right half is not read live: {answered:?}"
     );
-    assert!(a_half_the_starting_map_reads_live(&report));
+    // The per-range answer is the reading from the heal's, on another range, so the halves
+    // move no verdict of this run, and it is not counted as a half alone failing it.
+    assert_eq!(
+        report.liveness_of_the_ranges(),
+        Err(format!(
+            "liveness: no client write to range 5 completed after the last heal at {:?}",
+            report.last_heal
+        )),
+        "seed 76: the reading from the heal no longer fails range 5 first"
+    );
+    assert!(!a_half_alone_fails_the_per_range_answer(&report));
 
     // The pair: the correct node on the seed, whose every half answers.
     let correct_run = correct(76);
-    assert!(!a_half_the_starting_map_reads_live(&correct_run));
+    correct_run
+        .liveness_of_the_ranges()
+        .unwrap_or_else(|violation| panic!("the correct node's ranges on seed 76: {violation}"));
+    assert!(!a_half_alone_fails_the_per_range_answer(&correct_run));
     correct_run
         .check()
         .unwrap_or_else(|violation| panic!("the correct node fails seed 76: {violation}"));
+}
+
+/// Seed 69 under `SharedSnapshotDir`: **a run `liveness`'s per-range answer fails through a
+/// half alone, which it passed until PROPOSED D-121** (#148; from the entry's review, which
+/// found that neither pin above fails with `liveness`'s change reverted). Range 5 split at
+/// `k7`. Its left half, serving `k6`, completes no post-heal write; its right half does, and
+/// the map the run started with takes that completion for range 5's, within the bound of the
+/// heal, as it reads every range it started with within the bound. So the reading from the
+/// heal passes the run, and the per-range answer (`raft::Report::liveness_of_the_ranges`, the
+/// code `liveness` asks) fails it on the left half, asked from its first post-heal write. With
+/// the halves not asked, as before this entry, that answer passes the run. The per-key reading
+/// still reports the run first (`k6`), so `liveness` names the key and the sweep's verdict does
+/// not move. The pair is the correct node on the same seed, whose per-range answer passes.
+// PROPOSED(D-121): `liveness`'s per-range answer, where the starting map's passes.
+#[test]
+fn seed_69_under_a_shared_snapshot_dir_fails_the_per_range_answer_through_a_half_alone() {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let report = buggy(69, Variant::SharedSnapshotDir);
+    assert!(report.uniform(), "seed 69 is a uniform schedule");
+    let right = report
+        .records
+        .iter()
+        .find_map(|r| match &r.event {
+            TraceEvent::RangeSplit {
+                range: 5,
+                right,
+                key,
+                ..
+            } if ananke_raft::apply::user_key_of(key) == Some(&b"k7"[..]) => Some(*right),
+            _ => None,
+        })
+        .expect("seed 69's range 5 splits at k7");
+    let live = report.ranges_with_a_majority_up();
+    assert!(
+        live.contains(&5) && live.contains(&right),
+        "seed 69: both halves are asked of: {live:?}"
+    );
+    // D-076's reading from the heal passes every live range the run started with.
+    let starting = report.writes_after_heal_by_starting_range();
+    println!("seed 69: range 5 and its right half {right}: from the starting map {starting:?}");
+    for (range, took) in &starting {
+        assert!(
+            !live.contains(range) || took.is_some_and(|took| took <= bound),
+            "seed 69: the reading from the heal fails range {range}, {took:?}, so it is not the \
+             halves alone that fail the run"
+        );
+    }
+    let halves = report.recoveries_by_final_range();
+    assert_eq!(
+        halves.get(&5).map(|recovery| recovery.first_completed),
+        Some(None),
+        "seed 69: the left half is not read wedged"
+    );
+    let answered = halves.get(&right).and_then(|recovery| {
+        recovery
+            .first_completed
+            .map(|completed| completed.duration_since(recovery.first_call.max(report.last_heal)))
+    });
+    assert!(
+        answered.is_some_and(|took| took <= bound),
+        "seed 69: the right half is not read live: {answered:?}"
+    );
+    assert_eq!(
+        report.liveness_of_the_ranges(),
+        Err(format!(
+            "liveness: no client write to range 5 completed after the last heal at {:?}",
+            report.last_heal
+        )),
+        "seed 69: `liveness`'s per-range answer does not name the wedged half"
+    );
+    assert_eq!(
+        report.liveness(),
+        Err(format!(
+            "liveness: no client write to k6 completed after the last heal at {:?}",
+            report.last_heal
+        )),
+        "seed 69: the per-key reading no longer reports the run first"
+    );
+    assert!(a_half_alone_fails_the_per_range_answer(&report));
+
+    // The pair: the correct node on the seed, whose every range answers.
+    let correct_run = correct(69);
+    correct_run
+        .liveness_of_the_ranges()
+        .unwrap_or_else(|violation| panic!("the correct node's ranges on seed 69: {violation}"));
+    assert!(!a_half_alone_fails_the_per_range_answer(&correct_run));
+    correct_run
+        .check()
+        .unwrap_or_else(|violation| panic!("the correct node fails seed 69: {violation}"));
 }
 
 /// Seeds 105 and 300 of the correct node: **a half is read neither from the heal nor from a

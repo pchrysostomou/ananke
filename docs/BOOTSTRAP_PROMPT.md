@@ -115,12 +115,19 @@ _Update this section at the end of every session._
   `SharedSnapshotDir` (0 to 299, 73 of 150 uniform failing either way) or `sim/shard.rs` (0 to 499),
   nor on the 32 other variants the node sweep runs (seeds 0 to 39 each, a spot check); no `check()`,
   no off-schedule attribution and no key's asking moved; `SharedSnapshotDir` leaves a half the
-  starting map read live on 12 of 300, each also a per-key catch, now counted in its sweep and
-  asserted from the ten thousand. Read from the heal the correct node would fail seeds 105, 225 and
-  300, and from the invocations seed 300.
-  Pinned: seed 76 under `SharedSnapshotDir` (the wedged half beside a live sibling) and seeds 105 and
-  300 of the correct node (the clock); seven hand-built cases; ten plants each caught. Two nightly
-  rows, shard 4. Refs #148, not closed: a half that proposes nothing is in no reading (#197).
+  starting map read live on 12 of 300, each also a per-key catch, and on 5 of them (69, 80, 257,
+  277, 293) a half alone fails `liveness`'s per-range answer (`liveness_of_the_ranges`, the code
+  `liveness` asks), which its sweep counts and asserts from the ten thousand; the other 7 the
+  reading from the heal already fails on another range (seed 76's range 5). Read from the heal the
+  correct node would fail seeds 105, 225 and 300, and from the invocations seed 300.
+  Pinned: seed 76 under `SharedSnapshotDir` (the keying: the wedged half beside a live sibling),
+  seed 69 under it (the per-range answer failed by a half alone, which fails with the halves not
+  asked) and seeds 105 and 300 of the correct node (the clock); eight hand-built cases; ten plants
+  each caught. Three nightly rows, shard 4. **From the review**: the keying by completion also
+  passes a left half D-113's arm failed (a parent's completion before the split of a key its right
+  half serves later), named in D-121 with a hand-built pair and asked of the owner, recommended
+  taken (D-102's rule); no sharded run reaches it (17 variants, seeds 0 to 59, and the correct
+  sweep's 0 to 499). Refs #148, not closed: a half that proposes nothing is in no reading (#197).
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

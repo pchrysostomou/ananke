@@ -4282,12 +4282,7 @@ impl Report {
         }
         let splits = self.splits_taken();
         let asked = self.every_key_written_after_the_heal(&live, &splits)?;
-        self.recovery_from_the_heal(&live)?;
-        let cut: BTreeSet<u64> = splits
-            .iter()
-            .flat_map(|(parent, right, _, _)| [*parent, *right])
-            .collect();
-        self.recovery_from_the_first_call(&live, &splits, |range| cut.contains(&range))?;
+        self.ranges_recovered(&live, &splits)?;
         if asked == 0 {
             return Err(format!(
                 "liveness: no client write completed after the last heal at {:?}",
@@ -4295,6 +4290,46 @@ impl Report {
             ));
         }
         Ok(())
+    }
+
+    /// [`Report::liveness`]'s per-range answer: the arms it asks of the ranges, in its
+    /// order and in its words, without the per-key reading asked before them or the arm
+    /// for the clients writing nothing asked after. D-076's reading from the heal over
+    /// the map the run started with, then each range a split cut from its first post-heal
+    /// write (PROPOSED D-121). `liveness` asks exactly this, through the same code, so
+    /// what reads it reads `liveness`'s own answer about the ranges: `sim/tests/node.rs`
+    /// asks it of runs the per-key reading reports first, where `liveness` itself names
+    /// only the key. Ask it as `check` asks `liveness`, of uniform schedules only (D-016).
+    ///
+    /// # Errors
+    ///
+    /// The violation, naming the range and the bound.
+    // PROPOSED(D-121): `liveness`'s per-range arms, readable on their own.
+    pub fn liveness_of_the_ranges(&self) -> Result<(), String> {
+        let live = self.ranges_with_a_majority_up();
+        if live.is_empty() {
+            return Ok(());
+        }
+        self.ranges_recovered(&live, &self.splits_taken())
+    }
+
+    /// The per-range arms of [`Report::liveness`], shared with
+    /// [`Report::liveness_of_the_ranges`]: the reading from the heal over the starting map
+    /// ([`Report::recovery_from_the_heal`]), asked as it was and first, so a run it failed
+    /// still fails with its words; then each range a split cut, on either side, from its
+    /// first post-heal write ([`Report::recovery_from_the_first_call`]).
+    // PROPOSED(D-121): the halves are asked beside the reading from the heal.
+    fn ranges_recovered(
+        &self,
+        live: &BTreeSet<u64>,
+        splits: &[(u64, u64, Bytes, Instant)],
+    ) -> Result<(), String> {
+        self.recovery_from_the_heal(live)?;
+        let cut: BTreeSet<u64> = splits
+            .iter()
+            .flat_map(|(parent, right, _, _)| [*parent, *right])
+            .collect();
+        self.recovery_from_the_first_call(live, splits, |range| cut.contains(&range))
     }
 
     /// The per-key reading of the write bound: every key some client wrote after the heal
@@ -4428,6 +4463,15 @@ impl Report {
     /// parent's completion: one half's wedge behind the other's log, #148's shape by the
     /// map the run ended with. Every range a write is keyed to is one the run ended with,
     /// since a parent goes on as its left half.
+    ///
+    /// **The keying moves verdicts both ways.** The same completion, a parent's before its
+    /// split of a key its right half serves later, is now the left half's evidence, so it
+    /// can pass a left half the keying where the run stopped failed: one whose own first
+    /// post-heal write was proposed and never committed and whose key was answered again
+    /// only past the bound (#158's per-key fold passes that key). That is D-102's rule and
+    /// not a widening: the parent's log, which the left half is, did commit a write then.
+    /// [`Report::liveness`] cannot move that way, since it asked no half before PROPOSED
+    /// D-121; [`Report::liveness_by_final_range`] can, and the owner is asked (D-121).
     // PROPOSED(D-113): the write bound per range the run ended with.
     // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
     #[must_use]
@@ -13445,12 +13489,21 @@ mod tests {
         );
         assert_eq!(split.liveness(), wedge);
         assert_eq!(split.liveness_by_final_range(), wedge);
+        // `liveness` names the key; its per-range answer names the half.
+        assert_eq!(
+            split.liveness_of_the_ranges(),
+            Err(format!(
+                "liveness: no client write to range {SINGLE_GROUP} completed after the last \
+                 heal at Instant(0ns)"
+            ))
+        );
         // The pair: no split, one log, and that log's completion does stand for it.
         let unsplit = split_run(None, &[], ops);
         assert_eq!(
             unsplit.recoveries_by_final_range(),
             BTreeMap::from([(SINGLE_GROUP, recovery(500, Some(650)))])
         );
+        unsplit.liveness_of_the_ranges().unwrap();
     }
 
     /// **The catch only the halves' reading has (#148).** `k0`'s half proposes a write at
@@ -13655,6 +13708,59 @@ mod tests {
         );
         answered.liveness().unwrap();
         answered.liveness_by_final_range().unwrap();
+    }
+
+    /// **The direction in which the keying by completion passes a run D-113's arm failed
+    /// (PROPOSED D-121, from its review).** A split at 1 s. The parent, which goes on as
+    /// the left half, proposes a write to `k0` at 100 ms that never commits, and answers
+    /// `k0` next at 2.51 s, for a write called at 2.49 s; the per-key reading folds `k0`
+    /// into that write's 20 ms (#158). A write to `k1`, called at 200 ms, completes at
+    /// 250 ms, before the split, on the parent's log. That completion is the parent's
+    /// evidence (D-102), and a parent goes on as its left half, so the left half reads
+    /// 150 ms from its first write and both readings pass. Read where the run stopped, as
+    /// D-113's arm read it, the completion was the right half's, whose log did not exist
+    /// at 250 ms, the left half read 2.41 s and `liveness_by_final_range` failed the run.
+    /// The pair is the same run with `k1`'s write completed after the split, on the right
+    /// half's log: the left half's own first completion is then the one at 2.51 s, and
+    /// both readings fail it.
+    // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
+    #[test]
+    fn a_completion_before_a_split_is_the_left_halfs_and_one_after_it_the_right_halfs() {
+        let with_k1 = |call: u64, ret: u64| {
+            split_run(
+                Some(1000),
+                &[],
+                vec![
+                    put_at("k0", 100, None),
+                    put_at("k1", call, Some(ret)),
+                    put_at("k0", 2490, Some(2510)),
+                ],
+            )
+        };
+        let before = with_k1(200, 250);
+        assert_eq!(
+            before.recoveries_by_final_range(),
+            BTreeMap::from([(SINGLE_GROUP, recovery(100, Some(250)))]),
+            "the parent's completion is the left half's, and the right half was asked nothing"
+        );
+        before.liveness().unwrap();
+        before.liveness_by_final_range().unwrap();
+
+        let after = with_k1(1200, 1250);
+        assert_eq!(
+            after.recoveries_by_final_range(),
+            BTreeMap::from([
+                (SINGLE_GROUP, recovery(100, Some(2510))),
+                (SPLIT_RIGHT, recovery(1200, Some(1250))),
+            ]),
+            "a completion after the split is the right half's"
+        );
+        let over = Err(format!(
+            "liveness: range {SINGLE_GROUP} took 2.41s from its first client write after the \
+             last heal to complete one, over 2s"
+        ));
+        assert_eq!(after.liveness(), over);
+        assert_eq!(after.liveness_by_final_range(), over);
     }
 
     /// The majority is asked of the range serving the key (#148; SHARD.md §8 withholds
