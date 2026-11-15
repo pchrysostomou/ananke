@@ -4304,6 +4304,11 @@ struct QuorumNodeFigures {
     /// Votes the victim's re-seeded replicas granted in the hold, every range's: 0 on a
     /// node that keeps D-035.
     votes_granted_by_the_victim: usize,
+    /// Seeds on which the fan-out clause, asked on its own (`NodeReport::fan_out`), named
+    /// a replica the node's refusal left unrefused, whatever `NodeReport::check` asks
+    /// before it: 0 on the correct node, every seed under `RefuseOneRangeOnly` (the review
+    /// of PROPOSED D-136, N1).
+    seeds_the_fan_out_fell_short: u64,
 }
 
 impl QuorumNodeFigures {
@@ -4313,6 +4318,8 @@ impl QuorumNodeFigures {
         let (Some(cast), Some(holds)) = (report.cast.as_ref(), report.holds()) else {
             return;
         };
+        // PROPOSED(D-136): the clause asked on its own, not behind the checks before it.
+        self.seeds_the_fan_out_fell_short += u64::from(report.fan_out().is_err());
         // The answers, the streams and the step-downs are every range's, the system
         // ranges' with the user ranges' (PROPOSED D-119); the sides are counted apart.
         let user_ranges = ranges();
@@ -4418,6 +4425,12 @@ fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node()
         "the one refusal did not fan out to every range on every seed"
     );
     assert_eq!(figures.ranges_reseeded as u64, figures.seeds * ranges);
+    // PROPOSED(D-136): the fan-out clause asked on its own is green on the correct node,
+    // the pair's other half of `RefuseOneRangeOnly`'s every seed below.
+    assert_eq!(
+        figures.seeds_the_fan_out_fell_short, 0,
+        "the fan-out clause, asked on its own, named the correct node's refusal"
+    );
     assert!(
         figures.ranges_on_the_keepers_majority > 0 && figures.ranges_on_the_cut_off_leader > 0,
         "the sweep reached only one of the scenario's two outcomes"
@@ -4591,9 +4604,10 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 ///   and the harm's absence. Group 0 is excluded: the variant refuses range 0 exactly as
 ///   the correct node does, so a violation there is not this bug and fails the test.
 ///
-/// The fan-out clause is asserted seen (from the thousand since PROPOSED D-136, below), every
-/// catch is one of the three or check 20's below, and each one's share is printed at every
-/// tier.
+/// The fan-out clause, asked on its own, is asserted to fall short on every seed at every
+/// tier, and as the verdict it is asserted seen from the thousand (both since PROPOSED
+/// D-136, below); every catch is one of the three or check 20's below, and each one's share
+/// is printed at every tier.
 ///
 /// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
 /// and before the history and the fan-out clause (PROPOSED D-106, issue #140). Until
@@ -4605,13 +4619,16 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 /// created nor restated after the refusal, and each grant of theirs is check 20's "from a
 /// node that holds no replica of it". Measured on this tree, release, at the premerge's
 /// thousand: 655 by the meta range's state machine, as before, and 332 by check 20 of the
-/// 345 the fan-out clause named before D-136, which now names 13. Check 20 on range 0,
-/// which the variant refuses as the correct node does, is not this bug and fails the test
-/// as leader completeness of group 0 does. The fan-out clause's catch, at 1.3 %, is under
-/// D-061's 5 %, so it is asserted from the thousand; what every tier asserts is the
-/// variant's firing, one range refused per seed where the correct node refuses six. A fold
-/// that names any other catch fails this test as "caught by something other than", and is
-/// read before it is admitted.
+/// 345 the fan-out clause named before D-136, which now names 13. Those are the verdicts;
+/// check 20's fold itself is in violation on 987 of the thousand, the 655 among them.
+/// Check 20 on range 0, which the variant refuses as the correct node does, is not this bug
+/// and fails the test as leader completeness of group 0 does. The fan-out clause's catch as
+/// the verdict, at 1.3 %, is under D-061's 5 %, so it is asserted from the thousand. It is
+/// rare only because check 20 is asked before it on the same seeds, so every tier asserts
+/// the clause asked on its own (`NodeReport::fan_out`), which falls short on every seed,
+/// and the variant's firing, one range refused per seed where the correct node refuses six
+/// (the review of D-136, N1). A fold that names any other catch fails this test as "caught
+/// by something other than", and is read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 // PROPOSED(D-136): check 20 off group 0 is the fourth.
@@ -4662,12 +4679,17 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         seeds(),
         "RefuseOneRangeOnly was not caught on every seed: {caught:?}"
     );
-    // PROPOSED(D-136): the variant's firing at every tier, its fan-out catch from the
-    // thousand (D-061: 13 of 1 000).
+    // PROPOSED(D-136): the variant's firing and the fan-out clause asked on its own at every
+    // tier, the clause as the verdict from the thousand (D-061: 13 of 1 000).
     assert_eq!(
         figures.ranges_refused as u64, figures.seeds,
         "RefuseOneRangeOnly refused other than one range per seed, so the fan-out the clause \
          asks for did not fall short on every seed: {figures:?}"
+    );
+    assert_eq!(
+        figures.seeds_the_fan_out_fell_short, figures.seeds,
+        "the fan-out clause, asked on its own, did not name RefuseOneRangeOnly on every seed: \
+         {figures:?}"
     );
     if seeds() >= 1000 {
         assert!(
