@@ -32,9 +32,16 @@
 //!   the right half's lands first (PROPOSED D-128);
 //! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
 //!   on committing, and the leader as it was is caught by the read bound
-//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
+//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129);
+//! - issue #113's recipe, the shape with a second restart over the replicas its installs
+//!   filled, holds on the issue's seed 26 with no late job, and `RestartAppliesFromZero` is
+//!   caught there by its gap (`reseed::run_restarted_again`, PROPOSED D-126);
+//! - a re-seeded node takes the split of a range its log brought back, which holds no
+//!   descriptor, from the descriptor configuration names, and `ReplayedRangeRefusesItsSplit`,
+//!   the refusal it made before, is caught by state machine safety on every seed
+//!   (`reseed::run_split_of_a_replayed_range`, #199, PROPOSED D-138).
 
-use ananke_env::{RecoveredAs, TraceEvent};
+use ananke_env::{ApplyEffect, RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_shard::invariants::Fold;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -763,8 +770,9 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 /// `run_after_split` cannot: the `apply` task's `engine_dir`, by where the versions are, and
 /// the `snapshot` task's, by the sweep that empties nothing (PROPOSED D-117 gives the table).
 ///
-/// It splits P's left half and not a range the log rebuilt, whose split fails state machine
-/// safety on the re-seeded node, which is #199's.
+/// It splits P's left half, which came back by a stream. A range the log rebuilt is
+/// `a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back`'s, whose split failed
+/// state machine safety on the re-seeded node until D-138 (#199).
 // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
 // PROPOSED(D-130): on a node that may lead a right half made after its re-seed, the variant's.
 #[test]
@@ -858,4 +866,166 @@ fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_no
         Ok(())
     });
     verdict(&verdicts).expect("a right half made after a re-seed is quarantined on every seed");
+}
+
+/// Seed 26, issue #113's: the shape with a second restart after its `AFTER` window, a node
+/// restarted over the replicas its installs filled (`reseed::run_restarted_again`; PROPOSED
+/// D-126). On the tree the recipe was filed from, this seed failed the correct system with
+/// "an apply through 389 names index 384, which the core does not hold" (D-081).
+///
+/// What it pins:
+///
+/// - **the situation**: at the second start every streamed range's replica restates a
+///   compacted prefix, so the restart is over replicas an install filled, the issue's
+///   title;
+/// - **the correct system** meets (a) to (e), the node still running at the end;
+/// - **`RestartAppliesFromZero`** is caught there by its gap: the first `Apply` after the
+///   restart names index 1, which a compacted replica does not hold. D-081 paired it as a
+///   unit because the shape reaches a restart over a compacted replica only when an install
+///   lands before the arm's crash; this is the run beside that pair, which stays;
+/// - **the late job is absent**, and asserted absent: an index applied above a snapshot
+///   after the install's hold and before the replica commits on top of it
+///   (`reseed::late_applies`), #113's precondition. No seed measured on this tree reaches
+///   it (PROPOSED D-126), so `SwitchForgetsLateApplies` is paired as a unit in
+///   `ananke_shard::round` and `ananke_shard::server` and not run here. The correct node
+///   keeps what such a job applies, so the day a schedule reaches it here this assertion
+///   says so, and the pin is upgraded to assert that, and the variant run on it.
+///
+/// One seed and not the tier: over the tier's seeds this run's traces come within a few
+/// thousand records of the runaway cap, and a seed past the tier passes it (PROPOSED
+/// D-126 measures both), so a sweep of it would fail the correct system on the harness's
+/// cap the first time a change lengthened the run. The record count is printed here
+/// against the cap.
+// PROPOSED(D-126)
+#[test]
+fn seed_26_a_node_restarted_over_the_replicas_its_installs_filled_holds_the_shape() {
+    let seed = 26;
+    let report = reseed::run_restarted_again(seed, Variants::default(), NodeVariants::correct());
+    println!(
+        "seed {seed}, second restart: {} trace records, of the runaway cap's {}; late applies {:?}",
+        report.records.len(),
+        ananke_sim::ranges::TRACE_CAP,
+        report.late_applies()
+    );
+    assert_eq!(
+        report.compacted_at_the_last_start(),
+        Report::streamed_ranges(),
+        "seed {seed}: the second start is not over replicas the installs filled, so this pins \
+         nothing of issue #113"
+    );
+    report
+        .check()
+        .expect("the correct system meets (a) to (e) after a second restart");
+    assert!(
+        report.late_applies().is_empty(),
+        "seed {seed} now reaches issue #113's late job: {:?}. The correct node keeps what it \
+         applied, so upgrade this pin to assert that and run SwitchForgetsLateApplies on it",
+        report.late_applies()
+    );
+
+    let variant = NodeVariant::RestartAppliesFromZero;
+    let why = reseed::run_restarted_again(
+        seed,
+        Variants::default(),
+        NodeVariants::correct().with(variant),
+    )
+    .check()
+    .expect_err("RestartAppliesFromZero is caught on a restart over compacted replicas");
+    assert!(
+        why.contains("which the core does not hold"),
+        "seed {seed}: {variant} caught by something other than its gap: {why}"
+    );
+}
+
+/// A re-seeded node takes the split of a range its log brought back (#199; PROPOSED D-138):
+/// `reseed::run_split_of_a_replayed_range`, on every seed of the tier.
+///
+/// The re-seed writes a user range no descriptor, and range 3, which no writer writes and
+/// whose leader never compacts, comes back to `x` by its log from the first entry, never by
+/// a stream, so `x`'s replica of it holds none when the split reaches it. On every seed the
+/// run reaches that (`replayed_reached`: `x` installed no snapshot of range 3 after its
+/// refusal and applied the split's entry), every check of the trace passes, state machine
+/// safety among them, and `x` applies the split as a first apply does
+/// (`replayed_split_taken`): its apply took, it traced the split and range 3's descriptor
+/// over `[k2, k3)` at the second generation, and it created the right half over `[k3, k4)`
+/// with every server its voter.
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back() {
+    let run = shape_seeds();
+    tier_under(
+        "the split of a range the log rebuilt, correct",
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct());
+        report.replayed_reached()?;
+        report.check()?;
+        report.replayed_split_taken()
+    });
+    verdict(&verdicts)
+        .expect("a re-seeded node takes the split of a range its log brought back on every seed");
+}
+
+/// The pair's buggy half (CLAUDE.md; PROPOSED D-138): `ReplayedRangeRefusesItsSplit` on
+/// `reseed::run_split_of_a_replayed_range`, on [`HIGH_RATE_SHARE`] seeds, the first of the
+/// correct node's above.
+///
+/// On every seed the run reaches its situation as the correct node's does, `x` applies the
+/// split's entry to `refused` and traces no split of range 3, and state machine safety
+/// names that entry of range 3 applied to `took` on one server and `refused` on another.
+/// #199 measured it on 40 of 40 seeds, so it is asserted at every tier (D-061).
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught() {
+    let run = HIGH_RATE_SHARE;
+    let variant = NodeVariant::ReplayedRangeRefusesItsSplit;
+    tier_under(
+        &format!("the split of a range the log rebuilt, {variant}"),
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report =
+            reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct().with(variant));
+        report.replayed_reached()?;
+        let x = report.x;
+        let range = reseed::REPLAYED_RANGE;
+        let (index, _) = report
+            .replayed_split()
+            .expect("`replayed_reached` names the split");
+        let effect = report.applied_after_refusal(range, index);
+        if effect != Some(ApplyEffect::Refused) || report.second_right.is_some() {
+            return Err(format!(
+                "seed {seed}: {variant}: node {x} applied entry {index} of range {range} to \
+                 {effect:?} and made the right half {:?}: it should refuse it and make none",
+                report.second_right
+            ));
+        }
+        let expected = format!(
+            "seed {seed}: state machine safety: index {index} of group {range} was applied to \
+             effect "
+        );
+        match report.check() {
+            Err(words)
+                if words.starts_with(&expected)
+                    && words.contains("took")
+                    && words.contains("refused") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "seed {seed}: {variant} should fail state machine safety at entry {index} of \
+                 range {range}, and the checks said {other:?}"
+            )),
+        }
+    });
+    let caught = verdicts.iter().filter(|verdict| verdict.is_ok()).count();
+    println!(
+        "reseed: {variant} failed state machine safety at the split of range {} on {caught} of \
+         {run} seeds",
+        reseed::REPLAYED_RANGE
+    );
+    verdict(&verdicts).expect("the refusal is caught by state machine safety on every seed");
 }

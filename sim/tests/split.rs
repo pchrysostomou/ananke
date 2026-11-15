@@ -31,7 +31,7 @@ use ananke_raft::ServerId;
 use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
-use ananke_sim::{seeds, split, sweep, verdict, write_trace};
+use ananke_sim::{raft, seeds, split, sweep, verdict, write_trace};
 
 /// The right half's votes and pre-votes `x` granted before `x` created the right half:
 /// none on the correct system, which keeps a placeholder there and grants nothing.
@@ -544,10 +544,9 @@ fn fresh_take(report: &split::Report, measured: &mut ResplitMeasured) -> Result<
         ));
     }
     // The fresh take: a take of R by that leader at or past R's split, after the wait.
-    if !report.records[retook..].iter().any(|record| {
-        matches!(&record.event, TraceEvent::RaftSnapshot {
-            server, range, last_index, taken: true, ..
-        } if *server == leader && *range == right && *last_index >= index)
+    // PROPOSED(D-118): a restart restating the record of a take is not a take.
+    if !raft::snapshot_takes_of(&report.records).iter().any(|take| {
+        take.record >= retook && take.server == leader && take.range == right && take.index >= index
     }) {
         return Err(format!(
             "seed {seed}: server {leader} told its core to retake R's checkpoint and took \

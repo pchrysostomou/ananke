@@ -822,7 +822,9 @@ initialised, P's post-split snapshot onto a lagging P for instance, changes that
 replica's descriptor and is traced as a `RangeDescriptor` at the snapshot's last index
 (§8). Its switch replaces the span the host's descriptor names at the switch, not the span
 the node held when the stream completed: a split applied through the log in between has moved
-it (D-132). A replica with no descriptor, a re-seeded user range for instance, is not
+it (D-132). That switch and the range's split's apply exclude each other: the split applies
+before the switch reads the table and the store, or after the switch has moved the store,
+and never between the engine's numbering of the switch and the switch (D-133). A replica with no descriptor, a re-seeded user range for instance, is not
 initialised, so the rule lets a right half in beside it: its install replaces its Raft
 interval and the snapshot's span, as a placeholder's does, and no key configuration
 names for it beyond that (D-128). A node's replica of P that already applied past a
@@ -830,8 +832,12 @@ snapshot answers it installed without switching (RAFT.md:222-224), asked at the 
 as when the stream completes (D-132), so a replica of P that applied `s` is never set
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
 R could have been installed on the node only if no initialised replica of P covered its
-span, and then no initialised replica of P is there to apply `s`; a replica with no
-descriptor that replays to `s` refuses the split instead (#199). Check 8 asserts it, of the
+span, and then no initialised replica of P is there to apply `s`. A replica with no
+descriptor that replays to `s` is a re-seeded replica of a range configuration names, whose
+log brought it back from the first entry; it applies `s` from the descriptor configuration
+names, which is the one its replay implies, as every other replica of P applies it (D-138,
+#199). Where R's install landed beside it before it replayed to `s`, which no run has
+reached, that apply would make R a second time (D-138 names the window). Check 8 asserts it, of the
 trace and whatever made either creation: a `RangeCreated` of a range on a node that holds it
 initialised is a violation (§8). The node does not fail on it, which would stop every voter
 of a split whose right half's id was taken twice before check 18 read the reused id (D-109,
@@ -1177,7 +1183,7 @@ New events:
 |---|---|---|
 | `RangeCreated` | a replica of a range is initialised: at bootstrap, at a split's apply, at an install on a node that held no initialised replica of the range | `range`, `cause`, `parent`, `start`, `end`, `generation`, `voters`, `floor_index`, `floor_term`, and `incarnation`, the replica's, drawn at this creation (Q26) |
 | `RangeDescriptor` | a replica's descriptor changes at an apply; an install onto an initialised replica changes it (with `applied` the snapshot's last index); or it is restated at its node's start | `range`, `index`, `applied`, `start`, `end`, `generation`, `voters`, `state` |
-| `RangesRestated` | a node has restated every replica it holds | `ranges` |
+| `RangesRestated` | a node has restated every replica it holds | `ranges`, and `run`, the run nonce this start drew (§5; D-137) |
 | `RangeReplicaCreated` | a node made a placeholder for a range it does not hold (§5) | `range` |
 | `RangeSplit` | a replica applied a split that took effect | `range`, `right`, `key`, `index` |
 | `RangeSubsumed` | a replica of R applied a `Subsume` that took effect | `range`, `into`, `begun`, `index`, `generation`, `voters` |
@@ -1220,11 +1226,11 @@ with their state keyed by range first:
    `RangeCreated` sets its replica's floor as an installed snapshot does
    (invariants.rs:80-106), so a split-born range's log starts at its floor.
 3. **Leader completeness**, with the committed set per range; *commit by majority* takes
-   each range's first configuration from its `RangeCreated`, where today it takes
-   `1..=servers` (invariants.rs:289-295); *commit by current term* and *committed
-   entries stay* per (range, server). Leader completeness rescans the committed set at
-   every `RaftLeader` (invariants.rs:493-520); keyed by range, the rescan is of that
-   range's set.
+   each range's first configuration from its first `RangeCreated` that names voters,
+   where today it takes `1..=servers` (invariants.rs:289-295; PROPOSED D-125); *commit by
+   current term* and *committed entries stay* per (range, server). Leader completeness
+   rescans the committed set at every `RaftLeader` (invariants.rs:493-520); keyed by
+   range, the rescan is of that range's set.
 4. **State machine safety**, a map per range from index to (term, hash, effect): a
    second value is a violation, so two replicas that apply one entry with different
    effects — one writing a key, another refusing it; one taking a split, another
@@ -1355,7 +1361,9 @@ when its consequence lands.
     effect, with `right` R, no `RangeCreated` of R and no `RangeSplit` whose `range` or
     `right` is R was traced before that split's first `RangeSplit`, and R lies in a
     block a `RangeIdsLeased` traced before it granted to the node that led P in the
-    split entry's term. Cheap, exact.
+    split entry's term, carrying the run that node's last `RangesRestated` before it
+    took office in that term stated (D-137: the run, not only the node, §5's second
+    rule). Cheap, exact.
 19. **The ranges tile the keyspace.** Fold check 7's map, in record order by first apply:
     the latest value of every range, with a range dropped at the first `RangeMerged` that
     names it as `right` until a later new value of it is traced. After every event no two
@@ -1363,12 +1371,15 @@ when its consequence lands.
     addressable keyspace with no gap. Where check 8 is one node, this is the cluster.
     Incremental: an interval map.
 20. **A placeholder grants nothing** (a rule fold, Q22). Fold `RangeReplicaCreated`,
-    `RangeCreated`, `RangesRestated`, `RangeRemoved` and `RaftVote`. A `RaftVote` with
-    `granted`, vote or pre-vote, of range R on node `n` when `n` has traced neither a
-    `RangeCreated` of R nor a `RangesRestated` naming R since its last `RangeRemoved` of
-    R is a violation. The restatement counts because a creation can be durable and never
-    traced: a node that crashed with a split's batch durable restates the right half at
-    its next start (D-113). Cheap, exact.
+    `RangeCreated`, `RangesRestated`, `RangeRemoved`, `RaftRefused` and `RaftVote`. A
+    `RaftVote` with `granted`, vote or pre-vote, of range R on node `n` when `n` has traced
+    neither a `RangeCreated` of R nor a `RangesRestated` naming R since its last
+    `RangeRemoved` of R or its last `RaftRefused`, whichever came later, is a violation.
+    The restatement counts because a creation can be durable and never traced: a node that
+    crashed with a split's batch durable restates the right half at its next start
+    (D-113). The refusal ends what the node held because the node's loss is every
+    replica's (Q15): what it holds after is what its re-seed restates or an install
+    creates (D-136). Cheap, exact.
 21. **A removal is durable** (a rule fold). Fold `RangeRemoved`, `RangeCreated`,
     `RangeDescriptor` restatements and `RaftRecovered` per node. A restatement or a
     `RaftRecovered` of range X on node `n` after `n`'s `RangeRemoved` of X, with no
@@ -1775,7 +1786,7 @@ seed shares are sized so premerge stays near fifteen minutes (Q39):
 | `UninitialisedReplicaVotes` | §5: a placeholder grants no vote or pre-vote (Q22); the variant grants them from a placeholder, with nothing durable | check 20 at the first grant | `sim/split.rs` (ii) |
 | `PlaceholderAcknowledges` | §5: a placeholder acknowledges no append (Q22); the variant answers an AppendEntries at its `next` as matched, with nothing in any log | commit by majority, check 3: a commit counted node 4, which traced no `RaftAppend` of the entry | `sim/move.rs` (a) |
 | `SplitCreatesRightOnNonVoter` | §5: R's state is written only on a voter of P's configuration at `s`, and a learner gets a range delete; the variant writes R on every replica that applies `s` | check 8's clause that a node that is not a voter of P's configuration at `s` traces no `RangeCreated { cause: split }` of R | the sharded sweep's move just after a split |
-| `IdBlockResumed` | §5 and Q17: a node adopts only a block of range ids granted to its current run, so no id is taken twice; the variant's node adopts, at its start, the block its lease record names, whatever run it was granted to, and takes ids from that block's first | check 18 at the first apply of a split whose `right` a `RangeCreated` or `RangeSplit` named before it | the sharded sweep's crash and restart of a node that has taken an id from its block, followed by a split led from that node |
+| `IdBlockResumed` | §5 and Q17: a node adopts only a block of range ids granted to its current run, so no id is taken twice; the variant's node adopts, at its start, the block its lease record names, whatever run it was granted to, and takes ids from that block's first | check 18 at the first apply of a split whose `right` a `RangeCreated` or `RangeSplit` named before it, or whose `right` lies in a block of another run of the node that led it (D-137) | the sharded sweep's crash and restart of a node that has taken an id from its block, followed by a split led from that node |
 | `MergeDivergentReplicas` | SPEC §4 and §6: identical replica sets. The variant drops every voter-set check — the coordinator's, `MergeBegin`'s and `Subsume`'s `voters` re-checks, and `Merge`'s check that L's configuration has R's voters — and keeps adjacency, the states, the wait for every replica of R and each node's own check | check 11 at the first `RangeMerged` anywhere, on a node that holds both: L's configuration at `m − 1` and R's at `f` differ. Not linearizability: each node's own check stalls a replica of L with no R and re-seeds it with the merged range's data | `sim/merge.rs` (a) |
 | `MergeBeforeRightApplied` | §6: the coordinator waits for every replica of R to apply `Subsume`, and `Merge`'s apply checks its own node's; the variant keeps every voter-set check, waits for a majority and checks nothing on the node | check 11: `right_applied` below `f`; linearizability: that node's L lacks writes R committed below `f` and serves reads without them once it leads | `sim/merge.rs` (b) |
 | `MergeTakesLeftGeneration` | §1 and §6: a merged range's generation is max(g_L', g_R) + 1; the variant gives it g_L' + 1 | check 18 at the merge's apply; check 10 at the merged range's first write to a right-span key R wrote at a higher generation; meta's convergence bound, since meta keeps R's record over the merged one | `sim/merge.rs` (a) |

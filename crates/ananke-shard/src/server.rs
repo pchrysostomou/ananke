@@ -759,6 +759,9 @@ pub struct ServerHost<E: Environment> {
     /// (D-035, Q26).
     // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
     on_a_reseed: bool,
+    /// Shared with the `apply` task and the `snapshot` task: a switched range's hold
+    /// against its split's apply is let go here, at `Switched` (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
 }
 
 /// What [`lock`] calls first in a test of this crate, with the address of the mutex about
@@ -1043,24 +1046,51 @@ impl<E: Environment> ServerHost<E> {
         // a record whose term or configuration is off is one D-029's revert floor reads
         // wrong.
         // PROPOSED(D-086): a live install moves the `apply` task's applied state.
-        lock(&self.applied).insert(
-            range,
-            Applied {
-                index: at.last_index,
-                term: at.last_term,
-                config: config.clone(),
-            },
-        );
+        //
+        // It moves it *up* to the snapshot and never back. The `snapshot` task set it
+        // to the snapshot at the switch, and this runs later, when the `raft` task
+        // steps `Switched`; between the two the `apply` task may have run a job the
+        // replaced core queued before the hold and applied entries past the snapshot
+        // (issue #113). Taken back to the snapshot, the task applies them a second time
+        // when the new replica's first `Apply` names them; and where a record that
+        // job's core asked for has moved the new replica's compacted prefix past them,
+        // and the watermark with it (`Cores::step`), that `Apply` starts above where the
+        // task was taken back to and the task fails the range on the gap. What stands
+        // past the snapshot here was applied after the switch, on top of it, so it is
+        // kept (`kept_past_the_switch`).
+        // PROPOSED(D-126): the restatement at `Switched` takes nothing back.
+        {
+            let mut applied = lock(&self.applied);
+            let kept = applied
+                .get(&range)
+                .filter(|held| kept_past_the_switch(held.index, at.last_index, self.node))
+                .cloned();
+            applied.insert(
+                range,
+                kept.unwrap_or_else(|| Applied {
+                    index: at.last_index,
+                    term: at.last_term,
+                    config: config.clone(),
+                }),
+            );
+        }
         // And the store's own caches, for the same reason one layer down: the switch
         // wrote this range's hard state, log bounds and applied index without passing
-        // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
+        // through `persist` or `apply`, which are what keep them (PROPOSED D-086). The
+        // applied index, too, only up: an apply after the switch wrote its own key on
+        // top of the repair's (PROPOSED D-126).
         if let Some(store) = lock(&self.stores).get(&range).cloned() {
+            let applied = if kept_past_the_switch(store.applied(), at.last_index, self.node) {
+                store.applied()
+            } else {
+                at.last_index
+            };
             store.restate_after_install(
                 restored.term(),
                 restored.vote(),
                 at.last_index + 1,
                 restored.last_index(),
-                at.last_index,
+                applied,
             );
         }
         if created {
@@ -1623,6 +1653,17 @@ impl<E: Environment> Host for ServerHost<E> {
                         None => Some(SplitRefusal::NotLive),
                     }
                 };
+                // PROPOSED(D-137): `RefusedAfterRefill`, a node whose block a split found
+                // empty refuses every split once its refill lands, `NotLive`.
+                let refused = refused.or_else(|| {
+                    let ids = lock(&self.ids);
+                    (self
+                        .range_variants
+                        .contains(RangeVariant::RefusedAfterRefill)
+                        && ids.emptied()
+                        && ids.left() > 0)
+                        .then_some(SplitRefusal::NotLive)
+                });
                 let right = if refused.is_none() {
                     lock(&self.ids).take()
                 } else {
@@ -1745,7 +1786,7 @@ impl<E: Environment> Host for ServerHost<E> {
                         ],
                     });
                 }
-                match self.installed(
+                let work = match self.installed(
                     *range,
                     core,
                     at,
@@ -1755,7 +1796,13 @@ impl<E: Environment> Host for ServerHost<E> {
                 ) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => self.released(*range, *decided),
-                }
+                };
+                // The range's applied index is restated, in the store and in the `apply`
+                // task's state: the switch's hold against the range's split's apply is let
+                // go here and not at the switch, or an entry past the snapshot applied in
+                // between would be applied again after the restate (PROPOSED D-133).
+                self.switching.switched(*range);
+                work
             }
             SnapAnswer::Abandoned { range, decided } => self.released(*range, *decided),
             SnapAnswer::Taken { .. }
@@ -2123,6 +2170,15 @@ struct ServerApplier<E: Environment> {
     id_block: u64,
     /// The cores' parameters, for the right half's core at a split (PROPOSED D-100).
     raft: RaftConfig,
+    /// Shared with the `snapshot` task: a range's switch and its split's apply exclude
+    /// each other (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
+    /// The descriptor each range configuration names starts with on a bootstrap node, its
+    /// index-0 state's (SHARD.md §2, [`bootstrap_descriptor`]); empty on a node that joins,
+    /// which holds no such replica (PROPOSED D-109). A split's apply reads it on a replica
+    /// that holds no descriptor of its own, a re-seeded user range its log brought back.
+    // PROPOSED(D-138)
+    configured: Arc<BTreeMap<RangeId, RangeDescriptor>>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -2151,7 +2207,22 @@ impl<E: Environment> ServerApplier<E> {
     ///
     /// `None` is the entry left to an install: a non-voter's removal waited for the
     /// engine while P's own live install switched P past `index`, which then carries
-    /// the entry's effect, and nothing was written here (PROPOSED D-107).
+    /// the entry's effect, and nothing was written here (PROPOSED D-107); or the apply
+    /// waited out P's own switch, which moved the store to or past `index` (PROPOSED
+    /// D-133).
+    ///
+    /// **P is held against its install's switch** from the read of P's descriptor to both
+    /// halves' descriptors in the host's table: a switch of P in flight is waited out
+    /// before the read, and a switch that reaches its own reads while this apply is in
+    /// flight waits for it (`install::SwitchOrSplit`). So the apply lands before the
+    /// switch reads the table and the store, or after the host has stepped the install's
+    /// `Switched` and restated P's applied index, and never between the engine's numbering
+    /// of the switch and the switch, where it wrote its batch over the switch and narrowed
+    /// the table after the switch had read it, and the switch removed the right half's keys
+    /// (seed 13283 of the sharded sweep, #225), nor between the switch and `Switched`, where
+    /// the job's next entry applied before the restate and again after it.
+    /// `SplitAppliesInsideTheSwitch` holds nothing.
+    // PROPOSED(D-133)
     async fn split(
         &self,
         range: RangeId,
@@ -2160,6 +2231,20 @@ impl<E: Environment> ServerApplier<E> {
         right: u64,
         store: &Arc<RaftStore<E>>,
     ) -> io::Result<Option<(ApplyEffect, Outcome)>> {
+        let inside = if self
+            .node_variants
+            .contains(NodeVariant::SplitAppliesInsideTheSwitch)
+        {
+            None
+        } else {
+            let inside = self.switching.enter(&self.env, range).await;
+            // P's switch moved the store while this waited: the entry is the install's,
+            // as the apply loop skips an entry the store is past (D-083).
+            if store.applied() >= index {
+                return Ok(None);
+            }
+            Some(inside)
+        };
         let prefix = KeyPrefix::group(range.get());
         let held = store
             .engine()
@@ -2167,6 +2252,29 @@ impl<E: Environment> ServerApplier<E> {
             .await?
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
         let refuse = |reason: SplitRefusal| (ApplyEffect::Refused, Outcome::Refused(reason));
+        // A replica that holds no descriptor is a re-seeded replica of a range
+        // configuration names that its log brought back from the first entry: a bootstrap,
+        // a split's batch and an install each write one, and the re-seed writes none for a
+        // user range (it writes a system range's index-0 state, PROPOSED D-098). Its state machine
+        // started from index 0, whose state is configuration's alone (SHARD.md §2), and it
+        // has applied no split since, the first having written one. So the descriptor in
+        // force before `index` is the one configuration names, which every replica that
+        // was never re-seeded holds from its bootstrap, and the split is applied here as it
+        // is there. Refused here, `NotLive`, the entry took everywhere else and state
+        // machine safety saw it (#199). `ReplayedRangeRefusesItsSplit` keeps the refusal.
+        // A range configuration does not name has no replica without a descriptor, and is
+        // refused as before.
+        // PROPOSED(D-138)
+        let held = held.or_else(|| {
+            if self
+                .node_variants
+                .contains(NodeVariant::ReplayedRangeRefusesItsSplit)
+            {
+                None
+            } else {
+                self.configured.get(&range).cloned()
+            }
+        });
         let Some(parent) = held else {
             store.apply(index, WriteBatch::new()).await?;
             return Ok(Some(refuse(SplitRefusal::NotLive)));
@@ -2204,9 +2312,19 @@ impl<E: Environment> ServerApplier<E> {
             voters: parent.voters.clone(),
             state: RangeState::Live,
         };
+        // R starts at the split key; `SplitLeavesGap` starts it one key past it, the key
+        // followed by a zero byte, and leaves the key itself in no range.
+        // PROPOSED(D-140): check 19's instrument, the owner's ruling on D-093.
+        let right_start = if self.range_variants.contains(RangeVariant::SplitLeavesGap) {
+            let mut past = cut.to_vec();
+            past.push(0);
+            Bytes::from(past)
+        } else {
+            cut.clone()
+        };
         let created = RangeDescriptor {
             range: right_id,
-            start: cut.clone(),
+            start: right_start,
             end: parent.end.clone(),
             generation,
             voters: config.voters.clone(),
@@ -2327,6 +2445,9 @@ impl<E: Environment> ServerApplier<E> {
         // awaits, so a simulated schedule is the same.
         // PROPOSED(D-114)
         put_split_descriptors(&self.descriptors, left, voter.then_some(created));
+        // The store and the table are the split's: a switch of P waiting on it reads them
+        // now (PROPOSED D-133).
+        drop(inside);
         if !voter {
             return Ok(Some((ApplyEffect::Took, Outcome::Done)));
         }
@@ -2679,6 +2800,12 @@ impl<E: Environment> Applier for ServerApplier<E> {
             for entry in entries {
                 // The store's own applied index wins when it is ahead: a live install
                 // moved it inside a manifest switch, without an apply (D-083).
+                //
+                // Not closed here: an entry of a job the replaced core queued before the
+                // hold that passes this head before the `snapshot` task restates the
+                // store to the snapshot, and reaches `RaftStore::apply` after it past an
+                // await below, is refused ("applying N after N") and fails the range.
+                // That is PROPOSED D-126 section 7's window, #225's.
                 let applied = lock(&self.applied)
                     .get(&range)
                     .map_or(0, |state| state.index)
@@ -2790,8 +2917,9 @@ impl<E: Environment> Applier for ServerApplier<E> {
                             outcome
                         }
                         // The entry is P's own install's, which moved the store past it
-                        // while a non-voter's removal waited for the engine: skipped, as
-                        // one the store is past at the head of the loop (PROPOSED D-107).
+                        // while a non-voter's removal waited for the engine, or while the
+                        // apply waited out P's switch: skipped, as one the store is past at
+                        // the head of the loop (PROPOSED D-107, D-133).
                         Ok(None) => continue,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
@@ -3031,7 +3159,9 @@ fn put_split_descriptors(
 /// install's, tens of milliseconds for a live install; every range's applies wait with
 /// it (issue #169, Stage D's to measure).
 // PROPOSED(D-107)
-const INSTALL_RETRY: Duration = Duration::from_millis(1);
+// PROPOSED(D-133): and the period a range's switch and its split's apply ask again at
+// while the other holds the range (`install::SwitchOrSplit`).
+pub(crate) const INSTALL_RETRY: Duration = Duration::from_millis(1);
 
 /// Whether `error` is the engine refusing an install because another runs, which
 /// leaves nothing written and is asked again (`ananke_storage::InstallRefused`).
@@ -3361,6 +3491,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } else {
         Vec::new()
     };
+    // The descriptors those ranges start with, for the `apply` task: a split of a replica
+    // its re-seed left without one applies from these (SHARD.md §2).
+    // PROPOSED(D-138)
+    let configured: Arc<BTreeMap<RangeId, RangeDescriptor>> = Arc::new(
+        hosted
+            .iter()
+            .map(|range| (range.id, bootstrap_descriptor(range, &bootstrap)))
+            .collect(),
+    );
     // The store's recovery must never hand back a state with a hole (RAFT.md §3).
     let engine = EngineConfig {
         allow_manifest_fallback: false,
@@ -3386,6 +3525,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // The answers to the node's own `MetaUpdate`s, for its `meta` task (PROPOSED
     // D-098).
     let meta_answers: Queue<Response> = Queue::new();
+    // Set while the `snapshot` task makes an install, which it answers nothing during.
+    // PROPOSED(D-127)
+    let installing = install::Installing::default();
     env.spawn("net", {
         let env = env.clone();
         let sock = sock.clone();
@@ -3393,6 +3535,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let local = local.clone();
         let snaps = snaps.clone();
         let meta_answers = meta_answers.clone();
+        let installing = installing.clone();
         async move {
             loop {
                 let Ok((from, bytes)) = sock.recv().await else {
@@ -3417,6 +3560,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 let Ok(decoded) = decode(&bytes) else {
                     continue;
                 };
+                // D-050: when the frame reached the node, a stamp that reads the time
+                // and nothing else (D-047), so it moves no schedule. It rides the
+                // inbox entry of every message of the frame, and the step that takes
+                // the message puts it on a term change, however long the message
+                // waited in the inbox — behind the node's start, a flush or a held
+                // core — before a round drained it, as the one-group server's `net`
+                // task stamps its inbox events (node.rs, `run`).
+                // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
+                let received = env.decision();
                 for tagged in decoded.messages {
                     // Issue #96. `Raft::on_message`'s arm for `InstallSnapshot` and
                     // its response is empty, because "the server routes these to it
@@ -3440,6 +3592,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                     ) && !node_variants.contains(NodeVariant::ChunksToTheInbox);
                     if diverted {
                         let range = tagged.range;
+                        // A chunk that reaches the node while the `snapshot` task makes
+                        // an install waits behind it, and the task answers nothing until
+                        // it is made. It is answered here, `Waiting`, so its sender hears
+                        // that it is held rather than counting a silence the length of
+                        // the install against `CHUNK_RESENDS` (#120). The task still
+                        // takes it afterwards and answers it as it always did.
+                        // PROPOSED(D-127): the node answers a chunk while its `snapshot`
+                        // task is installing.
+                        if installing.now()
+                            && !node_variants.contains(NodeVariant::SilentWhileInstalling)
+                            && let Some(answer) = install::queued(id, range, &tagged.frame.message)
+                        {
+                            let _ = sock.send(from, answer).await;
+                        }
                         let from = tagged.frame.from;
                         snaps.push(match tagged.frame.message {
                             message @ Message::InstallSnapshot { .. } => SnapJob::Chunk {
@@ -3455,12 +3621,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                         });
                         continue;
                     }
-                    let admission = inbox.admit(Received {
-                        range: tagged.range,
-                        from: tagged.frame.from,
-                        message: tagged.frame.message,
-                        bytes: tagged.bytes,
-                    });
+                    let admission = inbox.admit(Received::stamped(tagged, received));
                     for dropped in admission.dropped() {
                         env.trace(TraceEvent::RaftInboxDropped {
                             server,
@@ -3564,7 +3725,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // on a node that joined, every replica an install made on it (PROPOSED
             // D-109); the anchor holds no descriptor and is no range.
             // PROPOSED(D-100)
-            let discovered = discover_ranges(anchor.engine(), &hosted).await?;
+            // The instrument that drops node 1's right halves at its restart reopens
+            // none of them, nor any replica an install made there (PROPOSED D-141).
+            // PROPOSED(D-141)
+            let discovered =
+                if server == 1 && range_variants.contains(RangeVariant::RestartDropsRightHalves) {
+                    Vec::new()
+                } else {
+                    discover_ranges(anchor.engine(), &hosted).await?
+                };
             for range in hosted.iter().skip(1).cloned().chain(discovered) {
                 let (store, recovered) = anchor
                     .open_sibling(KeyPrefix::group(range.id.get()))
@@ -3661,6 +3830,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
             .map_or((0, 0), |record| (record.last_index, record.last_term));
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
+        let snap_taken = snapshot_record.as_ref().is_some_and(|record| record.taken);
         let recovered_quarantined = recovered.quarantined;
         // A re-seeded replica is not fresh: its `RangeCreated` is the install's, with
         // `cause: snapshot`, and not a bootstrap's (§8; Q15).
@@ -3730,7 +3901,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             id_of,
             &core,
             &store,
-            (snap_index, snap_term),
+            (snap_index, snap_term, snap_taken),
             recovered_quarantined,
         );
         // §8: the replica's log restated, then its descriptor at its applied index. A
@@ -3743,10 +3914,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         cores.insert(id_of, core);
     }
     // §8: `RangesRestated` closes the node's restatement, naming every initialised
-    // replica it restated; check 8 reads the node's spans as complete here.
+    // replica it restated; check 8 reads the node's spans as complete here. It states the
+    // run's nonce too, so check 18 can hold a split's right half to a block of the run
+    // that led it.
     // PROPOSED(D-107)
+    // PROPOSED(D-137): the run stated at the node's start.
     restated.sort_unstable();
-    env.trace(TraceEvent::RangesRestated { ranges: restated });
+    let run = lock(&ids).run();
+    env.trace(TraceEvent::RangesRestated {
+        ranges: restated,
+        run,
+    });
     if let Some(descriptors) = bootstrap_meta.or(reseeded_meta) {
         env.trace(TraceEvent::MetaApplied {
             index: 0,
@@ -3759,6 +3937,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // a restart: a placeholder holds nothing durable.
     // PROPOSED(D-109)
     let placeholders: Arc<Mutex<BTreeSet<RangeId>>> = Arc::default();
+    // A range's switch and its split's apply, held against each other across the `apply`
+    // task, the `snapshot` task and the host (PROPOSED D-133).
+    let switching: Arc<install::SwitchOrSplit> = Arc::default();
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -3788,6 +3969,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         applied: applied_at.clone(),
         placeholders: placeholders.clone(),
         on_a_reseed,
+        switching: switching.clone(),
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
@@ -3872,6 +4054,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             cores: variants,
             descriptors: descriptors.clone(),
             applied: applied_at.clone(),
+            switching: switching.clone(),
+            configured: configured.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -3930,6 +4114,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             anchor,
             on_a_reseed,
             range_variants,
+            switching,
+            installing,
         );
         async move {
             task.run().await;
@@ -4230,28 +4416,46 @@ struct Reseeded<E: Environment> {
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the
 /// disk holds it, the snapshot it records, the configuration in force and the term,
 /// each naming the range (§8), and then its descriptor (`state_descriptor`).
+///
+/// `snapshot` is the record's last index and term and its own `taken`: whether the
+/// record is one this replica's take wrote or one an install's repair or a follower's
+/// compaction wrote (RAFT.md §2), restated as the record says, as the one-group server
+/// restates it (ananke-raft node.rs, `incarnation`).
 fn restate<E: Environment>(
     env: &E,
     server: u64,
     range: RangeId,
     core: &Raft,
     store: &RaftStore<E>,
-    snapshot: (Index, Term),
+    snapshot: (Index, Term, bool),
     quarantined: bool,
 ) {
-    let (snap_index, snap_term) = snapshot;
+    let (snap_index, snap_term, taken) = snapshot;
     env.trace(TraceEvent::RaftTruncate {
         server,
         range: range.get(),
         from_index: core.last_index() + 1,
     });
     if snap_index > 0 {
+        // The record's own flag. Until PROPOSED D-118 every restated snapshot was
+        // traced `taken: false`, an install, whatever the record said. A store
+        // switched to without its repair (`SnapshotWithoutCurrentLast` on the node's
+        // switch, PROPOSED D-086) keeps the leader's record, `taken: true`, and the
+        // leader's applied index; a crash between the switch's durability and its
+        // trace restarts onto both, and restated as an install the floor rose to the
+        // record and the applied index needed no log, so state machine safety had
+        // nothing to see (#126, #167). Restated as the record says, a taken snapshot
+        // moves no floor and the applied index its log cannot hold is reported. The
+        // pre-vote check's skip reads an install restated inside an isolation as an
+        // install (`Report::reseeding_during`), and a replica's own take restated
+        // there is now checked, which is why the receipt rides the inbox first (D-050).
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
         env.trace(TraceEvent::RaftSnapshot {
             server,
             range: range.get(),
             last_index: snap_index,
             last_term: snap_term,
-            taken: false,
+            taken,
         });
     }
     // The durable per-replica refused mark, restated per replica and carrying its range
@@ -4346,6 +4550,26 @@ fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Ind
     !held && applied == 0 && last_index == 0 && snapshot == (0, 0)
 }
 
+/// Whether an applied index `held` past a live install's `snapshot` is kept by the
+/// restatement at `Switched`: what the `apply` task, or the store, stands at above the
+/// snapshot when the `raft` task steps the switch was applied after it, on top of the
+/// state it installed, by a job the replaced core queued before the hold (issue #113).
+/// Taking it back hands those entries to the task a second time. A held index at or
+/// below the snapshot is the replaced replica's and moves up to the snapshot, which is
+/// D-086's restatement. [`NodeVariant::SwitchForgetsLateApplies`] keeps nothing.
+///
+/// The `snapshot` task's own restatement, right after the switch, reads it too: a job
+/// that applied past the snapshot while `install_spans` was in flight wrote above the
+/// switch, and is kept there as here (#113's review, F1). That such an index was applied
+/// above the switch rests there on D-132's second re-check, which leaves only a store
+/// below the snapshot to be numbered; `finish` reads the store at that re-check and asks
+/// this only where it stood below, so `InstallReplacesCopiedSpan`, which skips the
+/// re-check, keeps nothing there past a store that did not (#113's second review, N1).
+// PROPOSED(D-126)
+pub(crate) fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
+    held > snapshot && !variants.contains(NodeVariant::SwitchForgetsLateApplies)
+}
+
 /// The generation and the voters an install's creation names (`RangeCreated { cause:
 /// snapshot }`, SHARD.md §8): the descriptor the switch put in place, read back from the
 /// store, and for a snapshot that carries none, which no take of this tree makes, the
@@ -4395,19 +4619,28 @@ fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, appli
     });
 }
 
+/// What [`split_applied`] is wired to: the host's table, the `snapshot` task's queue, the
+/// node's exclusion between a range's switch and its split's apply, and the node's variants.
+// PROPOSED(D-133)
+#[cfg(test)]
+pub(crate) type SplitWired = (
+    Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
+    Queue<SnapJob>,
+    Arc<install::SwitchOrSplit>,
+    NodeVariants,
+);
+
 /// A split's apply as the `apply` task makes it, for `install.rs`'s directed tests of what
 /// lands around a switch: the real [`ServerApplier::split`] of `parent` at `index`, cutting
-/// at `key`, on a voter of three, over `store`, the host's `table` and the `snapshot` task's
-/// `snaps`. Whether the split took.
+/// at `key`, on a voter of three, over `store`, the host's `table`, the `snapshot` task's
+/// `snaps` and the node's `switching`, under `variants`. Whether the split took.
 // PROPOSED(D-132)
+// PROPOSED(D-133): the exclusion shared with the task, and the node's variants.
 #[cfg(test)]
 pub(crate) async fn split_applied<E: Environment>(
     env: &E,
     store: &Arc<RaftStore<E>>,
-    (table, snaps): (
-        Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
-        Queue<SnapJob>,
-    ),
+    (table, snaps, switching, variants): SplitWired,
     (parent, right): (RangeId, RangeId),
     (index, key): (Index, &'static [u8]),
 ) -> bool {
@@ -4426,7 +4659,7 @@ pub(crate) async fn split_applied<E: Environment>(
         local: Queue::new(),
         snaps,
         engine_dir: PathBuf::from("/n1"),
-        node_variants: NodeVariants::correct(),
+        node_variants: variants,
         range_variants: RangeVariants::correct(),
         cores: Variants::default(),
         descriptors: table,
@@ -4443,6 +4676,8 @@ pub(crate) async fn split_applied<E: Environment>(
         )),
         id_block: 8,
         raft: RaftConfig::default(),
+        switching,
+        configured: Arc::default(),
     };
     matches!(
         applier
@@ -4722,6 +4957,8 @@ mod tests {
                     )),
                     id_block: 8,
                     raft: RaftConfig::default(),
+                    switching: Arc::default(),
+                    configured: Arc::default(),
                 };
                 let outcome = applier
                     .split(
@@ -5002,6 +5239,179 @@ mod tests {
         );
     }
 
+    /// The restatement at `Switched` moves the `apply` task's applied index, and the
+    /// store's, up to the snapshot and never back (issue #113). A switch to 383 stepped
+    /// after a job the replaced core queued before the hold applied 384 to 386 keeps
+    /// 386: taken back to 383, the task applies 384 to 386 again when the new replica's
+    /// first `Apply` names them, and where that job's record compacted the replica past
+    /// them the `Apply` starts at 387 and the task fails the range, "apply of 387 after
+    /// 383". A replaced replica's index at or below the snapshot moves up to it, which is
+    /// D-086's restatement unchanged.
+    ///
+    /// The pair is [`NodeVariant::SwitchForgetsLateApplies`], which takes it back. This
+    /// holds the rule, as `install_creates`' test above holds its reading; its two call
+    /// sites in `installed`, which no sweep reaches at its tiers (PROPOSED D-126 measures
+    /// the late job; seed 13283 of the sharded sweep, past the nightly's range, reached it
+    /// on D-126's own tree and failed on #225's window on the correct node too, and on the
+    /// Stage C integration's tree reaches it on neither schedule, D-126 sections 6 and 7),
+    /// are held by the test below, and the watermark's half of the same variant is paired
+    /// in `round`.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot() {
+        let correct = NodeVariants::correct();
+        assert!(
+            kept_past_the_switch(386, 383, correct),
+            "entries applied after the switch are kept"
+        );
+        assert!(
+            !kept_past_the_switch(383, 383, correct),
+            "the snapshot itself"
+        );
+        assert!(
+            !kept_past_the_switch(380, 383, correct),
+            "the replaced replica's index moves up to the snapshot"
+        );
+        let buggy = NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies]);
+        assert!(
+            !kept_past_the_switch(386, 383, buggy),
+            "the variant takes the late job's applies back to the snapshot"
+        );
+        assert!(!kept_past_the_switch(380, 383, buggy));
+    }
+
+    /// The restatement at `Switched` through `ServerHost::installed` itself, at both of its
+    /// call sites, the `apply` task's applied state and the store's applied index (#113's
+    /// review, F2): the test above holds the rule, and either call site made to skip it
+    /// passed every test of the tree. R2's task and store stand at `held` when the host
+    /// steps a switch to a snapshot at 30. At 32, what a late job applied past the
+    /// snapshot, the correct host leaves both at 32 and `SwitchForgetsLateApplies` takes
+    /// both back to 30. At 28, a replaced replica's index, both move up to 30 on either,
+    /// which is D-086's restatement unchanged.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_host_keeps_at_switched_what_the_task_and_the_store_applied_past_the_snapshot() {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        const R2: RangeId = RangeId(2);
+        /// What the host left: whether it built the switched replica, the `apply` task's
+        /// applied index and the store's.
+        type Restated = Option<(bool, Option<Index>, Index)>;
+        for (held, buggy, expected) in [
+            (32, false, 32),
+            (32, true, 30),
+            (28, false, 30),
+            (28, true, 30),
+        ] {
+            let mut sim = Sim::new(SimConfig::new(7));
+            let node = sim.add_node();
+            let env = sim.env(node);
+            let restated: Arc<Mutex<Restated>> = Arc::default();
+            env.clone().spawn("test", {
+                let (env, restated) = (env.clone(), restated.clone());
+                async move {
+                    let (store, _) = RaftStore::open_dir(
+                        env.clone(),
+                        EngineConfig::new(PathBuf::from("/n1")),
+                        KeyPrefix::group(R2.get()),
+                    )
+                    .await
+                    .expect("the store opens");
+                    let store = Arc::new(store);
+                    store.installed_at(held);
+                    let voters = vec![ServerId(1), ServerId(2), ServerId(3)];
+                    let config = Configuration::of(&voters);
+                    let descriptor = RangeDescriptor {
+                        range: R2,
+                        start: Bytes::from_static(b"k0"),
+                        end: Bytes::from_static(b"k9"),
+                        generation: FIRST_GENERATION,
+                        voters: voters.clone(),
+                        state: RangeState::Live,
+                    };
+                    let sock = env
+                        .net()
+                        .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                        .await
+                        .expect("a bind");
+                    let host = ServerHost {
+                        env: env.clone(),
+                        id: ServerId(1),
+                        sock: Arc::new(sock),
+                        addrs: BTreeMap::new(),
+                        stores: Arc::new(Mutex::new([(R2, store.clone())].into())),
+                        replicas: Arc::default(),
+                        jobs: Queue::new(),
+                        answers: Queue::new(),
+                        snaps: Queue::new(),
+                        ranges: Vec::new(),
+                        initial: voters.clone(),
+                        raft: RaftConfig::default(),
+                        variants: Variants::default(),
+                        node: if buggy {
+                            NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies])
+                        } else {
+                            NodeVariants::correct()
+                        },
+                        range_variants: RangeVariants::correct(),
+                        gaps: Mutex::new(Gaps::default()),
+                        descriptors: Arc::new(Mutex::new([(R2, descriptor.clone())].into())),
+                        led: Mutex::new(BTreeMap::new()),
+                        meta: Queue::new(),
+                        ids: Arc::new(Mutex::new(IdBlocks::new(1))),
+                        refill_at: 0,
+                        applied: Arc::new(Mutex::new(
+                            [(
+                                R2,
+                                Applied {
+                                    index: held,
+                                    term: 2,
+                                    config: config.clone(),
+                                },
+                            )]
+                            .into(),
+                        )),
+                        placeholders: Arc::default(),
+                        on_a_reseed: false,
+                        switching: Arc::default(),
+                    };
+                    let core = Raft::new(
+                        ServerId(1),
+                        config.clone(),
+                        RaftConfig {
+                            range: R2.get(),
+                            ..RaftConfig::default()
+                        },
+                        7,
+                    );
+                    let at = Identity {
+                        term: 2,
+                        last_index: 30,
+                        last_term: 2,
+                    };
+                    let switched = host.installed(
+                        R2,
+                        &core,
+                        &at,
+                        &config,
+                        Some(&descriptor),
+                        Some(&descriptor),
+                    );
+                    let task = lock(&host.applied).get(&R2).map(|state| state.index);
+                    *lock(&restated) = Some((switched.is_some(), task, store.applied()));
+                }
+            });
+            sim.run_for(Duration::from_secs(1));
+            let restated = lock(&restated).take();
+            assert_eq!(
+                restated,
+                Some((true, Some(expected), expected)),
+                "held {held}, buggy: {buggy}: the replica built, the task's applied index and \
+                 the store's"
+            );
+        }
+    }
+
     fn client_addr() -> SocketAddr {
         "10.0.0.9:7000".parse().expect("an address")
     }
@@ -5099,5 +5509,170 @@ mod tests {
         // `answer_read` takes it when the answer comes.
         assert!(replica.reads.remove(&id).is_some());
         assert!(replica.reads.is_empty());
+    }
+
+    /// What [`split_with_no_descriptor`] found once the split's apply was done: its effect
+    /// and outcome, P's and R's descriptors as the store holds them, the host's table, and
+    /// the store's applied index.
+    type NoDescriptor = (
+        Option<(ApplyEffect, Outcome)>,
+        Option<RangeDescriptor>,
+        Option<RangeDescriptor>,
+        BTreeMap<RangeId, RangeDescriptor>,
+        Index,
+    );
+
+    /// [`split_case`]'s split at index 9, on a voter of three whose replica of P holds no
+    /// descriptor and has applied 1 to 8 with nothing in them, as a re-seeded replica its
+    /// log brings back does; `configured` is what configuration names, and `node_variants`
+    /// the node's set.
+    // PROPOSED(D-138)
+    fn split_with_no_descriptor(
+        configured: BTreeMap<RangeId, RangeDescriptor>,
+        node_variants: NodeVariants,
+    ) -> NoDescriptor {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let mut sim = Sim::new(SimConfig::new(7));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let table: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
+        let found: Arc<Mutex<Option<NoDescriptor>>> = Arc::default();
+        env.clone().spawn("test", {
+            let (env, table, found) = (env.clone(), table.clone(), found.clone());
+            async move {
+                let prefix = KeyPrefix::group(p.get());
+                let (store, _) = RaftStore::open_dir(
+                    env.clone(),
+                    EngineConfig::new(PathBuf::from("/n1")),
+                    prefix.clone(),
+                )
+                .await
+                .expect("the store opens");
+                let store = Arc::new(store);
+                for index in 1..=8 {
+                    store
+                        .apply(index, WriteBatch::new())
+                        .await
+                        .expect("an empty apply");
+                }
+                let sock = env
+                    .net()
+                    .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                    .await
+                    .expect("a bind");
+                let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+                let applier = ServerApplier {
+                    env: env.clone(),
+                    id: ServerId(1),
+                    sock: Arc::new(sock),
+                    stores: Arc::default(),
+                    replicas: Arc::default(),
+                    local: Queue::new(),
+                    snaps: Queue::new(),
+                    engine_dir: PathBuf::from("/n1"),
+                    node_variants,
+                    range_variants: RangeVariants::correct(),
+                    cores: Variants::default(),
+                    descriptors: table.clone(),
+                    applied: Arc::new(Mutex::new(
+                        [(
+                            p,
+                            Applied {
+                                index: 8,
+                                term: 1,
+                                config,
+                            },
+                        )]
+                        .into(),
+                    )),
+                    id_block: 8,
+                    raft: RaftConfig::default(),
+                    switching: Arc::default(),
+                    configured: Arc::new(configured),
+                };
+                let answered = applier
+                    .split(p, 9, &Bytes::from_static(b"k5"), r.get(), &store)
+                    .await
+                    .expect("the split's apply");
+                let held = |range: RangeId| {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .engine()
+                            .get(&KeyPrefix::group(range.get()).descriptor_key())
+                            .await
+                            .expect("a read")
+                            .map(|bytes| RangeDescriptor::decode(bytes).expect("a descriptor"))
+                    }
+                };
+                let (left, right) = (held(p).await, held(r).await);
+                let applied = store.applied();
+                *lock(&found) = Some((answered, left, right, lock(&table).clone(), applied));
+            }
+        });
+        sim.run_for(Duration::from_secs(1));
+        lock(&found).take().expect("the split's apply finished")
+    }
+
+    /// #199: a replica of P that holds no descriptor, a re-seeded user range its log brought
+    /// back from the first entry, applies P's split from the descriptor configuration names
+    /// for P, as a replica holding that descriptor from its bootstrap does: it takes it,
+    /// writes P's left half and R at the next generation, and puts both in the host's table.
+    /// Under `ReplayedRangeRefusesItsSplit` it refuses it, `NotLive`, and writes nothing but
+    /// the applied index, which is the effect state machine safety saw differ. A range
+    /// configuration does not name has no descriptor to fall back on, and is refused as before.
+    // PROPOSED(D-138)
+    #[test]
+    fn a_replica_with_no_descriptor_takes_a_split_from_the_descriptor_configuration_names() {
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let configured: BTreeMap<RangeId, RangeDescriptor> = [(p, case.parent.clone())].into();
+        let left = case.after.get(&p).cloned().expect("P's left half");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(configured.clone(), NodeVariants::correct());
+        assert_eq!(
+            answered,
+            Some((ApplyEffect::Took, Outcome::Done)),
+            "the split is taken from configuration's descriptor"
+        );
+        assert_eq!(held_left.as_ref(), Some(&left), "P's left half is written");
+        assert_eq!(held_right.as_ref(), Some(&case.right), "R is written");
+        assert_eq!(
+            table,
+            [(p, left), (r, case.right.clone())].into(),
+            "both halves are in the host's table"
+        );
+        assert_eq!(applied, 9);
+
+        let expected = Some((
+            ApplyEffect::Refused,
+            Outcome::Refused(SplitRefusal::NotLive),
+        ));
+        let (answered, held_left, held_right, table, applied) = split_with_no_descriptor(
+            configured,
+            NodeVariants::of(&[NodeVariant::ReplayedRangeRefusesItsSplit]),
+        );
+        assert_eq!(answered, expected, "the variant refuses the split");
+        assert_eq!(
+            (held_left, held_right),
+            (None, None),
+            "and writes neither half"
+        );
+        assert!(table.is_empty(), "and puts nothing in the host's table");
+        assert_eq!(applied, 9, "and applies the entry as nothing");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(BTreeMap::new(), NodeVariants::correct());
+        assert_eq!(
+            answered, expected,
+            "a range configuration does not name is refused as before"
+        );
+        assert_eq!((held_left, held_right), (None, None));
+        assert!(table.is_empty());
+        assert_eq!(applied, 9);
     }
 }

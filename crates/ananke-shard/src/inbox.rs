@@ -75,6 +75,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
+use ananke_env::Decision;
 use ananke_raft::message::Message;
 use ananke_raft::types::ServerId;
 
@@ -284,8 +285,8 @@ mod slots {
 
 use slots::{Pair, Slots};
 
-/// A message that arrived on the node's socket, with the range it is about and what
-/// it cost the node to receive it.
+/// A message that arrived on the node's socket, with the range it is about, what it
+/// cost the node to receive it and when the `net` task received it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     /// The range the message is about (Q10).
@@ -300,24 +301,36 @@ pub struct Received {
     // PROPOSED(D-072): the bound is in wire bytes, not in live heap; see the module
     // documentation.
     pub bytes: usize,
+    /// When the `net` task received the frame the message came in, a decision stamp
+    /// taken as the frame came off the socket and before the message was admitted
+    /// (D-047): the receipt a term change records (D-050). The message may then wait
+    /// here — behind the node's start, a round's flush or a held core — and the round
+    /// that drains it is later by that wait, so the stamp is carried and not taken
+    /// again where the message is stepped.
+    // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp, D-073's owed
+    // half (D-073, item 4).
+    pub received: Decision,
 }
 
 impl Received {
-    /// What this message is indexed under if it is a heartbeat, and nothing if it is
-    /// not.
-    fn heartbeat(&self) -> Option<(Pair, usize)> {
-        is_heartbeat(&self.message).then_some(((self.from, self.range), self.bytes))
-    }
-}
-
-impl From<Tagged> for Received {
-    fn from(tagged: Tagged) -> Self {
+    /// A message off the wire, `received` being the `net` task's stamp for the frame
+    /// it came in.
+    // PROPOSED(D-118)
+    #[must_use]
+    pub fn stamped(tagged: Tagged, received: Decision) -> Self {
         Self {
             range: tagged.range,
             from: tagged.frame.from,
             message: tagged.frame.message,
             bytes: tagged.bytes,
+            received,
         }
+    }
+
+    /// What this message is indexed under if it is a heartbeat, and nothing if it is
+    /// not.
+    fn heartbeat(&self) -> Option<(Pair, usize)> {
+        is_heartbeat(&self.message).then_some(((self.from, self.range), self.bytes))
     }
 }
 
@@ -659,8 +672,21 @@ mod tests {
 
     use super::*;
     use crate::frame::{Builder, HEADER_LEN, TAG_LEN, decode};
+    use ananke_env::Environment;
+    use ananke_env::sim::{Sim, SimConfig};
     use ananke_raft::message::Frame;
     use ananke_raft::types::{Entry, Payload};
+
+    /// A receipt stamp, at the start of a simulation of its own: the inbox carries the
+    /// stamp and never reads it, so every message here carries this one.
+    fn stamp() -> Decision {
+        static STAMP: std::sync::OnceLock<Decision> = std::sync::OnceLock::new();
+        *STAMP.get_or_init(|| {
+            let mut sim = Sim::new(SimConfig::new(0));
+            let node = sim.add_node();
+            sim.env(node).decision()
+        })
+    }
 
     /// A message of `bytes` bytes against the bound, tagged `range`: neither a
     /// heartbeat nor a carrier, which is the ordinary arrival the bound is about.
@@ -670,6 +696,7 @@ mod tests {
             from: ServerId(1),
             message: Message::TimeoutNow { term },
             bytes,
+            received: stamp(),
         }
     }
 
@@ -687,6 +714,7 @@ mod tests {
                 sent: 123_456_789,
             },
             bytes,
+            received: stamp(),
         }
     }
 
@@ -709,6 +737,7 @@ mod tests {
                 sent: 123_456_789,
             },
             bytes,
+            received: stamp(),
         }
     }
 
@@ -803,11 +832,13 @@ mod tests {
             "an AppendEntries carrying {command} bytes costs {cost} against a bound of {bound}"
         );
         assert!(cost > bound, "{cost} is over the whole bound of {bound}");
+        let received = stamp();
         let big = || Received {
             range: RangeId(9),
             from: ServerId(1),
             message: frame.message.clone(),
             bytes: cost,
+            received,
         };
         // A thousand retransmissions into an inbox that is empty each time: a
         // thousand admissions, not the thousand refusals refusing the arrival gives.
@@ -877,11 +908,13 @@ mod tests {
         };
         let cost = HEADER_LEN + TAG_LEN + frame.encode().len();
         assert!(cost > bound, "{cost} is over the whole bound of {bound}");
+        let received = stamp();
         let big = || Received {
             range: RangeId(9),
             from: ServerId(1),
             message: frame.message.clone(),
             bytes: cost,
+            received,
         };
 
         // The node holds 64 bytes of 16 384 — far under the bound, but not nothing,
@@ -1312,7 +1345,7 @@ mod tests {
         let inbox = Inbox::new(room);
         let admitted: Vec<_> = messages
             .into_iter()
-            .map(|tagged| inbox.admit(Received::from(tagged)))
+            .map(|tagged| inbox.admit(Received::stamped(tagged, stamp())))
             .collect();
         assert!(admitted[0].is_admitted());
         assert!(admitted[1].is_admitted());

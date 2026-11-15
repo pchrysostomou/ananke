@@ -1163,8 +1163,14 @@ impl NodeReport {
         // it was asserted: the correct node green on 10 000 of 10 000 seeds, no fold of the
         // seven in violation on any of seeds 0 to 999 under the correct node or
         // `RefuseOneRangeOnly`, and that variant's attribution D-101's 3 338 / 6 661 / 1 at
-        // ten thousand, to the seed (PROPOSED D-106).
+        // ten thousand, to the seed (PROPOSED D-106). Since PROPOSED D-136 check 20 forgets
+        // at a refusal what the node held, and its fold is in violation under that variant
+        // on 987 of seeds 0 to 999, naming the unrefused replicas' grants. It is this
+        // verdict on 332 of them, ahead of the fan-out clause below; the other 655 are
+        // state machine safety on the meta range, asked before it. The correct node is
+        // green as before (`sim/tests/node.rs`).
         // PROPOSED(D-106): the sharded quorum scenario folds the range layer's checks.
+        // PROPOSED(D-136)
         ananke_shard::invariants::all(&self.records).map_err(|v| format!("seed {seed}: {v}"))?;
         lin::check(&self.history).map_err(|v| format!("seed {seed}: {v}"))?;
         let holds = self.holds().expect("a cast has holds");
@@ -1194,13 +1200,8 @@ impl NodeReport {
         let mut incarnations: BTreeMap<u64, u64> = BTreeMap::new();
         for hold in holds.values() {
             let range = hold.range;
-            if !hold.replica_refused {
-                return fail(format!(
-                    "range {range}: the one `mark_store_lost` at node {victim}'s restart refused \
-                     the node but not this range's replica, where D-077 refuses every replica the \
-                     node held"
-                ));
-            }
+            // PROPOSED(D-136): the fan-out clause, which `fan_out` asks on its own.
+            fan_out_of(seed, victim, hold)?;
             if !hold.reseeded {
                 return fail(format!(
                     "range {range}: node {victim}'s replica of it was refused and never re-seeded"
@@ -1385,6 +1386,46 @@ impl NodeReport {
         }
         Ok(())
     }
+
+    /// The fan-out clause of [`check`](Self::check), the first question its clause 3 asks
+    /// of each range — was the node's replica of it refused with the node? — asked on its
+    /// own. `check` asks the ranges' invariants and the range layer's checks before it, so
+    /// its verdict names this clause only on a seed where none of those is in violation;
+    /// asked here, the clause answers whatever is asked before it. `sim/tests/node.rs` asks
+    /// it so that `RefuseOneRangeOnly`'s fan-out falling short is asserted at every tier
+    /// (the review of PROPOSED D-136, N1). A run with no cast, which `check` fails as
+    /// setup, gives this clause nothing to ask.
+    ///
+    /// # Errors
+    ///
+    /// The clause's message, naming the seed and the first range whose replica the
+    /// node's refusal left unrefused.
+    // PROPOSED(D-136)
+    pub fn fan_out(&self) -> Result<(), String> {
+        let (Some(cast), Some(holds)) = (self.cast.as_ref(), self.holds()) else {
+            return Ok(());
+        };
+        holds
+            .values()
+            .try_for_each(|hold| fan_out_of(self.seed, cast.victim, hold))
+    }
+}
+
+/// The fan-out clause of one range (D-077): the one `mark_store_lost` at `victim`'s restart
+/// refused the node, so it refused the node's replica of this range too. One function, so
+/// that [`NodeReport::check`] in its place and [`NodeReport::fan_out`] on its own ask the
+/// same clause.
+// PROPOSED(D-136)
+fn fan_out_of(seed: u64, victim: u64, hold: &RangeHold) -> Result<(), String> {
+    if hold.replica_refused {
+        return Ok(());
+    }
+    let range = hold.range;
+    Err(format!(
+        "seed {seed}: range {range}: the one `mark_store_lost` at node {victim}'s restart \
+         refused the node but not this range's replica, where D-077 refuses every replica the \
+         node held"
+    ))
 }
 
 /// Whether `range` is the root or the meta range (SHARD.md §1, Q4): the two whose

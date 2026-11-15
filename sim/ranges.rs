@@ -391,8 +391,10 @@ impl Report {
 
     /// The longest a live range took after the last heal to complete a client write:
     /// the recovery time proper, under the same bound and with the same meaning of
-    /// `asked` ([`raft::Report::writes_after_heal_by_range`]).
+    /// `asked` ([`raft::Report::writes_after_heal_by_starting_range`]). This scenario
+    /// takes no split, so the map it started with is the one it ends with.
     // PROPOSED(D-076): the recovery time proper is asked per range.
+    // PROPOSED(D-121): the reading renamed for the map it reads.
     #[must_use]
     pub fn worst_range_recovery(&self, asked: bool) -> Option<Duration> {
         if asked && !self.checked.uniform() {
@@ -400,7 +402,7 @@ impl Report {
         }
         let live = self.checked.ranges_with_a_majority_up();
         self.checked
-            .writes_after_heal_by_range()
+            .writes_after_heal_by_starting_range()
             .into_iter()
             .filter(|(range, _)| live.contains(range))
             .filter_map(|(_, took)| took)

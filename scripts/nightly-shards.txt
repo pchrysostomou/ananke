@@ -695,7 +695,133 @@
 # of 3: seed 16725's 0.2 (0.15 + 0.01, 0.12 + 0.00, 0.12 + 0.00, the median rounded up to a tenth), seed 18925's 0.2 (0.17 +
 # 0.00 three times), each into the lightest shard, shard 4 at 2230.8 -> 2231.0 -> 2231.2. No row moved and nothing was
 # re-weighed; the merge of D-132's text changed no row. Every header is recomputed.
-# shard 1: 2689.1 cpu s
+# PROPOSED D-124 (#168: a routing variant's first-violation print cuts a verdict on a character boundary)
+# added one `node` row, no sweep: the test builds its verdicts, runs no scenario and draws no seed, so no tier
+# moves it. Weighed on its tree from the built debug binary (`node-<hash> <test> --exact`), which can only
+# read high against release, three runs under a one-minute load average of 161: user and sys each 0.00 s all
+# three times, below the timer's resolution. Rounded up to 0.1 like the cheap rows beside it. Into the
+# lightest shard, shard 4 at 2231.2 -> 2231.3.
+# PROPOSED D-136 added one `shard` row, issue #221's plant run to its end over the thousand, weighed the same way
+# from the built release binary under load averages of 259 to 299, so if anything high: 187.1 (173.89 + 14.82,
+# 172.65 + 14.47, 174.03 + 12.52, the median), into the lightest shard, shard 4 at 2231.2 -> 2418.3. No row moved.
+# PROPOSED D-118 (#126, #167: the inbox carries the `net` task's receipt, the restatement each record's `taken`)
+# renamed one `node` row in place, `..._is_injected_on_the_node` to `..._is_caught_on_the_node`, which keeps its shard
+# and its weight, and added two `node` pins of one seed each, weighed from the built release binary (`node-<hash> <test>
+# --exact`) as user + sys, three runs, the median rounded up to a tenth, on an Apple M2 of 8 cores under load averages
+# of about 275, so if anything high: seed 91's, which runs the variant and the correct node, 0.6 (0.47 + 0.07, 0.51 +
+# 0.06, 0.49 + 0.07), and seed 358's 0.4 (0.29 + 0.04, 0.31 + 0.04, 0.31 + 0.08). Longest-first into the lightest
+# shard, shard 4 at 2231.2 -> 2231.8 -> 2232.2. Every header is recomputed.
+# PROPOSED D-135 (#162's S12, `Fault::MetaReorder`) added one `node` row, check 16's fold-by-fold comparison on the
+# sharded sweep's trace, weighed the same way under load averages past 250: 22.6 (20.49 + 3.29, 19.76 + 2.53, 19.99 +
+# 2.55, the median rounded up to a tenth), into the lightest shard, shard 4 at 2231.2 -> 2253.8. The arm adds a fault to
+# seven seeds in eight of the `shard` sweeps, whose rows keep their weights and shards; their re-weigh is owed, on a
+# quiet machine. The pins on seeds 707, 5620, 992 and 18925 now run the sweep's schedule beside the one they were found
+# on, two runs where they ran one, and keep their rows of a few tenths. Shard 4's header is recomputed.
+# PROPOSED D-137 (#222: check 18 compares the run, and D-092's retry has to take effect) added four `shard` rows,
+# weighed on its tree from the built release binary (`shard-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores beside other slices' sweeps, so if anything high.
+# `RefusedAfterRefill`'s sweep runs a thousand seeds at this tier and above (D-061): one run, 243.6 (232.50 + 11.07),
+# into the lightest shard, shard 4 at 2231.2 -> 2474.8. Its three pins, three runs each, the median rounded up to a
+# tenth, longest first into the lightest, shard 3: seed 992's under the variant 0.3 (0.22 + 0.02, 0.23 + 0.02, 0.24 +
+# 0.03), seed 1248's 0.3 (0.23 + 0.02, 0.26 + 0.02, 0.24 + 0.02) and seed 1032's 0.2 (0.16 + 0.01, 0.16 + 0.02, 0.17 +
+# 0.02), shard 3 at 2237.4 -> 2237.7 -> 2238.0 -> 2238.2. No row was re-weighed: the rows D-137 edited fold what they
+# folded and print more.
+# PROPOSED D-140 (S7, check 19 and `SplitLeavesGap`) added two rows, weighed on its tree from the built release binary
+# (`<binary>-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the median,
+# on an Apple M2 of 8 cores under load averages of 270 to 283 from the other slices beside it, so if anything high. The
+# fold-by-fold comparison in `node`, which compares min(seeds, 100) seeds, each run stopped at its first split's apply,
+# 22.3 (18.27 + 3.98, 18.21 + 3.55, 19.31 + 4.39), into the lightest shard, shard 4 at 2231.2 -> 2253.5; the sharded
+# sweep's catch in `shard`, on `share()`, 5.5 (4.83 + 0.62, 4.57 + 0.55, 5.22 + 0.85), into the lightest after it,
+# shard 3 at 2237.4 -> 2242.9. No row moved and nothing was re-weighed. Every header is recomputed.
+# PROPOSED D-133 (#225: a range's install and its split's apply exclude each other) added one `shard` row, seed
+# 13283's pin on the shaped schedule, which runs the seed correct and under `SplitAppliesInsideTheSwitch`, weighed
+# from the built release binary (`shard-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user +
+# sys, three runs, the median, on an Apple M2 of 8 cores under a load average of about 260: 0.5 (0.38 + 0.07, 0.38 +
+# 0.07, 0.37 + 0.05, the median rounded up to a tenth), into the lightest shard, shard 4 at 2231.2 -> 2231.7. Its
+# directed tests are in the crate's lib, in the `rest` job. Every header is recomputed.
+# PROPOSED D-126 (#113: a late job of the replaced core after a live install's switch) added one `reseed`
+# row, seed 26's pin of the shape with a second restart, a seed run twice and so the same at any tier,
+# weighed on its tree from the built release binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the median, on an Apple M2 of 8 cores beside other
+# slices' builds and sweeps (load averages 164 to 172): 1.4 (1.29 + 0.18, 1.26 + 0.13, 1.27 + 0.15). Into
+# the lightest shard, shard 4 at 2231.2 -> 2232.6. Every header is recomputed.
+# PROPOSED D-138 (#199, a split of a range a re-seeded node's log brought back) added two `reseed` rows, weighed
+# on its tree from the built release binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, three runs each, medians of user + sys, under load averages of 150 to 180 with the
+# 10 000-seed sharded sweep running beside them, so if anything high: the correct node's directed run, the
+# binary's TIER_CAP of 200 seeds, 46.9 (41.55 + 5.37, 41.34 + 5.57, 41.03 + 5.64); the variant's catch on
+# HIGH_RATE_SHARE's 20 seeds, 20.6 (15.22 + 6.55, 14.90 + 4.99, 15.55 + 5.03). Longest-first into the lightest
+# shard: shard 4 at 2231.2 -> 2278.1, then shard 3 at 2237.4 -> 2258.0. No row moved and nothing was
+# re-weighed. Every header is recomputed.
+# PROPOSED D-127 (#120: the resend bound tripped by a receiver that holds a chunk) added one `install` row, the
+# pair's other half, `SilentWhileInstalling` over the binary's fixed 32 seeds, the same at every tier. Weighed on its
+# tree from the built release binary (`install-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+# user + sys, three runs, the median, on an Apple M2 of 8 cores beside other slices' runs (load averages 256 to 274,
+# so if anything high): 6.5 (5.95 + 0.50; 6.55, 6.45, 6.40). Into the lightest shard, shard 4 at 2231.2 -> 2237.7. No
+# row was re-weighed: the correct node's sweep, `the_correct_node_installs_on_every_seed`, keeps its 8.9.
+# D-127 moved every node schedule, and the pins it moved off their shapes were re-audited (CLAUDE.md). Twelve were
+# re-pinned to a seed that carries the shape and renamed in place, each keeping its shard and re-weighed on D-127's
+# tree from the built release binary at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, user + sys, three runs, the median
+# rounded up to a tenth, beside other slices' builds (load averages 277 to 357, so if anything high): shard 4 seed
+# 992 -> 1314 (0.1 -> 0.3; 0.26, 0.26, 0.27) and seed 16725 -> 73 (0.2 -> 0.3; 0.27, 0.23, 0.30); shard 5 seeds 2272
+# and 7949 -> seed 2272 (0.3 -> 0.6; 0.56, 0.55, 0.57), seed 463 -> 1068 (0.1 -> 0.6; 0.53, 0.51, 0.54), seed 3291 ->
+# 9699 (0.2 -> 0.2; 0.20, 0.20, 0.21), seeds 12 and 76 -> 204 and 8 (1.0 -> 3.2; 3.19, 3.24, 3.04), seed 613 -> 145 (0.2
+# -> 0.3; 0.30, 0.30, 0.32) and seed 45 -> 2388 (0.4 -> 1.0; 1.07, 0.90, 0.91); shard 6 seed 219 -> 522 (0.7 -> 1.3;
+# 1.27, 1.23, 1.23), seeds 3870 and 5303 -> 9535 (0.3 -> 0.9; 0.88, 0.88, 0.89), seed 2097 -> 329 (0.2 -> 0.7; 0.62,
+# 0.57, 0.64) and seed 9 -> 68 (0.2 -> 0.5; 0.46, 0.54, 0.50). One row was added, seed 89's hold, the pin seed 633's
+# moved to while 633's became its absence: 1.0 (0.91, 0.94, 0.97), into the lightest shard, shard 3 at 2237.4 ->
+# 2238.4. The pins turned into absences in place keep their rows and weights. Every header is recomputed.
+# D-127's review (F1) added two `shard` rows, the plain schedule's seeds 2147 (the pre-vote check's defect, fixed) and 6773
+# (the liveness question put to the owner), each one seed and not swept. Weighed on its tree from the built release binary
+# (`shard-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, user + sys, three runs, the median rounded up
+# to a tenth, beside other slices' builds (load average 213 to 215): seed 2147's 0.2 (0.15, 0.20, 0.15) and seed 6773's 0.2
+# (0.13, 0.12, 0.12). Each into the lightest shard, shard 4 both times, at 2238.0 -> 2238.2 -> 2238.4.
+# PROPOSED D-121 (#148: the per-range liveness reading follows the splits) added two `node` rows, both pins
+# of fixed seeds, so the tier does not move them: weighed on its tree from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the
+# median rounded up to a tenth, on an Apple M2 of 8 cores under load averages of 135 to 155 from the slices
+# building beside it, so if anything high. Seed 76 under `SharedSnapshotDir` and on the correct node, 1.3 (1.08
+# + 0.16, 1.13 + 0.17, 1.19 + 0.18); seeds 105 and 300 of the correct node, 0.9 (0.84 + 0.10, 0.79 + 0.06, 0.73
+# + 0.05). Longest-first into the lightest shard, which stays shard 4 for both: 2231.2 -> 2232.5 -> 2233.4.
+# `SharedSnapshotDir`'s own row keeps its figure: its sweep only reads each run once more.
+# PROPOSED D-121's review added one `node` row, a pin of a fixed seed: seed 69 under `SharedSnapshotDir` and on the
+# correct node, weighed the same way on its tree, 1.0 (0.89 + 0.03, 0.89 + 0.04, 0.81 + 0.04, the median 0.92 rounded
+# up to a tenth), under load averages of 208 to 249, into the lightest shard, shard 4: 2233.4 -> 2234.4. Seed 76's row
+# keeps its figure: it reads the same two runs, twice more.
+# Merge note (the Stage C integration: #237, #238, #239, #240, #242, #243, #244, #246, #247, #249, #251, #252, #253 and
+# #254 together): the union of every PR's rows. Renamed in place, each
+# keeping its shard: D-118's seed 91 pin as seed 12's, D-121's seeds 76 and 69 as 137 and 189 and its seeds 105 and 300
+# as seed 32's (with 300's absence), each re-pinned because D-127 moved the node's schedules. Added: D-134's half of
+# seed 16725's old pin, its own test now, 0.9. Re-weighed, because the integration changed what they run, from the built
+# release binaries (`<binary>-<hash> <test> --exact`), user + sys, one run each beside the integration's own release
+# test run (load averages about 70, so if anything high), rounded up to a tenth: seed 12 0.5, seed 137 0.5, seed 189 1.4,
+# seed 32 1.0, seed 358 0.4 (an absence now), seed 13283 0.8 (an absence on both schedules, four runs), seed 1032 0.4 (an
+# absence on both schedules), seed 992 under `RefusedAfterRefill` 0.4 (its correct half added), seeds 707 0.4, 5620 1.0
+# and 18925 0.6 (absences on both schedules), seed 16725's new pin 0.9. Shard 1, near its timeout (#233), lost a row and
+# gained none: `a_leader_that_ignores_incarnations_never_forgets` (258.5) moved off it. Then the rows each PR added, and
+# that one, went longest-first into the lightest shard over the union's other rows, and two rows moved to even the
+# result out: `a_span_checkpoint_without_syncs_is_caught` (52.4) from shard 3 to shard 6 and
+# `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold` (72.9) from shard 4 to
+# shard 5. Every header is recomputed; the six shards come to 2418.6 to 2449.9.
+# At the integration's finish, four shaped-schedule pins went back to asserting their situations absent from the sweep's
+# schedule (D-135's `absent_from_the_sweep`), each one sharded run more: seeds 1314, 992 under `RefusedAfterRefill`, 1248
+# and 73. Re-weighed the same way, from the built release binary, user + sys, three runs, the median rounded up to a tenth,
+# under load averages of 10 to 30: 1314 0.3 (0.28, 0.24, 0.24), 992 0.4 (0.35, 0.35, 0.35), 1248 0.3 (0.23, 0.23, 0.23)
+# and 73 0.3 (0.23, 0.23, 0.24). Each row keeps its figure and its shard, so no header moves.
+# PROPOSED D-141 (S8 (c)'s clause half: check 8's right half's clause under the owner's reading R) added one `node` row,
+# `RestartDropsRightHalves`'s fold-by-fold test, which compares min(seeds, 100) seeds of the variant; the correct node's half
+# of its pair is `the_range_layers_folds_agree_one_by_one_on_the_correct_node`'s row, on the same seeds. Weighed from the
+# built release binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs,
+# the median rounded up to a tenth, on an Apple M2 of 8 cores under load averages of 209 to 214, so if anything high: 33.5
+# (32.25 + 1.08, 32.64 + 0.97, 32.49 + 0.93). Into the lightest shard, shard 4 at 2231.2 -> 2264.7. (Before its review the
+# test re-ran the correct node on its seeds and weighed 65.3.) The two sweeps that now assert the clause keep their rows and
+# weights: after the review the node sweep measured 545.8 (531.38 + 14.40) and the sharded sweep, at ANANKE_SEEDS=10000,
+# 2529.5 (2452.92 + 76.55), one run each under load averages of about 160 to 280, against 678.8 and 311.8 at 1 000.
+# At the Stage C integration (round 2, D-141 beside the integrated table) its row went the same way into the lightest
+# shard of the integrated table, shard 4 at 2418.6 -> 2452.1, and shard 1, near its timeout (#233), gained nothing. The
+# round's other three tips (#240, #249, #243) add no row, and what they add to seeds 18925's and 6773's pins reads runs
+# those pins already made, so no row was re-weighed. Every header is recomputed.
+# shard 1: 2430.6 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
 # (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
@@ -711,7 +837,6 @@
 1	engine	0.3	seed_420_which_the_first_nightly_found_stays_green
 1	node	344.4	a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node
 1	node	354.2	a_leader_that_trusts_the_clock_is_caught_on_the_node
-1	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
 1	raft	208.6	a_server_that_installs_without_current_last_is_caught
 1	raft	103.3	on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count
 1	raft	14.6	a_follower_that_truncates_on_every_append_is_caught
@@ -726,7 +851,7 @@
 1	split	80.0	a_replica_cut_off_from_its_first_start_is_installed_and_not_created_twice
 1	node	111.5	a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument
 1	node	61.3	a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario
-# shard 2: 2253.4 cpu s
+# shard 2: 2440.5 cpu s
 2	shard	104.8	a_client_that_ignores_a_mismatch_trips_the_write_bound_on_the_sharded_sweep
 2	shard	4.5	a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep
 2	shard	9.3	a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_sweep
@@ -748,16 +873,16 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	179.0	an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node
-# shard 3: 2237.4 cpu s
+2	shard	187.1	a_refused_nodes_placeholder_of_a_range_it_restated_before_its_loss_is_caught_by_check_20
+# shard 3: 2428.6 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
 3	engine	58.7	an_install_that_keeps_its_sources_numbers_is_caught
-3	engine	52.4	a_span_checkpoint_without_syncs_is_caught
 3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught
 3	engine	0.3	seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment
 3	install	5.0	every_wiring_variant_is_caught
-3	node	353.7	a_server_that_installs_without_current_last_is_injected_on_the_node
+3	node	353.7	a_server_that_installs_without_current_last_is_caught_on_the_node
 3	node	105.5	every_seed_passes_the_membership_scenario_on_the_correct_node
 3	node	41.0	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
 3	node	30.4	a_server_without_pre_vote_is_caught_on_the_node
@@ -774,14 +899,14 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2231.2 cpu s
+3	shard	243.6	a_node_that_refuses_splits_once_its_refill_lands_leaves_the_retry_without_effect
+# shard 4: 2452.1 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
 4	node	159.6	the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_no_placeholder_reset
-4	node	72.9	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
 4	node	34.9	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
 4	node	2.7	a_follower_that_truncates_on_every_append_is_caught_on_the_node
 4	node	2.3	seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them
@@ -814,20 +939,22 @@
 4	shard	17.4	a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep
 4	shard	13.8	a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep
 4	node	12.8	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only
-4	shard	0.1	seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
-4	shard	0.1	seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view
-4	shard	0.2	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
-4	shard	0.2	seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
-4	shard	0.2	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
-# shard 5: 2252.7 cpu s
+4	shard	0.3	seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
+4	shard	0.4	seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view
+4	shard	1.0	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
+4	shard	0.3	seed_73_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
+4	shard	0.6	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
+4	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
+4	node	33.5	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves
+# shard 5: 2449.9 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
-5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
+5	shard	0.6	seed_2272_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
 5	shard	0.1	seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 5	shard	0.1	seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split
 5	shard	0.1	seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracking_afresh
-5	shard	0.1	seed_463_a_leader_refuses_the_reads_it_can_never_confirm
+5	shard	0.6	seed_1068_a_leader_refuses_the_reads_it_can_never_confirm
 5	shard	0.2	seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands
-5	shard	0.2	seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant
+5	shard	0.2	seed_9699_a_replica_restated_before_any_node_traced_its_split_may_grant
 5	shard	0.6	seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read
 5	shard	0.3	seed_41_an_install_onto_a_reseeded_replica_keeps_the_right_half_beside_it
 5	shard	0.6	a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep
@@ -856,14 +983,14 @@
 5	node	0.5	seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 5	node	0.9	seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 5	node	0.1	seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry
-5	node	1.0	seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse
+5	node	3.2	seeds_204_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse
 5	node	0.6	seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tail
 5	node	0.3	seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes
-5	node	0.2	seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse
+5	node	0.3	seed_145_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse
 5	node	31.2	the_range_layers_folds_agree_one_by_one_on_the_correct_node
 5	node	29.3	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival
 5	node	23.1	the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed
-5	node	0.4	seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
+5	node	1.0	seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
 5	node	18.0	a_placeholder_that_grants_votes_is_caught_by_check_20
 5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
 5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
@@ -877,7 +1004,19 @@
 5	reseed	6.6	a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm
 5	reseed	22.7	a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs
 5	node	60.4	a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario
-# shard 6: 2361.6 cpu s
+5	shard	5.5	a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_sweep
+5	reseed	20.6	a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught
+5	node	72.9	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
+5	node	0.5	seed_12_restarts_onto_one_ranges_switch_without_its_repair_and_state_machine_safety_reports_it
+5	node	0.4	seed_358_takes_a_term_received_before_its_isolation_and_stepped_inside_it_and_is_not_flagged
+5	node	22.6	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_the_sharded_meta_reorder
+5	node	22.3	the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves_gap
+5	reseed	46.9	a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back
+5	shard	0.2	seed_2147_an_install_decided_inside_an_isolation_begins_it_at_the_term_it_wrote
+5	shard	0.2	seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_wedge
+5	node	0.5	seed_137_under_a_shared_snapshot_dir_reads_the_wedged_half_as_wedged_beside_its_live_sibling
+5	shard	0.9	seed_16725_a_hold_let_go_with_no_switch_is_held_to_its_release_by_the_timer_check
+# shard 6: 2429.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -924,8 +1063,19 @@
 6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node
 6	node	22.2	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica
 6	split	335.8	a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_every_seed
-6	node	0.7	seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second
-6	shard	0.3	seeds_3870_and_5303_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries
-6	shard	0.2	seed_2097_a_restart_restates_the_quarantine_a_right_half_took_at_its_split
-6	shard	0.2	seed_9_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too
+6	node	1.3	seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second
+6	shard	0.9	seed_9535_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries
+6	shard	0.7	seed_329_a_restart_restates_the_quarantine_a_right_half_took_at_its_split
+6	shard	0.5	seed_68_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too
 6	shard	181.0	a_server_that_trusts_a_stale_descriptor_serves_what_a_write_through_r_replaced
+6	engine	52.4	a_span_checkpoint_without_syncs_is_caught
+6	shard	0.4	seed_992_a_retry_refused_once_the_refill_lands_takes_no_effect_and_the_check_says_so
+6	shard	0.3	seed_1248_a_retry_answered_done_is_read_on_the_askers_clock
+6	shard	0.4	seed_1032_a_retry_another_split_left_outside_its_range_is_answered_truly
+6	node	1.0	seed_89_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
+6	node	0.1	the_first_violation_print_cuts_a_verdict_on_a_character_boundary
+6	reseed	1.4	seed_26_a_node_restarted_over_the_replicas_its_installs_filled_holds_the_shape
+6	shard	0.8	seed_13283_a_split_inside_an_install_waits_for_switched_and_nothing_is_applied_twice
+6	install	6.5	a_receiver_silent_while_it_installs_has_its_streams_given_up
+6	node	1.0	seed_32_is_a_half_past_the_bound_of_the_heal_and_live_and_seed_300_no_longer_is
+6	node	1.4	seed_189_under_a_shared_snapshot_dir_fails_the_per_range_answer_through_a_half_alone

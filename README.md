@@ -37,8 +37,8 @@ machines runs inside a deterministic simulator, which injects the faults under a
 - **Every bug class comes as a pair.** For each failure mode there is a deliberately
   broken variant the sweep must catch, and the correct code it must pass, on the same
   seeds.
-- **Every decision is written down.** `docs/DECISIONS.md` holds 124 entries, and none
-  is ever deleted.
+- **Every decision is written down.** `docs/DECISIONS.md` holds over 120 entries, and
+  none is ever deleted.
 
 > In Greek myth Ananke is necessity, and the Fates, the Moirai, are her daughters. The
 > simulator's traces and scheduling come from [moirae](https://github.com/pchrysostomou/moirae),
@@ -52,9 +52,9 @@ machines runs inside a deterministic simulator, which injects the faults under a
 | **Code** | About 128 000 lines of Rust: 72 000 in the crates, 56 000 in the simulation and its checks |
 | **Released** | Phase 0 (the runtime and simulator), Phase 1 (the storage engine) and Phase 2 (Raft), tagged `v0.1.0` to `v0.3.0` |
 | **In progress** | Phase 3, multi-raft sharding. Stages A and B are done (tag `phase-3-stage-b`). Stage C (descriptors, routing, the meta range and split) is nearly done |
-| **Seeds per change** | 20 at the gate, 100 in CI, 1 000 before a merge, 10 000 every night in seven parallel jobs |
-| **Known-buggy variants** | 20 in the Raft core, 52 in the node and 11 in the range layer, plus 3 each in the WAL and the engine |
-| **Checks read off the trace** | Raft's five invariants, the 22 numbered checks of [SHARD.md §8](docs/SHARD.md), and a linearizability checker |
+| **Seeds per change** | 20 at the gate, 100 in CI, 1 000 before a merge (100 for the released phases' sweeps, D-094), 10 000 every night in seven parallel jobs; a variant caught at a high rate runs a tenth of the tier, never under 20 (D-061), and a few costly sweeps run a capped or fixed count (D-081, D-083) |
+| **Known-buggy variants** | 20 in the Raft core, 56 in the node and 14 in the range layer, plus 4 in the WAL and 12 in the engine |
+| **Checks read off the trace** | 15 of the 22 numbered checks of [SHARD.md §8](docs/SHARD.md): Raft's five invariants, the first four keyed by range and the fifth, linearizability, per key across every split, and lease safety under drift (checks 1 to 6); and the range layer's checks 7 to 10 and 16 to 20, the tiling check (19) among them since S7. The move and merge checks (11 to 15, 21, 22) come with Stages D and E |
 
 ---
 
@@ -91,18 +91,23 @@ The design of each layer is a section of the [SPEC](docs/SPEC.md). Raft's is
 ### Inside one node
 
 Phase 3 runs many Raft groups, one per range, on each node. They share one socket, one
-ticker and one storage engine, so that a node can carry thousands of ranges (SHARD.md §4).
+ticker and one storage engine, so that a node does not need a socket and a ticker per
+range. Phase 3 proves this at 1 000 ranges, about 300 replicas a node on ten nodes;
+10 000 ranges is a non-goal (SHARD.md §4).
 
 ```mermaid
 flowchart LR
   peers(("peers")) -- "batch frames,<br/>each message tagged<br/>with its range id" --> netin["net task"]
-  netin --> inbox["inbox<br/>bounded in bytes,<br/>constant-time admission"]
+  netin --> inbox["inbox<br/>bounded in bytes,<br/>admission in constant<br/>or logarithmic time"]
   inbox --> raft["raft task<br/>one ticker drives<br/>a core per range"]
   raft --> outbox["per-peer outbox<br/>one frame per peer<br/>per flush"]
   outbox --> peers
   raft -- "committed entries" --> apply["apply task<br/>writes, splits,<br/>meta updates"]
   raft -- "snapshot needed" --> snap["snapshot task<br/>checkpoint streams<br/>and installs"]
+  netin -- "snapshot chunks,<br/>diverted before the inbox" --> snap
+  snap -- "chunks in frames<br/>of their own" --> peers
   apply --> engine[("one storage engine<br/>every range's keys<br/>and Raft state")]
+  raft -- "log and hard state,<br/>one sync per round" --> engine
   snap --> engine
 ```
 
@@ -110,9 +115,11 @@ flowchart LR
 
 A range is a contiguous interval `[start, end)` of encoded keys, and the ranges tile the
 keyspace. Two system ranges hold the map. **Range 0, the root**, is found through
-configuration and hands out range ids in blocks. **Range 1, meta**, holds every range's
-descriptor (span, generation, voters). Clients cache descriptors and go back to meta when
-a server answers that a key is outside its span.
+configuration; it holds meta's descriptor and the node records, and hands out range ids
+in blocks. **Range 1, meta**, holds a record of every user range's descriptor (span,
+generation, voters). Clients cache descriptors. A server that finds a key outside its
+span answers with the descriptors it holds, which the client merges in by generation; it
+reads meta only when its cache has no entry for the key or the answer named none.
 
 A split happens in the parent's own log, so every replica applies it at the same index:
 
@@ -124,9 +131,9 @@ sequenceDiagram
   participant P as P's replicas
   participant M as range 1 (meta)
   L->>R0: lease a block of range ids (once per block)
-  L->>P: propose Split(at s, right half R)
-  P->>P: apply at one index: P keeps [start, s), R is created over [s, end)
-  Note over P: A replica whose P was installed past s never applies the split.<br/>It holds a placeholder for R, which grants no vote,<br/>until R's leader installs R.
+  L->>P: propose Split(at key k, right half R)
+  P->>P: apply at index s: P keeps [start, k), R is created over [k, end)
+  Note over P: A replica whose P was installed past index s never applies the split.<br/>It holds a placeholder for R, which grants no vote,<br/>until R's leader installs R.
   L->>M: MetaUpdate: P and R at their new generation
 ```
 
@@ -152,23 +159,29 @@ stream, so even iteration order is part of the seed.
 - **The scheduler.** It picks which runnable task to poll next, uniformly or with
   probabilistic concurrency testing, per seed.
 
-Every state transition that matters is a trace event. This is the echo scenario's seed
-42 at the moment node 3 crashes, from the trace whose hash `sim/tests/echo.rs` pins:
+Every state transition that matters is a trace event. This is seed 42 of the echo
+scenario's negative control, `NoSyncDir`, which never syncs the directory at rotation, at
+the moment node 3 crashes, from the trace whose hash `sim/tests/echo.rs` pins:
 
 ```jsonl
 {"t":1100000000,"seq":969,"kind":"log","node":3,"event":"ananke.fs.bit-rot","data":{"path":"/echo/journal.prev","block":0,"offset":212,"bit":4}}
 {"t":1100000000,"seq":970,"kind":"log","node":3,"event":"ananke.fs.write-torn","data":{"path":"/echo/journal","offset":96,"written":16,"kept":14}}
 {"t":1100000000,"seq":971,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal.prev","op":"rename"}}
 {"t":1100000000,"seq":972,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal","op":"link"}}
+{"t":1100000000,"seq":973,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal.prev","op":"rename"}}
+{"t":1100000000,"seq":974,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal","op":"link"}}
+{"t":1100000000,"seq":975,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal.prev","op":"rename"}}
+{"t":1100000000,"seq":976,"kind":"log","node":3,"event":"ananke.fs.dir-entry-lost","data":{"dir":"/echo","entry":"/echo/journal","op":"link"}}
 {"t":1100000000,"seq":977,"kind":"fault","fault":"crash","node":3,"cause":"schedule"}
 {"t":1100000000,"seq":978,"kind":"fault","fault":"restart","node":3}
 ```
 
 In that one instant, a bit of the rotated journal flipped, the last record lost two of
-its sixteen bytes, and the rename and create of the last rotation, never synced, did not
-survive. A Raft record can also carry `decidedNs`, the time its step was decided, where
-that came before what it reports was durable (D-047). Checks about *why* a server acted
-read the decision time.
+its sixteen bytes, and the renames and creates of the last three rotations, which this
+variant never syncs, did not survive. The correct journal, the one `ananke-server` ships,
+syncs the directory after every rename and create. A Raft record can also carry
+`decidedNs`, the time its step was decided, where that came before what it reports was
+durable (D-047). Checks about *why* a server acted read the decision time.
 
 ---
 
@@ -199,8 +212,11 @@ flowchart LR
   whenever the code does, so a pin asserts the situation it was pinned for, or its
   absence with the reason.
 - **Four tiers of seeds** ([D-040](docs/DECISIONS.md), D-061): 20 at the gate, 100 in CI,
-  1 000 before a merge and 10 000 every night. A variant that fires on under 5 % of
-  seeds asserts its catch only from the thousand, where the miss rate is negligible.
+  1 000 before a merge and 10 000 every night. A variant caught on under 5 % of seeds
+  asserts its catch only from the thousand, where the miss rate is negligible, and the
+  fault's firing, wherever that is well above 5 %, at every tier. The released phases'
+  sweeps run 100 before a merge (D-094), so their thin catches are asserted in the
+  nightly alone.
 - **Bounds are never widened to get green.** If the correct system trips a bound, the
   system or the reading is wrong, and the owner decides which.
 - **Decisions are append-only.** Every choice the documents do not settle becomes an
@@ -231,7 +247,7 @@ flowchart LR
 | 0 | Deterministic runtime (§1) | The echo protocol under partitions with its trace open in the studio; byte-identical traces for one seed, checked in CI; clippy's `disallowed-methods` for all direct I/O | ✅ `v0.1.0` · [devlog](docs/devlog/00-phase-0.md) |
 | 1 | Storage engine (§2) | Random operations and crash points recover to the model's state; 10 000 seeds green nightly; over 200 000 writes/s single-threaded as a sanity number | ✅ `v0.2.0` · 299 169 writes/s in unsynced batches of a hundred · [devlog](docs/devlog/01-phase-1.md) |
 | 2 | Raft (§3) | The five invariants across 10 000 seeds under the network and disk fault model; 3 → 5 → 3 under partition completes both ways with no gap in completed client operations over ten maximum election timeouts | ✅ `v0.3.0` · worst membership gap 549 ms against the 2 s bound · [devlog](docs/devlog/02-phase-2.md) |
-| 3 | Multi-raft sharding (§4) | Linearizability across split, merge and rebalance under faults; a 1 000-range cluster stays balanced within 10 % after a node is added and removed | 🚧 Stages A and B done (`phase-3-stage-b`). Stage C: slices S1 to S11 on `main` except S7, which waits on an owner ruling (D-093); S12 (meta reordering) and S13 (close-out) in progress. Then D (moves, collection) and E (merge, rebalancer). Plan: [#162](https://github.com/pchrysostomou/ananke/issues/162) |
+| 3 | Multi-raft sharding (§4) | Linearizability across split, merge and rebalance under faults; a 1 000-range cluster stays balanced within 10 % after a node is added and removed | 🚧 Stages A and B done (`phase-3-stage-b`). Stage C: slices S1 to S12 on `main` except S8 (c) (a re-seeded node's right halves); S7 (check 19), S12 (meta reordering) and S8 (c)'s clause half (check 8's right half's clause under the owner's reading R of D-107, D-141) landed with the Stage C integration, S8 (c)'s installed voter's bound measured and put to the owner; S13 (close-out) in progress. Then D (moves, collection) and E (merge, rebalancer). Plan: [#162](https://github.com/pchrysostomou/ananke/issues/162) |
 | 4 | Transactions (§5) | elle reports no snapshot-isolation anomalies over simulation traces; an injected bug is caught within 100 seeds | Planned |
 | 5 | SQL (§6) | A sqllogictest subset passes; `psql` connects and runs the demo schema | Planned |
 | 6 | Security (§7) | A STRIDE-reviewed threat model; no plaintext user data recoverable from a dumped disk; a tamper-evident audit chain | Planned |
@@ -261,7 +277,13 @@ asserts its mechanism.
   shapes reached a split applied through the log while a snapshot of the same range was
   being installed. The switch used the span copied when the stream began, and removed
   the new right half's keys. The span is now read at the switch, and the applied index
-  is checked again there.
+  is checked again there. A split applied after the install was numbered could still
+  remove those keys (seed 13283, past the nightly's range); D-133
+  ([#239](https://github.com/pchrysostomou/ananke/pull/239)) now holds a range's switch and
+  its split's apply against each other. The routes D-133 §5 names stay open, and
+  [#225](https://github.com/pchrysostomou/ananke/issues/225) records them. A commit of
+  #239 says "Closes #225", so the merge closes that issue, and it must then be reopened
+  (or its open routes moved to an issue of their own).
 - **A leader that could never confirm a read** (seeds 128 and 643, D-129). With two of
   a range's three voters quarantined, the leader kept committing but could never confirm
   a read, and its outstanding reads grew without bound. By the owner's ruling, a leader
@@ -304,8 +326,8 @@ asserts its mechanism.
 - **A flipped bit that named an older manifest** (D-022). Bit rot turned `000007` in
   `CURRENT` into `000003`, a manifest that still existed, and recovery deleted four newer
   tables as orphans. `CURRENT` now carries a crc32c.
-- **A cut that came back** (seed 191) and **a fallback onto deleted tables** (seed 44),
-  both in D-022.
+- **A cut that came back** (seed 191, in the [Phase 1 devlog](docs/devlog/01-phase-1.md))
+  and **a fallback onto deleted tables** (seed 44, D-022).
 
 The full accounts, with seeds, traces and commits, are in the devlogs and in
 [DECISIONS.md](docs/DECISIONS.md).
@@ -319,7 +341,7 @@ git clone https://github.com/pchrysostomou/ananke && cd ananke
 rustup toolchain install     # the toolchain pinned in rust-toolchain.toml
 
 scripts/gate.sh              # rustfmt, clippy, the direct-I/O check, docs, every test (20 seeds)
-scripts/premerge.sh          # every current sweep at 1 000 seeds in release, catch rates printed
+scripts/premerge.sh          # every current sweep at 1 000 seeds (some fewer, see above) in release, catch rates printed
 ```
 
 `scripts/gate.sh` is the one command that precedes every commit. Any tier can be run by
@@ -330,13 +352,14 @@ ANANKE_SEEDS=500 cargo test --release -p ananke-sim --test engine
 ANANKE_SEEDS=1000 cargo test --release -p ananke-sim --all-features --test shard -- --nocapture
 ```
 
-A sweep writes each failing seed's trace to `sim/out/<scenario>-<seed>.jsonl`, and the
-nightly uploads those as artifacts. A seed runs the same whichever thread runs it, so to
-replay one, call its scenario with it:
+The main sweeps write each failing seed's trace to `sim/out/<scenario>-<seed>.jsonl`
+(the re-seed and install sweeps do not yet), and the nightly uploads those as
+artifacts. A seed runs the same whichever thread runs it, so to replay one, call its
+scenario with it:
 
 ```rust
 let report = ananke_sim::raft::run(5909, ananke_raft::core::Variant::Correct);
-ananke_sim::write_trace("raft-5909", &report.jsonl); // sim/out/raft-5909.jsonl
+ananke_sim::write_trace("raft-5909", &report.jsonl()); // sim/out/raft-5909.jsonl
 report.check().unwrap();
 ```
 
@@ -345,10 +368,13 @@ cargo test --release -p ananke-sim --all-features --test shard seeds_3870   # a 
 npx moirae replay sim/out/raft-42.jsonl                                     # open a trace in the studio
 ```
 
-The three-process echo cluster on real sockets:
+The three-process echo cluster on real sockets, one process per node:
 
 ```sh
-cargo run -p ananke-server -- echo --listen 127.0.0.1:7001 --peers 127.0.0.1:7002,127.0.0.1:7003 --duration-secs 3
+cargo build -p ananke-server
+target/debug/ananke-server echo --listen 127.0.0.1:7001 --peers 127.0.0.1:7002,127.0.0.1:7003 --duration-secs 3 &
+target/debug/ananke-server echo --listen 127.0.0.1:7002 --peers 127.0.0.1:7001,127.0.0.1:7003 --duration-secs 3 &
+target/debug/ananke-server echo --listen 127.0.0.1:7003 --peers 127.0.0.1:7001,127.0.0.1:7002 --duration-secs 3; wait
 ```
 
 ---

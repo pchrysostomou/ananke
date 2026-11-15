@@ -101,6 +101,249 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Stage C integration (2026-11-15), branch `integ-stage-c-2026-11-15` off `main` at 3030e34: one tree
+  holding #242, #253, #246, #247, #237, #238, #240, #254, #244, #239, #249, #251, #243 and #252,
+  and in a second round the updated tips of #240, #249 and #243 and #255 (D-118, D-121, D-124 to
+  D-127, D-133, D-135 to D-138, D-140 and D-141, with #247's corrections to D-134, which merged in
+  #236; D-139 and D-142 stay reserved for later commits, the owner's rulings of 2026-11-14 and
+  2026-11-15, and the footer reads D-143). Variant bits made unique, each renumbered entry saying
+  so: node bit 52 stays D-133's `SplitAppliesInsideTheSwitch`, D-126's `SwitchForgetsLateApplies`
+  moves to 53, D-138's `ReplayedRangeRefusesItsSplit` to 54 and D-127's `SilentWhileInstalling` to
+  55 (`NodeVariant::BUGS` 56); range bit 11 stays D-137's `RefusedAfterRefill`, D-140's
+  `SplitLeavesGap` moves to 12 and D-141's `RestartDropsRightHalves` to 13 (`RangeVariant::BUGS`
+  14). D-127's answers moved every node schedule under the other PRs' new pins, so each was
+  re-audited by search on the integrated tree:
+  D-118's seed 91 is seed 12 and seed 358 an absence; D-121's 76, 69 and 105 are 137, 189 and 32,
+  and 300 an absence; D-133's 13283 (not searched), D-134's 16725 (its own pin now) and D-137's
+  1032 are absences on both of the sharded sweep's schedules (for 13283, which draws no shape,
+  the two are one). D-127's 1314 and 73 and D-137's 992 under its instrument and 1248 hold on
+  the shaped schedule, and each asserts its situation absent from the sweep's schedule (D-135's
+  `absent_from_the_sweep`, restored at the finish after the verifiers found it removed on a false
+  premise). D-133's directed test reads D-126's restatement rule. D-118's, D-136's and D-140's
+  rates are re-measured on the integrated tree and noted in each entry. The nightly table is the union, rebalanced off shard 1 (#233). Round 2: #240's tip
+  tightens seed 18925's predicate (an absence on both schedules here); #249's keeps past the
+  snapshot only over a store below it at the numbering, and its docs' seed 13283 reaches the late
+  job on neither schedule of the integrated tree (probed); #243's bounds D-127 Q1's recommendation
+  and seed 6773's pin asks the checks `check` hides, D-141's clause among them here; #255's pin and
+  planting run on seed 2388 with D-127's move, its row went into shard 4 (2418.6 -> 2452.1), and
+  on the integrated tree its instrument is caught on 7 of 20 and 44 of 100, the sharded sweep at
+  1 000 passes with both coverage assertions (182 and 24 seeds), and the node sweep at 1 000 passes.
+  **Issues the merge closes:** a820ee1 (#239) says "Closes #225", so #225 closes when the merge
+  reaches `main`, though D-133 §5's routes stay open. Reopen it then, or move its open routes to an
+  issue of their own (D-133 §7, question 6). 1d10694 (#238) says "Closes #167", deliberately: #167
+  closes once the correct node is green at ten thousand, and the merge waits for that nightly.
+  **Found and not fixed, blocking the ten thousand:** seed 1137 of the sharded sweep's own schedule
+  fails the correct system on the meta convergence bound. Range 51, a right half, has one able
+  voter (node 2), one placeholder stuck `ParentPastTheSplit(216)` (node 1) and one quarantined
+  replica (node 3, re-seeded, its quarantine taken from range 2 by D-130), and #220's exception does
+  not excuse that. D-127's own sweep runs the shaped schedule, where 1137 passes, and D-135's ten
+  thousand ran without D-127's answers, so it takes both. Widening the exception is the owner's
+  ruling (D-135 §5's note). Not pushed.
+- Branch `phase-3-stage-c-right-half-clause` (2026-11-15), off 8760c49 (#236), **PROPOSED D-141,
+  #162's S8 (c), the clause half.** Check 8's right half's clause under the owner's reading R of
+  D-107 (2026-11-14): R owed from a voter's apply of the split and kept across its restarts, from a
+  restatement past the split only where no install had put the voter's P there when it was restated,
+  and from an installed voter's holding R. Asserted beside the node sweep's and the sharded sweep's
+  verdicts, not in `Checker::verdict`; the correct system trips it on none of the sharded sweep's
+  10 000 seeds or the node sweep's first 1 000. Instrument `RestartDropsRightHalves` (range bit 13
+  since the Stage C integration, 11 on the branch; outside §10's count), caught on 10 of 20 and 52
+  of 100 compared node seeds; the correct node's fold-by-fold test is its pair. The sharded sweep
+  asserts that reading R was reached where it differs from §8's reading. The installed voter's
+  bound is built, measured and printed and **not asserted**: the correct system fails a 5.632 s
+  bound on 117 of 10 000 sharded seeds, all #220's wedge, so it is the owner's question (D-141,
+  option (a) recommended). `PlaceholderAnswersNothing` was built and removed. Review F1 to F8
+  fixed in place. Second review (round 3): an installed voter that holds R at a restatement owes
+  it from there (S1), and T1 to T3 fixed; S2 and S3 filed as #256.
+- Branch `phase-3-stage-c-liveness-split-halves` (2026-11-14), off `main` at c5cd18d, PROPOSED
+  **D-121** (footer stays D-133), **#148's remainder after #216**: `Report::liveness`, which
+  `check()` asks of the node sweep and every run but `sim/shard.rs`'s, now follows the splits as
+  D-113 §5's reading does there. A key is asked on the majority of the range serving it at the
+  run's end; each range a split cut is read from its first post-heal write in the history, a half
+  whose writes all stayed pending the wedge; and D-076's reading from the heal over the starting
+  map stays, asked first and unchanged (renamed `writes_after_heal_by_starting_range`), so no run
+  it failed passes. Both readings now key a write by the range serving its key when it completed,
+  as D-102 keyed the exemption: read at the end, a right half born after the heal was passed on
+  its parent's completion. Measured in release, each run once under both readings: no verdict
+  moved on the correct node (seeds 0 to 499, 777 live halves, worst 721 ms from its first write),
+  `SharedSnapshotDir` (0 to 299, 73 of 150 uniform failing either way) or `sim/shard.rs` (0 to 499),
+  nor on the 32 other variants the node sweep runs (seeds 0 to 39 each, a spot check); no `check()`,
+  no off-schedule attribution and no key's asking moved; `SharedSnapshotDir` leaves a half the
+  starting map read live on 12 of 300, each also a per-key catch, and on 5 of them (69, 80, 257,
+  277, 293) a half alone fails `liveness`'s per-range answer (`liveness_of_the_ranges`, the code
+  `liveness` asks), which its sweep counts and asserts from the ten thousand; the other 7 the
+  reading from the heal already fails on another range (seed 76's range 5). Read from the heal the
+  correct node would fail seeds 105, 225 and 300, and from the invocations seed 300.
+  Pinned: seed 76 under `SharedSnapshotDir` (the keying: the wedged half beside a live sibling),
+  seed 69 under it (the per-range answer failed by a half alone, which fails with the halves not
+  asked) and seeds 105 and 300 of the correct node (the clock); eight hand-built cases; ten plants
+  each caught. Three nightly rows, shard 4. **From the review**: the keying by completion also
+  passes a left half D-113's arm failed (a parent's completion before the split of a key its right
+  half serves later), named in D-121 with a hand-built pair and asked of the owner, recommended
+  taken (D-102's rule); no sharded run reaches it (17 variants, seeds 0 to 59, and the correct
+  sweep's 0 to 499). Refs #148, not closed: a half that proposes nothing is in no reading (#197).
+- Branch `phase-3-stage-c-resend-bound` (2026-11-14), off c5cd18d, **PROPOSED D-127** (footer D-133
+  unchanged), Closes #120: **the node's resend bound was tripped by receivers that held the chunk.**
+  Measured on c5cd18d, `sim/install.rs` gave up 21 streams on 14 of 32 seeds with every receiver up,
+  each while the receiver's `snapshot` task was making an install (its own or another range's) and
+  answering nothing; since D-109 that, not #120's pending window, is what tripped there, and the
+  pending window is what trips on the raft sweep's live installs. The node now answers every chunk
+  it holds: `Waiting` while a stream's install is pending, and from the `net` task while the
+  `snapshot` task makes an install; and an answer counts from when it reaches the sender's node,
+  not when it is read (one of the 21 was given up with its answer queued). After: no stream given
+  up on those 32 seeds, longest resend run 3; `CHUNK_RESENDS` stays 4. New trace event
+  `RaftSnapshotGaveUp`, asserted absent by `sim/install.rs`; new variant `SilentWhileInstalling`
+  (node bit 55 since the Stage C integration, 52 on the branch), caught there on 16 of 32 seeds; one nightly row. **The answers moved every node
+  schedule, and 26 pins with them** (none a correct-system failure): each was re-audited, twelve
+  moved to a seed that carries the shape (463 -> 1068, 3291 -> 9699, 3870/5303 -> 9535,
+  2097 -> 329, 9 -> 68, 992 -> 1314, 16725 -> 73, 45 -> 2388 with `RIGHT_HALF_PINNED`,
+  219 -> 522, 12/76 -> 204/8, 613 -> 145, check 16's 48/66 -> 12/20; 633's hold -> 89, beside
+  633's absence; the membership shape -> seed 1972), the rest the absence with its reason; the
+  table is in D-127, the rows in `scripts/nightly-shards.txt`. **The shard scenario's plain
+  schedule failed the correct system on seeds 2147 and 6773** (both passing on c5cd18d and on the
+  shaped schedule the sweep runs for them; review F1). 2147 was the pre-vote check's: it read a
+  refused replica's lost term against an install decided inside the isolation and traced after it.
+  Fixed (`Report::created_term_by`, a unit test that the reading before fails, seed 2147's pin). 6773
+  is the per-key liveness reading counting a write truncated by an election, which one try leaves
+  open for ever, on a live range: **D-127 Q1 asks the owner** whether such a write is evidence
+  (recommended: not where the range serving its key completed a write called after it, so a range
+  in churn that completes nothing still fails; not built, its plants named; second review F1);
+  seed 6773's pin holds the shape and today's verdict until the ruling, and asserts the checks
+  after the write bound directly (#250).
+- Branch `phase-3-stage-c-replayed-range-split` (2026-11-14), off c5cd18d (`main`), PROPOSED **D-138**
+  (footer D-139; D-133 to D-137 are other open branches'), Closes #199: **a correct-server state
+  machine safety failure**, a re-seeded node refusing the split of a user range its log brought back,
+  which holds no descriptor, while every other replica takes it. The split's apply on a replica with
+  no descriptor now applies from the descriptor configuration names, the index-0 one its replay
+  implies (SHARD.md §2, D-098's precedent), and makes the right half as a first apply does. Where that
+  descriptor comes from is put to the owner (D-138 §3: at the split, built; not at the re-seed, which
+  would undo D-128's order and its tests). The pair is `ReplayedRangeRefusesItsSplit` (node bit 54 since the Stage C integration, 52 on the branch) on
+  `reseed::run_split_of_a_replayed_range`, caught by state machine safety on 20 of 20, beside a
+  directed test of the correct node on the binary's 200 and a unit test of `ServerApplier::split`. On
+  this tree the `reseed` binary at `ANANKE_SEEDS=1000` passes, 18 of 18, and the sharded sweep at
+  10 000 seeds passes with 0 failures. Not closed, named in D-138 §5 and reached on no seed: a right half
+  installed beside such a replica before it replays to the split. The premerge has not run.
+- Branch `phase-3-stage-c-restart-over-installed` (2026-11-14), off c5cd18d (`main`), **PROPOSED
+  D-126** (footer D-133), Closes #113. The issue's failure, the re-seed shape with a second restart
+  failing "an apply through 389 names index 384", is not reproduced by search: on this tree no gap
+  and no server failure over seeds 0 to 999 of the recipe (`reseed::run_restarted_again`), and on the
+  issue's own tree, 64ace84, none over 0 to 299, seed 26 included. Its numbers point at a path still
+  open: a job the replaced core queued before a live install's hold, landing after the switch. Its
+  record compacts the new replica past the applied watermark, and D-086's restatement at `Switched`
+  takes the `apply` task and the store back below what it applied. Fixed: a compaction carries the
+  watermark with it (`Cores::step`), and the restatement takes nothing back (`kept_past_the_switch`).
+  New node variant `SwitchForgetsLateApplies` (bit 53 since the Stage C integration, 52 on the
+  branch; the shape's fourth), paired as units in `round` and `server`, since no sweep reaches the
+  late job at its tiers (0 of 8 892 snapshots, each read from its install's hold,
+  `reseed::late_applies`; seed 13283 of the sharded sweep, past the nightly's range, does). The
+  recipe is pinned on seed 26, not swept: over the
+  tier its longest trace is 397 564 of the runaway cap's 400 000, and seed 344 passes it. Its review
+  (2026-11-15) found the `snapshot` task's own restatement in `finish` still took back a late job
+  that applies while `install_spans` is in flight (F1): it moves only up now, paired through a test
+  seam after the switch, and the restatement at `Switched` is held at its two call sites (F2). Left
+  open and asked of the owner (D-126 §7, §8): a late job's entries at or below the snapshot,
+  landing in that window, are applied again over the installed state, and one in flight across the
+  restatement is refused and fails the range; the recommendation is #225's exclusion widened to
+  every apply of the range. A second review (2026-11-15) found the keep in `finish` rested on
+  D-132's second re-check, which `InstallReplacesCopiedSpan` skips, so under that variant it kept
+  an index the switch had overwritten (N1): `finish` now keeps only where the store stood below
+  the snapshot at the numbering, every store on the correct node, held by a directed test; and the
+  docs now say the window fails the range too (N2) and that seed 13283 reaches the late job (N3).
+- Branch `phase-3-stage-c-install-split-exclusion` (2026-11-14), off 0d67f99 (S11's tip, #228, with
+  #226), **PROPOSED D-133**, Refs #225 (not closed): **route 1 of #225, a correct-server data loss and a double
+  apply**, a split's apply landing between an install's numbering and its switch (seed 13283 of the
+  sharded sweep, past the nightly's range). A range's install and its split's apply now exclude each
+  other through `install::SwitchOrSplit`: the switch holds the range from D-132's re-check to the host's
+  `Switched`, where the applied index is restated, and the split holds the parent from its descriptor's
+  read to both halves in the table. Held only to the switch, seed 13283 still failed, 168 applied
+  between the switch and `Switched` and again after it, so the hold runs to `Switched`. The pair is
+  `SplitAppliesInsideTheSwitch` (node bit 52), caught by check 8's install clause on a directed test of
+  four cases and on seed 13283's pin. Route 2 (#215's related window, a placeholder admitted before the
+  host steps `Switched`) is not closed: no split's apply is on it; a directed test asserts it open and
+  it needs an issue of its own. Non-split entries applied inside the switch are named in D-133 §5.
+  PR #239's review: "Closes #225" would have closed the only record of route 2, of #225's audit routes
+  1 to 3 for every apply but a split's and of its route 4 (check 8's install clause), so the branch now
+  says "Refs #225"; a820ee1's own message still says "Closes #225" (D-133 §7, question 6). D-133 §5 names
+  each audit route as this tree leaves it, §6 gives the 10 000-seed sweep and seeds 10 000 to 19 999,
+  and §7 asks whether the hold is widened to every job of the range, as the audit proposes.
+- Branch `phase-3-stage-c-check19-tiling` (2026-11-15), off 8760c49 (#236), **PROPOSED D-140**, #162's
+  S7, on the owner's ruling of 2026-11-14 on D-093 (option A): check 19, the ranges tile the keyspace, as a
+  fold of the range layer's checker (`invariants::Tiling`), asked last by its verdict; the keyspace is the
+  union of the bootstrap's spans and a range's latest value the one at the highest index of check 7's map.
+  Its instrument `SplitLeavesGap` (outside §10's count) writes a split's right half one key short; check 19
+  trips on exactly the seeds a split took effect on, under the per-fold equivalence test on the node sweep
+  and on the sharded sweep, at every tier; check 18's split clause sees the same apply, which D-093 missed.
+  The correct node sweep passes seeds 0 to 999; the sharded sweep's ten thousand ran beside the gate and
+  the commit says what they reported. Two nightly rows, into shards 4 and 3. After its review: the sharded
+  half asserts the gap's words and that checks 18 and 19 alone are in violation; a merged range comes back
+  only at a value above its `Subsume` index; a non-voter's apply of a split ahead of every voter would trip
+  the gap clause on the correct system, which Stage C cannot reach and D-140's question 6 puts to the owner.
+- Branch `phase-3-stage-c-d092-run-and-effect` (2026-11-14), off 0d67f99 (S11's tip, #228, which
+  carries #226), **PROPOSED D-137**, Closes #222: the two halves of D-092's per-seed assertion #216's
+  review found unasked. Check 18 compares the run: each start states the run nonce it drew on
+  `RangesRestated`, `SplitLineage` holds the run each term's leader took office in, and a split's
+  right half has to lie in a block granted to that run, not only that node; a leader with no run
+  stated is the clause's own violation. `IdBlockResumed` on the sharded sweep is caught by check 18
+  on 61 of 100 and 8 of the gate's 20 (42 and 4 before), 28 and 6 of them by the run's words; on the
+  node sweep fold by fold on 85 of 100, 40 by the run's. D-092's retry has to take effect: an asked
+  asker's answer must come with its split applied, or be a `KeyOutsideSpan` the trace shows true
+  because another split of the range left the key outside (`Report::split_fate`), read on the
+  asker's own clock (`RunHeader::node_time`, new). Both readings came from the correct sweep's first
+  ten thousand under this check, 19 seeds failed by the check's defects: 17 by comparing the asker's
+  skewed clock with the records' global time (seed 1248 pinned), 2 by a split another split
+  superseded (seed 1032 pinned). The pair is `RefusedAfterRefill` (range bit 11, an instrument), a
+  node that refuses every split `NotLive` once its refill lands: 7 of 1 000 seeds caught, each passed
+  by the old reading, asserted at the thousand (D-061), seed 992's pin under it at every tier.
+  `RefillNotResent` is unchanged, 32 of 100 and 8 of 20, all with no answer. The correct sharded
+  sweep passes 10 000 seeds, 0 fail, its shapes' figures D-131's to the seed, so no schedule moved;
+  the correct node sweep passes its 1 000. Not merged.
+- Branch `phase-3-stage-c-meta-reorder` (2026-11-14), off 0d67f99 (S11's tip, #228, carrying #226),
+  **PROPOSED D-135, #162's S12.** `Fault::MetaReorder` on `sim/shard.rs`, stream `meta-reorder`, one
+  on every seed that draws a shape, in the first half of the faults: a range that can split twice, led
+  off the meta range's leader's node, is split with its leader's link to that node blocked one way for
+  `META_REORDER_HOLD` (700 ms, measured: the second split's update applies at median 366 ms, 298 of
+  383 within it at a thousand seeds); its left half's lead goes to the third node, which splits it
+  again over an open link, so the first split's update reaches meta after the second's. Fired on 482
+  and reordered meta on 293 of 1 000 seeds, both asserted at every tier; the correct system passes
+  10 000 seeds under it. `MetaOverwritesByArrival`
+  under it: check 16 on 351 of 1 000 (68 before), on every reordered seed, now asserted at every tier;
+  the meta convergence bound on 29 of 1 000 (12 before), asserted over the thousand. A fold-by-fold row
+  for check 16 on the sharded sweep's trace, 30 of 100. Pins: the plain schedule's fifteen did not
+  move; seed 16725 still reaches its situation; 707, 5620, 992 and 18925 run `Schedule::shaped`, the
+  schedule they were found on, with their situations asserted absent from the sweep's. After #240's
+  review: seed 18925's absence names its own situation (it named 992's, false on either schedule),
+  and each of the four asserts its predicate true on its shaped run first; the hold's effect is
+  asserted over the thousand, a first's update after the second's on more than half the seeds meta
+  applied the second's on (293 of 383; with the block taken out 3 of 38 at the hundred and 19 of 396
+  at the thousand, where it fails); the reordered seeds are printed as well as counted. D-135 §9 asks
+  the owner about both. After the second review: 18925's predicate also asks for the arm's asker's
+  retry after its first `NoRangeId`, and D-135 §2's estimates are this tree's measures.
+
+- Branch `phase-3-stage-c-snapshot-current-last-check` (2026-11-14), off 0d67f99 (S11's tip, #228,
+  carrying #226), **PROPOSED D-118, #126 and #167**: the inbox carries the `net` task's receipt
+  stamp, the node's restatement restates each record's `taken`, and `SnapshotWithoutCurrentLast` is
+  caught on the node by state machine safety on 19 of 1 000 seeds (1.9 %, asserted from the
+  thousand), with the correct node green at 1 000 and seeds 91 and 358 pinned. Four readers that
+  counted `taken: true` as a take read `snapshot_takes_of` now, so a restated take is not counted.
+  The review (2026-11-15): the correct node at 10 000 is the nightly's and has not run on the tip,
+  so #167 closes only once it is green; `halves_installed` was a fifth reader of `taken: false` the
+  entry left out, now named there and its documentation corrected.
+- Branch `phase-3-stage-c-routing-print-utf8` (2026-11-14), off 0d67f99 (S11's tip, #228 with #226),
+  **PROPOSED D-124**, Closes #168. A routing variant's first-violation print cut its verdict at byte
+  200 and could panic inside a `§` or a `—`, failing the variant's test on a print, not on a check; it
+  now cuts at 200 characters with `head`, through `first_violation`. Its unit test builds the three
+  verdicts that put byte 200 inside either character and panics on the old cut (plant M1); a byte cut
+  moved back to a boundary fails it too (M2). One `node` row in the nightly's shard 4. Nothing else
+  moves.
+- Branch `phase-3-stage-c-commit-majority-birth` (2026-11-14), off 0d67f99 (S11's tip, #228),
+  **PROPOSED D-125** (footer stays D-133), Closes #105: `Checker::note_group` takes a group's
+  first configuration from its first `RangeCreated` that names voters, falling back on `initial`,
+  so a creation by a node outside the configuration is no birth. Latent on this tree, since no
+  creation names no voters; three unit tests over hand-built records in both orders, each seen to
+  fail under the old reading, and a fourth, after review, that a later creation naming other
+  voters does not replace the birth, seen to fail under a plant that takes the last. The sharded
+  sweep at 10 000 seeds fails none. Found beside it and
+  filed as #235: an install on the node traces no `RaftConfig` for the configuration it puts in
+  force.
 - Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
   **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
   ended in a switch, so a hold the node let go with no switch was measured as a running core (seed

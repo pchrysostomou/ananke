@@ -45,6 +45,7 @@
 //! | `RaftSnapshotStartOver` / `RaftSnapshotState` | `log` `ananke.raft.snapshot-start-over` / `.snapshot-state` |
 //! | `RaftSnapshotReleased`                   | `log` `ananke.raft.snapshot-released`         |
 //! | `RaftSnapshotOverlapped` / `RaftSnapshotRestream` | `log` `ananke.raft.snapshot-overlapped` / `.snapshot-restream` |
+//! | `RaftSnapshotGaveUp`                     | `log` `ananke.raft.snapshot-gave-up`          |
 //! | `RaftMatchStarted` / `RaftLearnerRound` / `RaftChangeAccepted` | `log` `ananke.raft.match-started` / `.learner-round` / `.change-accepted` |
 //! | `RangeCreated` / `RangeDescriptor` / `RangesRestated` / `RangeReplicaCreated` | `log` `ananke.range.created` / `.descriptor` / `.restated` / `.replica-created` |
 //! | `RangeSplit` / `RangeSubsumed` / `RangeMerged`           | `log` `ananke.range.split` / `.subsumed` / `.merged` |
@@ -1138,6 +1139,15 @@ fn convert(
                 ("offset", int(*offset)),
             ])),
         ),
+        // PROPOSED(D-127): the resend bound's give-up is traced.
+        TraceEvent::RaftSnapshotGaveUp { server, range, to } => log(
+            "ananke.raft.snapshot-gave-up",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("to", int(*to)),
+            ])),
+        ),
         // D-042: store incarnations.
         TraceEvent::RaftProgressReset {
             server,
@@ -1405,9 +1415,10 @@ fn convert(
                 ("state", Json::str(state.as_str())),
             ])),
         ),
-        TraceEvent::RangesRestated { ranges } => log(
+        // PROPOSED(D-137): the run stated at the node's start.
+        TraceEvent::RangesRestated { ranges, run } => log(
             "ananke.range.restated",
-            Some(Json::obj(vec![("ranges", ids(ranges))])),
+            Some(Json::obj(vec![("ranges", ids(ranges)), ("run", int(*run))])),
         ),
         TraceEvent::RangeReplicaCreated { range } => log(
             "ananke.range.replica-created",

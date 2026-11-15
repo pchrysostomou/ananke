@@ -2300,6 +2300,12 @@ mod tests {
     /// liveness clause called it wedged because no write of it completed.
     const SEED_1969: u64 = 1969;
 
+    /// The run seed 1969's shape is built from since PROPOSED D-127 moved seed 1969 off it:
+    /// the first seed after it with a range asked reads, each answered, before its first
+    /// write after the heal.
+    // PROPOSED(D-127)
+    const SHAPE_SEED: u64 = 1972;
+
     /// Seed 1969, pinned in CLAUDE.md's absence form: **on this tree no range of its run
     /// is left unasked for a write after the heal**, so the situation it was pinned for is
     /// absent, and this asserts the absence rather than a bare green.
@@ -2333,10 +2339,14 @@ mod tests {
         );
     }
 
-    /// Seed 1969's shape, built from seed 1969's own run on this tree, and the clause's
-    /// answer to it and to the wedges beside it (PROPOSED D-103). No record is invented:
-    /// every case is the run's own records, cut short, with some left out or with one
-    /// range's answers kept.
+    /// Seed 1969's shape, built from a run of this tree, and the clause's answer to it and
+    /// to the wedges beside it (PROPOSED D-103). No record is invented: every case is the
+    /// run's own records, cut short, with some left out or with one range's answers kept.
+    ///
+    /// The run was seed 1969's own until PROPOSED D-127, whose answers to the chunks a node
+    /// holds moved its schedule so that no range of it is asked reads before its first write
+    /// after the heal any more. It is [`SHAPE_SEED`]'s now, the first seed after 1969 whose
+    /// run has such a range.
     ///
     /// On 314ac8f the seed's range 5 was asked for reads and no write after the heal, and
     /// answered every read. On this tree no range of the run is left so (the pin above),
@@ -2356,10 +2366,11 @@ mod tests {
     ///   way: proposed, and never applied.
     // PROPOSED(D-103): a range not asked for a write after the heal is no evidence; one
     // asked for anything and answering nothing still is.
+    // PROPOSED(D-127): built on seed 1972, since D-127 moved seed 1969 off the shape.
     #[test]
     fn a_range_not_asked_for_a_write_after_the_heal_is_no_evidence_and_one_asked_still_is() {
-        let mut report = run_on(Cluster::Node, SEED_1969, Variant::Correct);
-        assert!(report.uniform(), "seed 1969 is uniformly scheduled");
+        let mut report = run_on(Cluster::Node, SHAPE_SEED, Variant::Correct);
+        assert!(report.uniform(), "seed {SHAPE_SEED} is uniformly scheduled");
         let ran = report.records.clone();
         let heal = report.last_heal;
         let key_range = Cluster::Node.key_range();
@@ -2394,12 +2405,15 @@ mod tests {
                 None
             })
             .max_by_key(|&(_, cut, _)| cut)
-            .expect(
-                "some range of seed 1969 was asked reads after the heal, each answered, before its \
-                 first write: if the schedule has moved off it, build the shape on another seed",
-            );
+            .unwrap_or_else(|| {
+                panic!(
+                    "some range of seed {SHAPE_SEED} was asked reads after the heal, each \
+                     answered, before its first write: if the schedule has moved off it, build \
+                     the shape on another seed"
+                )
+            });
         let wedged = Some(format!(
-            "seed {SEED_1969}: liveness: no client write of range {range} completed after the \
+            "seed {SHAPE_SEED}: liveness: no client write of range {range} completed after the \
              last heal at {heal:?}"
         ));
         let is_answer = |record: &TraceRecord| {
@@ -2445,7 +2459,7 @@ mod tests {
         assert_eq!(
             verdict(&mut report, unanswered.clone()),
             Some(format!(
-                "seed {SEED_1969}: liveness: range {range} completed no operation after the last \
+                "seed {SHAPE_SEED}: liveness: range {range} completed no operation after the last \
                  heal at {heal:?}, of {} asked, none of them a write",
                 reads.len()
             )),

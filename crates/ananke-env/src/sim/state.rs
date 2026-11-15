@@ -197,9 +197,7 @@ impl State {
     /// What `node`'s clock reads when global virtual time is `global`.
     pub(super) fn node_time(&self, node: NodeId, global: Instant) -> Instant {
         let n = &self.nodes[&node];
-        let g = i128::from(global.as_nanos());
-        let t = g + (g * i128::from(n.drift_ppm)).div_euclid(1_000_000) + i128::from(n.skew_nanos);
-        Instant::from_nanos(u64::try_from(t.clamp(0, i128::from(u64::MAX))).unwrap_or(u64::MAX))
+        clock_reads(n.skew_nanos, n.drift_ppm, global)
     }
 
     /// The earliest global time at which `node`'s clock reads at least `local`.
@@ -370,4 +368,14 @@ impl TaskControl for SimTask {
         };
         drop(future);
     }
+}
+
+/// What a clock with `skew_nanos` and `drift_ppm` reads when global virtual time is
+/// `global`: [`State::node_time`]'s reading, and [`super::RunHeader::node_time`]'s after the
+/// run.
+// PROPOSED(D-137): shared with the run's header.
+pub(super) fn clock_reads(skew_nanos: i64, drift_ppm: i64, global: Instant) -> Instant {
+    let g = i128::from(global.as_nanos());
+    let t = g + (g * i128::from(drift_ppm)).div_euclid(1_000_000) + i128::from(skew_nanos);
+    Instant::from_nanos(u64::try_from(t.clamp(0, i128::from(u64::MAX))).unwrap_or(u64::MAX))
 }

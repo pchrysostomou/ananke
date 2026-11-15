@@ -922,6 +922,20 @@ pub enum TraceEvent {
         /// The offset within the current file the stream resumed from.
         offset: u64,
     },
+    /// A leader gave a snapshot stream up on RAFT.md's resend bound: the chunk outstanding
+    /// on it fell due once more than the bound allows with no answer from the follower
+    /// since it was last answered, and the stream ends without asking for a fresh take.
+    /// It is the bound reached, and on a receiver that answers what it holds it means the
+    /// follower went silent or the network lost every exchange in that time.
+    // PROPOSED(D-127): the resend bound's give-up is traced.
+    RaftSnapshotGaveUp {
+        /// The leader.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The follower.
+        to: u64,
+    },
     /// A Raft server adopted a completed snapshot install at its start (RAFT.md
     /// §1): the staged store was copied into the server's store directory and
     /// its `CURRENT` switched to it, and the incarnation that follows runs on the
@@ -1140,6 +1154,11 @@ pub enum TraceEvent {
         /// The ranges restated, sorted: every initialised replica the node holds, one
         /// with a descriptor (PROPOSED D-107).
         ranges: Vec<u64>,
+        /// The run nonce this start drew (SHARD.md §5, Q17), which every refill the run
+        /// sends carries and every `RangeIdsLeased` granted to the run names: check 18
+        /// holds a split's right half to a block of the run that led it.
+        // PROPOSED(D-137): the run stated at the node's start.
+        run: u64,
     },
     /// A node made a placeholder for a range it does not hold (SHARD.md §5).
     // PROPOSED(D-069): defined and exported here; emitted by the stage that

@@ -190,6 +190,53 @@ fn every_wiring_variant_is_caught() {
     }
 }
 
+/// #120's pair (CLAUDE.md:52-67), on the whole of [`SEEDS`]: a node whose receiver
+/// answers nothing for a stream it holds while that stream's install is made —
+/// `SilentWhileInstalling`, the node before D-127 — is seen to fail the check the correct
+/// node passes, and on the clause about the resend bound rather than on another.
+///
+/// Before D-127 the correct node *was* this variant, and nothing went red: on these
+/// seeds it gave up 21 streams on 14 seeds, every receiver up and every install landing
+/// regardless, because the sender cannot tell a receiver's silence from a lost chunk.
+/// It runs on all thirty-two rather than on `every_wiring_variant_is_caught`'s three
+/// because it is caught on fewer than all of them, 16 of 32 on D-127's tree, and three
+/// seeds would leave its catch to the draw. At half the seeds, a sweep of 32 misses it
+/// fewer than once in 10^9 (D-061). The rate is printed.
+///
+/// What the variant leaves alone is the sender's reading, which D-127 changes too: a
+/// stream whose answer waits in the sender's own queue is no longer counted as
+/// unanswered. The silence the variant puts back is still counted under that reading,
+/// which is what this test says of it.
+// PROPOSED(D-127)
+#[test]
+fn a_receiver_silent_while_it_installs_has_its_streams_given_up() {
+    let results = sweep(SEEDS, |seed| {
+        let report = with(seed, NodeVariant::SilentWhileInstalling);
+        (report.check(), report.gave_up().len())
+    });
+    let failed: Vec<&String> = results
+        .iter()
+        .filter_map(|(result, _)| result.as_ref().err())
+        .collect();
+    let gave_up: usize = results.iter().map(|(_, gave_up)| gave_up).sum();
+    println!(
+        "install: SilentWhileInstalling caught on {}/{SEEDS} seeds, {gave_up} streams given up",
+        failed.len()
+    );
+    assert!(
+        !failed.is_empty(),
+        "SilentWhileInstalling was not caught on any of {SEEDS} seeds: either no stream's \
+         install outlasted the resend bound or the check no longer reads the give-up"
+    );
+    for violation in &failed {
+        assert!(
+            violation.contains("given up on the resend bound"),
+            "SilentWhileInstalling must be caught by the resend bound's clause, not by \
+             another: {violation}"
+        );
+    }
+}
+
 /// The most seeds the joiner's re-seed runs at any tier (PROPOSED D-109 §7).
 const JOINER_TIER_CAP: u64 = 200;
 

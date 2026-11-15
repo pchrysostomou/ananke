@@ -456,8 +456,66 @@ pub enum NodeVariant {
     /// right half the node holds, with every descriptor right. Check 8's install clause sees
     /// the switch's spans (PROPOSED D-132). A replica with no descriptor is D-128's and
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
+    ///
+    /// Its store can then stand at or past the snapshot when the switch is numbered, with
+    /// what it applied there overwritten by the switch. The `snapshot` task's restatement
+    /// keeps an index past the snapshot only where the store stood below it at the
+    /// numbering, which on the correct node the skipped re-check guarantees; under this
+    /// variant it takes the store and the `apply` task back to the snapshot, as the tree
+    /// before D-132 did, so those entries are handed out again rather than lost (PROPOSED
+    /// D-126, #113's second review, N1).
     // PROPOSED(D-132)
+    // PROPOSED(D-126)
     InstallReplacesCopiedSpan,
+    /// The tree before D-133: an install's switch and a split's apply of the same range do
+    /// not exclude each other. `Engine::install_spans` numbers the switch at the call and
+    /// makes it tens of milliseconds later, and the node's hold stops the range's core and
+    /// not the `apply` task, so a split's apply queued before the hold lands between: its
+    /// batch, written over the switch, makes the right half, and the switch, whose spans
+    /// were read before the split narrowed the host's table, removes the right half's
+    /// keys; where the apply carried the store past the snapshot's index, the switch takes
+    /// it back there. A split in flight when the switch reads the table does the same from
+    /// the other side. Check 8's install clause sees the switch's spans (seed 13283 of the
+    /// sharded sweep, #225; PROPOSED D-133).
+    // PROPOSED(D-133)
+    SplitAppliesInsideTheSwitch,
+    /// The tree before D-126: what a job the replaced core queued before a live
+    /// install's hold applies after the switch is forgotten twice over. The restatements,
+    /// the `snapshot` task's right after the switch and the host's at `Switched`, take the
+    /// `apply` task's applied state and the store's applied index back to the snapshot
+    /// below the entries that job applied, so the next `Apply` hands them out again, and
+    /// the applied watermark stays at the snapshot below a compaction
+    /// that job's record makes, so the next `Apply` names an index the replica the switch
+    /// built has compacted away and the node stops (issue #113). The node holds a range's
+    /// core across its install, not its `apply` task, so such a job can land. No sweep
+    /// reaches it at its tiers; seed 13283 of the sharded sweep, past the nightly's range,
+    /// did on D-126's own tree, failing on #225's window on the correct node too, and on the
+    /// Stage C integration's tree reaches it on neither schedule, so it is not pinned and
+    /// the pair is a unit pair (PROPOSED D-126 sections 6 and 7).
+    // PROPOSED(D-126)
+    SwitchForgetsLateApplies,
+    /// The tree before D-138: a split's apply on a replica that holds no descriptor is
+    /// refused, `NotLive`, as a split of a range the node does not hold live. Such a replica
+    /// is a re-seeded user range its log brought back from the first entry, so every other
+    /// replica applies the same entry over configuration's descriptor and takes it, and state
+    /// machine safety sees the entry applied to `took` on them and `refused` on this one
+    /// (#199). The correct node applies it from the descriptor configuration names.
+    // PROPOSED(D-138)
+    ReplayedRangeRefusesItsSplit,
+    /// The node as it stood before D-127: a stream it holds and has not finished with
+    /// is answered nothing. Its last chunk goes unanswered until the install it
+    /// completes is made, a chunk of it that arrives while that install is pending is
+    /// dropped without a word, and a chunk that reaches the node while the `snapshot`
+    /// task makes any install waits behind it unanswered. The sender cannot tell that
+    /// silence from a lost chunk, so it counts it against `CHUNK_RESENDS` and gives up
+    /// streams whose installs are being made: on `sim/install.rs`'s 32 seeds, where no
+    /// receiver is ever down, the node before D-127 gave up 21 streams on 14 seeds, and
+    /// this variant on D-127's tree, which keeps the sender's new reading, 21 on 16
+    /// (#120). Nothing else goes red, because the install lands without the stream; what
+    /// the trace shows is the give-up (`RaftSnapshotGaveUp`), which `sim/install.rs`
+    /// asserts never happens.
+    // PROPOSED(D-127)
+    SilentWhileInstalling,
 }
 
 impl NodeVariant {
@@ -515,6 +573,10 @@ impl NodeVariant {
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
         NodeVariant::InstallReplacesCopiedSpan,
+        NodeVariant::SplitAppliesInsideTheSwitch,
+        NodeVariant::SwitchForgetsLateApplies,
+        NodeVariant::ReplayedRangeRefusesItsSplit,
+        NodeVariant::SilentWhileInstalling,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -610,15 +672,22 @@ impl NodeVariant {
     /// mark, and what the *other three* replicas restate afterwards is the evidence.
     /// With one range there is one mark, the crash is on the only replica there is,
     /// and a node that lost it has nothing left to compare it against.
+    ///
+    /// [`SwitchForgetsLateApplies`](Self::SwitchForgetsLateApplies) is the fourth: the
+    /// family the shape's second restart was filed with as issue #113, a job the
+    /// replaced core queued before a live install's hold landing after the switch.
     // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    // PROPOSED(D-126): the shape's fourth.
     pub const SHAPE: &'static [NodeVariant] = &[
         NodeVariant::ReseedMarkNotSynced,
         NodeVariant::RestartAppliesFromZero,
         NodeVariant::RecordNeverQueued,
+        NodeVariant::SwitchForgetsLateApplies,
     ];
 
-    /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
-    /// from counting the wrong thing: the two ways to get D-090 wrong.
+    /// RAFT.md:209-212's bounds on a stream, and the answers that keep each bound from
+    /// counting the wrong thing: the two ways to get D-090 wrong, and D-127's one way to
+    /// make the resend bound count a receiver's deliberate silence.
     ///
     /// They are neither the `snapshot` task's discipline ([`SNAPSHOT`](Self::SNAPSHOT))
     /// nor its running inside the node ([`WIRING`](Self::WIRING)) but the *sender's*
@@ -626,11 +695,16 @@ impl NodeVariant {
     /// [`CapWaitIsAStartOver`](Self::CapWaitIsAStartOver) is one a node of a single range
     /// could not be wrong about; [`RestartsNotCounted`](Self::RestartsNotCounted) is
     /// wrong with one range too.
+    /// [`SilentWhileInstalling`](Self::SilentWhileInstalling) is the receiver's half of
+    /// the resend bound: the sender's count is right, and what it counts is a silence
+    /// the receiver chose.
     // PROPOSED(D-090): the node honours RAFT.md's restart bound, and a cap-wait is not
     // one of the asks it counts.
+    // PROPOSED(D-127)
     pub const BOUNDS: &'static [NodeVariant] = &[
         NodeVariant::CapWaitIsAStartOver,
         NodeVariant::RestartsNotCounted,
+        NodeVariant::SilentWhileInstalling,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -724,6 +798,20 @@ impl NodeVariant {
             // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
+            // PROPOSED(D-133): a split's apply landing inside its range's switch.
+            NodeVariant::SplitAppliesInsideTheSwitch => 1 << 52,
+            // PROPOSED(D-126): a late job's applies forgotten at a switch. Bit 53: D-126 took
+            // bit 52 on a tree without D-133, which took it too and merged first, and was
+            // renumbered at the Stage C integration.
+            NodeVariant::SwitchForgetsLateApplies => 1 << 53,
+            // PROPOSED(D-138): a replica with no descriptor refusing a split. Bit 54: D-138
+            // took bit 52 on a tree without D-133 or D-126, and was renumbered at the Stage C
+            // integration.
+            NodeVariant::ReplayedRangeRefusesItsSplit => 1 << 54,
+            // PROPOSED(D-127): a stream the node holds answered nothing while its install
+            // is made. Bit 55: D-127 took bit 52 on a tree without D-133, D-126 or D-138, and
+            // was renumbered at the Stage C integration. Eight bits are left.
+            NodeVariant::SilentWhileInstalling => 1 << 55,
         }
     }
 
@@ -783,6 +871,10 @@ impl NodeVariant {
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
             NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
+            NodeVariant::SplitAppliesInsideTheSwitch => "SplitAppliesInsideTheSwitch",
+            NodeVariant::SwitchForgetsLateApplies => "SwitchForgetsLateApplies",
+            NodeVariant::ReplayedRangeRefusesItsSplit => "ReplayedRangeRefusesItsSplit",
+            NodeVariant::SilentWhileInstalling => "SilentWhileInstalling",
         }
     }
 }
@@ -881,14 +973,22 @@ mod tests {
         // replica with no descriptor whose install replaces what it is hosted at.
         // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
         // one is a right half made on a quarantined parent with no quarantine. D-132's one
-        // is an initialised replica's install replacing the plan's copy of its spans.
+        // is an initialised replica's install replacing the plan's copy of its spans, and
+        // D-133's one a split's apply landing inside its range's switch.
+        // D-126's one is the shape's fourth, a late job's applies a switch forgot. D-138's
+        // one is a replica with no descriptor refusing a split its log brings, and D-127's
+        // one, the bounds' third, a receiver silent while it installs.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
         // PROPOSED(D-130)
         // PROPOSED(D-132)
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        // PROPOSED(D-133)
+        // PROPOSED(D-126)
+        // PROPOSED(D-138)
+        // PROPOSED(D-127)
+        assert_eq!(NodeVariant::BUGS.len(), 56);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -904,8 +1004,8 @@ mod tests {
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
-        assert_eq!(NodeVariant::SHAPE.len(), 3);
-        assert_eq!(NodeVariant::BOUNDS.len(), 2);
+        assert_eq!(NodeVariant::SHAPE.len(), 4);
+        assert_eq!(NodeVariant::BOUNDS.len(), 3);
         // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise
         // disjoint: a
         // variant is a way to get the `snapshot` task's keys, caps and frames wrong, a
@@ -929,7 +1029,7 @@ mod tests {
                 }
             }
         }
-        // D-090's two are a fourth kind: the sender's bookkeeping over a stream's
+        // D-090's two and D-127's one are a fourth kind: a stream's bookkeeping over its
         // answers, which is none of the three above.
         for variant in NodeVariant::BOUNDS {
             assert!(
