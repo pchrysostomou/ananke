@@ -825,19 +825,21 @@ pub struct PlaceholderCoverage {
 /// D-141, the owner's reading R of D-107): from its install's switch to its node's creation
 /// of R. **Measured and printed, and not asserted by any test until the owner rules on it**
 /// (D-141's question). Read off the correct system by the repo's rule for such a bound,
-/// twice the worst measured (D-076's `READS_OUTSTANDING`), the worst being the sharded
-/// sweep's at ten thousand seeds: 2.815 s (seed 3378, node 3, right half 36, a crash inside
-/// the wait), over 8 577 installed voters given their right half on seeds 0 to 9 999 on
-/// 8760c49 with reading R. The correct system fails it there: 189 installed voters on 117
-/// of those seeds never get theirs, each a right half that elects no leader after the
-/// install, #220's wedge, and on 58 of them in a form #220's exception does not cover (a
-/// third voter quarantined, D-130). The two sweeps print, at every tier, on how many seeds
-/// a voter is late against it ([`right_half_late`]).
+/// twice the worst measured (D-076's `READS_OUTSTANDING`), rounded up to the millisecond
+/// this constant is written in. The worst is the sharded sweep's at ten thousand seeds,
+/// 2.816 s (2.815 544 043 s: seed 3378, node 3, right half 36, a crash inside the wait),
+/// over 8 577 installed voters given their right half by its creation on seeds 0 to 9 999
+/// on 8760c49 with reading R; twice it is 5.631 088 s. The correct system fails it there:
+/// 189 installed voters on 117 of those seeds never get theirs, each a right half that
+/// elects no leader after the install, #220's wedge, and on 58 of them in a form #220's
+/// exception does not cover (a third voter quarantined, D-130). The two sweeps print, at
+/// every tier, on how many seeds a voter is late against it ([`right_half_late`]).
 // PROPOSED(D-141)
-pub const RIGHT_HALF_ARRIVAL: Duration = Duration::from_millis(5_630);
+pub const RIGHT_HALF_ARRIVAL: Duration = Duration::from_millis(5_632);
 
 /// The first installed voter of `voters` whose right half was not created on it within
-/// `bound` of its install's switch, in words: one whose node created R or was refused
+/// `bound` of its install's switch, in words: one whose node created R, restated it with
+/// no creation traced (a crash having cut R's creation from the trace) or was refused
 /// after the bound ran out, or that was still waiting when the run ended, at `ended`, past
 /// it. `None` where every one was given R in time, was refused first, or is not yet due.
 /// A measurement the sweeps print against [`RIGHT_HALF_ARRIVAL`], **not asserted** until
@@ -856,6 +858,9 @@ pub fn right_half_late(
             Some((at, _)) if at <= due => return None,
             None if ended <= due => return None,
             Some((at, WaitEnded::Created)) => format!("it was created at {at:?}"),
+            Some((at, WaitEnded::Restated)) => {
+                format!("its restatement at {at:?} held it, with no creation of it traced")
+            }
             Some((at, WaitEnded::Refused)) => format!("its store was refused at {at:?}"),
             None => format!("none was when the run ended at {ended:?}"),
         };
@@ -14079,10 +14084,10 @@ mod right_half_arrival {
         }
     }
 
-    /// A right half created within the bound, a refusal within it, and a run that ends
-    /// before the bound runs out are no violation; a creation or a refusal after it, and a
-    /// run that ends past it with the voter still waiting, are, each in its own words; the
-    /// first late voter is the one named.
+    /// A right half created within the bound, restated within it, a refusal within it, and
+    /// a run that ends before the bound runs out are no violation; a creation, a
+    /// restatement or a refusal after it, and a run that ends past it with the voter still
+    /// waiting, are, each in its own words; the first late voter is the one named.
     #[test]
     fn an_installed_voter_is_late_only_past_the_bound() {
         let bound = Duration::from_millis(1_000);
@@ -14093,8 +14098,19 @@ mod right_half_arrival {
             None
         );
         assert_eq!(
+            late(&[waited(100, Some((1_100, WaitEnded::Restated)))], 5_000),
+            None
+        );
+        assert_eq!(
             late(&[waited(100, Some((1_100, WaitEnded::Refused)))], 5_000),
             None
+        );
+        // PROPOSED(D-141), round 3: a restatement holding R past the bound is late too.
+        let restated = late(&[waited(100, Some((1_101, WaitEnded::Restated)))], 5_000)
+            .expect("restated after the bound");
+        assert!(
+            restated.contains("its restatement at") && restated.contains("held it"),
+            "{restated}"
         );
         assert_eq!(late(&[waited(100, None)], 1_100), None);
         let created = late(&[waited(100, Some((1_101, WaitEnded::Created)))], 5_000)

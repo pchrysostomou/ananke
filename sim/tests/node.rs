@@ -427,11 +427,13 @@ struct Coverage {
     crash_cut_installs: usize,
     crash_cut_install_seeds: usize,
     /// The installed voters' waits (PROPOSED D-141), measured and not asserted: ended by
-    /// their node's creation of the right half, how long each took; ended by a refusal;
-    /// still open at the run's end, how long each had waited; on how many seeds one
-    /// opened; and the seeds on which one was late against the candidate bound
-    /// `raft::RIGHT_HALF_ARRIVAL`, with the first late voter's words.
+    /// their node's creation of the right half, how long each took; ended by a restatement
+    /// holding it, how long each took (round 3); ended by a refusal; still open at the
+    /// run's end, how long each had waited; on how many seeds one opened; and the seeds on
+    /// which one was late against the candidate bound `raft::RIGHT_HALF_ARRIVAL`, with the
+    /// first late voter's words.
     installed_waits: Vec<Duration>,
+    installed_restated: Vec<Duration>,
     installed_refused: usize,
     installed_open: Vec<Duration>,
     installed_seeds: usize,
@@ -548,6 +550,7 @@ impl std::fmt::Debug for Coverage {
             .field("crash_cut_install_seeds", &self.crash_cut_install_seeds)
             .field("installed_waits", &self.installed_waits.len())
             .field("installed_wait_max", &self.installed_waits.iter().max())
+            .field("installed_restated", &self.installed_restated.len())
             .field("installed_refused", &self.installed_refused)
             .field("installed_open", &self.installed_open)
             .field("installed_seeds", &self.installed_seeds)
@@ -620,6 +623,9 @@ impl Coverage {
             match voter.ended {
                 Some((at, invariants::WaitEnded::Created)) => {
                     self.installed_waits.push(at.duration_since(voter.since));
+                }
+                Some((at, invariants::WaitEnded::Restated)) => {
+                    self.installed_restated.push(at.duration_since(voter.since));
                 }
                 Some((_, invariants::WaitEnded::Refused)) => self.installed_refused += 1,
                 None => self
@@ -1262,14 +1268,20 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     );
     println!(
         "node: installed voters (PROPOSED D-141), measured and not asserted: {} on {}/{seeds} \
-         seeds, {} given their right half, median {:?}, worst {:?}; {} refused first; {} still \
-         waiting at the run's end, the longest {:?}; late against the candidate bound of {:?} \
-         on {}/{seeds} seeds, first: {}",
-        waits.len() + coverage.installed_refused + coverage.installed_open.len(),
+         seeds, {} given their right half by its creation, median {:?}, worst {:?}; {} at a \
+         restatement holding it, the longest {:?}; {} refused first; {} still waiting at the \
+         run's end, the longest {:?}; late against the candidate bound of {:?} on {}/{seeds} \
+         seeds, first: {}",
+        waits.len()
+            + coverage.installed_restated.len()
+            + coverage.installed_refused
+            + coverage.installed_open.len(),
         coverage.installed_seeds,
         waits.len(),
         waits.get(waits.len() / 2),
         waits.last(),
+        coverage.installed_restated.len(),
+        coverage.installed_restated.iter().max(),
         coverage.installed_refused,
         coverage.installed_open.len(),
         coverage.installed_open.iter().max(),

@@ -111,9 +111,11 @@ _Update this section at the end of every session._
   outside §10's count), caught on 10 of 20 and 52 of 100 compared node seeds; the correct node's
   fold-by-fold test is its pair. The sharded sweep asserts that reading R was reached where it
   differs from §8's reading. The installed voter's bound is built, measured and printed and **not
-  asserted**: the correct system fails a 5.63 s bound on 117 of 10 000 sharded seeds, all #220's
+  asserted**: the correct system fails a 5.632 s bound on 117 of 10 000 sharded seeds, all #220's
   wedge, so it is the owner's question (D-141, option (a) recommended). `PlaceholderAnswersNothing`
-  was built and removed. Review F1 to F8 fixed in place.
+  was built and removed. Review F1 to F8 fixed in place. Second review (round 3): an installed voter
+  that holds R at a restatement owes it from there (S1), and T1 to T3 fixed; S2 and S3 filed as
+  #256.
 - Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
   **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
   ended in a switch, so a hold the node let go with no switch was measured as a running core (seed

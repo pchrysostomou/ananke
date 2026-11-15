@@ -67,10 +67,12 @@ struct Seen {
     /// before its read-back (PROPOSED D-141, review F5).
     crash_cut_installs: usize,
     /// The installed voters, measured and not asserted (PROPOSED D-141): how long each given
-    /// its right half waited, how many were refused first, how long each still open at the
-    /// run's end had waited, and the first late against the candidate bound
+    /// its right half by its creation waited, how long each whose wait a restatement holding
+    /// R ended had waited (round 3), how many were refused first, how long each still open
+    /// at the run's end had waited, and the first late against the candidate bound
     /// `raft::RIGHT_HALF_ARRIVAL`, in words.
     installed_waits: Vec<Duration>,
+    installed_restated: Vec<Duration>,
     installed_refused: usize,
     installed_open: Vec<Duration>,
     installed_late: Option<String>,
@@ -159,12 +161,16 @@ fn seen_of(seed: u64) -> Seen {
     let folded = invariants::folded(report.records());
     let owners = folded.owners();
     let mut installed_waits = Vec::new();
+    let mut installed_restated = Vec::new();
     let mut installed_refused = 0;
     let mut installed_open = Vec::new();
     for voter in owners.installed_voters() {
         match voter.ended {
             Some((at, invariants::WaitEnded::Created)) => {
                 installed_waits.push(at.duration_since(voter.since));
+            }
+            Some((at, invariants::WaitEnded::Restated)) => {
+                installed_restated.push(at.duration_since(voter.since));
             }
             Some((_, invariants::WaitEnded::Refused)) => installed_refused += 1,
             None => installed_open.push(report.checked.ended.duration_since(voter.since)),
@@ -214,6 +220,7 @@ fn seen_of(seed: u64) -> Seen {
         ),
         crash_cut_installs: owners.crash_cut_installs(),
         installed_waits,
+        installed_restated,
         installed_refused,
         installed_open,
         installed_late,
@@ -414,6 +421,10 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         .flat_map(|s| s.installed_waits.iter().copied())
         .collect();
     waits.sort_unstable();
+    let restated: Vec<Duration> = seen
+        .iter()
+        .flat_map(|s| s.installed_restated.iter().copied())
+        .collect();
     let open: Vec<Duration> = seen
         .iter()
         .flat_map(|s| s.installed_open.iter().copied())
@@ -441,13 +452,18 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     );
     println!(
         "shard: installed voters (PROPOSED D-141), measured and not asserted: {} on {} seeds, {} \
-         given their right half, median {:?}, p99 {:?}, worst {:?}; {} refused first; {} still \
-         waiting at the run's end, the longest {:?}; late against the candidate bound of {:?} on \
-         {}/{count} seeds {:?}, first: {}",
-        waits.len() + open.len() + seen.iter().map(|s| s.installed_refused).sum::<usize>(),
+         given their right half by its creation, median {:?}, p99 {:?}, worst {:?}; {} at a \
+         restatement holding it, the longest {:?}; {} refused first; {} still waiting at the \
+         run's end, the longest {:?}; late against the candidate bound of {:?} on {}/{count} \
+         seeds {:?}, first: {}",
+        waits.len()
+            + restated.len()
+            + open.len()
+            + seen.iter().map(|s| s.installed_refused).sum::<usize>(),
         seen.iter()
             .filter(|s| {
                 !s.installed_waits.is_empty()
+                    || !s.installed_restated.is_empty()
                     || !s.installed_open.is_empty()
                     || s.installed_refused > 0
             })
@@ -456,6 +472,8 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         waits.get(waits.len() / 2),
         waits.get(waits.len() * 99 / 100),
         waits.last(),
+        restated.len(),
+        restated.iter().max(),
         seen.iter().map(|s| s.installed_refused).sum::<usize>(),
         open.len(),
         open.iter().max(),
@@ -516,15 +534,16 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     // PROPOSED(D-141), review F2: reading R reached where it differs from §8's reading.
     // First, a voter installed past a split restarts before applying it, and its restatement
     // past the split is read as no apply of it: measured on the correct system on 4 of the
-    // first 20 seeds, 13 of the first 100, 111 of the first 1 000 and 1 248 of the first
-    // 10 000 (12.5 %), so asserted from CI's hundred (D-061: well above 5 %, but at that
-    // rate twenty seeds see none about one time in 14, a hundred about once in 600 000).
+    // first 20 seeds, 13 of the first 100, 111 of the first 1 000 (11.1 %) and 1 248 of the
+    // first 10 000 (12.5 %), so asserted from CI's hundred (D-061: well above 5 %; at the
+    // first thousand's rate, which D-061 reads, twenty seeds see none about one time in 10
+    // (0.889^20 = 0.095), a hundred about once in 130 000 (0.889^100 = 7.8e-6)).
     // Second, such a restatement without R, which §8's reading fails and reading R passes:
-    // measured on 2 of the first 100, 16 of the first 1 000 and 202 of the first 10 000
-    // (2.0 %), under 5 %, so asserted from the thousand (D-061; at 1.6 % a thousand see none
-    // about once in 10^7, at 2.0 % about once in 7 * 10^8). Without them the clause would be
-    // asserted where reading R and §8's reading are one. The node sweep sees the first on 3
-    // of its first 1 000 seeds, too few to assert at any tier.
+    // measured on 2 of the first 100, 16 of the first 1 000 (1.6 %) and 202 of the first
+    // 10 000 (2.0 %), under 5 %, so asserted from the thousand (D-061; at 1.6 % a thousand
+    // see none about once in 10^7). Without them the clause would be asserted where reading
+    // R and §8's reading are one. The node sweep sees the first on 3 of its first 1 000
+    // seeds, too few to assert at any tier.
     if seeds() >= 100 {
         assert!(
             !excused_seeds.is_empty(),
