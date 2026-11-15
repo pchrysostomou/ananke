@@ -25256,7 +25256,7 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 **The number.** D-125 was held for this issue by open work since de9f4d7 (D-128 names D-116 to
 D-127 as held). It sits after D-123, the highest entry below it in this tree. The footer stays
-D-133. The one code site carries `// PROPOSED(D-125)`, as do the three tests.
+D-133. The one code site carries `// PROPOSED(D-125)`, as do the four tests.
 
 **The ruling asked for.** None. This takes issue #105's own fix, as its "Wanted" section states
 it. What else assessing it found is a separate change and is filed (below).
@@ -25322,6 +25322,17 @@ both orders because which creation comes first is up to the scheduler. Under the
 two tests fail in the empty-first order, the one the issue found, which runs first. Their other
 order reads a creation that names voters first, as the old fold did.
 
+A fourth test pins item 1's last sentence, that only the first creation that names voters counts.
+The review found that no test could fail if `note_group` took the last such creation instead
+(`insert` for `or_insert_with`, keeping the guard). That gap was there at the base too, where
+`or_insert_with` had no test with two creations naming different voters. The reading matters
+because a split's right half traces no `RaftConfig`: a checker that took the last creation would
+read an install's voters as the right half's first configuration.
+
+| Test | First that names voters | Last that names voters planted |
+|---|---|---|
+| `a_later_creation_naming_other_voters_does_not_replace_the_groups_birth`: creations `[4, 5, 6]` then `[1, 2, 3]`, a commit on 4 and 5, then one on 1 and 2 | passes, then the violation `... durable on [1, 2] of voters [4, 5, 6]` | fails: `... durable on [4, 5] of voters [1, 2, 3]`; with that half skipped, the second half's `unwrap_err` finds `Ok` |
+
 **What was also found, and filed.** Issue #105's "a replica installed rather than bootstrapped"
 comes down, on this tree, to a different gap. An install on the node puts the snapshot's
 configuration in force and traces no `RaftConfig`, in `installed` and in `created_by_install`. The
@@ -25337,7 +25348,7 @@ code, in release, at `ANANKE_SEEDS=10000`: **0 of 10 000 seeds fail.** The run t
 30 071 crashes, 4 969 store refusals and 71 836 placeholders. The change is in a fold the checker
 runs after each run, so it draws nothing and no schedule can move.
 
-**The nightly's rows (D-064).** None. The three tests are in `ananke-raft`'s own test binary, which
+**The nightly's rows (D-064).** None. The four tests are in `ananke-raft`'s own test binary, which
 runs in the `rest` job, not in a sim shard. No schedule, trace or pinned hash moves: the change is
 in a fold the checker runs after the run. **PROPOSED.**
 

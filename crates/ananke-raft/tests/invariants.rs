@@ -406,6 +406,38 @@ fn a_group_created_only_with_no_voters_takes_the_initial_configuration() {
     );
 }
 
+/// Only the first creation that names voters is the birth: a later one naming others,
+/// as an install's names the descriptor its snapshot carried, does not replace it. A
+/// split's right half traces no `RaftConfig`, so a checker that took the last creation
+/// would read an install's voters as the right half's first configuration. Born on 4,
+/// 5 and 6 and then created naming 1, 2 and 3, the group commits on 4 and 5, and a
+/// commit on 1 and 2 is short of the voters it was born with; a checker that took the
+/// last creation reads both the other way round.
+// PROPOSED(D-125): only the first creation that names voters is the birth.
+#[test]
+fn a_later_creation_naming_other_voters_does_not_replace_the_groups_birth() {
+    let born = [created(B, &[4, 5, 6], 0, 0), created(B, &[1, 2, 3], 0, 0)];
+    let mut on_born = born.to_vec();
+    on_born.extend([
+        append(4, B, 1, 1, 0xbb),
+        append(5, B, 1, 1, 0xbb),
+        leader(4, B, 1),
+        commit(4, B, 1, 1),
+    ]);
+    invariants::commit_majority(&on_born, SERVERS).unwrap();
+    let mut on_later = born.to_vec();
+    on_later.extend([
+        append(1, B, 1, 1, 0xbb),
+        append(2, B, 1, 1, 0xbb),
+        leader(1, B, 1),
+        commit(1, B, 1, 1),
+    ]);
+    assert_eq!(
+        invariants::commit_majority(&on_later, SERVERS).unwrap_err(),
+        "commit majority: leader 1 committed index 1 of group 3 (term 1) in term 1 with it durable on [1, 2] of voters [4, 5, 6]"
+    );
+}
+
 /// The rescan at every `RaftLeader` is of that group's committed set: a new leader
 /// of B need hold nothing of what A committed. A checker with one committed set
 /// reads this as a leader missing a committed entry.

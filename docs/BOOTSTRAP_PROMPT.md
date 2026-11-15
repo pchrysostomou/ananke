@@ -106,7 +106,9 @@ _Update this section at the end of every session._
   first configuration from its first `RangeCreated` that names voters, falling back on `initial`,
   so a creation by a node outside the configuration is no birth. Latent on this tree, since no
   creation names no voters; three unit tests over hand-built records in both orders, each seen to
-  fail under the old reading. The sharded sweep at 10 000 seeds fails none. Found beside it and
+  fail under the old reading, and a fourth, after review, that a later creation naming other
+  voters does not replace the birth, seen to fail under a plant that takes the last. The sharded
+  sweep at 10 000 seeds fails none. Found beside it and
   filed as #235: an install on the node traces no `RaftConfig` for the configuration it puts in
   force.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
