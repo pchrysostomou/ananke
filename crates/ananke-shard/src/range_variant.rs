@@ -29,7 +29,7 @@
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
-//!   §8 has something that trips it where no protocol mistake of §10 does. Three are
+//!   §8 has something that trips it where no protocol mistake of §10 does. Four are
 //!   built. Two were moved here from the node's set by PROPOSED D-108 because each
 //!   breaks a rule of the range layer's and not of the node's:
 //!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
@@ -39,11 +39,13 @@
 //!   of the node's generator, at Q15's re-seed, at a split's right half and at a
 //!   placeholder's install (D-077, PROPOSED D-100, D-109).
 //!   [`RangeVariant::RefillNotResent`] breaks D-092's refill and is the instrument of
-//!   its per-seed assertion on the sharded sweep (PROPOSED D-113). Two more are
-//!   proposed and not built: D-093's `SplitLeavesGap` for check 19's fold, and Stage D's
-//!   variant for the re-add window assertion (§12, Stage D's question 1), which needs a
-//!   stream derived anew at each creation and so is not `IncarnationPerRangeStream` read
-//!   at one more site (PROPOSED D-108).
+//!   its per-seed assertion on the sharded sweep (PROPOSED D-113).
+//!   [`RangeVariant::SplitLeavesGap`] writes a split's right half one key short and is
+//!   check 19's instrument under the per-fold equivalence test, as the owner ruled on
+//!   D-093 (PROPOSED D-140). One more is proposed and not built: Stage D's variant for
+//!   the re-add window assertion (§12, Stage D's question 1), which needs a stream
+//!   derived anew at each creation and so is not `IncarnationPerRangeStream` read at one
+//!   more site (PROPOSED D-108).
 //!
 //! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
 //! and the four instruments built or proposed beside them, two of each, would leave a
@@ -58,6 +60,7 @@
 //! schedule or a trace: D-105 and D-108 measure it.
 // PROPOSED(D-105): the range layer's own variant set (Q37).
 // PROPOSED(D-108): the two range-layer instruments the node's set held.
+// PROPOSED(D-140): `SplitLeavesGap`, check 19's instrument (the owner's ruling on D-093).
 
 use std::fmt;
 
@@ -180,6 +183,19 @@ pub enum RangeVariant {
     /// D-092's rule, and the check needs one (CLAUDE.md's pair rule).
     // PROPOSED(D-113)
     RefillNotResent,
+    /// A split writes its right half one key short: R is written `[succ(k), y)` where
+    /// SHARD.md §5 writes `[k, y)`, `succ(k)` being the split key followed by a zero byte,
+    /// the least key above it, while P shrinks to `[x, k)` as it should. Every replica
+    /// writes the same wrong span, so the split key lies in no range from the split's apply
+    /// on, on every node. Check 19, the ranges tile the keyspace, sees the gap at the first
+    /// `RaftApply` of a range command after the split's values are traced — the split's own,
+    /// on the first replica to apply it — and check 18's split clause sees R's creation
+    /// differ from what the split leaves at that same apply (SHARD.md §8; PROPOSED D-140).
+    /// A test instrument outside §10's count: §10 has no variant that trips check 19, and
+    /// the owner's ruling on D-093 (option A) gives the fold this one for the per-fold
+    /// equivalence test.
+    // PROPOSED(D-140)
+    SplitLeavesGap,
 }
 
 impl RangeVariant {
@@ -196,6 +212,7 @@ impl RangeVariant {
         RangeVariant::UninitialisedReplicaVotes,
         RangeVariant::SnapshotOverlapsReplica,
         RangeVariant::RefillNotResent,
+        RangeVariant::SplitLeavesGap,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -223,6 +240,8 @@ impl RangeVariant {
             RangeVariant::RefillNotResent => 1 << 9,
             // PROPOSED(D-131): a read checked at its receipt and not at its serving.
             RangeVariant::ReadCheckAtReceiptOnly => 1 << 10,
+            // PROPOSED(D-140): a split's right half written one key short.
+            RangeVariant::SplitLeavesGap => 1 << 11,
         }
     }
 
@@ -242,7 +261,8 @@ impl RangeVariant {
             | RangeVariant::SnapshotOverlapsReplica => true,
             RangeVariant::AnyFreshNodeBootstraps
             | RangeVariant::IncarnationPerRangeStream
-            | RangeVariant::RefillNotResent => false,
+            | RangeVariant::RefillNotResent
+            | RangeVariant::SplitLeavesGap => false,
         }
     }
 
@@ -261,6 +281,7 @@ impl RangeVariant {
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
             RangeVariant::SnapshotOverlapsReplica => "SnapshotOverlapsReplica",
             RangeVariant::RefillNotResent => "RefillNotResent",
+            RangeVariant::SplitLeavesGap => "SplitLeavesGap",
         }
     }
 }
@@ -378,9 +399,10 @@ mod tests {
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
         // the range-id blocks, D-109's one for placeholders, D-110's one for the
         // overlap rule and D-131's one for the read check, all of them §10's; and
-        // the two instruments PROPOSED D-108 moved here from the node's set and PROPOSED
-        // D-113's one for D-092's refill, none of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 11);
+        // the two instruments PROPOSED D-108 moved here from the node's set, PROPOSED
+        // D-113's one for D-092's refill and PROPOSED D-140's one for check 19, none of
+        // them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 12);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -396,7 +418,8 @@ mod tests {
         assert_eq!(counted, 8, "§10's eight built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
-        // a replica's incarnation at its creation), and D-113's (D-092's refill).
+        // a replica's incarnation at its creation), D-113's (D-092's refill) and D-140's
+        // (check 19's, the owner's ruling on D-093).
         let instruments: Vec<&str> = RangeVariant::BUGS
             .iter()
             .filter(|variant| !variant.in_section_10())
@@ -407,7 +430,8 @@ mod tests {
             [
                 "AnyFreshNodeBootstraps",
                 "IncarnationPerRangeStream",
-                "RefillNotResent"
+                "RefillNotResent",
+                "SplitLeavesGap"
             ],
             "the range layer's instruments outside §10's count"
         );

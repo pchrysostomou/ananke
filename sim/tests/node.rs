@@ -2664,8 +2664,15 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12), on `sim/split.rs` (i)
 /// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`,
 /// PROPOSED D-110).
+///
+/// **Check 19** runs here and under every pair below, and stops a run, so it is asserted absent
+/// on every compared seed with the others ([`Fold::VERDICT`]); its comparison in violation comes
+/// with its instrument, `SplitLeavesGap`, as the owner ruled on D-093
+/// (`the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves_gap`,
+/// PROPOSED D-140).
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
 // PROPOSED(D-107): check 8's two clauses among them.
+// PROPOSED(D-140): and check 19.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
     let compared = range_folds_compared();
@@ -3019,6 +3026,75 @@ fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
         "UninitialisedReplicaVotes was caught on no seed of the share: no placeholder \
          received a vote request, or check 20 is silent"
     );
+}
+
+/// Check 19 against `SplitLeavesGap` (SHARD.md §12, Stage C's exit: "check 19 runs under
+/// the test the same way, and is asserted against a tripping variant as question 2
+/// settles"), the instrument the owner's ruling on D-093 chose (option A): every replica of
+/// a split's parent writes the right half one key short, `[succ(k), y)`, and the split key
+/// lies in no range from the split's apply on. Check 19 sees the gap at the first `RaftApply`
+/// of a range command after the split's values are traced, the split's own on its first
+/// replica; check 18's split clause sees the short right half at that same apply, and the
+/// run's verdict names check 18, check 19 being asked last.
+///
+/// D-093 has the fold trip on every seed on which a split takes effect, and D-104 §2
+/// corrects what that rests on: no per-seed assertion holds that a split takes effect, only
+/// the aggregate. So the test reads the set of compared seeds on which a split took effect
+/// under the instrument and asserts it non-empty, then asserts check 19 in violation on
+/// every seed of that set, in its gap's words, and on no seed outside it. Measured on this
+/// tree, release, over the first hundred compared seeds: a split took effect on all hundred
+/// and check 19 tripped on all hundred; over the gate's twenty, twenty of twenty — so the
+/// catch is asserted at every tier (D-061). The correct node's comparison above holds check
+/// 19 green on every compared seed, as a fold that stops a run (PROPOSED D-140).
+// PROPOSED(D-140)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves_gap() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("SplitLeavesGap", compared, |seed| {
+        node_records(seed, &[RangeVariant::SplitLeavesGap])
+    });
+    let split: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.split)
+        .map(|(seed, _)| seed)
+        .collect();
+    let tripped: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::Tiling))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: SplitLeavesGap: a split took effect on {}/{compared} compared seeds and \
+         check 19 tripped on {}/{compared}",
+        split.len(),
+        tripped.len()
+    );
+    assert!(
+        !split.is_empty(),
+        "no split took effect on SplitLeavesGap's {compared} compared seeds, so the instrument \
+         wrote no right half short and check 19 was compared on nothing of it (D-104 §2: splits \
+         are asserted in aggregate, so the set of seeds a split took effect on is read here)"
+    );
+    assert_eq!(
+        tripped, split,
+        "check 19 did not trip on exactly the compared seeds on which a split took effect \
+         under SplitLeavesGap: every such split leaves its key in no range (D-093)"
+    );
+    for seed in &tripped {
+        let words = &found[*seed].tripped[&Fold::Tiling];
+        assert!(
+            words.contains("no range's latest span holds") && words.contains("range command"),
+            "seed {seed}: check 19 tripped under SplitLeavesGap in words other than a gap at a \
+             range command's apply: {words}"
+        );
+        assert!(
+            found[*seed].tripped.contains_key(&Fold::SplitLineage),
+            "seed {seed}: check 18's split clause did not see the right half SplitLeavesGap \
+             wrote short"
+        );
+    }
 }
 
 /// Check 8 against `SnapshotOverlapsReplica` (SHARD.md §12, Stage C's exit: "check 8

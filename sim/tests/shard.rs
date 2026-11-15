@@ -756,6 +756,55 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
     );
 }
 
+/// Check 19's instrument, `SplitLeavesGap` (the owner's ruling on D-093, option A; outside
+/// §10's count): every replica of a split's parent writes the right half one key short, and
+/// the split key lies in no range from the split's apply on. Check 19 sees the gap at the
+/// split's apply on its first replica, beside check 18's split clause, which sees the short
+/// right half there and which the run's verdict names, check 19 being asked last. D-104 §2:
+/// splits are asserted only in aggregate, so the seeds a split took effect on are read and
+/// asserted non-empty, and check 19 asserted in violation on every one of them and on no
+/// other. Measured on this tree, release: a split took effect on 99 of 100 seeds and check 19
+/// tripped on the same 99, 19 of the gate's 20 — at every tier (D-061) — and every run stopped
+/// at check 18's split clause. The correct sweep above holds check 19 green on every seed.
+// PROPOSED(D-140)
+#[test]
+fn a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_sweep() {
+    let found = range_variant("SplitLeavesGap", share(), RangeVariant::SplitLeavesGap);
+    let split = found.iter().filter(|u| u.splits > 0).count();
+    let caught = found
+        .iter()
+        .filter(|u| u.tripped.contains(&Fold::Tiling))
+        .count();
+    println!(
+        "shard: SplitLeavesGap: a split took effect on {split}/{} seeds, check 19 tripped on \
+         {caught}",
+        found.len()
+    );
+    assert!(
+        split > 0,
+        "no split took effect under SplitLeavesGap, so no right half was written short (D-104 \
+         §2: the seeds a split took effect on are read, not assumed)"
+    );
+    for (seed, u) in found.iter().enumerate() {
+        assert_eq!(
+            u.tripped.contains(&Fold::Tiling),
+            u.splits > 0,
+            "seed {seed}: check 19 under SplitLeavesGap does not follow the split: {} splits \
+             took effect, and the folds in violation are {:?}",
+            u.splits,
+            u.tripped
+        );
+    }
+    let failed: Vec<&str> = found.iter().filter_map(|u| u.why.as_deref()).collect();
+    assert!(
+        failed
+            .iter()
+            .all(|why| why.contains("descriptor lineage: right half")),
+        "the run stops at check 18's split clause, the first fold the verdict asks that sees \
+         the short right half, and at nothing before it: {failed:?}"
+    );
+}
+
 /// §10's `IdBlockResumed`: 42 of 100 seeds and 4 of the gate's 20 by check 18, on the restart arm's shape
 /// (`Fault::SplitFromRestarted`, PROPOSED D-131), where it was 10 of 100 on the restarts the faults
 /// drew and the splits that landed on them by chance before the arm. So the catch is asserted at

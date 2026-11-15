@@ -2204,9 +2204,19 @@ impl<E: Environment> ServerApplier<E> {
             voters: parent.voters.clone(),
             state: RangeState::Live,
         };
+        // R starts at the split key; `SplitLeavesGap` starts it one key past it, the key
+        // followed by a zero byte, and leaves the key itself in no range.
+        // PROPOSED(D-140): check 19's instrument, the owner's ruling on D-093.
+        let right_start = if self.range_variants.contains(RangeVariant::SplitLeavesGap) {
+            let mut past = cut.to_vec();
+            past.push(0);
+            Bytes::from(past)
+        } else {
+            cut.clone()
+        };
         let created = RangeDescriptor {
             range: right_id,
-            start: cut.clone(),
+            start: right_start,
             end: parent.end.clone(),
             generation,
             voters: config.voters.clone(),

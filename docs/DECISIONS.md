@@ -26398,4 +26398,71 @@ Seeds 0 to 19 999 of the sharded sweep, in release, ran on this tree beside its 
 
 ---
 
-_Next entry: D-135. Add one before implementing anything not covered above._
+## PROPOSED D-140 — Check 19, the ranges tile the keyspace, folded with its instrument `SplitLeavesGap`, as the owner ruled on D-093 (#162's S7)
+
+**The number.** Off 8760c49 (#236 merged on c5cd18d), whose highest entry is D-134. D-135 to D-138 are taken by PRs in flight, D-139 records the owner's rulings of 2026-11-14, and this slice, Stage C's S7, is given **D-140**; none of D-135 to D-139 is in this tree, and the footer names the number after the highest entry here, D-141. Every code site carries `// PROPOSED(D-140)`.
+
+**The ruling this builds.** The owner's rulings of 2026-11-14, which D-139 records: on D-093, check 19's tripping variant, **option A** — `SplitLeavesGap`, a test instrument of the range layer's own outside §10's count, asserted from Stage C; B, `UnfreezeBeforeAbortCommitted` on `sim/merge.rs`'s shape (e), stays a Stage E measurement; C, exempting check 19 from §11's raft item 12, is not taken. D-104's correction of D-093 stands with it: splits are asserted only in aggregate, so the fold's own test reads the set of seeds on which a split took effect under the instrument and asserts that set non-empty. Stage C's question 2 (SHARD.md §12) is settled by the ruling, and its exit line "check 19 runs under the test the same way, and is asserted against a tripping variant as question 2 settles" is met here.
+
+### Decision
+
+1. **The fold** (`ananke_shard::invariants::Tiling`, `Fold::Tiling`), SHARD.md §8's check 19 as written: over check 7's map, the latest value of every range, with a range dropped at the first `RangeMerged` that names it as `right` until a later new value of it is traced; after every record no two of those spans overlap, and after every `RaftApply` of a range command they cover the keyspace with no gap. Incremental: each range's latest span kept by range, the overlap clause asked of a range where its latest value changes, and the first gap recomputed only where a span or the keyspace changes, so an apply that changes nothing reads a cached answer. Three readings the text leaves open are taken as follows, each for the owner (below).
+   - **The keyspace is what the bootstrap made addressable**: the union of the spans the bootstrap's creations name, `RangeCreated { cause: bootstrap }`, each range's as check 7's map holds it at its floor. SHARD.md §1 has the ranges tile "the addressable keyspace" and range 2 hold "the rest of the keyspace" (§2); a configuration whose user range is the rest makes the union the whole of it. Every scenario of `sim/` gives its user ranges a bounded span — `sim/shard.rs`'s range 2 is `[k, l)` of the user tenant, `sim/ranges.rs`'s four ranges `[k0, k8)` — so a reading of the whole encoded keyspace would find a gap between the system tenant's two tables and the user span on every run of the correct system, at its first range command. Splits and merges keep the union; a move (Stage D) changes no span.
+   - **The latest value is the one at the highest index check 7's map holds**, not the last one traced. Check 7 calls the value at or below an index "the map's latest value"; and a value traced late for a lower index — a replica's first apply of an entry its peers installed past, traced after the split above it — is not the range's descriptor now, and taken as the latest would set the parent back over its right half. The two readings agree wherever every value is traced by a replica that applied every entry below it; where they part, the hand-built `a_value_traced_late_below_a_split_does_not_move_its_ranges_latest_span` holds the fold to the highest index.
+   - **A range command's apply is one whose effect is `took`, `aborted` or `refused`**, the effects §8's `RaftApply` row gives a range command. The node also traces a `MetaUpdate`'s and a refill's apply with those effects (`server.rs`'s apply loop), so the gap clause is asked there too: more often than at splits alone, and no differently, since a span changes only inside a split's (and in Stage E a merge's) own apply, before its `RaftApply`. A split's apply traces P's shrunk descriptor, then R's creation, then — after the right half's store is opened — its `RaftApply`, with no wait between the first two (`ServerApplier::split`), so the overlap clause never sees R beside the parent it came from and the gap clause never sees P shrunk without R.
+2. **Where it is asked.** `Fold::VERDICT` asks check 19 **last**, after check 8's three clauses, and `Fold::ALL` puts it before check 8's right half's clause, which the verdict does not ask: thirteen folds, twelve asked. Check 19 is the cluster-wide property the others leave implicit (D-093), so where it trips beside another fold on the same records — check 8's overlap clause at two spans of one node, check 18's split clause at a right half written short — the verdict names the other, as D-116 put check 8's created-twice clause behind check 18; check 19 is named only where no other fold sees anything (`two_latest_spans_that_overlap_are_caught_by_check_19_where_no_other_fold_sees_it`). The per-fold verdicts (D-106) keep its own catch visible wherever it is behind another.
+3. **The instrument**, `RangeVariant::SplitLeavesGap`, bit 11 of the range layer's set, outside §10's count beside D-108's two instruments and D-113's: `in_section_10` is false, `BUGS` has twelve members, and the set's test names the four instruments. Its fix is the one expression that writes R's start in the split's apply (`ServerApplier::split`): R is written `[succ(k), y)`, `succ(k)` the split key followed by a zero byte, on every replica, and P shrinks to `[x, k)` as it should. The non-voter's range delete of the right span, the `snapshot` task's spans and the meta update all read the descriptors the apply wrote, so nothing else moves.
+
+### What D-093 got wrong, said here and not in its text
+
+D-093 has `SplitLeavesGap` silent to every check but 19 ("the gap is the one shape of a wrong split that only the tiling sees"), with the liveness bound the only other reporter. It was written before check 18's split clause landed (PROPOSED D-100), which holds R's creation at a split's first apply to `[k, y)` at g + 1 (`SplitLineage::check_values`): that clause sees the short right half **at the same `RaftApply`** the gap clause does, on every seed check 19 trips. So the instrument is not one only the tiling sees; what it remains is the instrument the tiling's fold is held to, its own verdict compared fold by fold, which is what the ruling asks of it. The run's verdict under it names check 18, check 19 being asked after it (above). D-093 is merged PROPOSED text and the ruling's record is D-139's, in flight, so D-093 is not edited here.
+
+### What says so
+
+**The fold's reasoning, on records written by hand** (`invariants.rs`, `mod tests`; the crate's lib, the `rest` job):
+
+- `a_split_that_leaves_a_key_in_no_range_is_caught_by_check_19_at_its_apply`: the pair. A split in shape tiles on two replicas, through a client write of the right half; the same split with R written short leaves the split key in no range, unseen before the split's `RaftApply` and at a client command's apply, seen at the split's apply with the gap beginning at the key; check 18's split clause in violation beside it and named by the verdict; every other fold green.
+- `check_19_asks_the_keyspace_the_bootstrap_made_addressable_and_no_more`: two bootstrap ranges apart are no gap at a refused range command; one shrunk by a change of its descriptor is, at the next.
+- `a_value_traced_late_below_a_split_does_not_move_its_ranges_latest_span`: the highest index, above.
+- `two_latest_spans_that_overlap_are_caught_by_check_19_where_no_other_fold_sees_it`: one range per node, check 8 silent, check 19 named.
+- `a_range_merged_away_leaves_the_tiling_until_a_later_value_of_it`: Stage E's arm on records standing in for a merge's apply.
+
+Plants, each applied alone to the fold and reverted, run against those tests and `a_split_in_shape_passes_check_18_on_every_replica`:
+
+| plant | caught by |
+|---|---|
+| the gap never reported | the pair's short split, and the keyspace test's shrunk range |
+| the gap reported wherever the spans change, not at a range command's apply | the pair's split in shape (P shrunk before R's creation), the keyspace test, the late value, and check 18's `a_split_in_shape_passes_check_18_on_every_replica` |
+| the gap asked at every apply, a client command's included | the pair, at the client write before the split's apply |
+| no overlap clause | the two-node overlap, and the merge test's range brought back |
+| the keyspace one interval from the least start to the greatest end | the keyspace test, at its refused range command |
+| no drop at a merge | the merge test, at the grown span |
+
+**Two older fixtures re-shaped, nothing they assert changed.** `a_key_written_at_a_lower_generation_or_by_a_sibling_at_the_same_one_is_a_violation` (check 10) and `a_meta_apply_that_names_a_lower_generation_for_a_key_is_a_violation` (check 16) each created a second range over the first's keys on another node and left the first's span as it was — D-107 moved them off one node to keep check 8 quiet — so two latest spans overlapped, which check 19 sees, and their `checker.verdict().unwrap()` before the violation they are about failed. Each now traces the first range shrunk, as a split's apply does, before the second's creation: check 10's as a split of range 2 at `b` whose right half writes `b` before range 2's first apply of index 4 writes it at the first generation, check 16's as the parent's change at the right half's floor on the same node. Each still asserts the same catch in the same words.
+
+**The pair on the sweeps.** Check 19 against `SplitLeavesGap`:
+
+- under the per-fold equivalence test (SHARD.md §11, raft 12), on the node sweep's arms (`the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves_gap`, `sim/tests/node.rs`): measured on this tree, release, a split took effect on all of the first hundred compared seeds and check 19 tripped on the same hundred, twenty of twenty at the gate's twenty, each a gap at the split's first apply; check 18's split clause is in violation on the same seeds and no other fold on any.
+- on the sharded sweep (`a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_sweep`, `sim/tests/shard.rs`, `share()`): a split took effect on 99 of the hundred and check 19 tripped on those 99 and on no other, 19 of 20 at the gate's twenty; every run that failed was stopped by check 18's split clause, at the same apply.
+
+Each reads the set of seeds a split took effect on and asserts it non-empty (D-104), and asserts check 19 in violation on exactly that set — on every seed a split took effect, as D-093 has it, and on none where none did. The rate is the split's, far above D-061's five per cent, so the catch is asserted at every tier.
+
+**The correct system passes.** Check 19 is in the verdict that stops every node scenario's run (`raft::Report`, `sim/shard.rs`, `sim/split.rs`, `sim/reseed.rs`, `sim/install.rs`, `sim/membership.rs`, `sim/quorum.rs`), and the correct node's fold-by-fold comparison asserts it green with every fold that stops a run. On this tree, release: the node sweep's correct node under the raft sweep's arms (`every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`) passes all of seeds 0 to 999, with 1 623 splits taking effect over them; the correct node's fold-by-fold comparison passes its hundred with check 19 green on each; and at CI's hundred, every test of `sim/tests/split.rs`, `sim/tests/reseed.rs` and `sim/tests/install.rs`, the correct membership scenario and the sharded quorum scenario pass. Seeds 0 to 9 999 of the sharded sweep (`every_seed_passes_on_the_correct_sharded_sweep`), in release, ran on this tree beside its gate; what they reported is in the commit that carries this entry.
+
+### What moves
+
+No schedule and no trace: the fold reads the trace and the instrument is off in every correct run. No bound, pinned hash or assertion is widened or removed. Under the instrument the run stops at the split's first apply, by check 18's split clause.
+
+**Tiers (D-061, D-064).** Two sweeps are added, each asserting its catch at every tier; their nightly rows are in `scripts/nightly-shards.txt`, weighed as that file says: the comparison in `node` at 22.3 cpu s into shard 4, the sharded sweep's catch at 5.5 into shard 3, each the lightest when it went in. `scripts/check-nightly-shards.sh` passes.
+
+### For the owner (PROPOSED)
+
+1. The keyspace as the union of the bootstrap's spans, rather than the whole encoded keyspace outside tenant 0, which no scenario's configuration tiles.
+2. The latest value by highest index, rather than by the last record.
+3. The gap clause asked at every apply whose effect is a range command's, the meta update's and the refill's among them.
+4. Check 19 asked last by the checker's verdict.
+5. The merge arm, which nothing exercises until Stage E. It assumes a merge's apply traces `RangeMerged` before L's grown descriptor, or the overlap clause trips on the correct node at the first merge; Stage E's merge fixes that order or revisits the arm.
+
+---
+
+_Next entry: D-141. Add one before implementing anything not covered above._

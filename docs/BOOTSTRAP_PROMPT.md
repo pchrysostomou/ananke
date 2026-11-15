@@ -101,6 +101,15 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-check19-tiling` (2026-11-15), off 8760c49 (#236), **PROPOSED D-140**, #162's
+  S7, on the owner's ruling of 2026-11-14 on D-093 (option A): check 19, the ranges tile the keyspace, as a
+  fold of the range layer's checker (`invariants::Tiling`), asked last by its verdict; the keyspace is the
+  union of the bootstrap's spans and a range's latest value the one at the highest index of check 7's map.
+  Its instrument `SplitLeavesGap` (outside §10's count) writes a split's right half one key short; check 19
+  trips on exactly the seeds a split took effect on, under the per-fold equivalence test on the node sweep
+  and on the sharded sweep, at every tier; check 18's split clause sees the same apply, which D-093 missed.
+  The correct node sweep passes seeds 0 to 999; the sharded sweep's ten thousand ran beside the gate and
+  the commit says what they reported. Two nightly rows, into shards 4 and 3.
 - Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
   **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
   ended in a switch, so a hold the node let go with no switch was measured as a running core (seed

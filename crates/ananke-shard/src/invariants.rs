@@ -1,11 +1,11 @@
-//! SHARD.md §8's checks 7, 8, 9, 10, 16, 17 and 18 as folds over the trace, in the
-//! range layer where Q40 puts checks 7 to 22: descriptor agreement, one owner per key on
-//! a node, serving within span, owners' generations rising, meta never going back, a
-//! client refreshing on a mismatch, and the lineage of range ids and splits. Each is a
-//! fold fed one record at a time, with a verdict readable at any prefix, so one
-//! [`Checker`] runs the eight — check 18 is two, [`IdsUnique`] and [`SplitLineage`] —
-//! incrementally beside `ananke_raft::invariants`'s and again over the whole trace at
-//! the end (D-046; §8).
+//! SHARD.md §8's checks 7, 8, 9, 10, 16, 17, 18, 19 and 20 as folds over the trace, in
+//! the range layer where Q40 puts checks 7 to 22: descriptor agreement, one owner per key
+//! on a node, serving within span, owners' generations rising, meta never going back, a
+//! client refreshing on a mismatch, the lineage of range ids and splits, the ranges
+//! tiling the keyspace, and a placeholder granting nothing. Each is a fold fed one record
+//! at a time, with a verdict readable at any prefix, so one [`Checker`] runs them — check
+//! 18 is two, [`IdsUnique`] and [`SplitLineage`] — incrementally beside
+//! `ananke_raft::invariants`'s and again over the whole trace at the end (D-046; §8).
 //!
 //! **Check 7** holds a map from (range, index) to the descriptor in force from that
 //! index: a `RangeCreated` of a bootstrap or a split is the value at (range,
@@ -58,10 +58,18 @@
 //! split's index from a history of the configurations each range committed, which a
 //! right half's creation seeds at its floor (PROPOSED D-106).
 //!
+//! **Check 19**, [`Tiling`]: the latest value of every range in check 7's map, a range
+//! dropped at its merge; after every record no two of those spans overlap, and after
+//! every `RaftApply` of a range command they cover, with no gap, the keyspace the
+//! bootstrap's creations made addressable. Its instrument is `SplitLeavesGap`, a right
+//! half written one key short, as the owner ruled on D-093 (PROPOSED D-140).
+//!
 //! **Each fold has a verdict of its own** ([`Fold`], [`Checker::verdict_of`]), so that a
 //! run in which two folds are in violation shows both: [`Checker::verdict`], which
-//! stops a run, reports the first of them in the order 7, 9, 10, 16, 17, 18, 20 and then
-//! check 8's overlap, install and created-twice clauses, and a catch read through it alone would
+//! stops a run, reports the first of them in the order 7, 9, 10, 16, 17, 18, 20, then
+//! check 8's overlap, install and created-twice clauses, and then check 19, which comes
+//! after every other so that a violation another fold names on the same records stays
+//! that fold's (PROPOSED D-140); and a catch read through it alone would
 //! credit every write applied outside its span to check 9 and never show check 10 trip
 //! on the same write (PROPOSED D-106). Check 8's four clauses are a verdict each ([`Fold::Overlap`],
 //! [`Fold::RightHalf`], [`Fold::InstallSpan`], [`Fold::CreatedTwice`]), and the right half's is
@@ -74,6 +82,7 @@
 // PROPOSED(D-106): a verdict per fold, and check 18's configuration history.
 // PROPOSED(D-107): check 7's restatement clause, and check 8.
 // PROPOSED(D-116): check 8's created-twice clause.
+// PROPOSED(D-140): check 19.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -1835,8 +1844,237 @@ impl PlaceholderGrantsNothing {
     }
 }
 
-/// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16, 17 and 20,
-/// check 18's two clauses, and check 8's four, each of which keeps a verdict of its own
+/// Check 19, the ranges tile the keyspace (SHARD.md §8), over check 7's map: the latest
+/// value of every range — the value at the highest index the map holds for it — with a
+/// range dropped at the first `RangeMerged` that names it as `right` until a later new
+/// value of it is traced. After every record no two of those spans overlap, and after
+/// every `RaftApply` of a range command — an apply whose effect is `took`, `aborted` or
+/// `refused`, the effects §8 gives a range command — they cover the keyspace with no gap.
+/// Where check 8 is one node, this is the cluster: the descriptors every replica agrees
+/// on (check 7) and every node keeps disjoint (check 8) must also add up to the keyspace.
+///
+/// **The keyspace** is what the bootstrap made addressable: the union of the spans its
+/// creations name, `RangeCreated { cause: bootstrap }`, each range's as check 7's map
+/// holds it at its floor. SHARD.md §1 has range 2 hold "the rest of the keyspace", and
+/// there the union is the whole of it; a configuration that gives its user ranges a
+/// bounded span, as every scenario of `sim/` does, makes only that span addressable,
+/// and a gap between it and the system tenant is no range's to cover.
+///
+/// **Latest** is the highest index and not the last record: a value check 7's map takes
+/// late at a lower index — a replica tracing its first apply of an entry its peers
+/// installed past — is not the range's descriptor now, and its span would put an old
+/// shape back beside the halves that replaced it. The two agree wherever every value is
+/// traced by a replica that applied every entry below it.
+///
+/// A split's apply traces P's shrunk descriptor before R's creation and its `RaftApply`
+/// after both, so the overlap clause never sees R beside the parent it came from, and the
+/// gap clause, asked at the apply, never sees P shrunk without R. Incremental: the
+/// latest spans by range, recomputed against the keyspace only where one changes.
+// PROPOSED(D-140): check 19 (the owner's ruling on D-093).
+#[derive(Clone, Debug, Default)]
+pub struct Tiling {
+    /// The keyspace, as disjoint and non-adjacent intervals keyed by start.
+    keyspace: BTreeMap<Bytes, Bytes>,
+    /// The ranges whose bootstrap creation has added its span to the keyspace.
+    bootstrapped: BTreeSet<u64>,
+    /// Each range's latest value as last folded: its index in check 7's map and its span.
+    latest: BTreeMap<u64, Tile>,
+    /// The ranges a `RangeMerged` has named as `right`, each dropped at the first.
+    merged: BTreeSet<u64>,
+    /// The ranges dropped, each with how many values check 7's map held for it at its
+    /// drop: a value beyond them is a later new value, which brings the range back.
+    dropped: BTreeMap<u64, usize>,
+    /// The first part of the keyspace no latest span holds, as the spans stand.
+    gap: Option<(Bytes, Bytes)>,
+    violation: Option<String>,
+}
+
+/// One range's latest value as check 19 holds it.
+// PROPOSED(D-140)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tile {
+    index: u64,
+    start: Bytes,
+    end: Bytes,
+}
+
+impl Tiling {
+    /// Folds one record against check 7's map as it stands.
+    pub fn push(&mut self, record: &TraceRecord, descriptors: &Descriptors) {
+        if self.violation.is_some() {
+            return;
+        }
+        let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                floor_index,
+                ..
+            } => {
+                let mut widened = false;
+                if *cause == RangeCause::Bootstrap
+                    && !self.bootstrapped.contains(range)
+                    && let Some(held) = descriptors.at(*range, *floor_index)
+                {
+                    self.bootstrapped.insert(*range);
+                    self.widen(held.start.clone(), held.end.clone());
+                    widened = true;
+                }
+                self.refresh(*range, descriptors, node, "creation", widened);
+            }
+            TraceEvent::RangeDescriptor { range, .. } => {
+                self.refresh(*range, descriptors, node, "descriptor", false);
+            }
+            TraceEvent::RangeMerged { right, .. } => {
+                if self.merged.insert(*right) {
+                    let values = descriptors.by_range.get(right).map_or(0, BTreeMap::len);
+                    self.dropped.insert(*right, values);
+                    self.gap = self.first_gap();
+                }
+            }
+            TraceEvent::RaftApply {
+                range,
+                index,
+                effect: effect @ (ApplyEffect::Took | ApplyEffect::Aborted | ApplyEffect::Refused),
+                ..
+            } => {
+                if let Some((start, end)) = &self.gap {
+                    self.violation = Some(format!(
+                        "ranges tile the keyspace: after node {node:?}'s apply of range \
+                         {range}'s index {index}, a range command that applied as {}, no \
+                         range's latest span holds {start:?}..{end:?} of the keyspace the \
+                         bootstrap made addressable (SHARD.md §1, §8, check 19)",
+                        effect.as_str()
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds `start..end` to the keyspace, joined with every interval it meets.
+    fn widen(&mut self, start: Bytes, end: Bytes) {
+        if start >= end {
+            return;
+        }
+        let (mut low, mut high) = (start, end);
+        let met: Vec<Bytes> = self
+            .keyspace
+            .range(..=high.clone())
+            .filter(|(_, until)| **until >= low)
+            .map(|(from, _)| from.clone())
+            .collect();
+        for from in met {
+            if let Some(until) = self.keyspace.remove(&from) {
+                low = low.min(from);
+                high = high.max(until);
+            }
+        }
+        self.keyspace.insert(low, high);
+    }
+
+    /// Takes `range`'s latest value from check 7's map, and where it changed — or the
+    /// range came back from a drop, or the keyspace widened — asks the overlap clause of
+    /// it and recomputes the gap.
+    fn refresh(
+        &mut self,
+        range: u64,
+        descriptors: &Descriptors,
+        node: Option<u64>,
+        what: &str,
+        widened: bool,
+    ) {
+        let Some(values) = descriptors.by_range.get(&range) else {
+            if widened {
+                self.gap = self.first_gap();
+            }
+            return;
+        };
+        let Some((index, held)) = values.last_key_value() else {
+            return;
+        };
+        let back = self
+            .dropped
+            .get(&range)
+            .is_some_and(|at_drop| values.len() > *at_drop);
+        if back {
+            self.dropped.remove(&range);
+        }
+        let tile = Tile {
+            index: *index,
+            start: held.start.clone(),
+            end: held.end.clone(),
+        };
+        let changed = self.latest.get(&range) != Some(&tile);
+        if changed {
+            self.latest.insert(range, tile.clone());
+        }
+        if !(changed || back || widened) {
+            return;
+        }
+        if (changed || back) && !self.dropped.contains_key(&range) {
+            let overlapped = self.latest.iter().find(|(other, held)| {
+                **other != range
+                    && !self.dropped.contains_key(other)
+                    && held.start < tile.end
+                    && tile.start < held.end
+            });
+            if let Some((other, held)) = overlapped {
+                self.violation = Some(format!(
+                    "ranges tile the keyspace: range {range}'s latest span {:?}..{:?}, its \
+                     value at index {}, overlaps range {other}'s, {:?}..{:?} at index {}, at \
+                     node {node:?}'s {what} (SHARD.md §8, check 19)",
+                    tile.start, tile.end, tile.index, held.start, held.end, held.index
+                ));
+                return;
+            }
+        }
+        self.gap = self.first_gap();
+    }
+
+    /// The first part of the keyspace that no latest span of a range not dropped holds.
+    fn first_gap(&self) -> Option<(Bytes, Bytes)> {
+        let mut spans: Vec<(&Bytes, &Bytes)> = self
+            .latest
+            .iter()
+            .filter(|(range, _)| !self.dropped.contains_key(range))
+            .map(|(_, tile)| (&tile.start, &tile.end))
+            .collect();
+        spans.sort();
+        for (from, until) in &self.keyspace {
+            let mut covered = from;
+            for (start, end) in &spans {
+                if covered >= until {
+                    break;
+                }
+                if *end <= covered {
+                    continue;
+                }
+                if *start > covered {
+                    return Some((covered.clone(), (*start).min(until).clone()));
+                }
+                covered = (*end).max(covered);
+            }
+            if covered < until {
+                return Some((covered.clone(), until.clone()));
+            }
+        }
+        None
+    }
+
+    /// The first violation, if one was folded.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    pub fn verdict(&self) -> Result<(), String> {
+        self.violation.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16, 17, 19 and
+/// 20, check 18's two clauses, and check 8's four, each of which keeps a verdict of its own
 /// in [`Checker`].
 // PROPOSED(D-106): a verdict per fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1876,13 +2114,19 @@ pub enum Fold {
     /// Check 20, a placeholder grants nothing ([`PlaceholderGrantsNothing`]).
     // PROPOSED(D-109)
     PlaceholderGrants,
+    /// Check 19, the ranges tile the keyspace ([`Tiling`]): asked by [`Checker::verdict`]
+    /// after every other fold it asks, so a violation another fold names on the same
+    /// records stays that fold's.
+    // PROPOSED(D-140)
+    Tiling,
 }
 
 impl Fold {
-    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20
-    /// and check 8's overlap, install and created-twice clauses — and then check 8's right
-    /// half's clause, which it does not ask ([`Fold::VERDICT`]).
-    pub const ALL: [Self; 12] = [
+    /// Every fold, in the order [`Checker::verdict`] asks them — 7, 9, 10, 16, 17, 18, 20,
+    /// check 8's overlap, install and created-twice clauses and check 19 — and then check
+    /// 8's right half's clause, which it does not ask ([`Fold::VERDICT`]).
+    // PROPOSED(D-140): check 19.
+    pub const ALL: [Self; 13] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1894,6 +2138,7 @@ impl Fold {
         Self::Overlap,
         Self::InstallSpan,
         Self::CreatedTwice,
+        Self::Tiling,
         Self::RightHalf,
     ];
 
@@ -1902,10 +2147,15 @@ impl Fold {
     /// fold before them reports moves to them — check 18's reused id, which the
     /// created-twice clause also sees at the second split's creation, stays check 18's
     /// (PROPOSED D-116) — and check 8's right half's clause not at all (PROPOSED D-107,
-    /// D-128).
+    /// D-128). Check 19 comes after all of them: it is the cluster-wide property the
+    /// others leave implicit, so where it trips beside one of them — check 8's overlap
+    /// clause at two spans of one node, check 18's split clause at a right half written
+    /// short — the verdict names the other, and check 19 is named only where no other
+    /// fold sees anything (PROPOSED D-140).
     // PROPOSED(D-107)
-    // PROPOSED(D-116): the created-twice clause, last.
-    pub const VERDICT: [Self; 11] = [
+    // PROPOSED(D-116): the created-twice clause, last of check 8's.
+    // PROPOSED(D-140): check 19 after every other.
+    pub const VERDICT: [Self; 12] = [
         Self::DescriptorAgreement,
         Self::ServingWithinSpan,
         Self::GenerationsRise,
@@ -1917,6 +2167,7 @@ impl Fold {
         Self::Overlap,
         Self::InstallSpan,
         Self::CreatedTwice,
+        Self::Tiling,
     ];
 
     /// The check of SHARD.md §8 the fold is; check 8 is four folds and check 18 two.
@@ -1930,6 +2181,7 @@ impl Fold {
             Self::MetaNeverGoesBack => 16,
             Self::ClientRefreshes => 17,
             Self::RangeIds | Self::SplitLineage => 18,
+            Self::Tiling => 19,
             Self::PlaceholderGrants => 20,
         }
     }
@@ -1950,6 +2202,7 @@ impl Fold {
                 "one owner per key:"
             }
             Self::PlaceholderGrants => "placeholder grants nothing:",
+            Self::Tiling => "ranges tile the keyspace:",
         }
     }
 }
@@ -1973,7 +2226,7 @@ impl std::fmt::Display for Fold {
     }
 }
 
-/// The range layer's folds — checks 7, 8, 9, 10, 16, 17 and 20, and check 18's two
+/// The range layer's folds — checks 7, 8, 9, 10, 16, 17, 19 and 20, and check 18's two
 /// clauses — as one incremental checker: fed the records since its last look, with a verdict at
 /// any prefix that is what the folds over the whole prefix report, in the same words
 /// (D-046), for each fold on its own ([`Checker::verdict_of`], check 8 a verdict per
@@ -1994,6 +2247,8 @@ pub struct Checker {
     lineage: SplitLineage,
     // PROPOSED(D-109)
     placeholders: PlaceholderGrantsNothing,
+    // PROPOSED(D-140)
+    tiling: Tiling,
 }
 
 impl Checker {
@@ -2020,6 +2275,7 @@ impl Checker {
         self.ids.push(record);
         self.lineage.push(record, &self.descriptors, &self.ids);
         self.placeholders.push(record);
+        self.tiling.push(record, &self.descriptors);
     }
 
     /// Folds records in order.
@@ -2062,18 +2318,21 @@ impl Checker {
             Fold::InstallSpan => self.owners.install_verdict(),
             Fold::CreatedTwice => self.owners.created_twice_verdict(),
             Fold::PlaceholderGrants => self.placeholders.verdict(),
+            Fold::Tiling => self.tiling.verdict(),
         }
     }
 
     /// Every fold's own verdict, in [`Fold::ALL`]'s order.
     // PROPOSED(D-106): a verdict per fold.
-    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 12] {
+    // PROPOSED(D-140): and check 19's.
+    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 13] {
         Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
     }
 
-    /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, 20, and
-    /// then check 8's overlap clause, its install clause and its created-twice clause,
-    /// last so that no violation a fold before them reports moves to them. This is what stops a run, and it names one fold where several may
+    /// The first violation, in [`Fold::VERDICT`]'s order: 7, 9, 10, 16, 17, 18, 20, then
+    /// check 8's overlap clause, its install clause and its created-twice clause, so that
+    /// no violation a fold before them reports moves to them, and check 19 last, for the
+    /// same reason (PROPOSED D-140). This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
     /// right half's clause is folded and **not** in it: the correct node trips it on a
     /// voter installed past a split, which holds no placeholder for the right half
@@ -2268,23 +2527,49 @@ mod tests {
     fn a_key_written_at_a_lower_generation_or_by_a_sibling_at_the_same_one_is_a_violation() {
         let mut checker = Checker::new(true);
         checker.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
-        // On another node: one node holding both spans is check 8's (PROPOSED D-107).
-        let mut higher = created(2, 3, b"a", b"k", 2, &[1, 2, 3]);
-        if let TraceEvent::RangeCreated { floor_index, .. } = &mut higher.event {
-            *floor_index = 0;
+        // Range 2 splits at index 5 at `b`, as a split's apply traces it: the parent
+        // shrunk, then its right half, range 3, at the next generation. Until PROPOSED
+        // D-140 range 3 was created over range 2's whole span on another node, which
+        // check 8 does not see and check 19 does: two latest spans that overlap.
+        checker.push(&record(
+            1,
+            TraceEvent::RangeDescriptor {
+                range: 2,
+                index: 5,
+                applied: 5,
+                start: user_key(b"a"),
+                end: user_key(b"b"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
+        let mut higher = created(1, 3, b"b", b"k", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated {
+            cause,
+            parent,
+            floor_index,
+            ..
+        } = &mut higher.event
+        {
+            *cause = RangeCause::Split;
+            *parent = Some(2);
+            *floor_index = 5;
         }
         checker.push(&higher);
-        checker.push(&applied(1, 3, 1, b"b", ApplyEffect::Applied));
+        checker.push(&applied(1, 3, 6, b"b", ApplyEffect::Applied));
         checker.verdict().unwrap();
+        // Range 2's first apply of an index below the split, writing `b` at the first
+        // generation after range 3 wrote it at the second.
         let mut lower = checker.clone();
-        lower.push(&applied(1, 2, 9, b"b", ApplyEffect::Applied));
+        lower.push(&applied(1, 2, 4, b"b", ApplyEffect::Applied));
         assert!(lower.verdict().unwrap_err().contains("strictly rise"));
         // The same range writing again at the same generation is fine.
-        checker.push(&applied(1, 3, 2, b"b", ApplyEffect::Applied));
+        checker.push(&applied(1, 3, 7, b"b", ApplyEffect::Applied));
         checker.verdict().unwrap();
         // A second apply of the same (range, index) on another server is not a second
         // write.
-        checker.push(&applied(2, 3, 2, b"b", ApplyEffect::Applied));
+        checker.push(&applied(2, 3, 7, b"b", ApplyEffect::Applied));
         checker.verdict().unwrap();
     }
 
@@ -3859,12 +4144,12 @@ mod tests {
         }
         assert_eq!(
             Fold::VERDICT.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8, 19],
             "the order the checker's verdict asks the folds in"
         );
         assert_eq!(
             Fold::ALL.map(Fold::check),
-            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8, 8],
+            [7, 9, 10, 16, 17, 18, 18, 20, 8, 8, 8, 19, 8],
             "every fold, the verdict's first and check 8's right half's clause last"
         );
         assert_eq!(
@@ -3999,7 +4284,21 @@ mod tests {
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
         // On another node: one node holding the parent's whole span beside it is check
-        // 8's (PROPOSED D-107).
+        // 8's (PROPOSED D-107). The parent shrinks there first, as a split's apply traces
+        // it: two latest spans that overlap are check 19's (PROPOSED D-140).
+        checker.push(&record(
+            2,
+            TraceEvent::RangeDescriptor {
+                range: 2,
+                index: 7,
+                applied: 7,
+                start: user_key(b"a"),
+                end: user_key(b"k"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
         let mut higher = created(2, 3, b"k", b"z", 2, &[1, 2, 3]);
         if let TraceEvent::RangeCreated {
             cause, floor_index, ..
@@ -4207,6 +4506,227 @@ mod tests {
         ])
         .unwrap_err();
         assert!(gone.contains("from its placeholder"), "{gone}");
+    }
+
+    /// A split's records on node `on` with its right half written as `SplitLeavesGap`
+    /// writes it, one key past the split key: `[succ(key), end)` (PROPOSED D-140).
+    #[allow(clippy::too_many_arguments)]
+    fn a_split_leaving_a_gap(
+        on: u64,
+        parent: u64,
+        index: u64,
+        term: u64,
+        key: &[u8],
+        start: &[u8],
+        end: &[u8],
+        generation: u64,
+        right: u64,
+    ) -> Vec<TraceRecord> {
+        let mut records =
+            split_records(on, parent, index, term, key, start, end, generation, right);
+        if let TraceEvent::RangeCreated { start, .. } = &mut records[2].event {
+            let mut past = start.to_vec();
+            past.push(0);
+            *start = Bytes::from(past);
+        }
+        records
+    }
+
+    /// Check 19's pair on records written by hand (PROPOSED D-140): a split in shape
+    /// tiles the keyspace on every replica, and the same split with its right half
+    /// written one key short leaves the split key in no range, which the fold sees at the
+    /// split's apply — the first `RaftApply` of a range command after the gap — and not
+    /// before it, at a client command's apply. Check 18's split clause sees the short
+    /// right half at that same apply, and the checker's verdict names it, check 19 being
+    /// asked last.
+    // PROPOSED(D-140)
+    #[test]
+    fn a_split_that_leaves_a_key_in_no_range_is_caught_by_check_19_at_its_apply() {
+        let mut tiled = Checker::new(true);
+        tiled.extend(&before_a_split());
+        tiled.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        tiled.extend(&split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        tiled.push(&applied(1, 6, 10, b"q", ApplyEffect::Applied));
+        assert_eq!(tiled.verdict_of(Fold::Tiling), Ok(()));
+        tiled.verdict().unwrap();
+
+        let mut gap = Checker::new(true);
+        gap.extend(&before_a_split());
+        let records = a_split_leaving_a_gap(1, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        gap.extend(&records[..3]);
+        assert_eq!(
+            gap.verdict_of(Fold::Tiling),
+            Ok(()),
+            "a gap is judged at a range command's apply and not before it"
+        );
+        gap.push(&applied(1, 2, 8, b"c", ApplyEffect::Applied));
+        assert_eq!(
+            gap.verdict_of(Fold::Tiling),
+            Ok(()),
+            "a client command's apply is not a range command's"
+        );
+        gap.push(&records[3]);
+        let nineteen = gap.verdict_of(Fold::Tiling).unwrap_err();
+        assert!(nineteen.starts_with(Fold::Tiling.words()), "{nineteen}");
+        assert!(
+            nineteen.contains(&format!("{:?}..", user_key(b"m"))),
+            "the gap begins at the split key: {nineteen}"
+        );
+        assert!(nineteen.contains("index 9"), "{nineteen}");
+        let eighteen = gap.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert_eq!(gap.verdict(), Err(eighteen), "check 19 is asked last");
+        for (fold, verdict) in gap.verdicts() {
+            if !matches!(fold, Fold::Tiling | Fold::SplitLineage) {
+                assert_eq!(verdict, Ok(()), "{fold}");
+            }
+        }
+        assert_eq!(
+            Fold::Tiling.to_string(),
+            "check 19 (ranges tile the keyspace)"
+        );
+    }
+
+    /// The keyspace is what the bootstrap's creations cover, and a span between two of
+    /// them is no range's to hold: two user ranges apart, a refused range command applied
+    /// beside them, no gap; one of them shrunk by a change of its descriptor, the next
+    /// range command's apply finds the part it let go (PROPOSED D-140).
+    // PROPOSED(D-140)
+    #[test]
+    fn check_19_asks_the_keyspace_the_bootstrap_made_addressable_and_no_more() {
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"c", 1, &[1, 2, 3]));
+        checker.push(&created(1, 3, b"x", b"z", 1, &[1, 2, 3]));
+        checker.push(&applied(1, 2, 1, b"a", ApplyEffect::Refused));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
+        checker.push(&record(
+            1,
+            TraceEvent::RangeDescriptor {
+                range: 2,
+                index: 2,
+                applied: 2,
+                start: user_key(b"a"),
+                end: user_key(b"b"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
+        checker.push(&applied(1, 3, 1, b"x", ApplyEffect::Took));
+        let gap = checker.verdict_of(Fold::Tiling).unwrap_err();
+        assert!(
+            gap.contains(&format!("{:?}..{:?}", user_key(b"b"), user_key(b"c"))),
+            "{gap}"
+        );
+    }
+
+    /// A range's latest value is the one at the highest index check 7's map holds, not
+    /// the last one traced: a lagging replica's first apply of an index below a split,
+    /// traced after the split, puts a value there that is not the range's descriptor now,
+    /// and its span would set the parent back over its right half (PROPOSED D-140).
+    // PROPOSED(D-140)
+    #[test]
+    fn a_value_traced_late_below_a_split_does_not_move_its_ranges_latest_span() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        // Node 3's first apply of range 2's index 5, after node 1 traced the split at 9:
+        // a change of range 2's descriptor at 5 that kept its span.
+        checker.push(&record(
+            3,
+            TraceEvent::RangeDescriptor {
+                range: 2,
+                index: 5,
+                applied: 5,
+                start: user_key(b"a"),
+                end: user_key(b"z"),
+                generation: 1,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
+        checker.push(&applied(1, 6, 10, b"q", ApplyEffect::Took));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
+    }
+
+    /// Two ranges whose latest spans overlap, each on a node of its own so that check 8
+    /// sees nothing: check 19 sees it at the record that made the overlap, and the
+    /// checker's verdict names it, no other fold having anything (PROPOSED D-140).
+    // PROPOSED(D-140)
+    #[test]
+    fn two_latest_spans_that_overlap_are_caught_by_check_19_where_no_other_fold_sees_it() {
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.verdict().unwrap();
+        checker.push(&created(2, 3, b"k", b"z", 1, &[1, 2, 3]));
+        let nineteen = checker.verdict_of(Fold::Tiling).unwrap_err();
+        assert!(nineteen.contains("overlaps range 2's"), "{nineteen}");
+        assert_eq!(checker.verdict(), Err(nineteen));
+        assert_eq!(checker.verdict_of(Fold::Overlap), Ok(()), "one node each");
+    }
+
+    /// A range merged away leaves the tiling at the first `RangeMerged` that names it
+    /// as `right`, so the left range's grown span overlaps nothing; a later new value of
+    /// it brings it back (SHARD.md §8, check 19). Merge is Stage E's, and these records
+    /// stand in for what its apply will trace (PROPOSED D-140).
+    // PROPOSED(D-140)
+    #[test]
+    fn a_range_merged_away_leaves_the_tiling_until_a_later_value_of_it() {
+        let grown = |index: u64| {
+            record(
+                1,
+                TraceEvent::RangeDescriptor {
+                    range: 2,
+                    index,
+                    applied: index,
+                    start: user_key(b"a"),
+                    end: user_key(b"z"),
+                    generation: 2,
+                    voters: vec![1, 2, 3],
+                    state: RangeState::Live,
+                },
+            )
+        };
+        let merged = record(
+            1,
+            TraceEvent::RangeMerged {
+                range: 2,
+                right: 3,
+                begun: 4,
+                index: 5,
+                right_index: 3,
+                right_generation: 1,
+                right_applied: 3,
+            },
+        );
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
+        checker.push(&created(1, 3, b"k", b"z", 1, &[1, 2, 3]));
+        checker.push(&merged);
+        checker.push(&grown(5));
+        checker.push(&applied(1, 2, 5, b"a", ApplyEffect::Took));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
+        // Range 3 traced anew: back in the tiling, over range 2's grown span.
+        checker.push(&record(
+            2,
+            TraceEvent::RangeDescriptor {
+                range: 3,
+                index: 9,
+                applied: 9,
+                start: user_key(b"k"),
+                end: user_key(b"z"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
+        let back = checker.verdict_of(Fold::Tiling).unwrap_err();
+        assert!(back.contains("range 3's latest span"), "{back}");
+        // Without the merge, the grown span overlaps range 3 at once.
+        let mut unmerged = Checker::new(true);
+        unmerged.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
+        unmerged.push(&created(1, 3, b"k", b"z", 1, &[1, 2, 3]));
+        unmerged.push(&grown(5));
+        assert!(unmerged.verdict_of(Fold::Tiling).is_err());
     }
 
     #[test]

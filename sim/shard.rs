@@ -57,7 +57,7 @@
 //!
 //! **The checks** ([`Report::check`]): the raft sweep's, over this run's trace
 //! (`raft::Report::over_a_run`) — checks 1 to 4 keyed by range; the range layer's folds,
-//! checks 7, 8, 9, 10, 16, 17, 18 and 20, in one incremental checker that stops the run
+//! checks 7, 8, 9, 10, 16, 17, 18, 19 and 20, in one incremental checker that stops the run
 //! at its first violation and again over the whole trace (D-046); linearizability of
 //! every key across every split (§9), which with the drifting clocks is check 6, lease
 //! safety under drift, as Phase 2 built it; pre-vote's property per (range, server);
@@ -67,7 +67,9 @@
 //! sweep's own: the meta convergence bound (§8), less the right halves the owner's ruling of
 //! 2026-11-09 excuses from it and from nothing else (#220), the shape (nodes 4 and 5 hold nothing;
 //! every bootstrap node created ranges 0, 1 and 2), and D-092's per-seed assertion wherever
-//! a split was refused for want of a range id. Check 19 is S7's, which waits on D-093.
+//! a split was refused for want of a range id. Check 19, the ranges tile the keyspace, is
+//! S7's and among the folds since the owner's ruling on D-093, its instrument
+//! `SplitLeavesGap` (PROPOSED D-140).
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
