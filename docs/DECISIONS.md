@@ -26388,7 +26388,7 @@ The sharded rows' "before" is this tree's, from D-131. The node sweep's comments
 
 Neither moved a schedule: both are the harness's reading of the trace.
 
-**Left as it was, and named.** Which askers are asked (`ended` at or past the heal) and the bound (`took`) still compare the asker's clock with the global `last_fault_healed`, as they did before this entry: up to 50 ms on a 2 s bound. Putting the heal on the admins' clock too changes who is asked, so it is not done here. PROPOSED: a follow-up.
+**Left as it was, and named.** Which askers are asked (`ended` at or past the heal) and the bound (`took`) still compare the asker's clock with the global `last_fault_healed`, as they did before this entry: up to 50 ms on a 2 s bound. Putting the heal on the admins' clock too changes who is asked, so it is not done here. PROPOSED: a follow-up, #245 (opened on this entry's review, N1).
 
 **On the correct system.** Over the ten thousand seeds 631 askers were refused `NoRangeId`, and 76 of them are asked of, still asking at the last fault's heal on a uniform seed with their ranges live: 62 answered done, each with its split applied by the answer on the asker's clock; 12 answered `KeyOutsideSpan` with their split applied, each an asker that asked anew after its split landed; and 2 answered `KeyOutsideSpan` whose split another split had superseded. None took no effect, and the slowest answer came 1.42 s from its origin against the 2 s bound.
 
@@ -26406,7 +26406,7 @@ The correct sharded sweep, `every_seed_passes_on_the_correct_sharded_sweep`, pas
 2. A leader with no run stated as check 18's own violation, rather than a fallback to the node.
 3. The retry's effect read from the trace on the asker's clock (`split_fate`, `RunHeader::node_time`), and a `KeyOutsideSpan` the trace shows true read as final where another split pre-empted the one asked for.
 4. `RefusedAfterRefill` at bit 11, an instrument, its catch asserted at the thousand with seed 992's pin at every tier, since the situation D-092's check asks about is reached on under 1 % of seeds.
-5. The heal read on the asker's clock as well, as a follow-up.
+5. The heal read on the asker's clock as well, as a follow-up (#245).
 
 ---
 

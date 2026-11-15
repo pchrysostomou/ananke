@@ -853,6 +853,8 @@ pub struct Retried {
 impl Retried {
     /// Whether it was still asking when the last fault healed at `heal`, so that some retry
     /// of its came after the heal.
+    // PROPOSED(D-137): `ended` is on the asker's clock and `heal` is global, here and in
+    // `took`; reading the heal on the asker's clock too is #245.
     #[must_use]
     pub fn asking_at(&self, heal: Instant) -> bool {
         self.ended >= heal
