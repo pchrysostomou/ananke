@@ -1050,7 +1050,7 @@ fn convert(
                 ("outstanding", int(*outstanding)),
             ])),
         ),
-        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        // D-129: a leader refuses a read it can never confirm.
         TraceEvent::RaftReadsConfirmable {
             server,
             range,
@@ -1069,7 +1069,7 @@ fn convert(
                 ("dropped", int(*dropped)),
             ])),
         ),
-        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        // D-129: a leader refuses a read it can never confirm.
         TraceEvent::RaftReadRefused {
             server,
             range,
@@ -1236,7 +1236,7 @@ fn convert(
                 ("range", int(*range)),
             ])),
         ),
-        // PROPOSED(D-110): the leader's half of the overlap rule.
+        // D-110: the leader's half of the overlap rule.
         TraceEvent::RaftSnapshotOverlapped {
             server,
             range,
@@ -1251,7 +1251,7 @@ fn convert(
                 ("last_index", int(*last_index)),
             ])),
         ),
-        // PROPOSED(D-110): the leader's half of the overlap rule.
+        // D-110: the leader's half of the overlap rule.
         TraceEvent::RaftSnapshotRestream {
             server,
             range,

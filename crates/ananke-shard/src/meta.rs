@@ -30,7 +30,7 @@
 //! [`meta_descriptor`] reads range 0's copy of the meta range's descriptor. Both are
 //! served at the version a read is served at (§3), and neither enters the history
 //! (Q36).
-// PROPOSED(D-098): the root and the meta range.
+// D-098: the root and the meta range.
 
 use std::collections::BTreeMap;
 use std::io;

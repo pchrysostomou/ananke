@@ -237,10 +237,10 @@ fn a_receiver_silent_while_it_installs_has_its_streams_given_up() {
     }
 }
 
-/// The most seeds the joiner's re-seed runs at any tier (PROPOSED D-109 §7).
+/// The most seeds the joiner's re-seed runs at any tier (D-109 §7).
 const JOINER_TIER_CAP: u64 = 200;
 
-/// A node that joined and then lost its store (#174's review, B1; PROPOSED D-109 §2;
+/// A node that joined and then lost its store (#174's review, B1; D-109 §2;
 /// #178): every user range it was a voter of comes back to it through its placeholder's
 /// install, quarantined, and it grants no vote or pre-vote afterwards, though the
 /// bootstrap node leading the most user ranges is crashed so that those ranges elect and
@@ -253,7 +253,7 @@ const JOINER_TIER_CAP: u64 = 200;
 /// nodes and 26 simulated seconds a seed weigh about 0.26 cpu s each in release (1 000
 /// seeds: 241.9 user + 14.8 sys), so the nightly's ten thousand would be some 2 600 cpu s,
 /// more than a whole nightly shard carries. The gate's twenty and CI's hundred run in full;
-/// the premerge and the nightly run two hundred. The cap is **PROPOSED** (D-109 §7).
+/// the premerge and the nightly run two hundred. The cap is **approved** (D-109 §7; D-139).
 #[test]
 fn a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing() {
     let seeds = seeds().min(JOINER_TIER_CAP);

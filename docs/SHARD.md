@@ -800,7 +800,10 @@ Where R's other voters are one that was refused and one that is
 initialised, R has no leader and can get none: the initialised voter stays a pre-candidate
 for good, and no data is lost. Nothing built today ends that shape. §8's meta convergence
 bound excuses exactly it, by the owner's ruling of 2026-11-09 recorded in #220 and D-113
-§6, and #220 tracks the fix.
+§6, and #220 tracks the fix. Until that fix, by the owner's ruling of 2026-11-15 (D-142), the
+bound's exception and nothing else counts a voter holding a replica of R quarantined under
+D-130, one a split's apply made on a quarantined replica of P, as one that cannot vote, as it
+counts such a placeholder, where the voters able to vote and the placeholders are a majority.
 
 **The overlap rule (Q27).** A snapshot is installed on a node only if its span overlaps
 no other initialised replica there; otherwise it is refused and asked for again later.
@@ -1455,7 +1458,8 @@ completes within ten maximum election timeouts; today the check takes one minimu
 every write (sim/raft.rs:990-998), which a wedged range beside a live one would pass, so
 it is asked per key. After the last heal, meta names every key's current descriptor
 within a bound, which asks nothing of a right half §5's second exception has left with
-no possible majority (PROPOSED D-113 §6, #220); a move the rebalancer began is traced
+no possible majority (PROPOSED D-113 §6, #220; a voter quarantined under D-130's rule counted
+as unable to vote there beside a placeholder, D-142); a move the rebalancer began is traced
 done or abandoned within a bound;
 a subsumed range is merged or unfrozen within a bound (each bound measured on the
 correct system before it is asserted, Q39).

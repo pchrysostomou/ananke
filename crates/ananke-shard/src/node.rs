@@ -171,8 +171,8 @@ pub trait Host {
     }
     /// A local input that adds a range to the node: the right half a split's apply
     /// created, with the core the `apply` task built for it and the parent it split
-    /// from (SHARD.md §5; PROPOSED D-100), or a replica a placeholder's install created,
-    /// which has no parent (§5, Q22; PROPOSED D-109). Asked only for a range the node
+    /// from (SHARD.md §5; D-100), or a replica a placeholder's install created,
+    /// which has no parent (§5, Q22; D-109). Asked only for a range the node
     /// does not hold; `None` for every other input.
     fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, Option<RangeId>)> {
         let _ = local;
@@ -186,7 +186,7 @@ pub trait Host {
     /// nothing to persist. The correct placeholder answers an `AppendEntries` as a
     /// refused server does and grants nothing. The default, a host with no
     /// placeholders, does nothing with it.
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     fn unheld(&self, range: RangeId, from: ServerId, message: Message) -> Vec<Output> {
         let _ = (range, from, message);
         Vec::new()
@@ -585,7 +585,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             CoreWork::Step => {}
         }
         if self.cores.core(range).is_none() {
-            // A range added at a split's apply (SHARD.md §5; PROPOSED D-100): the
+            // A range added at a split's apply (SHARD.md §5; D-100): the
             // right half's core takes its place on the node, and where this node's
             // parent leads, the new replica pre-votes at once and every heartbeat
             // interval until it hears from a leader (Q21).
@@ -594,7 +594,7 @@ impl<E: Environment, H: Host> Node<E, H> {
                 // node and nothing more: it was not born at a split, so no parent of
                 // it here led, and its first election is its own timer's (SHARD.md §5,
                 // Q22).
-                // PROPOSED(D-109)
+                // D-109
                 let Some(parent) = parent else {
                     self.cores.insert(range, *core);
                     return Ok(());
@@ -720,7 +720,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             // The placeholders' answers first: they wait on nothing (SHARD.md §5, Q22). A
             // message a placeholder sends nothing for leaves the round as empty as it was,
             // so a round of those alone flushes nothing, as it never did.
-            // PROPOSED(D-109): a message for a range not held is the placeholder's.
+            // D-109: a message for a range not held is the placeholder's.
             let mut answered = false;
             for Unheld {
                 range,
@@ -1057,7 +1057,7 @@ pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A, variants: No
 /// has a job pending. A range that stops committing holds the rest for as long as it
 /// is quiet; a closed queue drops what is pending, as the correct task's close drops
 /// nothing.
-// PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
+// D-095: the variant the apply-lag and cross-range hold folds trip on.
 async fn apply_waiting_for_every_range<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
     let mut pending: BTreeMap<RangeId, VecDeque<ApplyJob>> = BTreeMap::new();
     while let Some(job) = jobs.pop().await {

@@ -20,12 +20,12 @@
 //! - **One of §10's twenty-four**, the variants SHARD.md tables, each breaking one
 //!   rule with a reference, built by the stage §12 assigns it. Eight are built:
 //!   [`RangeVariant::TrustStaleDescriptor`], [`RangeVariant::ApplyIgnoresSpan`] and
-//!   [`RangeVariant::ClientIgnoresMismatch`] (routing, PROPOSED D-097),
-//!   [`RangeVariant::ReadCheckAtReceiptOnly`] (routing, PROPOSED D-131),
-//!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, PROPOSED D-098),
-//!   [`RangeVariant::IdBlockResumed`] (range ids, PROPOSED D-099),
-//!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, PROPOSED D-109) and
-//!   [`RangeVariant::SnapshotOverlapsReplica`] (the overlap rule, PROPOSED D-110). The
+//!   [`RangeVariant::ClientIgnoresMismatch`] (routing, D-097),
+//!   [`RangeVariant::ReadCheckAtReceiptOnly`] (routing, D-131),
+//!   [`RangeVariant::MetaOverwritesByArrival`] (the meta range, D-098),
+//!   [`RangeVariant::IdBlockResumed`] (range ids, D-099),
+//!   [`RangeVariant::UninitialisedReplicaVotes`] (placeholders, D-109) and
+//!   [`RangeVariant::SnapshotOverlapsReplica`] (the overlap rule, D-110). The
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
@@ -34,12 +34,12 @@
 //!   breaks a rule of the range layer's and not of the node's:
 //!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
 //!   the initial state and is check 7's instrument on the membership scenario
-//!   (PROPOSED D-096), and [`RangeVariant::IncarnationPerRangeStream`] draws a
+//!   (D-096), and [`RangeVariant::IncarnationPerRangeStream`] draws a
 //!   replica's incarnation at its creation from the range's protocol stream instead
 //!   of the node's generator, at Q15's re-seed, at a split's right half and at a
-//!   placeholder's install (D-077, PROPOSED D-100, D-109).
+//!   placeholder's install (D-077, D-100, D-109).
 //!   [`RangeVariant::RefillNotResent`] breaks D-092's refill and is the instrument of
-//!   its per-seed assertion on the sharded sweep (PROPOSED D-113), and
+//!   its per-seed assertion on the sharded sweep (D-113), and
 //!   [`RangeVariant::RefusedAfterRefill`] breaks the retry's taking effect that the
 //!   same assertion asks for (PROPOSED D-137).
 //!   [`RangeVariant::SplitLeavesGap`] writes a split's right half one key short and is
@@ -51,7 +51,7 @@
 //!   1), which needs a stream derived anew at each creation and so is not
 //!   `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
 //!
-//! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
+//! The set is a `u64` where Raft's is a `u32` (D-105): twenty-four of §10's
 //! and the four instruments built or proposed beside them, two of each, would leave a
 //! `u32` four bits for every variant the stages' reviews add, and the node's own set,
 //! planned at twenty, reached fifty-four and outgrew its `u32` inside Stage B. The bits
@@ -62,7 +62,7 @@
 //! Until D-105 the five sat in [`NodeVariants`](crate::variant::NodeVariants) at bits 49
 //! to 53, and until D-108 the two instruments at bits 48 and 25. Neither move moved a
 //! schedule or a trace: D-105 and D-108 measure it.
-// PROPOSED(D-105): the range layer's own variant set (Q37).
+// D-105: the range layer's own variant set (Q37).
 // PROPOSED(D-108): the two range-layer instruments the node's set held.
 // PROPOSED(D-140): `SplitLeavesGap`, check 19's instrument (the owner's ruling on D-093).
 // PROPOSED(D-141): check 8's right half's clause's instrument.
@@ -80,18 +80,18 @@ pub enum RangeVariant {
     /// client's cache is advisory by design and a stale one costs a round trip unless
     /// a server honours it. Check 9 catches the first read served for a key outside
     /// the serving range's span; the writes it proposes the apply check refuses.
-    // PROPOSED(D-097)
+    // D-097
     TrustStaleDescriptor,
     /// The apply check skipped: a command applies whatever its key, where §3's check
     /// is what makes a split take effect for proposals in flight and a
     /// `RangeMismatch` at apply definite. Check 9 catches the first applied write
     /// outside the span, check 10 a write by the wrong owner (SHARD.md §10).
-    // PROPOSED(D-097)
+    // D-097
     ApplyIgnoresSpan,
     /// The sweep's client resends to the range and generation it had, merging nothing
     /// of what a `RangeMismatch` carried (SHARD.md §3, §10; Q38). Check 17 catches
     /// the first resend, and the liveness bound a client that never converges.
-    // PROPOSED(D-097)
+    // D-097
     ClientIgnoresMismatch,
     /// A read is checked against the node's descriptors at its receipt and not again at its
     /// serving, where §3 checks it against the descriptor at the applied index it is served
@@ -99,7 +99,7 @@ pub enum RangeVariant {
     /// for a key the right half now owns. Check 9 catches the first `RaftRead` whose `applied`
     /// lies at or past the split, for a right-half key (SHARD.md §10). `sim/shard.rs`'s split
     /// under a pending burst of right-half gets aims at that window.
-    // PROPOSED(D-131)
+    // D-131
     ReadCheckAtReceiptOnly,
     /// The meta range stores each update as it arrives: every record an update
     /// overlaps is cut and replaced whatever its generation, where §1 keeps, per key,
@@ -109,8 +109,8 @@ pub enum RangeVariant {
     /// of `sim/shard.rs`, make one arrive so. That arm is not built; on this tree the
     /// node sweep's split arms and `sim/shard.rs`'s own drops and resends reach it: a
     /// resend of the parent's update at its old generation that arrives after the split's
-    /// (PROPOSED D-100; D-104; PROPOSED D-113).
-    // PROPOSED(D-098)
+    /// (D-100; D-104; D-113).
+    // D-098
     MetaOverwritesByArrival,
     /// The node adopts, at its start, the block of range ids its lease record names,
     /// whatever run it was granted to, and takes ids from that block's first, where
@@ -124,30 +124,30 @@ pub enum RangeVariant {
     /// node that took an id followed by a split led from that node, is `sim/shard.rs`'s
     /// to build (S11); on this tree the node sweep's `Fault::SplitFromRestarted` arm draws
     /// that shape, and `sim/shard.rs` reaches it on the restarts its faults happen to draw
-    /// (PROPOSED D-100; D-104; PROPOSED D-113).
-    // PROPOSED(D-099)
+    /// (D-100; D-104; D-113).
+    // D-099
     IdBlockResumed,
     /// A node takes a fresh store for a bootstrap: whether or not configuration
     /// names it among range 0's replicas, a node whose store holds no digest writes
     /// the initial state, and, lacking the bootstrap list it was not given, takes the
     /// address book for every range's voters. Two clusters then bootstrap where
     /// configuration named one, and check 7 reads the disagreement off the replicas'
-    /// creations (SHARD.md §2, §8; PROPOSED D-096). A test instrument outside §10's
+    /// creations (SHARD.md §2, §8; D-096). A test instrument outside §10's
     /// count: §10 has no variant for §2's rule, and check 7 needs one on the
     /// membership scenario, whose nodes 4 and 5 are not bootstrap nodes.
-    // PROPOSED(D-096)
+    // D-096
     // PROPOSED(D-108): moved from the node's set, outside §10's count.
     AnyFreshNodeBootstraps,
     /// A replica's incarnation drawn at its creation from the range's protocol
     /// stream, `n{id}/r{range}/protocol` (`Environment::range_rng`), rather than from
     /// the node's own generator, from which SHARD.md §8 draws a fresh incarnation
     /// (Q26). It is read wherever the node draws one: Q15's re-seed (D-077), a split's
-    /// right half (PROPOSED D-100) and a placeholder's install (PROPOSED D-109). What
+    /// right half (D-100) and a placeholder's install (D-109). What
     /// catches it is the draw itself: the directed refusal scenario finds every
     /// re-seeded replica's incarnation different from the node generator's
     /// (`sim/tests/ranges.rs`), and the node sweep finds every right half a split
     /// creates on a voter restating its stream's draw, where the correct node's restates
-    /// no such draw (`sim/tests/node.rs`, issue #160, PROPOSED D-123). No test reads the
+    /// no such draw (`sim/tests/node.rs`, issue #160, D-123). No test reads the
     /// install's.
     ///
     /// It does not reach the harm §8 names for a stream derived anew at each creation:
@@ -167,7 +167,7 @@ pub enum RangeVariant {
     /// traced no `RangeCreated` of (SHARD.md §8, §10). A placeholder that keeps no
     /// vote can give one term's vote to two candidates, and a right half whose other
     /// replicas are down elects with it.
-    // PROPOSED(D-109)
+    // D-109
     UninitialisedReplicaVotes,
     /// A node installs every snapshot it is streamed, where SHARD.md §5's overlap rule
     /// (Q27) installs one only if its span overlaps no other initialised replica on the
@@ -177,7 +177,7 @@ pub enum RangeVariant {
     /// split over the newer state the right half's snapshot put there. Check 8's overlap
     /// clause sees it at the install's `RangeCreated { cause: snapshot }` (SHARD.md §8,
     /// §10); `sim/split.rs` (i) makes the shape on every seed.
-    // PROPOSED(D-110)
+    // D-110
     SnapshotOverlapsReplica,
     /// A refill of a node's block of range ids is sent once and not again, where D-092 has
     /// a node at or below its threshold keep one outstanding, sent "after a minimum election
@@ -188,7 +188,7 @@ pub enum RangeVariant {
     /// assertion (`sim/shard.rs`'s `retries_take_effect`) sees an asker's retries after the
     /// heal end unanswered. A test instrument outside §10's count: §10 has no variant for
     /// D-092's rule, and the check needs one (CLAUDE.md's pair rule).
-    // PROPOSED(D-113)
+    // D-113
     RefillNotResent,
     /// A node whose block of range ids a split has found empty in this run refuses every
     /// split after its refill lands, `NotLive`, where D-092 has the refill land and "the
@@ -250,25 +250,25 @@ impl RangeVariant {
     /// the sixty-fourth is an overflow, which does not compile either.
     const fn bit(self) -> u64 {
         match self {
-            // PROPOSED(D-097): §10's three routing variants.
+            // D-097: §10's three routing variants.
             RangeVariant::TrustStaleDescriptor => 1,
             RangeVariant::ApplyIgnoresSpan => 1 << 1,
             RangeVariant::ClientIgnoresMismatch => 1 << 2,
-            // PROPOSED(D-098): the meta range storing updates as they arrive.
+            // D-098: the meta range storing updates as they arrive.
             RangeVariant::MetaOverwritesByArrival => 1 << 3,
-            // PROPOSED(D-099): a node resuming another run's block of ids.
+            // D-099: a node resuming another run's block of ids.
             RangeVariant::IdBlockResumed => 1 << 4,
             // PROPOSED(D-108): the two instruments the node's set held at bits 48
             // (D-096) and 25 (D-077).
             RangeVariant::AnyFreshNodeBootstraps => 1 << 5,
             RangeVariant::IncarnationPerRangeStream => 1 << 6,
-            // PROPOSED(D-109): a placeholder that grants votes.
+            // D-109: a placeholder that grants votes.
             RangeVariant::UninitialisedReplicaVotes => 1 << 7,
-            // PROPOSED(D-110): a node that installs every snapshot.
+            // D-110: a node that installs every snapshot.
             RangeVariant::SnapshotOverlapsReplica => 1 << 8,
-            // PROPOSED(D-113): a refill sent once and not again.
+            // D-113: a refill sent once and not again.
             RangeVariant::RefillNotResent => 1 << 9,
-            // PROPOSED(D-131): a read checked at its receipt and not at its serving.
+            // D-131: a read checked at its receipt and not at its serving.
             RangeVariant::ReadCheckAtReceiptOnly => 1 << 10,
             // PROPOSED(D-137): every split refused once a refill lands on an emptied block.
             RangeVariant::RefusedAfterRefill => 1 << 11,
@@ -441,7 +441,7 @@ mod tests {
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
         // the range-id blocks, D-109's one for placeholders, D-110's one for the
         // overlap rule and D-131's one for the read check, all of them §10's; and
-        // the two instruments PROPOSED D-108 moved here from the node's set, PROPOSED
+        // the two instruments PROPOSED D-108 moved here from the node's set,
         // D-113's one for D-092's refill, PROPOSED D-137's one for its retry, PROPOSED
         // D-140's one for check 19 and PROPOSED D-141's one for check 8's right half,
         // none of them §10's.

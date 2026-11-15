@@ -2,7 +2,7 @@
 //! four nodes, nodes 1 to 3 the bootstrap nodes and node 4 a node that joins and holds
 //! nothing. Shapes (i), *overlap*, and (ii), *vote*, are built here; (iii) is Stage D's.
 //!
-//! Shape (i), at every tier (PROPOSED D-110): the correct system passes every seed, and on
+//! Shape (i), at every tier (D-110): the correct system passes every seed, and on
 //! every seed the shape is built, its premise holds, and while the limit held a chunk of
 //! R's stream reached `x` while a chunk of P's was dropped as oversized; `x` refused R's
 //! install for overlap, R's leader waited a minimum election timeout each time before it
@@ -22,8 +22,8 @@
 //! `UninitialisedReplicaVotes` the shape is built too, and `x`'s placeholder grants the
 //! right half's remaining replica its vote on every seed, and check 20 catches it on every
 //! seed.
-// PROPOSED(D-109): `sim/split.rs` (ii).
-// PROPOSED(D-110): `sim/split.rs` (i).
+// D-109: `sim/split.rs` (ii).
+// D-110: `sim/split.rs` (i).
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{Environment, TraceEvent};
@@ -115,7 +115,7 @@ fn every_seed_of_the_vote_shape_passes_on_the_correct_node() {
 /// passed could otherwise not show it had made. With the placeholder's vote the right
 /// half elects without the crashed node, so `x` gets its right half well inside the ten
 /// maximum election timeouts the correct system waits. Check 20 trips on every seed, a
-/// placeholder's grant (PROPOSED D-109 §3), and the correct system's test beside it holds
+/// placeholder's grant (D-109 §3), and the correct system's test beside it holds
 /// check 20 green on every seed through the run's verdict.
 #[test]
 fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() {
@@ -139,7 +139,7 @@ fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() 
             }
         });
         // And check 20 catches it, on every seed: the fold's own verdict, a placeholder's
-        // grant (PROPOSED D-109 §3).
+        // grant (D-109 §3).
         let outcome = outcome.and_then(|()| {
             match invariants::folded(&report.records).verdict_of(Fold::PlaceholderGrants) {
                 Err(words) if words.contains("from its placeholder") => Ok(()),
@@ -174,7 +174,7 @@ fn a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape() 
 /// spawns no task of its own, and creates or restates no replica. The same harness with
 /// `[1, 2, 3]` is the control: that node starts, creates its replicas and sends, so the
 /// harness tells a node that stopped from one that did not.
-// PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+// D-109: exactly three bootstrap nodes, enforced.
 #[test]
 fn a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why() {
     // What the harness saw of a node configured with `bootstrap`: its failures, and
@@ -266,7 +266,7 @@ struct OverlapMeasured {
 }
 
 /// Shape (i) on the correct system, every seed of the tier (SHARD.md §12, Stage C's exit;
-/// PROPOSED D-110): the run passes its checks and the shape is built, its premise held and
+/// D-110): the run passes its checks and the shape is built, its premise held and
 /// across the limit a chunk of R's stream reached `x` while a chunk of P's was dropped as
 /// oversized. And the overlap rule's mechanism, on every seed: `x` refused R's install for
 /// overlap while its P still covered R's span; each refusal ended R's leader's stream, and
@@ -384,7 +384,7 @@ fn overlap_mechanism(report: &split::Report, measured: &mut OverlapMeasured) -> 
 }
 
 /// Shape (i) under `SnapshotOverlapsReplica`, every seed of the tier (SHARD.md §10, §12;
-/// PROPOSED D-110): the shape is built, `x` installs R's snapshot while its P still covers
+/// D-110): the shape is built, `x` installs R's snapshot while its P still covers
 /// R's span, and check 8's overlap clause trips on every seed at that install's
 /// `RangeCreated { cause: snapshot }` — the record at which the fold, fed one record at a
 /// time, first reads a violation is that creation, on `x`, of R. The correct system's test
@@ -518,7 +518,7 @@ fn x_made_split_right(report: &split::Report) -> Option<usize> {
     })
 }
 
-/// The overlap rule's fresh take on one correct run of the resplit shape (PROPOSED D-110,
+/// The overlap rule's fresh take on one correct run of the resplit shape (D-110,
 /// #180's review, B1; #185's review, NB1), measured into `measured`: one wait ended before
 /// R's split, in no fresh take; exactly one after it ended in a fresh take, and its
 /// leader took R at or past the split; at least one after that ended in none; and `x`
@@ -575,7 +575,7 @@ fn fresh_take(report: &split::Report, measured: &mut ResplitMeasured) -> Result<
     Ok(())
 }
 
-/// The overlap rule's fresh take, every seed of the tier (SHARD.md §5, Q27; PROPOSED
+/// The overlap rule's fresh take, every seed of the tier (SHARD.md §5, Q27;
 /// D-110, #180's review, B1; #185's review, NB1): shape (i) with R split again at `k15`
 /// while the limit holds, R idle from the heal and the split asked once a wait after a
 /// refusal of R has ended. On every seed the run passes its checks and (i)'s shape is
@@ -622,7 +622,7 @@ fn a_checkpoint_refused_for_overlap_from_before_its_ranges_split_is_retaken_on_e
     verdict(&verdicts).expect("the overlap rule's fresh take holds on every seed");
 }
 
-/// The fresh take's pair (PROPOSED D-110, #185's review, NB2): the resplit run under
+/// The fresh take's pair (D-110, #185's review, NB2): the resplit run under
 /// `RetakeNeverAfterOverlap`, a leader that streams a checkpoint refused for overlap
 /// again whatever it predates. On every seed the shape is built and the variant injected —
 /// a wait ends after R's split, and none in a fresh take. Its harm is liveness: where R′
@@ -695,7 +695,7 @@ fn a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_rig
 }
 
 /// **A replica cut off from its first start is installed, not created a second time**
-/// (PROPOSED D-116 §4). A follower of P holds the descriptor its bootstrap wrote and has
+/// (D-116 §4). A follower of P holds the descriptor its bootstrap wrote and has
 /// applied nothing when P's snapshot reaches it. The node read a creation off the core
 /// alone, so it traced `RangeCreated { cause: snapshot }` of a replica it had created at
 /// its bootstrap and restated, which check 8's created-twice clause fails. The same reading
@@ -704,7 +704,7 @@ fn a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_rig
 /// at every tier (every seed reaches it): the run's checks pass; `x` restated P at applied
 /// 0 and applied no entry of P before its install; `x` installed P; and `x`'s only creation
 /// of P is its bootstrap's.
-// PROPOSED(D-116)
+// D-116
 #[test]
 fn a_replica_cut_off_from_its_first_start_is_installed_and_not_created_twice() {
     let outcomes = sweep(seeds(), |seed| -> Result<u64, String> {

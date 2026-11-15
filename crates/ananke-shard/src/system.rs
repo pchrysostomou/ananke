@@ -10,7 +10,7 @@
 //! (§1, Q4). Neither splits nor merges in Phase 3.
 //!
 //! D-096 wrote both at bootstrap; D-098 reads them by the lookups and writes range
-//! 1 by `MetaUpdate`; the refill of a node's block of ids (§5, Q17) is PROPOSED
+//! 1 by `MetaUpdate`; the refill of a node's block of ids (§5, Q17) is
 //! D-099's, and its lease record is here.
 
 use std::io;
@@ -61,7 +61,7 @@ pub fn counter_key() -> Bytes {
 
 /// Where range 0 keeps node `id`'s lease record (§5, Q17): the block of ids last
 /// granted to it and the run nonce the refill carried.
-// PROPOSED(D-099)
+// D-099
 #[must_use]
 pub fn lease_key(id: ServerId) -> Bytes {
     let mut name = BytesMut::with_capacity(14);
@@ -73,7 +73,7 @@ pub fn lease_key(id: ServerId) -> Bytes {
 /// A node's lease record (§5, Q17): the block of range ids range 0 last granted it,
 /// `first..=last`, and the run nonce its refill carried, by which the node tells a
 /// grant of its current run from an earlier run's.
-// PROPOSED(D-099)
+// D-099
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {
     /// The nonce of the run that asked.
@@ -119,7 +119,7 @@ impl LeaseRecord {
 /// # Errors
 ///
 /// Bytes that are not one.
-// PROPOSED(D-099)
+// D-099
 pub fn decode_counter(mut bytes: Bytes) -> io::Result<u64> {
     if bytes.len() != 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "the counter"));

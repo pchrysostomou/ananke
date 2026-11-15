@@ -36,9 +36,9 @@
 //!
 //! [`node_run`] is the same scenario **sharded**, on the node of SHARD.md §4 (PROPOSED
 //! D-085): one `mark_store_lost` refuses a node and every replica it holds (D-077) — the
-//! four user ranges' and, since PROPOSED D-096, the root's and the meta range's — and
+//! four user ranges' and, since D-096, the root's and the meta range's — and
 //! check quorum is then asked separately of each range's own leader about that one
-//! node, the system ranges' included (PROPOSED D-119). It is not D-049's two halves.
+//! node, the system ranges' included (D-119). It is not D-049's two halves.
 //! Those are about a *store-less* refused server, whose rejections are stamped
 //! incarnation 0, and about the re-seed stream whose acknowledgements make them count;
 //! the node produces neither, and [`NodeReport::check`] asserts both absences per seed,
@@ -284,9 +284,9 @@ const HOLD_PUTS: u64 = 4;
 /// in the hold: half of it, the same seven and a half check-quorum windows on either
 /// side. The clause it serves (`NodeReport::check`) is about an entry nothing in the
 /// scenario drives, which could otherwise land the instant before the heal. Measured,
-/// not assumed (PROPOSED D-119): on the correct node the last such entry lands 303 ms
+/// not assumed (D-119): on the correct node the last such entry lands 303 ms
 /// into the hold and each commits within 30 ms of its entry, on seeds 0 to 999.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 pub const SYSTEM_ENTRY_DEADLINE: Duration = Duration::from_millis(750);
 
 /// How long the scenario gives the whole-node re-seed to land and the ranges the
@@ -313,11 +313,11 @@ pub struct NodeCast {
     /// The node cut off for the hold. It leads the ranges the keeper does not.
     pub other: u64,
     /// Each range's leader when the cut is made: every range the node hosts
-    /// ([`Cluster::hosted`]), the root and the meta range first. Until PROPOSED D-119
+    /// ([`Cluster::hosted`]), the root and the meta range first. Until D-119
     /// this held the four user ranges alone, and nothing the hold asks was asked of
     /// ranges 0 and 1 (issue #143). The keeper and [`NodeReport::both_outcomes`] are
     /// still read off the user ranges, the ones the scenario drives writes into.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     pub leaders: BTreeMap<u64, u64>,
 }
 
@@ -429,7 +429,7 @@ pub struct RangeHold {
     /// cut by [`SYSTEM_ENTRY_DEADLINE`] into the hold: something for it to commit there.
     /// The scenario drives that on a user range and not on a system range, where only a
     /// refill or a `MetaUpdate` the run sent of its own accord gives it one.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     pub entry_to_commit: bool,
     /// Servers that became leader of this range in the hold, keeper's side and
     /// other's alike.
@@ -439,13 +439,13 @@ pub struct RangeHold {
     /// the far side, the keeper's campaign asking the one replica that could make it
     /// a majority, and the quarantine (D-035) saying no. It is the situation the
     /// "elected in the hold" clause decides, counted so a sweep can say it reached it.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     pub votes_refused: usize,
     /// Votes of this range the victim **granted** in the hold, pre-votes not counted:
     /// 0 on every seed of a node that keeps D-035, and the mechanism of the catch on one
     /// that does not. Read by the sweep rather than asked by [`NodeReport::check`],
     /// whose question is what the vote elected.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     pub votes_granted: usize,
     /// Snapshot streams opened toward the victim for this range: the wiring's path.
     pub streams: usize,
@@ -479,7 +479,7 @@ pub struct NodeReport {
     /// seeds few; the share is measured and printed rather than assumed, and every range
     /// is asked its own question on every seed either way. Read over the user ranges, as
     /// D-085 measured it: the system ranges are asked the same two outcomes and do not
-    /// decide this one (PROPOSED D-119).
+    /// decide this one (D-119).
     pub both_outcomes: bool,
     /// Each node's clock rate error, in parts per million.
     pub drifts: Vec<i64>,
@@ -492,9 +492,9 @@ pub struct NodeReport {
 }
 
 /// The sharded check-quorum scenario on the node of SHARD.md §4 (PROPOSED D-085):
-/// three nodes, six ranges on every node — the root, the meta range (PROPOSED D-096)
+/// three nodes, six ranges on every node — the root, the meta range (D-096)
 /// and four user ranges — **one** `mark_store_lost` at the victim's restart, and check
-/// quorum asked of every range's leader about the one refused node (PROPOSED D-119).
+/// quorum asked of every range's leader about the one refused node (D-119).
 ///
 /// What "sharded" means here is D-085's reading: not the scenario run once per range,
 /// but one fault and an answer per range. Four things change in kind, and none of them
@@ -649,8 +649,8 @@ pub fn node_run(
         settled += step;
         // Every range the node hosts, the system ranges with the user ranges: a root
         // or meta range the victim led must have elected again too, or its hold
-        // would be asked of a leader that is not there (PROPOSED D-119).
-        // PROPOSED(D-119): the hold clauses ask the system ranges too.
+        // would be asked of a leader that is not there (D-119).
+        // D-119: the hold clauses ask the system ranges too.
         leaders = cluster
             .hosted()
             .into_iter()
@@ -670,8 +670,8 @@ pub fn node_run(
         // majority the cut leaves as the keeper and the refused node. Counted over
         // the user ranges, which are the ones the hold drives a write into: the
         // system ranges are asked the hold's questions of whichever survivor leads
-        // them, and do not choose it (PROPOSED D-119).
-        // PROPOSED(D-119): the hold clauses ask the system ranges too.
+        // them, and do not choose it (D-119).
+        // D-119: the hold clauses ask the system ranges too.
         let user_ranges = cluster.ranges();
         let mut leading: BTreeMap<u64, usize> = BTreeMap::new();
         for (range, &leader) in &leaders {
@@ -707,7 +707,7 @@ pub fn node_run(
         // are given nothing: their leader is on the far side of the cut. Nor are the
         // system ranges: no client writes one (Q4), and `spread_on`'s keys are user
         // keys.
-        // PROPOSED(D-119): the hold clauses ask the system ranges too.
+        // D-119: the hold clauses ask the system ranges too.
         let keepers_ranges: Vec<u64> = report
             .cast
             .as_ref()
@@ -739,7 +739,7 @@ pub fn node_run(
     // Over the user ranges, as D-085 measured it: a system range on the keeper's side
     // is asked to commit only what the run gave it (`NodeReport::check`), so it does
     // not carry the keeper's whole outcome.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     report.both_outcomes = report.cast.as_ref().is_some_and(|cast| {
         let sides: BTreeSet<u64> = cast
             .leaders
@@ -882,7 +882,7 @@ impl NodeReport {
                         let _ = term;
                     }
                 }
-                // PROPOSED(D-119): the hold clauses ask the system ranges too.
+                // D-119: the hold clauses ask the system ranges too.
                 TraceEvent::RaftVote {
                     server,
                     range,
@@ -1083,7 +1083,7 @@ impl NodeReport {
     ///    other node scenario folds them (issue #140) — and linearizability over the
     ///    trace.
     /// 3. **The fan-out (D-077).** Every one of the node's six replicas — the four user
-    ///    ranges' and the root's and the meta range's (PROPOSED D-096) — was refused
+    ///    ranges' and the root's and the meta range's (D-096) — was refused
     ///    with it and re-seeded, each stamping its answers with a store incarnation of
     ///    its own, the six of them six different numbers.
     /// 4. **Check quorum, per range, of every range the node hosts.** A range the
@@ -1096,7 +1096,7 @@ impl NodeReport {
     ///    majority. A range that reaches neither fails, naming the range: the scenario
     ///    must not pass by not asking.
     ///
-    ///    The root and the meta range are asked every one of these (PROPOSED D-119,
+    ///    The root and the meta range are asked every one of these (D-119,
     ///    issue #143). Until then the hold asked the user ranges alone, and a re-seeded
     ///    root replica that voted passed ten thousand seeds. The commit is asked of them
     ///    where they have something to commit: the scenario writes nothing there, since
@@ -1163,13 +1163,13 @@ impl NodeReport {
         // it was asserted: the correct node green on 10 000 of 10 000 seeds, no fold of the
         // seven in violation on any of seeds 0 to 999 under the correct node or
         // `RefuseOneRangeOnly`, and that variant's attribution D-101's 3 338 / 6 661 / 1 at
-        // ten thousand, to the seed (PROPOSED D-106). Since PROPOSED D-136 check 20 forgets
+        // ten thousand, to the seed (D-106). Since PROPOSED D-136 check 20 forgets
         // at a refusal what the node held, and its fold is in violation under that variant
         // on 987 of seeds 0 to 999, naming the unrefused replicas' grants. It is this
         // verdict on 332 of them, ahead of the fan-out clause below; the other 655 are
         // state machine safety on the meta range, asked before it. The correct node is
         // green as before (`sim/tests/node.rs`).
-        // PROPOSED(D-106): the sharded quorum scenario folds the range layer's checks.
+        // D-106: the sharded quorum scenario folds the range layer's checks.
         // PROPOSED(D-136)
         ananke_shard::invariants::all(&self.records).map_err(|v| format!("seed {seed}: {v}"))?;
         lin::check(&self.history).map_err(|v| format!("seed {seed}: {v}"))?;
@@ -1196,7 +1196,7 @@ impl NodeReport {
             ));
         }
         // The fan-out, and the six incarnations that are the sharded reading of it,
-        // the system ranges' with the user ranges' (PROPOSED D-119).
+        // the system ranges' with the user ranges' (D-119).
         let mut incarnations: BTreeMap<u64, u64> = BTreeMap::new();
         for hold in holds.values() {
             let range = hold.range;
@@ -1282,7 +1282,7 @@ impl NodeReport {
             }
         }
         // Check quorum, per range, of every range's leader about the one refused node:
-        // the root's and the meta range's with the user ranges' (PROPOSED D-119).
+        // the root's and the meta range's with the user ranges' (D-119).
         let mut kept = 0usize;
         let mut lost = 0usize;
         for hold in holds.values() {
@@ -1322,7 +1322,7 @@ impl NodeReport {
                 // Asked of every user range, which the hold drives a write into, and of
                 // a system range the run itself gave an entry to commit: nothing in this
                 // scenario writes one (Q4).
-                // PROPOSED(D-119): the hold clauses ask the system ranges too.
+                // D-119: the hold clauses ask the system ranges too.
                 let owed = !system_range(range) || hold.entry_to_commit;
                 if owed && hold.commit_after_cut.is_none() {
                     return fail(format!(
@@ -1431,7 +1431,7 @@ fn fan_out_of(seed: u64, victim: u64, hold: &RangeHold) -> Result<(), String> {
 /// Whether `range` is the root or the meta range (SHARD.md §1, Q4): the two whose
 /// keeper's commit the hold asks only where the run gave it an entry to commit, since
 /// nothing in this scenario writes them.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 fn system_range(range: u64) -> bool {
     range == crate::ranges::ROOT_RANGE || range == crate::ranges::META_RANGE
 }

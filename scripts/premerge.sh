@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The pre-merge tier (D-040): every sweep of the current phase at a thousand seeds, and
-# the released phases' at CI's hundred (PROPOSED D-094), in release, seeds in parallel,
+# the released phases' at CI's hundred (D-094), in release, seeds in parallel,
 # on the machine in front of you. The gate's twenty seeds catch the
 # shallow bugs and CI's hundred the next layer; this is the layer under that, in
 # about a quarter of an hour. Ten thousand seeds are the nightly's on GitHub, not a
@@ -19,7 +19,7 @@ export RUSTFLAGS="-D warnings"
 export ANANKE_SEEDS="${ANANKE_SEEDS:-1000}"
 # The released phases' sweeps — Phase 1's storage sweeps and Phase 2's one-group Raft
 # sweeps, each with a ten-thousand-seed nightly of its own — run at CI's hundred here, so
-# the thousand is the current phase's (PROPOSED D-094). Only this script sets it: the
+# the thousand is the current phase's (D-094). Only this script sets it: the
 # gate, CI and the nightly leave it unset and run those sweeps at their own count.
 export ANANKE_RELEASED_SEEDS="${ANANKE_RELEASED_SEEDS:-100}"
 
@@ -38,7 +38,7 @@ machine_state() {
     elif [ -d /sys/class/power_supply ]; then
         # A machine that lists no supply at all — a container, a VM — reads `unknown`
         # (D-070), not `Battery Power`: the absence of an `online` flag says nothing.
-        # PROPOSED(D-094): found by the measurement in this entry.
+        # D-094: found by the measurement in this entry.
         if ls /sys/class/power_supply/*/online > /dev/null 2>&1; then
             if grep -qs 1 /sys/class/power_supply/A*/online; then power="AC Power"; else power="Battery Power"; fi
         fi

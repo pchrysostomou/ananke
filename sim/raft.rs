@@ -299,7 +299,7 @@ impl Cluster {
     /// trace's oracle holds a replica event's range to, and what a coverage divides
     /// by. The arms and the keys draw from [`Cluster::ranges`], the user ranges,
     /// since no client writes a system range and no arm aims at one yet.
-    // PROPOSED(D-096): the bootstrap nodes host ranges 0 and 1 beside the user ranges.
+    // D-096: the bootstrap nodes host ranges 0 and 1 beside the user ranges.
     #[must_use]
     pub fn hosted(self) -> Vec<u64> {
         match self {
@@ -343,7 +343,7 @@ impl Cluster {
 
     /// What this cluster's clients draw their keys from: `k0` up to [`Cluster::keys`],
     /// routed by [`Cluster::key_range`] where the cache cannot say.
-    // PROPOSED(D-113): the client's keys and first cache are its scenario's.
+    // D-113: the client's keys and first cache are its scenario's.
     #[must_use]
     pub fn client_keys(self) -> ClientKeys {
         ClientKeys {
@@ -357,16 +357,16 @@ impl Cluster {
     /// thirds: [`stale_descriptor`] for the first client and every third after it —
     /// a client that knew the cluster before its ranges were fixed, so that every seed
     /// has requests refused at receipt and clients that converge through
-    /// `RangeMismatch` alone (§3; PROPOSED D-097) — [`root_descriptor`] alone for the
+    /// `RangeMismatch` alone (§3; D-097) — [`root_descriptor`] alone for the
     /// second and every third after it, a client that found the cluster through
     /// configuration and looks everything else up through ranges 0 and 1 (SHARD.md §2,
-    /// §3; PROPOSED D-098), and the bootstrap descriptors of the configuration for the
+    /// §3; D-098), and the bootstrap descriptors of the configuration for the
     /// third (§2). The sweep's two clients are one of each of the first two kinds.
     /// Nothing on one group, which has no ranges to route among. A leader hint per
     /// range lives in it on both.
-    // PROPOSED(D-097): the node cluster's client routes by its cache, and every
+    // D-097: the node cluster's client routes by its cache, and every
     // other client starts stale.
-    // PROPOSED(D-098): every third client starts knowing range 0 alone.
+    // D-098: every third client starts knowing range 0 alone.
     #[must_use]
     pub fn initial_cache(self, n: u64) -> Cache {
         match self {
@@ -488,7 +488,7 @@ pub fn node_range_of_key(key: &Bytes) -> u64 {
 }
 
 /// `RangeMismatchSent` over `records`, by where the server saw it (SHARD.md §3).
-// PROPOSED(D-097)
+// D-097
 #[must_use]
 pub fn mismatches_sent_of(records: &[TraceRecord]) -> BTreeMap<MismatchAt, usize> {
     let mut out = BTreeMap::new();
@@ -504,7 +504,7 @@ pub fn mismatches_sent_of(records: &[TraceRecord]) -> BTreeMap<MismatchAt, usize
 /// would hold: §2's "range 2, the rest of the keyspace" over the whole user keyspace
 /// at generation 0, below every bootstrap descriptor, so that every `RangeMismatch`
 /// it draws replaces it for the part the answer names (SHARD.md §3).
-// PROPOSED(D-097): a client that starts stale.
+// D-097: a client that starts stale.
 #[must_use]
 pub fn root_descriptor() -> RangeDescriptor {
     let span = ananke_shard::system::root_span();
@@ -520,7 +520,7 @@ pub fn root_descriptor() -> RangeDescriptor {
 
 /// `RaftRead` served by the root or the meta range over `records`: the lookups
 /// (SHARD.md §1, §3; Q36).
-// PROPOSED(D-098)
+// D-098
 #[must_use]
 pub fn lookups_served_of(records: &[TraceRecord]) -> usize {
     records
@@ -539,7 +539,7 @@ pub fn lookups_served_of(records: &[TraceRecord]) -> usize {
 /// `MetaApplied` after the bootstrap over `records`: how many, and how many of them
 /// won some sub-interval, which is what an update that changes something does
 /// (SHARD.md §1).
-// PROPOSED(D-098)
+// D-098
 #[must_use]
 pub fn meta_applies_of(records: &[TraceRecord]) -> (usize, usize) {
     let mut applies = 0;
@@ -557,7 +557,7 @@ pub fn meta_applies_of(records: &[TraceRecord]) -> (usize, usize) {
 
 /// `RangeIdsLeased` over `records` by the first apply of each of range 0's indices:
 /// the blocks granted (SHARD.md §5, Q17), and the nodes granted one.
-// PROPOSED(D-099)
+// D-099
 #[must_use]
 pub fn ids_leased_of(records: &[TraceRecord]) -> (usize, BTreeSet<u64>) {
     let mut indices = BTreeSet::new();
@@ -572,11 +572,11 @@ pub fn ids_leased_of(records: &[TraceRecord]) -> (usize, BTreeSet<u64>) {
     (indices.len(), nodes)
 }
 
-/// The splits over `records` (SHARD.md §5; PROPOSED D-100), by the first `RangeSplit`
+/// The splits over `records` (SHARD.md §5; D-100), by the first `RangeSplit`
 /// of each (parent, index): how many took effect, how many right halves were created
 /// on some replica, how many right halves elected a leader, and how many writes were
 /// applied through a right half.
-// PROPOSED(D-100)
+// D-100
 #[must_use]
 pub fn splits_of(records: &[TraceRecord]) -> SplitCoverage {
     let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
@@ -648,7 +648,7 @@ pub fn splits_of(records: &[TraceRecord]) -> SplitCoverage {
 /// (`StartOver::Overlaps`, Q27); and how long each voter of a split's parent that was
 /// installed the parent's snapshot at or past the split while it held no right half
 /// waited for the right half to be created on it (#170).
-// PROPOSED(D-109)
+// D-109
 #[must_use]
 pub fn placeholders_of(records: &[TraceRecord]) -> PlaceholderCoverage {
     let mut coverage = PlaceholderCoverage::default();
@@ -658,7 +658,7 @@ pub fn placeholders_of(records: &[TraceRecord]) -> PlaceholderCoverage {
     let mut splits: BTreeMap<(u64, u64), (u64, Vec<u64>)> = BTreeMap::new();
     let mut waiting: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
     // The replicas a node answers for as replicas: from its creation of the range to its
-    // refusal or the range's removal there (PROPOSED D-109 §1.6).
+    // refusal or the range's removal there (D-109 §1.6).
     let mut created: BTreeSet<(u64, u64)> = BTreeSet::new();
     for (at, record) in records.iter().enumerate() {
         let node = record.node.map(|node| u64::from(node.get()));
@@ -793,7 +793,7 @@ pub fn placeholders_of(records: &[TraceRecord]) -> PlaceholderCoverage {
 }
 
 /// What [`placeholders_of`] counts.
-// PROPOSED(D-109)
+// D-109
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlaceholderCoverage {
     /// Placeholders made.
@@ -881,7 +881,7 @@ pub fn right_half_late(
 }
 
 /// What [`splits_of`] counts.
-// PROPOSED(D-100)
+// D-100
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SplitCoverage {
     /// Splits that took effect, by first apply.
@@ -911,7 +911,7 @@ pub struct SplitCoverage {
 
 /// Range 0's descriptor as configuration fixes it (SHARD.md §2): what a client that
 /// found the cluster through configuration alone starts with.
-// PROPOSED(D-098)
+// D-098
 #[must_use]
 pub fn stale_descriptor() -> RangeDescriptor {
     let ranges = crate::ranges::ranges();
@@ -930,7 +930,7 @@ pub fn stale_descriptor() -> RangeDescriptor {
 /// The descriptors the node cluster's bootstrap writes for its user ranges (SHARD.md
 /// §2): every configured range at the first generation with the bootstrap nodes as
 /// voters, which is what a client of the cluster starts its cache with.
-// PROPOSED(D-097)
+// D-097
 #[must_use]
 pub fn node_descriptors() -> Vec<RangeDescriptor> {
     crate::ranges::ranges()
@@ -1047,7 +1047,7 @@ pub enum Fault {
         steer: Duration,
     },
     /// A split of the range the arm aims at, asked by an admin of its leader at its
-    /// middle key (SHARD.md §5, Q18; PROPOSED D-100): drawn on the node cluster only,
+    /// middle key (SHARD.md §5, Q18; D-100): drawn on the node cluster only,
     /// where a range can split, and followed by `settle` for the right half to elect
     /// and the clients to find it. The admin follows `NotLeader` for a round of the
     /// servers and records the answer — done, or refused with its reason — for the
@@ -1056,7 +1056,7 @@ pub enum Fault {
         /// How long the run waits after the ask.
         settle: Duration,
     },
-    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; PROPOSED D-100): the node
+    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; D-100): the node
     /// that proposed the last split done is crashed, restarted after `down`, handed
     /// the lead of a range the split did not cut (`Command::Transfer`, thesis §3.10)
     /// and asked, alone, to split it, then `settle` follows. A correct node's new run
@@ -1065,8 +1065,8 @@ pub enum Fault {
     /// right half named before. Drawn after the split. If no split is done by then, the
     /// arm is a wait of `settle` and nothing else: it asks nothing of the cluster, so it
     /// leaves the run's `last_heal` where the arm before it left it — which is that arm's
-    /// end, a heal or not — and no gap follows it (PROPOSED D-120).
-    // PROPOSED(D-120): with no split done the arm is its settle alone.
+    /// end, a heal or not — and no gap follows it (D-120).
+    // D-120: with no split done the arm is its settle alone.
     SplitFromRestarted {
         /// How long the proposer stays down.
         down: Duration,
@@ -1389,18 +1389,18 @@ const TRIAL_GAP: Duration = Duration::from_millis(500);
 const ADMIN: u64 = 99 << 32;
 
 /// The split admin's first sequence number and address slot: above the term-raise
-/// admin's, whose slots are `TERM_RAISE_ADMIN` and after (PROPOSED D-100).
+/// admin's, whose slots are `TERM_RAISE_ADMIN` and after (D-100).
 const SPLIT_ADMIN: u64 = 100;
 /// How long a split's admin waits for each answer before it tries the next server.
 const SPLIT_WAIT_BUDGET: Duration = Duration::from_millis(600);
 /// How long the split admin waits before asking again: after `NoRangeId`, and, for a
 /// restarted proposer's admin, after no answer, `NotLeader` or a mismatch. 150 ms is
 /// one and a half minimum election timeouts (`ELECTION_MIN`), the sweep's own choice
-/// (PROPOSED D-100): PROPOSED D-092's A says only that the asker retries, and the
+/// (D-100): D-092's A says only that the asker retries, and the
 /// minimum election timeout is D-092's interval for the refill's resend (D-104).
 const SPLIT_RETRY: Duration = Duration::from_millis(150);
 
-/// What the split arms' admins recorded on a run (SHARD.md §5; PROPOSED D-100).
+/// What the split arms' admins recorded on a run (SHARD.md §5; D-100).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplitStats {
     /// Splits asked.
@@ -1423,14 +1423,14 @@ pub struct SplitStats {
 }
 
 /// The key a split of `range` cuts at on the node cluster: the second of the two the
-/// range's clients draw from, so both halves keep one (PROPOSED D-100).
+/// range's clients draw from, so both halves keep one (D-100).
 #[must_use]
 pub fn split_key_of(range: u64) -> Bytes {
     Bytes::from(format!("k{}", 2 * (range - crate::ranges::FIRST_RANGE) + 1))
 }
 
 /// The split admin: asks `range`'s leader, `target` first, to split at `key`, follows
-/// `NotLeader` around the servers once, and records the answer (PROPOSED D-100).
+/// `NotLeader` around the servers once, and records the answer (D-100).
 // The ask's seven parts and its stickiness, spelt out rather than bundled.
 #[allow(clippy::too_many_arguments)]
 async fn split_admin<E: Environment>(
@@ -1502,7 +1502,7 @@ async fn split_admin<E: Environment>(
                     .entry(reason.name())
                     .or_default() += 1;
                 if reason == SplitRefusal::NoRangeId {
-                    // PROPOSED D-092's A, as proposed: a split asked while the node's
+                    // D-092's A, as proposed: a split asked while the node's
                     // block holds no id is refused and the asker retries — here after
                     // `SPLIT_RETRY`, the sweep's own interval and not D-092's, for the
                     // rest of the round.
@@ -1613,11 +1613,11 @@ pub struct Schedule {
     /// The faults, each healed before the next, with `gaps[i]` of quiet after it.
     pub faults: Vec<Fault>,
     /// The quiet after each fault. One arm spends none: [`Fault::SplitFromRestarted`]
-    /// with no split done, whose own wait is that quiet (PROPOSED D-120). It is the
+    /// with no split done, whose own wait is that quiet (D-120). It is the
     /// only one, and not because it injects nothing — a [`Fault::Split`] whose ask goes
     /// unanswered or refused injects nothing either, and spends its gap at the loop's
     /// foot like every other arm.
-    // PROPOSED(D-120): that one arm spends no gap; no general rule is claimed.
+    // D-120: that one arm spends no gap; no general rule is claimed.
     pub gaps: Vec<Duration>,
     /// The quiet after the last fault: the liveness window.
     pub settle: Duration,
@@ -1860,10 +1860,10 @@ impl Schedule {
             faults.push(fault.clone());
             gaps.push(*gap);
         }
-        // PROPOSED(D-104): these two split arms stand in for `sim/shard.rs`'s driver, a
+        // D-104: these two split arms stand in for `sim/shard.rs`'s driver, a
         // departure from §12's text, and stay when it lands so no node schedule moves.
         // One split per schedule, at a drawn position among the arms, from a stream
-        // of its own so the other arms' draws stay where they were (PROPOSED D-100).
+        // of its own so the other arms' draws stay where they were (D-100).
         let mut split = moirae_sched::stream(seed, "split");
         let at = usize::try_from(split.below(faults.len() as u64 + 1)).expect("small");
         let settle = Duration::from_millis(400 + split.below(401));
@@ -2042,7 +2042,7 @@ impl Schedule {
                     (TERM_RAISE_WAIT_BUDGET + *isolate + *quiet)
                         * u32::try_from(*tries).expect("small")
                 }
-                // PROPOSED(D-100): the admin's ask and the settle after it.
+                // D-100: the admin's ask and the settle after it.
                 Fault::Split { settle } => SPLIT_WAIT_BUDGET + *settle,
                 Fault::SplitFromRestarted { down, settle } => {
                     *down + TRANSFER_WAIT + SPLIT_WAIT_BUDGET + *settle
@@ -2068,10 +2068,10 @@ pub struct ClientStats {
     /// Tries answered with NotLeader.
     pub redirected: u64,
     /// Tries answered with RangeMismatch (SHARD.md §3).
-    // PROPOSED(D-097)
+    // D-097
     pub mismatched: u64,
     /// Lookups the client made through range 0 or range 1 (SHARD.md §1, §3).
-    // PROPOSED(D-098)
+    // D-098
     pub lookups: u64,
 }
 
@@ -2105,8 +2105,8 @@ pub struct Report {
     /// cluster at all and so has no moment of its own to date this from; it leaves the
     /// field where the arm before it left it, which is as near the last real heal as the
     /// run can say and never further from it than the arm's own end would be
-    /// (PROPOSED D-120).
-    // PROPOSED(D-120): the no-split arm asks nothing, so it does not move this.
+    /// (D-120).
+    // D-120: the no-split arm asks nothing, so it does not move this.
     pub last_heal: Instant,
     /// Where the simulation stopped: the virtual time once the run's last advance
     /// returned, read off the simulator and not worked out from the schedule.
@@ -2115,8 +2115,8 @@ pub struct Report {
     /// budget — an install that landed early, a stream that opened at once, a
     /// term raise delivered on the first try — and an arm's tail whether or not the
     /// arm reached it, so it lies past the end of every run the sweeps measured, by
-    /// more than the liveness bound on many (PROPOSED D-102).
-    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    /// more than the liveness bound on many (D-102).
+    // D-102: the run's end is where the simulation stopped.
     pub ended: Instant,
     /// Every isolation of one server: (server, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
@@ -2189,13 +2189,13 @@ pub struct Report {
     /// a run another scenario drove.
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
     pub aimed: Vec<(u64, u64, Instant)>,
-    /// What the split arms' admins recorded (PROPOSED D-100).
+    /// What the split arms' admins recorded (D-100).
     pub splits: SplitStats,
 }
 
 /// A range's first client write after the last heal
 /// ([`Report::recoveries_by_final_range`]).
-// PROPOSED(D-113): the write bound per range the run ended with.
+// D-113: the write bound per range the run ended with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Recovery {
     /// When the first of them was called.
@@ -2220,7 +2220,7 @@ pub struct Run {
     /// When the run's last fault healed.
     pub last_heal: Instant,
     /// Where the run's simulation stopped ([`Report::ended`]).
-    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    // D-102: the run's end is where the simulation stopped.
     pub ended: Instant,
     /// Every isolation of one node: (node, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
@@ -2276,7 +2276,7 @@ fn replica_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftSnapshotDeleted { server, .. }
         | TraceEvent::RaftSnapshotReused { server, .. }
         | TraceEvent::RaftSnapshotStreams { server, .. }
-        // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
+        // D-110: the leader's half of the overlap rule (#180's review, N8).
         | TraceEvent::RaftSnapshotOverlapped { server, .. }
         | TraceEvent::RaftSnapshotRestream { server, .. }
         // PROPOSED(D-127): the resend bound's give-up is traced.
@@ -2446,13 +2446,13 @@ impl Report {
     /// any of them: the schedule is read for the clock drift alone, which a run with
     /// no skew and no drift has none of.
     ///
-    /// The run's end was the one exception until PROPOSED D-102: the liveness
+    /// The run's end was the one exception until D-102: the liveness
     /// readings took it from the schedule, and [`Schedule::none`]'s total is zero, so
     /// every run handed here ended at the origin by that reading and D-086's
     /// exemption for a write pending at the end never applied to it. The end is the
     /// run's own now ([`Run::ended`]).
     // PROPOSED(D-076): the node scenario is checked by the checks D-071 keyed.
-    // PROPOSED(D-102): the run's end is the run's, not the schedule's.
+    // D-102: the run's end is the run's, not the schedule's.
     #[must_use]
     pub fn over_a_run(run: Run) -> Self {
         let Run {
@@ -2832,11 +2832,11 @@ impl Report {
 }
 
 /// The middle value of a sorted slice, the lower of the two when it is even.
-// PROPOSED(D-095): the whole-trace readings as functions over a prefix, so the
+// D-095: the whole-trace readings as functions over a prefix, so the
 // equivalence test in `sim/tests/node.rs` can hold the incremental folds to them.
 /// The apply lag per range over `records` from the first: the whole-trace reading
 /// [`Report::apply_lags`] takes, kept as the reference the incremental
-/// [`crate::folds::ApplyLagFold`] is held to (PROPOSED D-095).
+/// [`crate::folds::ApplyLagFold`] is held to (D-095).
 #[must_use]
 pub fn apply_lags_of(records: &[TraceRecord]) -> BTreeMap<u64, Vec<Duration>> {
     let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
@@ -2878,8 +2878,8 @@ pub fn apply_lags_of(records: &[TraceRecord]) -> BTreeMap<u64, Vec<Duration>> {
 
 /// The cross-range holds over `records` from the first, in two passes: the
 /// whole-trace reading [`Report::cross_range_apply_holds_counted`] takes, kept as the
-/// reference the one-pass [`crate::folds::CrossRangeHoldFold`] is held to (PROPOSED
-/// D-095).
+/// reference the one-pass [`crate::folds::CrossRangeHoldFold`] is held to
+/// (D-095).
 #[must_use]
 pub fn cross_range_apply_holds_of(records: &[TraceRecord]) -> (Vec<Duration>, usize) {
     // Every crash and restart, by the node that suffered it, in time order.
@@ -2949,7 +2949,7 @@ pub fn cross_range_apply_holds_of(records: &[TraceRecord]) -> (Vec<Duration>, us
 }
 
 /// The inbox's drops over `records`, by kind and range: [`Report::inbox_drops`]'s
-/// reading, the reference for [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+/// reading, the reference for [`crate::folds::NodeCoverageFold`] (D-095).
 #[must_use]
 pub fn inbox_drops_of(records: &[TraceRecord]) -> BTreeMap<(&'static str, u64), usize> {
     let mut by: BTreeMap<(&'static str, u64), usize> = BTreeMap::new();
@@ -2963,7 +2963,7 @@ pub fn inbox_drops_of(records: &[TraceRecord]) -> BTreeMap<(&'static str, u64), 
 
 /// The highest index any append, commit or apply in `records` names:
 /// [`Report::highest_index`]'s reading, the reference for
-/// [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+/// [`crate::folds::NodeCoverageFold`] (D-095).
 #[must_use]
 pub fn highest_index_of(records: &[TraceRecord]) -> u64 {
     records
@@ -2980,7 +2980,7 @@ pub fn highest_index_of(records: &[TraceRecord]) -> u64 {
 
 /// Records per range over `records`, by [`range_of`]: what
 /// [`Report::busiest_range_records_per_second`] reads, the reference for
-/// [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+/// [`crate::folds::NodeCoverageFold`] (D-095).
 #[must_use]
 pub fn records_by_range_of(records: &[TraceRecord]) -> BTreeMap<u64, usize> {
     let mut by_range: BTreeMap<u64, usize> = BTreeMap::new();
@@ -3033,7 +3033,7 @@ pub fn range_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftSnapshotDeleted { range, .. }
         | TraceEvent::RaftSnapshotReused { range, .. }
         | TraceEvent::RaftSnapshotStreams { range, .. }
-        // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
+        // D-110: the leader's half of the overlap rule (#180's review, N8).
         | TraceEvent::RaftSnapshotOverlapped { range, .. }
         | TraceEvent::RaftSnapshotRestream { range, .. }
         // PROPOSED(D-127): the resend bound's give-up is traced.
@@ -3088,11 +3088,11 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
 pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result<(), String> {
     // The ranges the run hosts: configuration's, and every right half a split's apply
-    // creates (SHARD.md §5; PROPOSED D-100), named anywhere in the run and not only before
+    // creates (SHARD.md §5; D-100), named anywhere in the run and not only before
     // the record. A node crashed with a split's batch durable and its `RangeSplit` not yet
     // traced restates the right half at its next start, log first and descriptor last,
     // before any node has traced the split: seed 88 of the sharded sweep under `NoPreVote`
-    // (PROPOSED D-113).
+    // (D-113).
     let mut hosted: BTreeSet<u64> = hosted.iter().copied().collect();
     for record in records {
         match &record.event {
@@ -3135,14 +3135,14 @@ pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result
                          names the key {key:?}"
                     ));
                 }
-                // PROPOSED(D-097): the apply check's refusal, which names its key.
+                // D-097: the apply check's refusal, which names its key.
                 ApplyEffect::OutOfSpan if key.is_none() => {
                     return Err(format!(
                         "the trace's payload: server {server}'s apply of {index} is \
                          `out_of_span` and names no key"
                     ));
                 }
-                // PROPOSED(D-098): a range command's effects, which name no key — a
+                // D-098: a range command's effects, which name no key — a
                 // `MetaUpdate` took effect, or applied as nothing.
                 ApplyEffect::Took | ApplyEffect::Refused if key.is_some() => {
                     return Err(format!(
@@ -3251,7 +3251,7 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 ///
 /// **A change to 0 is read by what could have sent it.** 0 is no store's number: a
 /// node stamps it on an answer for a replica it holds no store of, a placeholder's
-/// (`ServerHost::unheld`, PROPOSED D-109) or a refused server's (D-042), and a store
+/// (`ServerHost::unheld`, D-109) or a refused server's (D-042), and a store
 /// stamps its own. So a store's number *can* repeat around a 0 on the correct system:
 /// D-042's own consequences name it, "a rejection stamped 0 that is delayed past the
 /// install is a change too", which forgets the follower's progress for a round trip.
@@ -3261,7 +3261,7 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 /// shape: node 2's placeholder of range 43 answered, node 2's split made the store,
 /// the store's first answer overtook the placeholder's, and leader 1 traced a rise, a
 /// reset to 0, a reset back and a rise under the one number. (This comment said a
-/// retired incarnation could not repeat; that seed is what falsified it. PROPOSED
+/// retired incarnation could not repeat; that seed is what falsified it.
 /// D-113 §5.)
 ///
 /// What tells that from a store that lost its state is whether the follower holds a
@@ -3313,7 +3313,7 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 // incarnation)`.
 // PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
 // is a fresh first rise (issue #81).
-// PROPOSED(D-113): a 0 read while the follower holds a store is a delayed answer, and
+// D-113: a 0 read while the follower holds a store is a delayed answer, and
 // opens a window; a refused follower's 0 does not.
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
     // (range, server): the replicas whose store the trace says is there.
@@ -3743,7 +3743,7 @@ impl Report {
     /// node, the sole reader of this is the node's own sweep.
     ///
     /// **A replica configuration never names is read from the node's own creations**
-    /// (PROPOSED D-113). The node's refusal names configuration's ranges, since those
+    /// (D-113). The node's refusal names configuration's ranges, since those
     /// are all it knows before it opens its store, so a right half on a refused node is
     /// named by no `RaftReplicaRefused` (#178). §8 is plain about it: every replica on a
     /// refused node counts as refused in this rule. So a `RaftRefused` takes down every
@@ -3751,7 +3751,7 @@ impl Report {
     /// last refusal, until that replica's `RaftRecovered`; and a voter of such a range on
     /// an engine a re-seed built, holding nothing of it, counts as impaired too, since a
     /// placeholder grants no vote (Q22) and the install that ends it quarantines
-    /// (PROPOSED D-109). Configuration's ranges are read as they were, from the events
+    /// (D-109). Configuration's ranges are read as they were, from the events
     /// the node traces of them: `RefuseOneRangeOnly` is the node naming too few, which
     /// this must not paper over.
     // PROPOSED(D-071): the checks about time are asked per range.
@@ -3769,7 +3769,7 @@ impl Report {
     /// Per range of the run, the voters [`Report::ranges_with_a_majority_up`] counts as neither
     /// up nor able to help elect: refused, quarantined, or holding nothing of a right half on an
     /// engine a re-seed built. That rule's reading, and nothing else.
-    // PROPOSED(D-113): §6 reads the sets as well as their sizes.
+    // D-113: §6 reads the sets as well as their sizes.
     #[must_use]
     pub fn impaired_voters(&self) -> BTreeMap<u64, BTreeSet<u64>> {
         let ranges = self.ranges();
@@ -3796,7 +3796,7 @@ impl Report {
                 TraceEvent::RaftReseeded { server, range } => {
                     quarantined.insert((*range, *server));
                 }
-                // PROPOSED(D-113): the node's refusal, for the replicas no per-replica
+                // D-113: the node's refusal, for the replicas no per-replica
                 // refusal can name (#178).
                 TraceEvent::RaftRefused { server, .. } => {
                     let lost: Vec<u64> = held
@@ -3838,7 +3838,7 @@ impl Report {
         }
         // A voter on an engine a re-seed built that holds nothing of a range configuration
         // never named: it grants no vote from a placeholder, and the install that ends the
-        // placeholder quarantines it (PROPOSED D-109), so it helps elect nobody either way.
+        // placeholder quarantines it (D-109), so it helps elect nobody either way.
         for (range, (_, named)) in &voters {
             if configured.contains(range) {
                 continue;
@@ -4191,7 +4191,7 @@ impl Report {
     /// # Errors
     ///
     /// A message naming the seed and the violation.
-    // PROPOSED(D-113): the write bound per range the run ended with.
+    // D-113: the write bound per range the run ended with.
     pub fn check_by_final_range(&self) -> Result<(), String> {
         self.check_with(Self::liveness_by_final_range)
     }
@@ -4232,7 +4232,7 @@ impl Report {
         }
         // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18, folded over the whole trace
         // of a run that traces descriptors: the node's. One group traces none (Q40).
-        // PROPOSED(D-097)
+        // D-097
         if self.traces_descriptors()
             && let Err(violation) = ananke_shard::invariants::all(&self.records)
         {
@@ -4298,7 +4298,7 @@ impl Report {
 
     /// Whether the run traced a descriptor at all: the node cluster's runs do, from
     /// every replica's bootstrap creation, and one group's never do.
-    // PROPOSED(D-097)
+    // D-097
     #[must_use]
     pub fn traces_descriptors(&self) -> bool {
         self.records
@@ -4307,7 +4307,7 @@ impl Report {
     }
 
     /// `RangeMismatchSent`, by where the server saw it (SHARD.md §3).
-    // PROPOSED(D-097)
+    // D-097
     #[must_use]
     pub fn mismatches_sent(&self) -> BTreeMap<MismatchAt, usize> {
         mismatches_sent_of(&self.records)
@@ -4446,7 +4446,7 @@ impl Report {
     /// post-heal writes all stayed pending the wedge ([`Report::writes_after_heal_by_key`]).
     /// The number of keys asked, or the first violation.
     // PROPOSED(D-071): the write bound is asked per key.
-    // PROPOSED(D-113): asked where the range serving the key at the end has a majority.
+    // D-113: asked where the range serving the key at the end has a majority.
     // PROPOSED(D-121): on every run, and not only the sharded sweep's.
     fn every_key_written_after_the_heal(
         &self,
@@ -4483,7 +4483,7 @@ impl Report {
     /// up, of those in `live`, the first write completed within the bound of **the heal**
     /// ([`Report::writes_after_heal_by_starting_range`]).
     // PROPOSED(D-076): the recovery time proper is asked per range.
-    // PROPOSED(D-113): read beside the per-range arm from the first call.
+    // D-113: read beside the per-range arm from the first call.
     fn recovery_from_the_heal(&self, live: &BTreeSet<u64>) -> Result<(), String> {
         let bound = election_max() * LIVENESS_TIMEOUTS;
         for (range, took) in self.writes_after_heal_by_starting_range() {
@@ -4517,7 +4517,7 @@ impl Report {
     /// post-heal writes all stayed pending the wedge. Not always the per-key reading's
     /// wedge: a key that completed a write on a parent before a split passes that
     /// reading, and the right half's own writes are what stayed pending.
-    // PROPOSED(D-113): the write bound per range the run ended with.
+    // D-113: the write bound per range the run ended with.
     // PROPOSED(D-121): shared by both liveness readings.
     fn recovery_from_the_first_call(
         &self,
@@ -4552,7 +4552,7 @@ impl Report {
 
     /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then every
     /// split the trace took, read where the run stopped ([`Report::ended`]).
-    // PROPOSED(D-113): the write bound per range the run ended with.
+    // D-113: the write bound per range the run ended with.
     #[must_use]
     pub fn final_range_of(&self, key: &Bytes) -> u64 {
         self.serving_at(&self.splits_taken(), key, self.ended)
@@ -4580,7 +4580,7 @@ impl Report {
     /// not a widening: the parent's log, which the left half is, did commit a write then.
     /// [`Report::liveness`] cannot move that way, since it asked no half before PROPOSED
     /// D-121; [`Report::liveness_by_final_range`] can, and the owner is asked (D-121).
-    // PROPOSED(D-113): the write bound per range the run ended with.
+    // D-113: the write bound per range the run ended with.
     // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
     #[must_use]
     pub fn recoveries_by_final_range(&self) -> BTreeMap<u64, Recovery> {
@@ -4641,7 +4641,7 @@ impl Report {
     /// D-103's reading from the invocations is not a drop-in, as #197 measures.
     ///
     /// **What moved against [`Report::liveness`] under the map that starts every key in one
-    /// range** (PROPOSED D-113 §5). The bound is the same constant, the whole-keyspace
+    /// range** (D-113 §5). The bound is the same constant, the whole-keyspace
     /// reading from the heal is the same code, and every key that reading asks is still
     /// asked: a voter impaired on any final range is on a refused node, and a refused
     /// bootstrap node impairs every range configuration names, so if the first range has a
@@ -4654,7 +4654,7 @@ impl Report {
     /// # Errors
     ///
     /// The violation, naming the key or the range and the bound.
-    // PROPOSED(D-113): the write bound per range the run ended with.
+    // D-113: the write bound per range the run ended with.
     // PROPOSED(D-121): its arms shared with `liveness`, which asks them of a split's halves.
     pub fn liveness_by_final_range(&self) -> Result<(), String> {
         let live = self.ranges_with_a_majority_up();
@@ -4929,7 +4929,7 @@ impl Report {
                         | TraceEvent::RaftReseeded { .. }
                         | TraceEvent::RaftSnapshot { taken: false, .. }
                         | TraceEvent::RangeCreated { .. }
-                        // PROPOSED(D-112): an install's restatement is read as the
+                        // D-112: an install's restatement is read as the
                         // term its creation wrote ([`Report::installed_term`]).
                         | TraceEvent::RaftRecovered { .. }
                 )
@@ -5053,7 +5053,7 @@ impl Report {
     /// A replica an install created *before* the isolation, whose core first states
     /// its term inside it, takes that restatement's term as the term the isolation
     /// began with, where it equals the term of the stream the install completed
-    /// ([`Report::installed_term`], PROPOSED D-112). The switch wrote that term before
+    /// ([`Report::installed_term`], D-112). The switch wrote that term before
     /// the window, and no core of the replica exists to change it until the
     /// restatement. What the check still trusts is that pairing: the stream is read
     /// as the done chunk of the creation's snapshot delivered last to the node by the
@@ -5264,14 +5264,14 @@ impl Report {
                 // traces no `RaftTerm` for it: the creation is the term's source
                 // until an election moves it, else a replica created before an
                 // isolation reads as raising its term from 0 at its first pre-vote
-                // inside it (PROPOSED D-100).
+                // inside it (D-100).
                 TraceEvent::RangeCreated {
                     range: g,
                     cause: ananke_env::RangeCause::Split,
                     floor_term,
                     ..
                 } if *g == range && on(r) => Some((index, Some(*floor_term))),
-                // PROPOSED(D-112): an install's creation, a placeholder's or a
+                // D-112: an install's creation, a placeholder's or a
                 // re-seed's.
                 TraceEvent::RangeCreated {
                     range: g,
@@ -5301,7 +5301,7 @@ impl Report {
         0
     }
 
-    /// The term an install's creation wrote, as the trace states it (PROPOSED D-112):
+    /// The term an install's creation wrote, as the trace states it (D-112):
     /// the term of the replica's restatement after the creation at `created` in
     /// `records`, when that restatement is the term the install's stream carried.
     ///
@@ -5321,7 +5321,7 @@ impl Report {
     /// install's creation the fold falls back past, because the creation after it could
     /// not be paired, gives `None` unless its own restatement came before that later
     /// creation, and the fold reads on as it did before D-112.
-    // PROPOSED(D-112): the pre-vote fold reads an install's creation as a term source.
+    // D-112: the pre-vote fold reads an install's creation as a term source.
     fn installed_term(
         records: &[&TraceRecord],
         streams: &StreamTerms,
@@ -5363,7 +5363,7 @@ impl Report {
         None
     }
 
-    /// The term of the stream each install's creation completed (PROPOSED D-112): for
+    /// The term of the stream each install's creation completed (D-112): for
     /// every `RangeCreated { cause: snapshot }` on a node, the term of the last
     /// `InstallSnapshot` chunk of that range marked done, for the snapshot the creation
     /// names (its floor index and term), delivered to the node by the time the switch
@@ -5461,7 +5461,7 @@ impl Report {
     /// start. A re-seeded server is exempt: it never campaigns on that store, by
     /// design (RAFT.md §3, D-035). So is a placeholder, from its `RangeReplicaCreated`
     /// to its range's `RangeCreated` on that node: it has no core and runs no timer
-    /// (SHARD.md §8, PROPOSED D-109). So is a replica whose core the node holds for a
+    /// (SHARD.md §8, D-109). So is a replica whose core the node holds for a
     /// live install, from the install's decision to the restatement its switch traces
     /// (PROPOSED D-091) or, where the hold ends with no switch, to its release, which
     /// resets its clock (PROPOSED D-134). The first gap [`Report::replay_timers`] finds
@@ -5631,7 +5631,7 @@ impl Report {
         // `RangeCreated` (SHARD.md §8): a placeholder has no core and so no election
         // timer, and the check skips it. A crash forgets every placeholder on the node,
         // as the node does.
-        // PROPOSED(D-109): the timer check skips a placeholder.
+        // D-109: the timer check skips a placeholder.
         let mut placeholders: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
@@ -5748,7 +5748,7 @@ impl Report {
                 // PROPOSED(D-071): the timer check is per (range, server).
                 TraceEvent::RangeCreated { range, .. } => {
                     if let Some(server) = record.node.map(|node| u64::from(node.get())) {
-                        // PROPOSED(D-109): a placeholder ends at its replica's creation.
+                        // D-109: a placeholder ends at its replica's creation.
                         placeholders.remove(&(*range, server));
                         clocks.reset((*range, server), at);
                     }
@@ -5756,7 +5756,7 @@ impl Report {
                 // A placeholder is no replica: it has no core and runs no timer, so
                 // nothing is measured of it until its range is created on the node
                 // (SHARD.md §8).
-                // PROPOSED(D-109): the timer check skips a placeholder.
+                // D-109: the timer check skips a placeholder.
                 TraceEvent::RangeReplicaCreated { range } => {
                     if let Some(server) = record.node.map(|node| u64::from(node.get())) {
                         placeholders.insert((*range, server));
@@ -5982,7 +5982,7 @@ impl Report {
                     // replica is down for the ordinary reason now, and its restart's
                     // `RaftTerm` is what re-admits it.
                     held.retain(|&(_, s)| s != server);
-                    // PROPOSED(D-109): and so do its placeholders, which held nothing.
+                    // D-109: and so do its placeholders, which held nothing.
                     placeholders.retain(|&(_, s)| s != server);
                 }
                 _ => {}
@@ -6048,7 +6048,7 @@ impl Report {
 
 /// The term of the stream each install's creation completed, keyed by (server, range,
 /// when the creation was traced): [`Report::install_stream_terms`].
-// PROPOSED(D-112)
+// D-112
 pub type StreamTerms = BTreeMap<(u64, u64, Instant), u64>;
 
 /// Which of a record's two times a check reads (D-047). A node traces a
@@ -8026,7 +8026,7 @@ impl StreamProgress {
             message::SnapshotStatus::Waiting => false,
             // The overlap rule's refusal: the stream ends there, and nothing it covered
             // is progress.
-            // PROPOSED(D-110): the overlap rule's refusal ends the stream.
+            // D-110: the overlap rule's refusal ends the stream.
             message::SnapshotStatus::Overlaps => {
                 self.streams.remove(&(to, from));
                 false
@@ -8230,7 +8230,7 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
 // PROPOSED(D-086): the threshold is the scenario's own — the sweep that reaches the
 // path passes 12, and a scenario whose rates were measured without it keeps `1 << 30`.
-// PROPOSED(D-105): the range layer's variants carried beside the node's.
+// D-105: the range layer's variants carried beside the node's.
 #[must_use]
 pub fn node_server_config(
     id: u64,
@@ -8452,7 +8452,7 @@ fn aim_among_lagging(
     lagging[at]
 }
 
-// PROPOSED(D-131): shared with the sharded sweep's load clients.
+// D-131: shared with the sharded sweep's load clients.
 pub(crate) fn to_command(op: &ClientOp) -> Command {
     match op {
         ClientOp::Put { key, value } => Command::Put {
@@ -8469,21 +8469,21 @@ pub(crate) fn to_command(op: &ClientOp) -> Command {
     }
 }
 
-// PROPOSED(D-131): shared with the sharded sweep's load clients.
+// D-131: shared with the sharded sweep's load clients.
 pub(crate) fn to_result(outcome: Outcome) -> ClientResult {
     match outcome {
         Outcome::Done => ClientResult::Done,
         Outcome::Swapped(swapped) => ClientResult::Swapped(swapped),
         Outcome::Value(value) => ClientResult::Value(value),
         // A refusal answers a split, which no client sends as an operation of the
-        // history (SHARD.md §5, §9; PROPOSED D-100).
+        // history (SHARD.md §5, §9; D-100).
         Outcome::Refused(reason) => unreachable!("a split's refusal, {reason:?}, as an operation"),
     }
 }
 
 /// Where a client of `cluster` sends `key`: the range and the generation its cache
 /// names (SHARD.md §3), looked up through ranges 0 and 1 when the cache holds no entry
-/// for the key (§1; PROPOSED D-098), or the group on one group. A lookup that finds
+/// for the key (§1; D-098), or the group on one group. A lookup that finds
 /// nothing leaves the operation to the scenario's map at the first generation, which
 /// the sweep counts.
 /// Where a client's lookup sequence numbers start (SHARD.md §3, §9): an operation's
@@ -8650,9 +8650,9 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
 /// and every draw falls exactly where it fell before (PROPOSED D-082).
 ///
 /// The client is the range layer's, so the variants it reads are the range layer's:
-/// [`RangeVariant::ClientIgnoresMismatch`] is the only one (PROPOSED D-105).
+/// [`RangeVariant::ClientIgnoresMismatch`] is the only one (D-105).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
-// PROPOSED(D-105): the range layer's variants carried beside the node's.
+// D-105: the range layer's variants carried beside the node's.
 pub(crate) async fn client_on<E: Environment>(
     cluster: Cluster,
     env: E,
@@ -8677,8 +8677,8 @@ pub(crate) async fn client_on<E: Environment>(
 /// The keys a client draws from, and the range it sends a key to when neither its
 /// cache nor a lookup places it: [`Cluster::client_keys`] for the two clusters of this
 /// file, and `sim/shard.rs`'s own for the sharded sweep, whose ranges are made by the
-/// splits its driver draws (PROPOSED D-113).
-// PROPOSED(D-113): the client's keys and first cache are its scenario's.
+/// splits its driver draws (D-113).
+// D-113: the client's keys and first cache are its scenario's.
 #[derive(Clone, Copy, Debug)]
 pub struct ClientKeys {
     /// How many keys it draws among.
@@ -8698,8 +8698,8 @@ fn plain_key(i: u64) -> Bytes {
 /// The client of [`client_on`] over `keys`, starting from `cache`: the same draws, the
 /// same deadlines and the same rules, with the scenario's own keys and first cache. Every
 /// draw falls where [`client_on`]'s fell before the two were told apart, so no schedule of
-/// this file moves (PROPOSED D-113).
-// PROPOSED(D-113): the client's keys and first cache are its scenario's.
+/// this file moves (D-113).
+// D-113: the client's keys and first cache are its scenario's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn client_over<E: Environment>(
     cluster: Cluster,
@@ -8719,7 +8719,7 @@ pub(crate) async fn client_over<E: Environment>(
     let mut seq = 0u64;
     // What it knows of the ranges, and the leader it last heard of per range
     // (SHARD.md §3). On one group the cache holds no span and only the hint.
-    // PROPOSED(D-097): the node cluster's client routes by its cache.
+    // D-097: the node cluster's client routes by its cache.
     let mut cache = cache;
     // The lookups' sequence numbers, from a base no operation reaches: a lookup
     // under an operation's number would be paired with it by the history's closure
@@ -8792,7 +8792,7 @@ pub(crate) async fn client_over<E: Environment>(
                 seq,
                 command: command.clone(),
             };
-            // PROPOSED(D-097): every send is traced, with the operation it belongs
+            // D-097: every send is traced, with the operation it belongs
             // to (SHARD.md §8, §9).
             env.trace(TraceEvent::ClientSend {
                 client: process,
@@ -8860,7 +8860,7 @@ pub(crate) async fn client_over<E: Environment>(
                 // answer that carries none evicts the entry, and the operation goes
                 // again to the range the cache now names, under a fresh sequence
                 // number the history pairs with `invoked` (§9, Q10).
-                // PROPOSED(D-097)
+                // D-097
                 Some(Reply::RangeMismatch { descriptors }) => {
                     stats.lock().unwrap().mismatched += 1;
                     let decoded: Vec<RangeDescriptor> = descriptors
@@ -8881,7 +8881,7 @@ pub(crate) async fn client_over<E: Environment>(
                     seq += 1;
                     // `ClientIgnoresMismatch`: the resend goes to the range and
                     // generation the client had, merging nothing (§10, Q38).
-                    // PROPOSED(D-105): read from the range layer's set.
+                    // D-105: read from the range layer's set.
                     if range_variants.contains(RangeVariant::ClientIgnoresMismatch) {
                         target = target % servers + 1;
                         continue;
@@ -9108,7 +9108,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
 /// `variants`, the node `node` and the range layer `range`, three sets read by three
 /// layers (Q37).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
-// PROPOSED(D-105): the range layer's variants carried beside the node's.
+// D-105: the range layer's variants carried beside the node's.
 #[must_use]
 pub fn run_on_the_node(
     seed: u64,
@@ -9132,7 +9132,7 @@ pub fn run_on_the_node(
 /// heals is the same code whichever system is underneath, so the node's sweep and
 /// the one-group sweep cannot drift apart (PROPOSED D-082).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
-// PROPOSED(D-105): the range layer's variants carried beside the node's.
+// D-105: the range layer's variants carried beside the node's.
 #[must_use]
 pub fn run_on(
     cluster: Cluster,
@@ -9180,7 +9180,7 @@ pub fn run_on(
     let mut aimed: Vec<(u64, u64, Instant)> = Vec::new();
     // The range layer's checks fold on the node cluster, which traces descriptors;
     // one group traces none and is checked with an inactive checker.
-    // PROPOSED(D-097)
+    // D-097
     let mut watch = Watch {
         shard: ananke_shard::invariants::Checker::new(cluster == Cluster::Node),
         ..Watch::default()
@@ -9256,7 +9256,7 @@ pub fn run_on(
         advance(&mut sim, TRIAL_GAP, &mut watch);
     }
     let mut bursts = 0u64;
-    // The split arms' admins and what they record (PROPOSED D-100).
+    // The split arms' admins and what they record (D-100).
     let split_stats: Arc<Mutex<SplitStats>> = Arc::default();
     let mut splits_asked = 0u64;
     let mut fills = 0u64;
@@ -9597,7 +9597,7 @@ pub fn run_on(
                 advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
-            // PROPOSED(D-100): a split of the aimed range, asked of its leader.
+            // D-100: a split of the aimed range, asked of its leader.
             Fault::Split { settle } => {
                 let leader = leader_of_range(&sim, aimed_range);
                 let key = split_key_of(aimed_range);
@@ -9611,7 +9611,7 @@ pub fn run_on(
                 });
                 advance(&mut sim, *settle, &mut watch);
             }
-            // PROPOSED(D-100): §10's shape for `IdBlockResumed`. The node that proposed
+            // D-100: §10's shape for `IdBlockResumed`. The node that proposed
             // the last split done, crashed and restarted, is handed the lead of a range
             // that split did not cut and asked, alone, to split it.
             Fault::SplitFromRestarted { down, settle } => {
@@ -9624,7 +9624,7 @@ pub fn run_on(
                     // resume from: the arm is a wait, counted as not reached.
                     //
                     // The `continue` skips `last_heal` and the gap **deliberately**
-                    // (PROPOSED D-120, issue #147). The arm asks nothing of the cluster
+                    // (D-120, issue #147). The arm asks nothing of the cluster
                     // — no split, no crash, no transfer — so it has no moment of its own
                     // to date `last_heal` from, and a gap is the quiet after a fault,
                     // which this settle already was.
@@ -9651,7 +9651,7 @@ pub fn run_on(
                     // losing 47 of `SharedSnapshotDir`'s uniform liveness catches and
                     // winning 2 — it is not a superset either way — and moving no verdict
                     // of the correct node. A looser reading, not a fix.
-                    // PROPOSED(D-120): the no-split branch is the arm's settle alone.
+                    // D-120: the no-split branch is the arm's settle alone.
                     advance(&mut sim, *settle, &mut watch);
                     continue;
                 };
@@ -9766,7 +9766,7 @@ pub fn run_on(
     }
     // Where the run stopped, read off the simulator: each budgeted wait above returns
     // when its event lands, and an arm skips its tail when its wait ran out, so the
-    // schedule's total is not this (PROPOSED D-102).
+    // schedule's total is not this (D-102).
     let ended = sim.now();
     let records = sim.trace();
     let refused: Vec<(u64, String)> = records
@@ -9820,7 +9820,7 @@ pub(crate) struct Watch {
     /// Whether the checkers fold at all, and so whether a violation can stop the run: off
     /// for a run taken to its end, so that a check about time can be read of a variant
     /// another check would have stopped first (`shard::run_to_the_end`).
-    // PROPOSED(D-113)
+    // D-113
     pub(crate) stops: bool,
     /// The safety checks, one checker for the whole run with the state of each
     /// check kept across looks, so a look costs only the records since the last
@@ -9828,7 +9828,7 @@ pub(crate) struct Watch {
     checker: invariants::Checker,
     /// The range layer's checks — SHARD.md §8's 7, 9, 10, 16, 17 and 18 — fed the
     /// same records at the same looks (Q40). Inactive on one group.
-    // PROPOSED(D-097)
+    // D-097
     shard: ananke_shard::invariants::Checker,
     /// How many trace records the checker has been fed.
     checked: usize,
@@ -10443,7 +10443,7 @@ mod tests {
         let schedule = Schedule::term_raise_behind_a_step(0);
         // A hand-built run stops where its schedule's total says, 3.9 s: what every
         // case below was written against while the end was read off the schedule
-        // (PROPOSED D-102). A case about the two differing sets `ended` itself.
+        // (D-102). A case about the two differing sets `ended` itself.
         let ended = Instant::default() + schedule.total();
         Report {
             seed: 0,
@@ -10637,7 +10637,7 @@ mod tests {
     }
 
     /// An install's creation traced before an isolation and its restatement inside it
-    /// (PROPOSED D-112): seeds 1817 and 248 of the node's nightly. The switch wrote the
+    /// (D-112): seeds 1817 and 248 of the node's nightly. The switch wrote the
     /// replica's term before the window and its core first states it inside, so the
     /// term the window began with is the restatement's, taken only where it equals the
     /// term of the stream the install completed. Four cases on one server:
@@ -10648,7 +10648,7 @@ mod tests {
     /// - a first term record after the creation that is no restatement (a candidacy, no
     ///   `RaftRecovered`): nothing is taken from it, and the window reads "from 0";
     /// - a restatement of a term above the stream's: not the creation's term, "from 0".
-    // PROPOSED(D-112): an install's creation is a term source, tied to its stream.
+    // D-112: an install's creation is a term source, tied to its stream.
     #[test]
     fn an_installs_creation_before_an_isolation_is_read_at_the_term_its_stream_carried() {
         let isolation = (1, ms(100), ms(500));
@@ -10770,7 +10770,7 @@ mod tests {
     }
 
     /// What the pairing and the restatement's shape each refuse (#184's review, N1, N2,
-    /// N4; PROPOSED D-112), one case per condition, each on one server whose replica an
+    /// N4; D-112), one case per condition, each on one server whose replica an
     /// install created at 95 ms, its switch decided at 90 ms, before an isolation from
     /// 100 ms; the install's stream is a done chunk of the checkpoint (72, 2) at term 5,
     /// delivered at 85 ms, and the restatement is at 110 ms. Each case fails under the
@@ -10791,7 +10791,7 @@ mod tests {
     ///   falls back past it to the first, whose restatement is looked for only up to the
     ///   second, so nothing is taken and the window reads "from 0 to 5", as before
     ///   D-112.
-    // PROPOSED(D-112): the pairing's and the restatement's conditions, one case each.
+    // D-112: the pairing's and the restatement's conditions, one case each.
     #[test]
     fn an_installs_pairing_and_restatement_refuse_what_is_not_the_switchs_stream() {
         let isolation = (1, ms(100), ms(500));
@@ -12002,7 +12002,7 @@ mod tests {
     /// past the 400 ms bound, it is no gap. The install creates the replica at 600 ms and
     /// states its term, as `created_by_install` does, and at 1 100 ms, 500 ms past that,
     /// it is one. Without the skip the first stretch is a gap too.
-    // PROPOSED(D-109): the timer check skips a placeholder.
+    // D-109: the timer check skips a placeholder.
     #[test]
     fn a_placeholder_is_not_measured_and_the_replica_its_install_creates_is() {
         let report = report(
@@ -12626,7 +12626,7 @@ mod tests {
     /// Seed 8934's shape: the follower holds a store when the leader reads the 0, so
     /// the 0 is older than the store, and the leader tracks the follower afresh. The
     /// old reading took the two rises as a retired number coming back.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_zero_read_while_the_follower_holds_a_store_is_a_delayed_answer_and_opens_a_window() {
         let mut delayed = vec![(4, store_recovered(4, 7))];
@@ -12656,7 +12656,7 @@ mod tests {
     /// `RefusalNotDurable`'s shape, the fold's catch: the follower refused its store
     /// and answered 0, and the same number came back when it opened again. Nothing
     /// replaced what it lost, so the 0 opens no window.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_zero_from_a_refused_follower_opens_no_window() {
         let events = vec![
@@ -12675,7 +12675,7 @@ mod tests {
     }
 
     /// With no store of the follower in the trace at all the 0 explains nothing.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_zero_with_no_store_traced_opens_no_window() {
         assert!(
@@ -12690,7 +12690,7 @@ mod tests {
     /// D-042's own consequence, "a rejection stamped 0 that is delayed past the
     /// install": the refusal ended one store and the install's `RaftSnapshot`, traced
     /// before its answer goes, is the store the leader read a rise from.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_refused_followers_zero_delayed_past_its_install_opens_a_window() {
         let mut installed = vec![
@@ -12734,7 +12734,7 @@ mod tests {
 
     /// A store is the replica's, in its range and on its node: a split's creation
     /// opens one, a removal ends it, and neither says anything of another replica.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_store_held_is_read_per_range_and_per_node() {
         let created = |range: u64| TraceEvent::RangeCreated {
@@ -12783,7 +12783,7 @@ mod tests {
 
     /// A delayed 0 opens the window of the follower it is about and of the leader
     /// that read it: follower 5's rises are in no window of 4's.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_delayed_zero_opens_the_window_of_its_follower_alone() {
         let records = traced_by(vec![
@@ -13169,7 +13169,7 @@ mod tests {
     }
 
     /// A write still pending where the run **stopped** is judged against that
-    /// instant, not against the schedule's total (PROPOSED D-102). A run whose
+    /// instant, not against the schedule's total (D-102). A run whose
     /// budgeted waits ended early stops before its schedule's total: seed 8885 of
     /// `main`'s nightly on 6c54705 stopped 2.714 s before it, and a put to `k5` called
     /// 11 ms before the end — on a range whose other key wrote throughout — was read
@@ -13181,7 +13181,7 @@ mod tests {
     /// either way, though 2.4 s separate it from the total — and read against the
     /// total, as D-086 read it, it is the wedge, which is the half that says the end
     /// is what moved the verdict. Called 2.1 s before the end it stays the wedge.
-    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    // D-102: the run's end is where the simulation stopped.
     #[test]
     fn a_write_pending_where_the_run_stopped_is_judged_against_that_instant() {
         let live = vec![record(
@@ -13226,7 +13226,7 @@ mod tests {
     }
 
     /// [`Fault::SplitFromRestarted`] with no split done is a wait of its settle and
-    /// nothing else, **by design** (PROPOSED D-120, issue #147). The arm asks nothing of
+    /// nothing else, **by design** (D-120, issue #147). The arm asks nothing of
     /// the cluster, so it has no moment of its own to date `last_heal` from and leaves the
     /// field where the arm before it left it; and no gap follows it, because a gap is "the
     /// quiet after a fault" and the arm's settle, longer than any gap the node schedule
@@ -13265,7 +13265,7 @@ mod tests {
     /// Seed 5 is pinned for part 3 because its split is done and seed 0 for part 2 because
     /// its is not. Should a change redraw either the other way, that part's first assertion
     /// says so and another seed is to be pinned.
-    // PROPOSED(D-120): the no-split branch is the arm's settle alone, by design.
+    // D-120: the no-split branch is the arm's settle alone, by design.
     #[test]
     fn a_split_from_restarted_with_no_split_done_is_its_settle_alone() {
         const SEED: u64 = 5;
@@ -13449,7 +13449,7 @@ mod tests {
     /// split's batch durable and its `RangeSplit` not yet traced restates it, log first and
     /// descriptor last. Its range is the run's though nothing has named it yet, and a range
     /// the run names nowhere is still a stamp from nowhere.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn the_payload_oracle_takes_a_right_half_its_split_has_not_been_traced_for() {
         const RIGHT: u64 = 28;
@@ -13486,7 +13486,7 @@ mod tests {
     }
 
     /// A replica's creation on `server`'s node, for the cases below.
-    // PROPOSED(D-113)
+    // D-113
     fn created_on(server: u64, at: u64, range: u64, cause: ananke_env::RangeCause) -> TraceRecord {
         record(
             ms(at),
@@ -13512,7 +13512,7 @@ mod tests {
     /// never names it (#178), so it is read from the node's own creations; configuration's
     /// ranges go on being read from the events the node traces of them, which a node that
     /// names too few (`RefuseOneRangeOnly`) gets wrong and this must not paper over.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn a_refused_nodes_right_half_is_refused_though_no_event_names_it() {
         use ananke_env::RangeCause::{Bootstrap, Snapshot, Split};
@@ -13537,7 +13537,7 @@ mod tests {
         records.extend([refusal(1, 2), refusal(2, 3)]);
         assert_eq!(live(records), BTreeSet::new(), "two refused nodes");
         // A voter on a re-seeded engine that holds nothing of the range: a placeholder
-        // grants no vote (Q22), and the install that ends it quarantines (PROPOSED D-109).
+        // grants no vote (Q22), and the install that ends it quarantines (D-109).
         let records = vec![
             refusal(1, 1),
             created_on(2, 2, RIGHT, Split),
@@ -13599,7 +13599,7 @@ mod tests {
     }
 
     /// The write bound per range the run ended with (SHARD.md §8).
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn the_write_bound_is_asked_of_the_range_serving_a_key_where_the_run_stopped() {
         use ananke_env::RangeCause::{Bootstrap, Split};

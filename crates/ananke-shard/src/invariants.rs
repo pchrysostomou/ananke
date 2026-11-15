@@ -14,15 +14,15 @@
 //! start and an install — its `RangeCreated` or its `RangeDescriptor` — are
 //! statements: each carries an index and must equal the map's latest value at or below
 //! it, judged when it is traced and again at every later value of its range at or
-//! below that index (PROPOSED D-107). Every other check reads "the descriptor in force
+//! below that index (D-107). Every other check reads "the descriptor in force
 //! before an index" off this map: the latest value strictly below it.
 //!
 //! **Check 8**, [`OneOwnerPerKey`], Stage C's four clauses: no two of a node's spans
 //! overlap, and a voter of P at a split that applied it holds R at every restatement
-//! after (PROPOSED D-107), under the owner's reading R of 2026-11-14 (PROPOSED D-141);
-//! no install replaces another replica's span (PROPOSED D-128);
+//! after (D-107), under the owner's reading R of 2026-11-14 (PROPOSED D-141);
+//! no install replaces another replica's span (D-128);
 //! and no node creates a replica it already holds initialised
-//! (PROPOSED D-116), SHARD.md §5's "R already initialised here" asked of the trace. The
+//! (D-116), SHARD.md §5's "R already initialised here" asked of the trace. The
 //! second clause is folded, compared under the equivalence test, and not in the
 //! [`Checker`]'s verdict ([`Fold::RightHalf`]): the node sweep and the sharded sweep
 //! assert it of the correct system beside that verdict (PROPOSED D-141). The installed
@@ -55,12 +55,12 @@
 //! its operation through the `invoked` its own `ClientSend` carried.
 //!
 //! **Check 18**, two folds: [`IdsUnique`], the range-id clause over `RangeIdsLeased`
-//! (PROPOSED D-099), and [`SplitLineage`], the split clause at each split's first
+//! (D-099), and [`SplitLineage`], the split clause at each split's first
 //! apply, which also holds a right half to a block granted to the node that led its
-//! parent (PROPOSED D-100), under the run that node took office in, which each start
+//! parent (D-100), under the run that node took office in, which each start
 //! states on its `RangesRestated` (PROPOSED D-137). The split clause reads P's configuration in force at the
 //! split's index from a history of the configurations each range committed, which a
-//! right half's creation seeds at its floor (PROPOSED D-106).
+//! right half's creation seeds at its floor (D-106).
 //!
 //! **Check 19**, [`Tiling`]: the latest value of every range in check 7's map, a range
 //! dropped at its merge; after every record no two of those spans overlap, and after
@@ -75,17 +75,17 @@
 //! after every other so that a violation another fold names on the same records stays
 //! that fold's (PROPOSED D-140); and a catch read through it alone would
 //! credit every write applied outside its span to check 9 and never show check 10 trip
-//! on the same write (PROPOSED D-106). Check 8's four clauses are a verdict each ([`Fold::Overlap`],
+//! on the same write (D-106). Check 8's four clauses are a verdict each ([`Fold::Overlap`],
 //! [`Fold::RightHalf`], [`Fold::InstallSpan`], [`Fold::CreatedTwice`]), and the right half's is
-//! not in the checker's (PROPOSED D-107, D-116, D-128).
+//! not in the checker's (D-107, D-116, D-128).
 //!
 //! The keys the trace carries are user keys; the spans are encoded (§1), so every
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
-// PROPOSED(D-097): checks 7, 9, 10 and 17.
-// PROPOSED(D-098): check 16, and check 9's lookups.
-// PROPOSED(D-106): a verdict per fold, and check 18's configuration history.
-// PROPOSED(D-107): check 7's restatement clause, and check 8.
-// PROPOSED(D-116): check 8's created-twice clause.
+// D-097: checks 7, 9, 10 and 17.
+// D-098: check 16, and check 9's lookups.
+// D-106: a verdict per fold, and check 18's configuration history.
+// D-107: check 7's restatement clause, and check 8.
+// D-116: check 8's created-twice clause.
 // PROPOSED(D-140): check 19.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -135,7 +135,7 @@ pub struct Descriptors {
     by_range: BTreeMap<u64, BTreeMap<u64, Held>>,
     /// The first value traced for each (range, generation): what a lookup by
     /// generation takes (SHARD.md §8, check 7).
-    // PROPOSED(D-098)
+    // D-098
     by_generation: BTreeMap<(u64, u64), Held>,
     /// Each replica's applied index as its node last traced it, by (node, range):
     /// a `RaftApply`'s index, a `RaftRecovered`'s `applied`, a creation's floor. A
@@ -143,16 +143,16 @@ pub struct Descriptors {
     /// it did not reach by that apply — a restatement or an install — and one above
     /// it is the apply's own change, traced before the apply's `RaftApply` (§8's fixed
     /// order).
-    // PROPOSED(D-107)
+    // D-107
     applied: BTreeMap<(u64, u64), u64>,
     /// The nodes that closed their restatement (`RangesRestated`) since their last
     /// crash: a statement on any other node is a restatement, which only names it.
-    // PROPOSED(D-107)
+    // D-107
     restated: BTreeSet<u64>,
     /// Every statement a value is held to, per range: a restatement and an install,
     /// each at its index. Judged when it is traced and again at every later value of
     /// its range, so a value traced after it at or below its index is held to it too.
-    // PROPOSED(D-107)
+    // D-107
     statements: BTreeMap<u64, Vec<Statement>>,
     /// How many statements were folded.
     stated: usize,
@@ -161,7 +161,7 @@ pub struct Descriptors {
 
 /// A descriptor a replica stated at an index without changing the range's: a
 /// restatement at its node's start, or an install (SHARD.md §8, check 7).
-// PROPOSED(D-107)
+// D-107
 #[derive(Clone, Debug)]
 struct Statement {
     index: u64,
@@ -200,14 +200,14 @@ impl Descriptors {
 
     /// How many statements — restatements and installs — have been folded, the
     /// first value traced at their index among them.
-    // PROPOSED(D-107)
+    // D-107
     #[must_use]
     pub fn statements(&self) -> usize {
         self.stated
     }
 
     /// The first value traced for `range` at `generation`.
-    // PROPOSED(D-098)
+    // D-098
     #[must_use]
     pub fn first_at_generation(&self, range: u64, generation: u64) -> Option<&Held> {
         self.by_generation.get(&(range, generation))
@@ -250,8 +250,8 @@ impl Descriptors {
     /// generation past its index. Any other difference is a violation where it is
     /// seen. Until #166's review a statement with no value under it was put as the
     /// value there, judged against nothing, and made the first value of its
-    /// generation, which check 16 reads (PROPOSED D-107).
-    // PROPOSED(D-107): check 7's restatement clause.
+    /// generation, which check 16 reads (D-107).
+    // D-107: check 7's restatement clause.
     fn state(&mut self, range: u64, index: u64, held: Held, node: Option<u64>, what: &'static str) {
         self.stated += 1;
         self.statements.entry(range).or_default().push(Statement {
@@ -264,7 +264,7 @@ impl Descriptors {
     }
 
     /// Judges every statement of `range` against the map as it stands.
-    // PROPOSED(D-107)
+    // D-107
     fn judge(&mut self, range: u64) {
         if self.violation.is_some() {
             return;
@@ -365,7 +365,7 @@ impl Descriptors {
                 // A statement — the restatement at a node's start, or an install onto
                 // an initialised replica — follows the `RaftRecovered` that states the
                 // applied index it is read at; an apply's change comes before the
-                // apply it belongs to (PROPOSED D-107).
+                // apply it belongs to (D-107).
                 let stated = node
                     .and_then(|node| self.applied.get(&(node, *range)))
                     .is_some_and(|known| *applied <= *known);
@@ -414,7 +414,7 @@ impl Descriptors {
 /// What put a range among a node's spans, for check 8's created-twice clause's words:
 /// a creation, with its cause and floor index, or a statement of its descriptor at an
 /// applied index (a restatement, where the range was not held already).
-// PROPOSED(D-116)
+// D-116
 #[derive(Clone, Copy, Debug)]
 enum Since {
     Created(RangeCause, u64),
@@ -553,7 +553,7 @@ pub struct Excused {
 /// that is not a voter there, that it traces no creation of R, is Stage D's (SHARD.md
 /// §12).
 ///
-/// **The install clause** (PROPOSED D-128): the spans an engine's install replaced,
+/// **The install clause** (D-128): the spans an engine's install replaced,
 /// from its `SpanInstalled`, overlap no span the node holds of a replica other than the
 /// one installed. A descriptor says what a replica claims and a switch what it removes,
 /// so the overlap clause, which folds descriptors, holds with every descriptor right and
@@ -570,8 +570,8 @@ pub struct Excused {
 /// SHARD.md §5's "the apply asserts" that R is not "already initialised here", which
 /// the overlap rule and a fresh right half's id make unreachable, asked of the trace
 /// rather than of the node: as a node failure it stopped every voter of a split whose
-/// id was taken twice before check 18 could read the reused id (PROPOSED D-109 §2),
-/// and a fold stops nothing (PROPOSED D-116). It reads the spans the overlap clause
+/// id was taken twice before check 18 could read the reused id (D-109 §2),
+/// and a fold stops nothing (D-116). It reads the spans the overlap clause
 /// folds, which a crash forgets and the node's restatement states again: what the node
 /// holds is what its trace has said since its last start, and a node that restates no R
 /// holds none, which for a voter of R's split is the right half's clause's to see.
@@ -579,9 +579,9 @@ pub struct Excused {
 /// Each clause keeps its own verdict ([`OneOwnerPerKey::overlap_verdict`],
 /// [`OneOwnerPerKey::right_half_verdict`], [`OneOwnerPerKey::install_verdict`],
 /// [`OneOwnerPerKey::created_twice_verdict`]), so a scenario can read them apart.
-// PROPOSED(D-107): check 8's two Stage C clauses.
-// PROPOSED(D-128): and what a switch replaced.
-// PROPOSED(D-116): and the created-twice clause.
+// D-107: check 8's two Stage C clauses.
+// D-128: and what a switch replaced.
+// D-116: and the created-twice clause.
 // PROPOSED(D-141): the right half's clause under reading R, and the installed voters.
 #[derive(Clone, Debug, Default)]
 pub struct OneOwnerPerKey {
@@ -589,7 +589,7 @@ pub struct OneOwnerPerKey {
     spans: BTreeMap<u64, BTreeMap<u64, (Bytes, Bytes)>>,
     /// Per (node, range) in [`OneOwnerPerKey::spans`], what first put it there since the
     /// node's last crash, which the created-twice clause's words name.
-    // PROPOSED(D-116)
+    // D-116
     held_since: BTreeMap<(u64, u64), Since>,
     /// The nodes that closed their restatement since their last crash.
     restated: BTreeSet<u64>,
@@ -653,15 +653,15 @@ pub struct OneOwnerPerKey {
     excused: Vec<Excused>,
     overlap: Option<String>,
     right_half: Option<String>,
-    // PROPOSED(D-128)
+    // D-128
     install: Option<String>,
-    // PROPOSED(D-116)
+    // D-116
     created_twice: Option<String>,
 }
 
 /// The group whose Raft state `key` is, by the layout of `KeyPrefix::group`: `None` for a
 /// key of any other tenant.
-// PROPOSED(D-128)
+// D-128
 fn raft_group_of(key: &[u8]) -> Option<u64> {
     let (tenant, rest) = key.split_first_chunk::<8>()?;
     if u64::from_be_bytes(*tenant) != RAFT_TENANT {
@@ -944,7 +944,7 @@ impl OneOwnerPerKey {
     /// An install on `node` replaced `spans`: none of its keyspace spans may overlap a
     /// span the node holds of a replica other than the one installed. The replica is
     /// named by the Raft keys among the spans (`raft_group_of`).
-    // PROPOSED(D-128)
+    // D-128
     fn replaced(&mut self, node: u64, spans: &[(Bytes, Bytes)]) {
         if self.install.is_some() {
             return;
@@ -1010,7 +1010,7 @@ impl OneOwnerPerKey {
                 floor_index,
                 ..
             } => {
-                // PROPOSED(D-116): the created-twice clause, asked before the creation
+                // D-116: the created-twice clause, asked before the creation
                 // is held.
                 if self.created_twice.is_none()
                     && let Some(since) = self.held_since.get(&(node, *range))
@@ -1052,7 +1052,7 @@ impl OneOwnerPerKey {
                 self.hold(node, *range, start, end, Since::Stated(*applied));
                 // A split's own change of P, after its `RangeSplit`: the split is
                 // known from here, with P's voters at it, whether or not R is
-                // created after (PROPOSED D-107, #166's review).
+                // created after (D-107, #166's review).
                 if let Some(&(parent, at, right)) = self.splitting.get(&node)
                     && (parent, at) == (*range, *index)
                 {
@@ -1127,7 +1127,7 @@ impl OneOwnerPerKey {
                         self.owed_and_missing(node, &format!("at its apply of {index}"));
                 }
             }
-            // PROPOSED(D-128)
+            // D-128
             TraceEvent::SpanInstalled { spans, .. } => {
                 self.replaced(node, spans);
                 // PROPOSED(D-141): the switch of an install of each range whose Raft
@@ -1296,7 +1296,7 @@ impl OneOwnerPerKey {
     /// # Errors
     ///
     /// The violation, in words naming it.
-    // PROPOSED(D-128)
+    // D-128
     pub fn install_verdict(&self) -> Result<(), String> {
         self.install.clone().map_or(Ok(()), Err)
     }
@@ -1306,7 +1306,7 @@ impl OneOwnerPerKey {
     /// # Errors
     ///
     /// The violation, in words naming it.
-    // PROPOSED(D-116)
+    // D-116
     pub fn created_twice_verdict(&self) -> Result<(), String> {
         self.created_twice.clone().map_or(Ok(()), Err)
     }
@@ -1374,7 +1374,7 @@ impl ServingWithinSpan {
             }
             // A read served by the root or the meta range is a lookup, which any key
             // may ask (SHARD.md §1, §3; Q36): check 16 holds meta to account.
-            // PROPOSED(D-098)
+            // D-098
             TraceEvent::RaftRead { range, .. }
                 if *range == ROOT_RANGE.get() || *range == META_RANGE.get() => {}
             TraceEvent::RaftRead {
@@ -1483,11 +1483,11 @@ impl GenerationsRise {
 /// violation's message is latched: the split clause reads them, and its verdict is its
 /// own whatever this clause found ([`Checker::verdict_of`]). A fold that stopped at its
 /// violation would freeze the grants the split clause reads, and every split whose right
-/// half lies in a block granted after it would read "lies in no block" (PROPOSED D-106,
+/// half lies in a block granted after it would read "lies in no block" (D-106,
 /// #163's review). The checker's one verdict is unchanged by it: this clause is asked
 /// before the split clause.
-// PROPOSED(D-099)
-// PROPOSED(D-106): the grants folded after the clause's violation.
+// D-099
+// D-106: the grants folded after the clause's violation.
 #[derive(Clone, Debug, Default)]
 pub struct IdsUnique {
     /// The grant at each index of range 0 by its first apply: node, run, first, last.
@@ -1566,7 +1566,7 @@ impl IdsUnique {
 
     /// The blocks granted so far by the first apply of each index, as first id to the
     /// last id, the node and the run of each block that starts there.
-    // PROPOSED(D-106): the grants folded after the clause's violation.
+    // D-106: the grants folded after the clause's violation.
     // PROPOSED(D-137): each block kept with its run.
     #[must_use]
     pub fn blocks(&self) -> &BTreeMap<u64, Vec<(u64, u64, u64)>> {
@@ -1576,7 +1576,7 @@ impl IdsUnique {
     /// The holders of `id`: each block holding it as the node it was granted to and the
     /// run nonce its refill carried, in the order of the blocks' first ids — one at most
     /// while the blocks are disjoint, none if no block holds it.
-    // PROPOSED(D-106): the grants folded after the clause's violation.
+    // D-106: the grants folded after the clause's violation.
     // PROPOSED(D-137): a holder is a node's run, not the node.
     #[must_use]
     pub fn holders_of(&self, id: u64) -> Vec<(u64, u64)> {
@@ -1600,7 +1600,7 @@ impl IdsUnique {
 
 /// One configuration a range may have had in force from an index, as check 18's
 /// history holds it (SHARD.md §8, check 11's history, which check 18 folds).
-// PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
+// D-106: check 18's configuration history keyed on the configuration in force.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Candidate {
     /// The configuration entry's term and payload hash, as the `RaftAppend` that put it
@@ -1646,8 +1646,8 @@ struct Candidate {
 /// bootstrap's at index 0 and a right half's at its floor `s`, where its core starts from
 /// P's configuration and traces none (`restore_compacted`), so a split of a right half
 /// reads the configuration its creation names (issue #138).
-// PROPOSED(D-100)
-// PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
+// D-100
+// D-106: check 18's configuration history keyed on the configuration in force.
 #[derive(Clone, Debug, Default)]
 pub struct SplitLineage {
     /// Each range's configurations by the index they are in force from, every one
@@ -1689,7 +1689,7 @@ impl SplitLineage {
     /// The voters of `range`'s configuration in force at `index`, and whether it is
     /// joint: the latest at or below it that the range committed — carried by the entry
     /// the range first applied at its index, or in force by a creation.
-    // PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
+    // D-106: check 18's configuration history keyed on the configuration in force.
     fn config_at(&self, range: u64, index: u64) -> Option<(bool, Vec<u64>)> {
         self.configs
             .get(&range)?
@@ -1727,7 +1727,7 @@ impl SplitLineage {
         }
         let node = record.node.map(|node| u64::from(node.get()));
         match &record.event {
-            // PROPOSED(D-106): the configuration history keyed on the configuration in
+            // D-106: the configuration history keyed on the configuration in
             // force — each configuration held with the entry its own append traced.
             TraceEvent::RaftAppend {
                 server,
@@ -1805,7 +1805,7 @@ impl SplitLineage {
                 // floor are in force by the creation, and no entry carries them; an
                 // install's is its snapshot's, whose entries their own appends traced,
                 // and a creation names no joint configuration's other half.
-                // PROPOSED(D-106): a right half's history seeded from its creation.
+                // D-106: a right half's history seeded from its creation.
                 if matches!(cause, RangeCause::Bootstrap | RangeCause::Split) {
                     self.hold(
                         *range,
@@ -1857,7 +1857,7 @@ impl SplitLineage {
             } => {
                 // The entry a range first applied at an index holding a configuration
                 // is the committed one there (check 4 holds every later apply to it).
-                // PROPOSED(D-106): the configuration history keyed on the one in force.
+                // D-106: the configuration history keyed on the one in force.
                 if self
                     .configs
                     .get(range)
@@ -2032,7 +2032,7 @@ impl SplitLineage {
 
 /// Check 16, the meta range never goes back and names only real descriptors, over
 /// check 7's map.
-// PROPOSED(D-098)
+// D-098
 #[derive(Clone, Debug, Default)]
 pub struct MetaNeverGoesBack {
     /// What meta names, as the sub-intervals its applies won: keyed by end, with the
@@ -2043,7 +2043,7 @@ pub struct MetaNeverGoesBack {
     /// already folded — a lagging follower, or a re-seeded replica of the meta range,
     /// whose state starts again at the bootstrap's index 0 (D-098) — is compared with
     /// the later index as an earlier one, and does not replace what it named
-    /// (PROPOSED D-109).
+    /// (D-109).
     named: BTreeMap<Bytes, (Bytes, u64, u64)>,
     violation: Option<String>,
 }
@@ -2271,7 +2271,7 @@ impl ClientRefreshes {
 /// `RangeCreated` not yet traced restates the right half at its next start, a replica
 /// with a descriptor, a log and a core, and goes on to grant for it with no creation in
 /// the trace at all: seed 3291 of the sharded sweep, the window seed 88 showed the
-/// payload oracle (PROPOSED D-113 §5). `RangesRestated` names the initialised replicas
+/// payload oracle (D-113 §5). `RangesRestated` names the initialised replicas
 /// only and no placeholder survives a restart, so the restatement itself names nothing a
 /// placeholder could grant for at the time it is traced.
 ///
@@ -2293,7 +2293,7 @@ impl ClientRefreshes {
 /// right only because such a replica is quarantined, and the quarantine refuses every vote it
 /// could grant (`quarantine_refuses_votes` in `ananke-raft`'s core). A change that lifts the
 /// quarantine has to revisit this check.
-// PROPOSED(D-109)
+// D-109
 // PROPOSED(D-136): a refusal ends what the node held.
 #[derive(Clone, Debug, Default)]
 pub struct PlaceholderGrantsNothing {
@@ -2321,7 +2321,7 @@ impl PlaceholderGrantsNothing {
                 self.held.insert((node, *range));
                 self.placeholders.remove(&(node, *range));
             }
-            // PROPOSED(D-113): a replica durable before its creation was traced.
+            // D-113: a replica durable before its creation was traced.
             TraceEvent::RangesRestated { ranges, .. } => {
                 for range in ranges {
                     self.held.insert((node, *range));
@@ -2620,7 +2620,7 @@ impl Tiling {
 /// One of the range layer's folds' verdicts: SHARD.md §8's checks 7, 9, 10, 16, 17, 19 and
 /// 20, check 18's two clauses, and check 8's four, each of which keeps a verdict of its own
 /// in [`Checker`].
-// PROPOSED(D-106): a verdict per fold.
+// D-106: a verdict per fold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Fold {
     /// Check 7, descriptor agreement ([`Descriptors`]).
@@ -2639,25 +2639,25 @@ pub enum Fold {
     SplitLineage,
     /// Check 8's overlap clause ([`OneOwnerPerKey::overlap_verdict`]): asked third from
     /// last by [`Checker::verdict`], before the install and created-twice clauses.
-    // PROPOSED(D-107)
+    // D-107
     Overlap,
     /// Check 8's right half's clause ([`OneOwnerPerKey::right_half_verdict`]): folded
     /// and compared, and **not** asked by [`Checker::verdict`], whose verdict every node
     /// scenario and variant test reads; the node sweep and the sharded sweep assert it of
     /// the correct system under the owner's reading R (PROPOSED D-141).
-    // PROPOSED(D-107)
+    // D-107
     RightHalf,
     /// Check 8's install clause ([`OneOwnerPerKey::install_verdict`]): asked after the
     /// overlap clause by [`Checker::verdict`], so a switch that overlaps and the creation
     /// the overlap clause reads after it stay the overlap clause's.
-    // PROPOSED(D-128)
+    // D-128
     InstallSpan,
     /// Check 8's created-twice clause ([`OneOwnerPerKey::created_twice_verdict`]): asked
     /// by [`Checker::verdict`] after the overlap and install clauses, last.
-    // PROPOSED(D-116)
+    // D-116
     CreatedTwice,
     /// Check 20, a placeholder grants nothing ([`PlaceholderGrantsNothing`]).
-    // PROPOSED(D-109)
+    // D-109
     PlaceholderGrants,
     /// Check 19, the ranges tile the keyspace ([`Tiling`]): asked by [`Checker::verdict`]
     /// after every other fold it asks, so a violation another fold names on the same
@@ -2691,14 +2691,14 @@ impl Fold {
     /// then its install clause and its created-twice clause last, so that no violation a
     /// fold before them reports moves to them — check 18's reused id, which the
     /// created-twice clause also sees at the second split's creation, stays check 18's
-    /// (PROPOSED D-116) — and check 8's right half's clause not at all (PROPOSED D-107,
+    /// (D-116) — and check 8's right half's clause not at all (D-107,
     /// D-128). Check 19 comes after all of them: it is the cluster-wide property the
     /// others leave implicit, so where it trips beside one of them — check 8's overlap
     /// clause at two spans of one node, check 18's split clause at a right half written
     /// short — the verdict names the other, and check 19 is named only where no other
     /// fold sees anything (PROPOSED D-140).
-    // PROPOSED(D-107)
-    // PROPOSED(D-116): the created-twice clause, last of check 8's.
+    // D-107
+    // D-116: the created-twice clause, last of check 8's.
     // PROPOSED(D-140): check 19 after every other.
     pub const VERDICT: [Self; 12] = [
         Self::DescriptorAgreement,
@@ -2790,7 +2790,7 @@ pub struct Checker {
     refreshes: ClientRefreshes,
     ids: IdsUnique,
     lineage: SplitLineage,
-    // PROPOSED(D-109)
+    // D-109
     placeholders: PlaceholderGrantsNothing,
     // PROPOSED(D-140)
     tiling: Tiling,
@@ -2853,10 +2853,10 @@ impl Checker {
     /// # Errors
     ///
     /// The fold's violation, in words naming it ([`Fold::words`]).
-    // PROPOSED(D-106): a verdict per fold.
-    // PROPOSED(D-107): check 8's two clauses.
-    // PROPOSED(D-116): and its third.
-    // PROPOSED(D-128): and its fourth.
+    // D-106: a verdict per fold.
+    // D-107: check 8's two clauses.
+    // D-116: and its third.
+    // D-128: and its fourth.
     pub fn verdict_of(&self, fold: Fold) -> Result<(), String> {
         match fold {
             Fold::DescriptorAgreement => self.descriptors.verdict(),
@@ -2876,7 +2876,7 @@ impl Checker {
     }
 
     /// Every fold's own verdict, in [`Fold::ALL`]'s order.
-    // PROPOSED(D-106): a verdict per fold.
+    // D-106: a verdict per fold.
     // PROPOSED(D-140): and check 19's.
     pub fn verdicts(&self) -> [(Fold, Result<(), String>); 13] {
         Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
@@ -2887,7 +2887,7 @@ impl Checker {
     /// no violation a fold before them reports moves to them, and check 19 last, for the
     /// same reason (PROPOSED D-140). This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
-    /// right half's clause is folded and **not** in it (PROPOSED D-107): it is read apart
+    /// right half's clause is folded and **not** in it (D-107): it is read apart
     /// ([`Fold::RightHalf`]), and asserted under the owner's reading R by the node sweep
     /// and the sharded sweep beside this verdict, which every node scenario and variant
     /// test reads and which other scenarios have not been measured against (PROPOSED
@@ -2906,7 +2906,7 @@ impl Checker {
 /// The checker folded over `records` from the first: the whole-trace form of
 /// [`Checker`], whose verdicts, together and per fold, an incremental checker fed the
 /// same records in pieces must equal (D-046).
-// PROPOSED(D-106): a verdict per fold.
+// D-106: a verdict per fold.
 #[must_use]
 pub fn folded(records: &[TraceRecord]) -> Checker {
     let mut checker = Checker::new(true);
@@ -3505,7 +3505,7 @@ mod tests {
         assert!(verdict.contains("is what the split leaves"), "{verdict}");
     }
 
-    // --- Check 7's restatement clause and check 8 (PROPOSED D-107) ---
+    // --- Check 7's restatement clause and check 8 (D-107) ---
 
     /// A replica's restatement of its log: what precedes its descriptor's.
     fn recovered(node: u64, range: u64, applied: u64) -> TraceRecord {
@@ -3793,7 +3793,7 @@ mod tests {
     }
 
     /// An engine's install, as `SpanInstalled` traces it: only `spans` is read.
-    // PROPOSED(D-128)
+    // D-128
     fn switched(node: u64, spans: Vec<(Bytes, Bytes)>) -> TraceRecord {
         record(
             node,
@@ -3810,19 +3810,19 @@ mod tests {
     }
 
     /// `range`'s Raft interval, as a span of an install.
-    // PROPOSED(D-128)
+    // D-128
     fn raft_span(range: u64) -> (Bytes, Bytes) {
         let span = ananke_raft::store::KeyPrefix::group(range).span();
         (span.start, span.end)
     }
 
     /// A key span of an install.
-    // PROPOSED(D-128)
+    // D-128
     fn keys(start: &[u8], end: &[u8]) -> (Bytes, Bytes) {
         (user_key(start), user_key(end))
     }
 
-    /// Check 8's install clause, on its shapes (PROPOSED D-128). Node 3 holds right half 6
+    /// Check 8's install clause, on its shapes (D-128). Node 3 holds right half 6
     /// over `[m, z)` and has no descriptor of range 2, a re-seeded user range: an install
     /// of range 2 that replaces configuration's `[a, z)` is the data loss, with the
     /// overlap clause green, since no descriptor of 2 is traced and the descriptor it
@@ -3830,7 +3830,7 @@ mod tests {
     /// install of the same span on another node, one on a node whose spans a crash or a
     /// refusal forgot, a range replacing its own span, nor a split's non-voter's step,
     /// whose spans are one-key spans of P's Raft state and the right span.
-    // PROPOSED(D-128)
+    // D-128
     #[test]
     fn check_8s_install_clause_sees_a_switch_that_replaces_another_replicas_keys() {
         let held = created(3, 6, b"m", b"z", 2, &[1, 2, 3]);
@@ -3917,9 +3917,9 @@ mod tests {
         );
     }
 
-    /// The clause in the checker (PROPOSED D-128): it stops a run, after the overlap
+    /// The clause in the checker (D-128): it stops a run, after the overlap
     /// clause, so a run in which both hold names the overlap clause as before.
-    // PROPOSED(D-128)
+    // D-128
     #[test]
     fn check_8s_install_clause_is_asked_after_its_overlap_clause() {
         let wide = vec![raft_span(2), keys(b"a", b"z")];
@@ -3950,7 +3950,7 @@ mod tests {
 
     /// An install's creation of `range` over `[start, end)` on `node`, at the snapshot's
     /// last index `floor`: a placeholder's install, or a re-seed's.
-    // PROPOSED(D-116)
+    // D-116
     fn installed_as_created(
         node: u64,
         range: u64,
@@ -3976,13 +3976,13 @@ mod tests {
         )
     }
 
-    /// Check 8's created-twice clause (PROPOSED D-116): a `RangeCreated` of a range its
+    /// Check 8's created-twice clause (D-116): a `RangeCreated` of a range its
     /// node already holds initialised is a violation whichever creation came first —
     /// seed 219's split and then an install, SHARD.md §5's install and then a split's
     /// apply — and is no violation where the node let the range go between: a
     /// `RangeRemoved`, a crash before the range was restated, a refusal. The overlap
     /// clause sees none of the first, where the second creation has the first's span.
-    // PROPOSED(D-116)
+    // D-116
     #[test]
     fn a_replica_created_twice_on_one_node_is_caught_by_check_8_whatever_made_either() {
         // Seed 219's order: node 1's apply of the split creates 6, and an install that
@@ -4109,11 +4109,11 @@ mod tests {
         assert!(apart.verdict().is_ok(), "{:?}", apart.verdict());
     }
 
-    /// The created-twice clause in the checker (PROPOSED D-116): asked last, after the
+    /// The created-twice clause in the checker (D-116): asked last, after the
     /// overlap clause, so a split whose right half's id another split took first — every
     /// voter holding that id creates it again, `IdBlockResumed`'s shape — is check 18's
     /// in the checker's verdict, as before the clause, and the clause's in its own.
-    // PROPOSED(D-116)
+    // D-116
     #[test]
     fn check_8s_created_twice_clause_is_asked_last_and_a_reused_id_stays_check_18s() {
         let mut checker = Checker::new(true);
@@ -4165,7 +4165,7 @@ mod tests {
         }
         assert!(owners.verdict().is_ok(), "{:?}", owners.verdict());
         // Node 2 restarts without its right half: the restart that does not reopen
-        // a right half (PROPOSED D-100's second finding).
+        // a right half (D-100's second finding).
         let mut lost = owners.clone();
         for record in [
             crashed(2),
@@ -4979,7 +4979,7 @@ mod tests {
     /// configuration at `s`, and one whose P value at `s` names voters other than P's,
     /// are each caught, each in its own words (issue #150; D-100's item 8 listed the
     /// case and the tree had none).
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn a_split_that_leaves_wrong_voters_on_either_half_is_caught() {
         let mut right = Checker::new(true);
@@ -5013,10 +5013,10 @@ mod tests {
 
     /// A split of a right half: the half's core starts from its floor with P's
     /// configuration and traces no `RaftConfig` for it, so the configuration in force
-    /// at its own split is the one its creation names (issue #138). Before PROPOSED
+    /// at its own split is the one its creation names (issue #138). Before
     /// D-106 the history held only traced configurations, and the second split failed
     /// the correct trace with "no plain configuration in force".
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn a_split_of_a_right_half_reads_the_configuration_its_creation_names() {
         let mut checker = Checker::new(true);
@@ -5161,10 +5161,10 @@ mod tests {
 
     /// A configuration entry the core traced at its append and then truncated is not
     /// the configuration in force at its index: the core traces `RaftConfig` at
-    /// append, committed or not, and before PROPOSED D-106 the first one traced at an
+    /// append, committed or not, and before D-106 the first one traced at an
     /// index stood (issue #138). The pair: the same joint entry, committed, is in force
     /// and still refuses the split (Q23).
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn a_configuration_truncated_at_its_index_is_not_the_one_in_force_and_a_committed_one_is() {
         let mut truncated = Checker::new(true);
@@ -5239,7 +5239,7 @@ mod tests {
     /// voters of a plain configuration an append put in force, so emptying them passed
     /// every case). The descriptor's own change at `C_new` is Stage D's clause and is not
     /// traced here; P's value keeps its voters.
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn a_plain_configuration_committed_after_a_joint_one_is_the_one_a_later_split_reads() {
         let change = [
@@ -5276,7 +5276,7 @@ mod tests {
     /// and a split at 9 that took effect while joint: still caught (Q23). Holding the
     /// install's creation as a configuration in force would read it as plain and pass
     /// the split (#163's review).
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn an_installs_creation_puts_no_configuration_in_force() {
         let mut checker = Checker::new(true);
@@ -5312,7 +5312,7 @@ mod tests {
     /// split's own index is not the splitting range's, and the split is in shape (Q23 asks
     /// it of P's configuration alone). With one range every configuration is P's and a
     /// history keyed by the index alone says the same; with two it refuses this split.
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn a_configuration_another_range_committed_is_not_the_splitting_ranges() {
         let mut checker = Checker::new(true);
@@ -5358,13 +5358,13 @@ mod tests {
 
     /// The grants clause's violation leaves the split clause's own verdict what it is: a
     /// split whose right half lies in a block granted after the grants clause latched is
-    /// in shape (PROPOSED D-106, #163's review). Before the fix the grants fold stopped
+    /// in shape (D-106, #163's review). Before the fix the grants fold stopped
     /// at its violation, the blocks the split clause reads froze, and both splits below
     /// read "lies in no block". Once for each way the grants clause can latch that still
     /// leaves a grant of record behind it: another replica granting something else at an
     /// index, then a clean grant; and a grant over an earlier block's ids, which is a
     /// block granted all the same.
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn the_grants_clause_keeps_folding_after_its_violation_for_the_split_clause() {
         let mut agreement = Checker::new(true);
@@ -5409,9 +5409,9 @@ mod tests {
     /// longer holds its key, to a key its sibling wrote at the same generation — are
     /// each reported by their own fold, and the checker's verdict names the first in
     /// check order. Read through that verdict alone, check 10's violation is never seen,
-    /// which is how every catch of `ApplyIgnoresSpan` read as check 9's before PROPOSED
+    /// which is how every catch of `ApplyIgnoresSpan` read as check 9's before
     /// D-106.
-    // PROPOSED(D-106)
+    // D-106
     #[test]
     fn each_fold_keeps_its_own_verdict_and_the_checker_names_the_first() {
         let mut checker = Checker::new(true);
@@ -5449,12 +5449,12 @@ mod tests {
         );
     }
 
-    /// Check 8's two clauses in the checker (PROPOSED D-107): the overlap clause is the
+    /// Check 8's two clauses in the checker (D-107): the overlap clause is the
     /// verdict's third fold from last, after every fold but the install and created-twice
-    /// clauses (PROPOSED D-128, D-116), so a violation an earlier fold reports on the same
+    /// clauses (D-128, D-116), so a violation an earlier fold reports on the same
     /// records is the one the verdict names; the right half's clause is its own verdict
     /// and not the checker's (PROPOSED D-141: asserted apart by the two sweeps).
-    // PROPOSED(D-107)
+    // D-107
     #[test]
     fn check_8s_overlap_clause_is_third_from_last_and_its_right_half_clause_is_not_in_it() {
         // Node 2 applies the split node 1 created R at, and creates no R itself.
@@ -5575,7 +5575,7 @@ mod tests {
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
         // On another node: one node holding the parent's whole span beside it is check
-        // 8's (PROPOSED D-107). The parent shrinks there first, as a split's apply traces
+        // 8's (D-107). The parent shrinks there first, as a split's apply traces
         // it: two latest spans that overlap are check 19's (PROPOSED D-140).
         checker.push(&record(
             2,
@@ -5618,7 +5618,7 @@ mod tests {
 
     #[test]
     fn a_meta_apply_of_an_index_below_one_folded_is_compared_as_the_earlier_index() {
-        // PROPOSED(D-109): a re-seeded replica of the meta range restates the bootstrap's
+        // D-109: a re-seeded replica of the meta range restates the bootstrap's
         // index 0 after the split's update at index 5 was applied elsewhere; index 0
         // naming the parent's first generation is no fall from 5, and leaves 5's halves
         // standing.
@@ -5630,7 +5630,7 @@ mod tests {
             vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
         ));
         // The split's two values at 5, traced on node 2: on node 1, which holds range 2
-        // from its bootstrap, a second creation of it is check 8's (PROPOSED D-116).
+        // from its bootstrap, a second creation of it is check 8's (D-116).
         let mut left = created(2, 2, b"a", b"k", 2, &[1, 2, 3]);
         if let TraceEvent::RangeCreated { floor_index, .. } = &mut left.event {
             *floor_index = 5;
@@ -5749,8 +5749,8 @@ mod tests {
     }
 
     /// A restart's `RangesRestated` is a replica's evidence where no `RangeCreated` is in
-    /// the trace (seed 3291, PROPOSED D-113 §5), and of that node and those ranges alone.
-    // PROPOSED(D-113)
+    /// the trace (seed 3291, D-113 §5), and of that node and those ranges alone.
+    // D-113
     #[test]
     fn check_20_takes_a_range_a_restart_restated_as_held_and_no_other() {
         check_20(&[restated(3, &[2, 30]), pre_vote_granted(3, 30)])
@@ -5770,7 +5770,7 @@ mod tests {
 
     /// The pair's other half on hand-written records: what the variant does, a placeholder
     /// granting, is still a violation beside a restatement, before it and after it.
-    // PROPOSED(D-113)
+    // D-113
     #[test]
     fn check_20_names_a_placeholders_grant_whatever_was_restated() {
         let after = check_20(&[

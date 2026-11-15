@@ -53,7 +53,7 @@
 //! - `SingleMajorityInJointConsensus` re-asserted on the node to the standard its
 //!   Phase 2 test asserts and no stronger, at the tier it uses today;
 //! - the other half of issue #46, a joining server fed by a snapshot in its learner
-//!   phase: since the placeholders (PROPOSED D-109) a node that joins holds nothing and
+//!   phase: since the placeholders (D-109) a node that joins holds nothing and
 //!   gets every range it is added to through its placeholder's install, asserted on
 //!   every seed, joiner by joiner and range by range. Until then a joiner here started
 //!   with D-076's interim replicas and the path was asserted absent.
@@ -338,11 +338,11 @@ struct Coverage {
     /// Tries answered `RangeMismatch`, and where the servers saw them (SHARD.md §3):
     /// at receipt on every seed, since every other client starts stale; at a read's
     /// serving and at apply never on the correct node before the split, asserted
-    /// absent with that reason (PROPOSED D-097).
+    /// absent with that reason (D-097).
     mismatched: u64,
     mismatches_at: BTreeMap<MismatchAt, usize>,
     client_mismatches: usize,
-    /// The meta range in use (SHARD.md §1; PROPOSED D-098): lookups served by the
+    /// The meta range in use (SHARD.md §1; D-098): lookups served by the
     /// root and the meta range, the clients' lookup rounds, and the meta applies after
     /// the bootstrap — every leader elected sends its descriptor — of which none wins
     /// anything on this tree, since nothing raises a generation before the split,
@@ -351,7 +351,7 @@ struct Coverage {
     client_lookups: u64,
     meta_applies: usize,
     meta_took: usize,
-    /// Range 0's grants of blocks of range ids (SHARD.md §5, Q17; PROPOSED D-099), by
+    /// Range 0's grants of blocks of range ids (SHARD.md §5, Q17; D-099), by
     /// the first apply of each index, and the fewest on any one seed: every node asks
     /// once at its start and again at every restart, and nothing on this tree takes
     /// an id.
@@ -360,10 +360,10 @@ struct Coverage {
     /// Seeds on which a live install's hold outlasted a replica's timer bound and
     /// D-091's fourth arm answered for it (`timer_gaps_held_by_a_live_install`), and
     /// the first such seed: what the hold's pin is moved to when a schedule move
-    /// takes the pinned seed off the hold (PROPOSED D-099, after seed 368).
+    /// takes the pinned seed off the hold (D-099, after seed 368).
     live_install_holds: usize,
     live_install_holds_first: Option<u64>,
-    /// The split arm (SHARD.md §5; PROPOSED D-100): splits the admins asked, answered
+    /// The split arm (SHARD.md §5; D-100): splits the admins asked, answered
     /// done, refused by reason and unanswered; and, read off the trace, splits that
     /// took effect, right halves' replicas created, terms a right half led in and
     /// writes applied through a right half.
@@ -403,7 +403,7 @@ struct Coverage {
     /// asserted, because this node has no follower compaction to bound it.
     largest_follower_log: u64,
     follower_log_multiples: BTreeMap<u64, u64>,
-    /// The restatements check 7 reads (SHARD.md §8; PROPOSED D-107): the nodes'
+    /// The restatements check 7 reads (SHARD.md §8; D-107): the nodes'
     /// `RangesRestated`, and the descriptors stated at an applied index an apply did
     /// not reach — restated at a start, or changed by an install — which check 7
     /// holds to its map.
@@ -445,7 +445,7 @@ struct Coverage {
     installed_late: Vec<(u64, String)>,
     /// What the placeholders did over the tier (SHARD.md §5, Q22), summed, and on how
     /// many seeds a placeholder was made, was installed into, and had an install refused
-    /// for overlapping a replica (PROPOSED D-109).
+    /// for overlapping a replica (D-109).
     placeholders: raft::PlaceholderCoverage,
     placeholder_seeds: usize,
     placeholder_install_seeds: usize,
@@ -590,7 +590,7 @@ impl Coverage {
     fn add(&mut self, report: &raft::Report) {
         use ananke_env::{ClientOp, DropReason, TraceEvent};
         self.seeds += 1;
-        // PROPOSED(D-107): the restatements, and the descriptors check 7 holds to its
+        // D-107: the restatements, and the descriptors check 7 holds to its
         // map as statements.
         let checker = invariants::folded(&report.records);
         self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
@@ -599,7 +599,7 @@ impl Coverage {
         let takes_restated = report.takes_restated();
         self.takes_restated += takes_restated;
         self.takes_restated_seeds += u64::from(takes_restated > 0);
-        // PROPOSED(D-107): check 8's right-half clause, folded over the correct node.
+        // D-107: check 8's right-half clause, folded over the correct node.
         // PROPOSED(D-141): under reading R, asserted by the sweep's verdict
         // (`raft::Report::right_half_held`); printed here with what it excused, and the
         // installed voters' waits, measured against the candidate bound and not asserted.
@@ -644,7 +644,7 @@ impl Coverage {
                     .push(report.ended.duration_since(voter.since)),
             }
         }
-        // PROPOSED(D-109): the placeholders.
+        // D-109: the placeholders.
         let placeholders = raft::placeholders_of(&report.records);
         self.placeholder_seeds += usize::from(placeholders.made > 0);
         self.placeholder_install_seeds += usize::from(placeholders.installed > 0);
@@ -778,7 +778,7 @@ impl Coverage {
             // The lowest seed, not the first folded: the sweep folds its seeds in
             // the order they finish, which two premerges of one tree need not share
             // (D-099's premerge named seed 979 and this tree's two named 979 and 633
-            // of the same three; PROPOSED D-100).
+            // of the same three; D-100).
             self.live_install_holds_first = Some(
                 self.live_install_holds_first
                     .map_or(report.seed, |first| first.min(report.seed)),
@@ -871,7 +871,7 @@ impl Coverage {
                 self.seeds
             );
         }
-        // **Routing's three checks** (SHARD.md §3; PROPOSED D-097). Every other client
+        // **Routing's three checks** (SHARD.md §3; D-097). Every other client
         // starts stale, so every seed has requests refused at receipt and merged back
         // into the right range: at least one a seed, and in practice one per stale
         // client per range it first touches. At a read's serving and at apply the
@@ -889,7 +889,7 @@ impl Coverage {
             self.seeds
         );
         // A split under a read in flight or a proposal in flight is what refuses at
-        // serving and at apply (SHARD.md §3, §5; PROPOSED D-100): reached now that the
+        // serving and at apply (SHARD.md §3, §5; D-100): reached now that the
         // split arm lands one on most seeds, printed at every tier and asserted at
         // the tier its rate supports by the sharded sweep's directed shapes, which
         // aim a burst of right-half writes and gets at a split (D-061).
@@ -907,7 +907,7 @@ impl Coverage {
             self.client_mismatches,
             self.seeds
         );
-        // **The meta range in use** (SHARD.md §1; PROPOSED D-098). Every third client
+        // **The meta range in use** (SHARD.md §1; D-098). Every third client
         // starts knowing range 0 alone, so every seed has lookups through both system
         // ranges; every leader elected sends its descriptor to the meta range, so
         // every seed has meta applies after the bootstrap; and none of them wins
@@ -928,7 +928,7 @@ impl Coverage {
             self.seeds
         );
         // A split raises both halves' generations, and the leader's update after it
-        // is the first the meta range takes (SHARD.md §1, §5; PROPOSED D-100): every
+        // is the first the meta range takes (SHARD.md §1, §5; D-100): every
         // split that took effect is a `took` on meta, and a run with no split has none.
         if self.split_coverage.applied > 0 {
             assert!(
@@ -945,7 +945,7 @@ impl Coverage {
                  where nothing else raises a generation"
             );
         }
-        // The split's coverage (SHARD.md §5; PROPOSED D-100), printed at every tier and
+        // The split's coverage (SHARD.md §5; D-100), printed at every tier and
         // asserted where the sample supports it (D-061). Well above 5 % of seeds at the
         // gate's twenty, so asserted at every tier: a split took effect, its right half
         // was created and led and took writes, a restart reopened a right half from
@@ -992,7 +992,7 @@ impl Coverage {
                 self.seeds
             );
         }
-        // Range 0 granting blocks of ids (SHARD.md §5, Q17; PROPOSED D-099): every
+        // Range 0 granting blocks of ids (SHARD.md §5, Q17; D-099): every
         // node asks at its start, so every seed has grants; the floor is one a seed,
         // and the fewest on a seed is printed beside it.
         assert!(
@@ -1223,7 +1223,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
 
     // §8's restatement, which check 7's restatement clause reads: every node restates
     // every replica it holds at every start, its first included, so three nodes give
-    // at least three a seed (PROPOSED D-107).
+    // at least three a seed (D-107).
     println!(
         "node: {} restatements and {} descriptors stated at an applied index an apply did \
          not reach, over {seeds} seeds",
@@ -1334,7 +1334,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // in 10^7 (0.985^1000), and at 10 in 1 000 no refusal about once in 23 000
     // (0.99^1000, 4.3e-5). The second is within D-061's letter and is the weakest
     // assertion here (#173's review, N3).
-    // PROPOSED(D-109)
+    // D-109
     let placeholders = &coverage.placeholders;
     let longest_wait = placeholders.installed_voters_waited.iter().max();
     println!(
@@ -1446,7 +1446,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // 5: 33 776} — least over busiest, **0.87** — and a key map that answers one range
     // gives {2: 95 986, 3: 16 459, 4: 12 886, 5: 14 353}, **0.13**. The floor is half,
     // between them and far from both.
-    // The spread is the user ranges' (PROPOSED D-096): ranges 0 and 1 apply their
+    // The spread is the user ranges' (D-096): ranges 0 and 1 apply their
     // terms' no-ops and nothing else, since no client writes a system range, and a
     // floor that counted them would read the bootstrap as a key map answering one
     // range. They are printed with the rest of `applies_by_range`.
@@ -1564,7 +1564,7 @@ const HEARTBEAT: Duration = Duration::from_millis(20);
 /// persists paid one at a time, which moves every timing — so the comparison sees
 /// verdicts of both kinds and counters that differ from the correct node's, and not
 /// only `Ok` and one shape of trace.
-// PROPOSED(D-095): the node's folds under the equivalence test.
+// D-095: the node's folds under the equivalence test.
 const FOLDS_COMPARED: [Option<NodeVariant>; 4] = [
     None,
     Some(NodeVariant::ApplyWaitsForEveryRange),
@@ -1680,7 +1680,7 @@ fn compare_folds(
 /// the whole trace, so a comparison that saw only `Ok` is visible — and so is what
 /// the per-run verdict says of the correct node, which is why the sweep asserts the
 /// pooled median and not this one.
-// PROPOSED(D-095): the node's folds under the equivalence test.
+// D-095: the node's folds under the equivalence test.
 #[test]
 fn the_node_folds_agree_with_their_whole_trace_readings() {
     let compared = seeds().min(100);
@@ -1737,7 +1737,7 @@ fn the_node_folds_agree_with_their_whole_trace_readings() {
 /// fold (D-091's attribution). The hold fold's figures under it are printed too: the
 /// wait a stalled apply spends is the lag's to see, not the hold's, which measures
 /// one job's duration (D-082), and the figure says so.
-// PROPOSED(D-095): the variant the apply-lag fold trips on.
+// D-095: the variant the apply-lag fold trips on.
 #[test]
 fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node() {
     /// What one run under the variant showed: the lag verdict's violation, the run's
@@ -1794,13 +1794,13 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
     );
 }
 
-// --- The bootstrap (SHARD.md §2; PROPOSED D-096) ---
+// --- The bootstrap (SHARD.md §2; D-096) ---
 
 /// A node that takes a fresh store for a bootstrap (`AnyFreshNodeBootstraps`), caught
 /// by check 7 on the membership scenario's five nodes, whose nodes 4 and 5 are not
 /// bootstrap nodes: each writes the initial state with the address book as every
 /// range's voters, so its creations disagree with the three bootstrap nodes' on every
-/// range, and check 7 says so — read since PROPOSED D-109 as the range layer folds it,
+/// range, and check 7 says so — read since D-109 as the range layer folds it,
 /// and not as `creations_agree_of`, its first step, which takes a replica created by an
 /// install for a mistake and so fails the correct node's joiners now that they hold
 /// nothing until their placeholders' installs. The run's own
@@ -1820,7 +1820,7 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 /// The variant is a range-layer instrument outside §10's count since PROPOSED D-108,
 /// which moved it out of the node's set and measured the move: every verdict, catch
 /// and trace hash of this test's runs is the same on both sides of it.
-// PROPOSED(D-096): the bootstrap nodes named in configuration.
+// D-096: the bootstrap nodes named in configuration.
 // PROPOSED(D-108): the instrument in the range layer's set.
 #[test]
 fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
@@ -1828,7 +1828,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
     let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
     // Check 7 as the range layer folds it, which holds an install's creation to its
     // map as well as a bootstrap's: since the placeholders the correct membership
-    // node's joiners are created by installs into their placeholders (PROPOSED D-109),
+    // node's joiners are created by installs into their placeholders (D-109),
     // which `ranges::creations_agree_of` — check 7's first step, written for a
     // scenario that bootstraps every replica — rejects on sight, so the pair is read
     // on the fold that both systems are judged by.
@@ -1875,7 +1875,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         by_check_7, seeds as usize,
         "AnyFreshNodeBootstraps was not caught by check 7 on every membership seed"
     );
-    // Check 18's half that no §10 variant trips (PROPOSED D-106, a question for the
+    // Check 18's half that no §10 variant trips (D-106, a question for the
     // owner): every replica of range 0 grants at an index what its first apply granted.
     // Two clusters' replicas of range 0 grant two blocks at one index, read fold by fold
     // since the run's verdict names check 7 first. Measured over seeds 0 to 999 in
@@ -1894,8 +1894,8 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
     // bootstrap traced its interim replica's creation with its own empty Raft
     // configuration as the voters, so nodes 4 and 5 disagreed with the bootstrap
     // nodes on every range and the "catch" told the two systems apart on nothing.
-    // The creation named the range's voters on every node from PROPOSED D-097; since
-    // PROPOSED D-109 a node that joins holds nothing and its replicas are its
+    // The creation named the range's voters on every node from D-097; since
+    // D-109 a node that joins holds nothing and its replicas are its
     // placeholders' installs, which check 7 holds to its map.
     let honest = membership::run_on_node(
         Cluster::Node,
@@ -1922,7 +1922,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 }
 
 /// The routing variants of §10 on the node, with the clients that start stale
-/// (PROPOSED D-097): what each is caught by, over `high_rate_share` seeds, printed and
+/// (D-097): what each is caught by, over `high_rate_share` seeds, printed and
 /// asserted.
 ///
 /// **`TrustStaleDescriptor`** takes a stale client's range as proof and checks neither
@@ -1946,7 +1946,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 ///
 /// **`ClientIgnoresMismatch`** resends to the range and generation it had: check 17 at
 /// the first resend, on every seed, since every other client starts stale.
-// PROPOSED(D-097)
+// D-097
 fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
     routing_variant_on(name, variants, high_rate_share())
 }
@@ -1964,8 +1964,8 @@ fn routing_variant_on(name: &str, variants: &[RangeVariant], seeds: u64) -> Vec<
             .unwrap_or(0);
         // Writes applied outside the span of the descriptor in force before their
         // index: what `ApplyIgnoresSpan` lets through, read against check 7's map
-        // rather than the scenario's fixed map, which a split moves off (PROPOSED
-        // D-100).
+        // rather than the scenario's fixed map, which a split moves off
+        // (D-100).
         let misapplied = {
             let mut descriptors = ananke_shard::invariants::Descriptors::default();
             let mut count = 0usize;
@@ -2050,12 +2050,12 @@ struct Routed {
     at_apply: usize,
     /// Applied writes in a range the fixed map does not give the key to.
     misapplied: usize,
-    /// Splits that took effect on the run (PROPOSED D-100).
+    /// Splits that took effect on the run (D-100).
     splits: usize,
     /// Splits done by a proposer restarted after its last (`Fault::SplitFromRestarted`).
     resumed: u64,
     /// The range layer's folds in violation over the whole run, each read on its own
-    /// (PROPOSED D-106): the run's verdict names only the first in check order.
+    /// (D-106): the run's verdict names only the first in check order.
     tripped: BTreeSet<Fold>,
 }
 
@@ -2185,7 +2185,7 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
 }
 
 /// `ApplyIgnoresSpan` with `TrustStaleDescriptor`, where the trusted writes land in
-/// the wrong range, and alone, where its path is the split's (SHARD.md §5; PROPOSED
+/// the wrong range, and alone, where its path is the split's (SHARD.md §5;
 /// D-100): a write proposed under P's span before the split and appended above the
 /// split's index applies as nothing on the correct node, since the apply check reads
 /// the descriptor in force before its index, and applies in P under the variant —
@@ -2274,7 +2274,7 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
         );
     }
     let caught = alone.iter().filter(|o| o.why.is_some()).count();
-    // Check 10 behind check 9, read fold by fold (PROPOSED D-106): the misapplied write
+    // Check 10 behind check 9, read fold by fold (D-106): the misapplied write
     // breaks check 9, and where the right half writes the key at the same generation, or
     // had, check 10 on the same run, which the run's verdict never names. Measured over
     // seeds 0 to 999 in release: 1 of 20, 3 of 100 and 26 of 1 000, every one on a seed
@@ -2316,14 +2316,14 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
     }
 }
 
-/// §10's `MetaOverwritesByArrival` on the node, whose path is the split's (PROPOSED
-/// D-100): the split's update names P and R at generation g + 1, and an update of P's
+/// §10's `MetaOverwritesByArrival` on the node, whose path is the split's
+/// (D-100): the split's update names P and R at generation g + 1, and an update of P's
 /// old descriptor that arrives after it — a resend of a `MetaUpdate` the meta task
 /// was still carrying — is left alone by the correct meta range (§1's maximum by
 /// generation) and stored by the variant, where check 16 sees the generation fall.
 /// Before the split every update named the first generation and the variant had no
-/// path (PROPOSED D-098). A rate, the schedule's to give, and a low one since check 16
-/// reads "from one meta index to the next" by index (PROPOSED D-109): 0 of 20 at the
+/// path (D-098). A rate, the schedule's to give, and a low one since check 16
+/// reads "from one meta index to the next" by index (D-109): 0 of 20 at the
 /// gate, 2 of 100 and 19 of 1 000. The trace-order reading before it counted 3, 18 and
 /// 149, most of them a lagging follower's apply of an index below the split's, which
 /// is no fall. So the catch is asserted over a thousand seeds, at the premerge and the
@@ -2397,7 +2397,7 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
 
 /// §10's `IdBlockResumed` on the node, caught by check 18's range-id clause at the
 /// first apply of a split whose right half was named before (SHARD.md §5, Q17; §10;
-/// PROPOSED D-100), on the schedule's shape for it: the node that proposed the last
+/// D-100), on the schedule's shape for it: the node that proposed the last
 /// split done, crashed and restarted, handed the lead of a range that split did not
 /// cut and asked to split it (`Fault::SplitFromRestarted`). The correct node's new run
 /// draws a fresh block for the second split; the variant resumes its record's block
@@ -2441,7 +2441,7 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     // fold (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
     // With the run compared (PROPOSED D-137), the run's words are that clause too, and the
     // figures on its tree are above.
-    // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
+    // D-106: IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
         .filter(|o| o.why.as_deref().is_some_and(by_the_range_id_clause))
@@ -2579,10 +2579,10 @@ fn right_half_draws(seed: u64, records: &[TraceRecord]) -> Vec<RightHalfDraw> {
 ///
 /// The variant is read at three sites of a creation. The directed refusal scenario
 /// asserts the first, Q15's re-seed (`sim/tests/ranges.rs`). This is the second, a
-/// split's apply (`ServerApplier::split`, PROPOSED D-100), which only a scenario that
+/// split's apply (`ServerApplier::split`, D-100), which only a scenario that
 /// splits reaches and which no test ran until now: D-108's M6, the split's draw reading
-/// the correct set, failed nothing. The third, a placeholder's install (PROPOSED
-/// D-109), this test does not read (PROPOSED D-123). Nothing downstream can see what the
+/// the correct set, failed nothing. The third, a placeholder's install
+/// (D-109), this test does not read (D-123). Nothing downstream can see what the
 /// variant draws at a split: `range_rng` continues across draws, handles and restarts,
 /// so it repeats no incarnation, and a right half is new on every node anyway. So what
 /// is asserted is the draw itself, as the refusal test asserts the re-seed's, on both
@@ -2598,7 +2598,7 @@ fn right_half_draws(seed: u64, records: &[TraceRecord]) -> Vec<RightHalfDraw> {
 /// draw of that stream. So no seed of the thousand needs [`right_half_draws`]'s allowance
 /// for a crash: it is reasoned from the apply, for the schedule that lands a crash there.
 // PROPOSED(D-108): the instrument at its second site.
-// PROPOSED(D-123)
+// D-123
 #[test]
 fn a_splits_right_half_draws_its_incarnation_from_its_ranges_stream_under_the_instrument() {
     let seeds = high_rate_share();
@@ -2690,11 +2690,11 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
 }
 
 // --- The range layer's folds under the equivalence test, fold by fold (SHARD.md §11,
-// raft 12; §12 Stage C's exit; PROPOSED D-106) ---
+// raft 12; §12 Stage C's exit; D-106) ---
 
 /// How many seeds a pair's comparison runs: the hundred the one-group checker is
 /// compared over (D-046), the gate's twenty at the gate.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 fn range_folds_compared() -> u64 {
     seeds().min(100)
 }
@@ -2715,10 +2715,10 @@ struct FoldsFound {
 /// A fold's violation is in its own words ([`Fold::words`]) and latched: once a prefix
 /// shows it, every later prefix shows the same one.
 ///
-/// Until PROPOSED D-106 the comparison was of the checker's one verdict, the first
+/// Until D-106 the comparison was of the checker's one verdict, the first
 /// violation in check order, so a fold behind another — check 10 behind check 9 on the
 /// same misapplied write — was compared on nothing but the first fold's words.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 fn compare_range_folds(
     seed: u64,
     system: &str,
@@ -2792,7 +2792,7 @@ fn compare_range_folds(
 /// every run, fails on any disagreement, and prints each fold's trip count over the
 /// seeds compared, with the first violation of each, so a comparison that saw only
 /// `Ok` of a fold is visible at every tier.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 fn range_folds_under(
     system: &str,
     seeds: u64,
@@ -2877,7 +2877,7 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// below.
 ///
 /// **Check 8** runs here and under every pair below too, its clauses a fold each
-/// (PROPOSED D-107, D-116, D-128). Its install clause trips on no run of the correct node; its
+/// (D-107, D-116, D-128). Its install clause trips on no run of the correct node; its
 /// tripping variant is `InstallReplacesHostedSpan`, on the re-seed after a split
 /// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span`).
 /// Its created-twice clause stops a run and is asserted absent
@@ -2898,15 +2898,15 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// clause trips on no run of this tree, so its comparison in violation comes with its
 /// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12), on `sim/split.rs` (i)
 /// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`,
-/// PROPOSED D-110).
+/// D-110).
 ///
 /// **Check 19** runs here and under every pair below, and stops a run, so it is asserted absent
 /// on every compared seed with the others ([`Fold::VERDICT`]); its comparison in violation comes
 /// with its instrument, `SplitLeavesGap`, as the owner ruled on D-093
 /// (`the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves_gap`,
 /// PROPOSED D-140).
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
-// PROPOSED(D-107): check 8's two clauses among them.
+// D-106: the range layer's folds compared fold by fold, per pair.
+// D-107: check 8's two clauses among them.
 // PROPOSED(D-140): and check 19.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
@@ -2946,14 +2946,14 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
         on.first()
             .and_then(|seed| found[*seed].tripped.get(&Fold::RightHalf))
     );
-    // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
+    // D-107: check 8's right half's clause, compared in violation at every
     // tier.
     // With the placeholders the correct node's pinned seed holds the clause: its voter gets
     // its right half through its placeholder before its restart
     // (`seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`;
     // seed 45 until PROPOSED D-127). So the shape is planted on that seed's own trace, the
     // voter's creation and restatements of the right half taken out, and compared there at
-    // every tier (PROPOSED D-109). Under reading R that voter, installed past the split, owes
+    // every tier (D-109). Under reading R that voter, installed past the split, owes
     // no R at its restatement, so the planting also takes out its installs of the parent: its
     // restatement past the split then reads as an apply of it (PROPOSED D-141).
     let (seed, node, parent, _, right) = RIGHT_HALF_PINNED;
@@ -2983,7 +2983,7 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
 /// The folds of `outcome` in violation that stop a run ([`Fold::VERDICT`]): every one
 /// but check 8's right half's clause, which is not in the checker's verdict and is asserted
 /// apart where a scenario asks it (PROPOSED D-107, D-141).
-// PROPOSED(D-107)
+// D-107
 fn stopping_folds(outcome: &FoldsFound) -> BTreeMap<Fold, &str> {
     outcome
         .tripped
@@ -3012,7 +3012,7 @@ fn at_apply(violation: &str) -> bool {
 ///   trip here, and every check-9 trip at an apply, is the apply check's absence.
 /// - **Alone**, §10's path through the split: a write proposed under P's span and
 ///   appended above the split's index applies in P — check 9 — and where R has written
-///   the key at the same generation, or writes it next, check 10. Before PROPOSED D-106
+///   the key at the same generation, or writes it next, check 10. Before D-106
 ///   every such catch read as check 9's, the first in check order, and check 10 had
 ///   never been seen to trip on any run.
 ///
@@ -3026,7 +3026,7 @@ fn at_apply(violation: &str) -> bool {
 /// of it, so alone's trips are printed at every tier and not asserted, and the variant's
 /// own catch stays asserted from the nightly's share (D-100); the split it needs, which
 /// took effect on 999 of the 1 000, is asserted at every tier.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span() {
     let compared = range_folds_compared();
@@ -3092,7 +3092,7 @@ fn the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_
 /// client's read served from the wrong range. Measured: 998 of seeds 0 to 999, 100 of
 /// the first hundred, 20 of the first twenty — asserted at every tier; and check 10 on
 /// none of the thousand, asserted on every seed.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor() {
     let seeds = range_folds_compared();
@@ -3121,7 +3121,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_d
 /// hundred at most, as every pair here is; caught on 57 of the hundred and 13 of the gate's
 /// twenty, so asserted at every tier. `Fault::MetaReorder` moved the schedule: 63 of the hundred
 /// and 12 of the twenty since (PROPOSED D-135).
-// PROPOSED(D-131)
+// D-131
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only() {
     let seeds = range_folds_compared();
@@ -3174,8 +3174,8 @@ fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_the_sharded_
 }
 
 /// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
-/// hundred, since check 16 reads one meta index against the next by index (PROPOSED
-/// D-109): 48 and 66 until PROPOSED D-127 moved the node's schedules, and 12 and 20 on its
+/// hundred, since check 16 reads one meta index against the next by index
+/// (D-109): 48 and 66 until PROPOSED D-127 moved the node's schedules, and 12 and 20 on its
 /// tree, each a resend of a split parent's first generation applied at an index above the
 /// split's update.
 // PROPOSED(D-127): 48 and 66 moved off the shape; 12, 20 and 30 trip among the hundred.
@@ -3185,7 +3185,7 @@ const META_REORDER_PINNED: [u64; 2] = [12, 20];
 /// of a split parent's old descriptor that the variant's meta range stores after the
 /// split's update. Measured, by trace order (D-106): 149 of seeds 0 to 999, 18 of the
 /// first hundred, 3 of the first twenty, asserted from CI's hundred compared seeds. By
-/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0; on PROPOSED D-127's tree, 3 of
+/// index (D-109): 19, 2 (seeds 48 and 66) and 0; on PROPOSED D-127's tree, 3 of
 /// the first hundred (seeds 12, 20 and 30) and 1 of the first twenty. The comparison never sees more
 /// than a hundred seeds, and two in a hundred is under D-061's 5 %, so the tier's catch
 /// is printed and not asserted; the comparison is held in violation on the two seeds
@@ -3193,8 +3193,8 @@ const META_REORDER_PINNED: [u64; 2] = [12, 20];
 /// pins, and the variant's own catch is asserted over a thousand seeds from the premerge
 /// (`a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split`).
 /// The split it needs, on 999 of the 1 000, at every tier.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
-// PROPOSED(D-109): check 16 by index; its comparison in violation on two pins.
+// D-106: the range layer's folds compared fold by fold, per pair.
+// D-109: check 16 by index; its comparison in violation on two pins.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival() {
     let compared = range_folds_compared();
@@ -3255,7 +3255,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwri
 /// placeholder's grant — asserted at every tier, where twenty seeds at 75 % miss it about
 /// once in 10^12 (D-061). The correct node's comparison above asserts check 20 green on
 /// every compared seed.
-// PROPOSED(D-109)
+// D-109
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes() {
     let compared = range_folds_compared();
@@ -3282,7 +3282,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialise
 }
 
 /// §10's `UninitialisedReplicaVotes` on the node, caught by check 20 at the first grant
-/// (SHARD.md §8, §10; PROPOSED D-109), and its pair: the correct node's sweep, which runs
+/// (SHARD.md §8, §10; D-109), and its pair: the correct node's sweep, which runs
 /// the same checks, asserts every seed green. A placeholder is made on most seeds — a
 /// split's right half pre-votes at once to replicas of its parent that have not applied
 /// the split (Q21, Q22) — and the variant grants that pre-vote. Measured on this tree,
@@ -3291,7 +3291,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialise
 /// window followed the creation, and every catch here precedes it), each check 20's at a
 /// right half's first pre-vote reaching a node that had not applied its split. Asserted
 /// as a catch at every tier (D-061: far above 5 %), and every catch is check 20's.
-// PROPOSED(D-109)
+// D-109
 #[test]
 fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
     let outcomes = routing_variant(
@@ -3389,15 +3389,15 @@ fn the_range_layers_folds_agree_one_by_one_and_check_19_trips_under_split_leaves
 
 /// Check 8 against `SnapshotOverlapsReplica` (SHARD.md §12, Stage C's exit: "check 8
 /// against `SnapshotOverlapsReplica`"), the overlap clause's tripping variant, deferred
-/// here from S6 (PROPOSED D-107, D-110). Compared on `sim/split.rs` (i), where the
+/// here from S6 (D-107, D-110). Compared on `sim/split.rs` (i), where the
 /// variant's install of R over `x`'s lagging P lands on every seed (1 000 of 1 000
 /// measured), rather than on the node sweep, whose correct node refuses an install for
-/// overlap on about one seed in a hundred (PROPOSED D-109) and whose variant runs reach
+/// overlap on about one seed in a hundred (D-109) and whose variant runs reach
 /// the shape about as rarely. Every compared seed's folds agree fold by fold, and check
 /// 8's overlap clause is in violation on every one, in its own words, at every tier
 /// (D-061: every seed). The correct system's shape (i) holds check 8 green on every seed
 /// through the run's verdict (`sim/tests/split.rs`).
-// PROPOSED(D-110)
+// D-110
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica() {
     let compared = range_folds_compared();
@@ -3423,14 +3423,14 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_over
     }
 }
 
-/// Check 8's install clause against `InstallReplacesHostedSpan` (PROPOSED D-128), compared
+/// Check 8's install clause against `InstallReplacesHostedSpan` (D-128), compared
 /// on `reseed::run_after_split`, where the right half's install lands before P's on about a
 /// third of seeds, so at every tier (D-061). The node sweep refuses a store on about one
 /// seed in ten thousand, so it almost never makes a span-less replica. On every compared seed the folds agree fold by
 /// fold; on a seed the clause trips, every descriptor is right and it alone of the folds
 /// that stop a run is in violation. The correct node's run holds the clause green on the
 /// same seeds through its verdict (`sim/tests/reseed.rs`).
-// PROPOSED(D-128)
+// D-128
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_replaces_hosted_span() {
     let compared = range_folds_compared();
@@ -3511,7 +3511,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
 /// the range and generation a mismatch has already corrected. Measured: 1 000 of seeds
 /// 0 to 999 — asserted on every compared seed.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch() {
     let seeds = range_folds_compared();
@@ -3526,7 +3526,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignor
 }
 
 /// The membership seeds on which `AnyFreshNodeBootstraps` trips check 18's grants clause
-/// among the first hundred (PROPOSED D-106, #163's review): 41, 74, 81 and 82, measured
+/// among the first hundred (D-106, #163's review): 41, 74, 81 and 82, measured
 /// over seeds 0 to 999 in release, where it trips on 34, every one the clause's agreement
 /// branch at index 2 of range 0. Two groups of range 0 run side by side — the bootstrap
 /// nodes' and the one the variant's fresh nodes bootstrap beside it, whose leaders of term
@@ -3560,7 +3560,7 @@ fn grants_at_index_2_of(violation: &str) -> Option<(u64, u64)> {
 /// which a node that resumes another run's block does not break and `descriptor
 /// lineage:` alone also names (issue #141). Read off a fold's own verdict or a run's,
 /// which names its seed first.
-// PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
+// D-106: IdBlockResumed's catch narrowed to check 18's range-id clause.
 // PROPOSED(D-137): and the run compared, which is that clause too.
 fn by_the_range_id_clause(violation: &str) -> bool {
     violation.contains(Fold::RangeIds.words())
@@ -3584,7 +3584,7 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// taken twice on 45 and 10. Check 8's created-twice clause, which D-137 does not change, is on
 /// 45 of the hundred (42 over a restatement) and 10 of the twenty (9) on that tree.
 ///
-/// **Check 8's created-twice clause** against the same variant (PROPOSED D-116): a voter
+/// **Check 8's created-twice clause** against the same variant (D-116): a voter
 /// of the second split that holds the right half the first made, created there or
 /// restated there after the restart the variant needs, creates it again at its apply,
 /// which is SHARD.md §5's "R already initialised here". Measured fold by fold over seeds 0
@@ -3600,8 +3600,8 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// pinned: `seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`)
 /// and on none of `sim/split.rs` (i)'s. The run's own verdict names check 18 or an
 /// earlier check on every one of the 630, since the clause is asked last.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
-// PROPOSED(D-116): and check 8's created-twice clause, its tripping variant.
+// D-106: the range layer's folds compared fold by fold, per pair.
+// D-116: and check 8's created-twice clause, its tripping variant.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed() {
     let seeds = range_folds_compared();
@@ -3638,7 +3638,7 @@ fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_blo
         by_clause > 0,
         "check 18's range-id clause tripped on no compared seed of IdBlockResumed's {seeds}"
     );
-    // PROPOSED(D-116)
+    // D-116
     let twice: Vec<(usize, &str)> = found
         .iter()
         .enumerate()
@@ -3702,7 +3702,7 @@ fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_blo
 /// here on a violation at every tier: the variant trips it on 4 of the first hundred
 /// seeds and none of the first twenty, so those four are pinned ([`GRANTS_PINNED`]) and
 /// compared fold by fold whatever the tier, each asserting its mechanism.
-// PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// D-106: the range layer's folds compared fold by fold, per pair.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps() {
     let compared = range_folds_compared();
@@ -3780,7 +3780,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
         .records
     });
     for (seed, outcome) in correct.iter().enumerate() {
-        // PROPOSED(D-107): check 8's right half's clause is compared and printed above,
+        // D-107: check 8's right half's clause is compared and printed above,
         // and not asserted absent on a correct system.
         let stopping = stopping_folds(outcome);
         assert!(
@@ -3792,16 +3792,16 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
 
 /// The correct node's seed on which check 8's right half's clause tripped before the
 /// placeholders, and on whose trace its shape is now planted (`without_the_right_half`;
-/// PROPOSED D-109): (seed, node, parent, the split's index, the right half). Seed 45 until
+/// D-109): (seed, node, parent, the split's index, the right half). Seed 45 until
 /// PROPOSED D-127 moved its schedule off the install past the split; seed 2388 carries the
 /// shape on D-127's tree, the install past the split, the right half through its placeholder
 /// and a restatement after it, where none of seeds 0 to 1999 does.
-// PROPOSED(D-107)
+// D-107
 // PROPOSED(D-127): moved from seed 45, whose schedule D-127 moved.
 const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (2388, 1, 5, 35, 30);
 
 /// Check 8's right half's clause's violation on [`RIGHT_HALF_PINNED`], word for word.
-// PROPOSED(D-107)
+// D-107
 fn right_half_pinned_words() -> String {
     let (_, node, parent, index, right) = RIGHT_HALF_PINNED;
     format!(
@@ -3815,7 +3815,7 @@ fn right_half_pinned_words() -> String {
 /// creation, the restatements of its descriptor, and its name in every `RangesRestated`
 /// of `node` — the trace of a voter that never gets its right half, which is what check
 /// 8's right half's clause exists to see and what the placeholders keep the correct node
-/// from tracing (PROPOSED D-109) — and, since the owner's reading R of D-107, the
+/// from tracing (D-109) — and, since the owner's reading R of D-107, the
 /// switches and read-backs of `node`'s installs of `parent`, so that its restatement past
 /// the split reads as an apply of it with no install that excuses it: the crash between
 /// a split's durable batch and its trace, which the restated form is there for
@@ -3858,7 +3858,7 @@ fn without_the_right_half(
 }
 
 /// **Seed 45 is where check 8's right-half clause tripped on the correct node, and the
-/// placeholders are what close it** (PROPOSED D-107, D-109). Node 2's replica of range 4
+/// placeholders are what close it** (D-107, D-109). Node 2's replica of range 4
 /// lagged the split at index 165 (key `k5`, right half 14) and was installed P's
 /// post-split snapshot at 165 — the install's `RangeDescriptor`, at generation 2 —
 /// without applying the split or creating 14. Before the placeholders nothing gave it 14,
@@ -3878,8 +3878,8 @@ fn without_the_right_half(
 /// voter from its install's switch to 30's creation, and its restatement past the split is read
 /// as installed and not as an apply of it: both asserted, the wait printed (on seed 45's node 2
 /// on D-141's own tree, moved to seed 2388 at the Stage C integration).
-// PROPOSED(D-107): the right half's clause's STOP, pinned where the thousand found it.
-// PROPOSED(D-109): and closed by a placeholder, on the same seed.
+// D-107: the right half's clause's STOP, pinned where the thousand found it.
+// D-109: and closed by a placeholder, on the same seed.
 // PROPOSED(D-127): moved from seed 45, whose schedule D-127 moved.
 // PROPOSED(D-141): and read under reading R.
 #[test]
@@ -4035,7 +4035,7 @@ fn seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_plac
 
 /// **Seed 219 under `SnapshotOverlapsReplica`: one range created twice on one node, by
 /// a split's apply and then an install, and check 8's created-twice clause sees the
-/// second creation** (PROPOSED D-116, #181; found by D-110 §4). Node 3 made a placeholder
+/// second creation** (D-116, #181; found by D-110 §4). Node 3 made a placeholder
 /// of range 62 at 17.653 s, before its replica of range 5 applied the split at index 346
 /// that makes 62. A stream of 62 reached the placeholder, and the variant let its install
 /// past the overlap check while node 3's 5 still covered 62's span. Node 3's apply of the
@@ -4068,7 +4068,7 @@ fn seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_plac
 /// sees the run, its verdict, which is asserted in place of the raft checker's. And the
 /// correct node refuses the install for overlap after its split's apply made 14, the refusal
 /// of a range made here meanwhile, where on seed 219 it refused it before the apply.
-// PROPOSED(D-116)
+// D-116
 // PROPOSED(D-127): re-pinned from seed 219, whose schedule D-127 moved.
 #[test]
 fn seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second() {
@@ -4234,7 +4234,7 @@ fn seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_s
     // On seed 219 the correct node refused the install while its parent still covered the
     // right half, before the split's apply; on this seed the stream completes after the
     // apply made the range, and the refusal is the one of a range made here meanwhile
-    // (`a_placeholders_install_of_a_range_made_here_meanwhile_is_refused`, PROPOSED D-110).
+    // (`a_placeholders_install_of_a_range_made_here_meanwhile_is_refused`, D-110).
     // PROPOSED(D-127)
     assert!(
         refused.is_some_and(|refused| refused > created[0]),
@@ -4389,7 +4389,7 @@ fn mechanism(violation: &str) -> &'static str {
         ("serving within span", "serving within span"),
         ("owners' generations", "owners' generations"),
         ("client refreshes", "client refreshes"),
-        // PROPOSED(D-109): check 20.
+        // D-109: check 20.
         ("placeholder grants nothing", "placeholder grants nothing"),
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
@@ -4849,7 +4849,7 @@ struct QuorumNodeFigures {
     step_downs_naming_anyone_uncounted: usize,
     streams: usize,
     seeds_carrying_both_outcomes: u64,
-    /// The root and the meta range, asked the hold's clauses since PROPOSED D-119
+    /// The root and the meta range, asked the hold's clauses since D-119
     /// (issue #143), counted apart from the user ranges so the figures above read as
     /// D-085 and D-101 measured them: the system ranges on the keeper's majority, those
     /// of them that had an entry of the keeper's term to commit — which nothing in the
@@ -4886,7 +4886,7 @@ impl QuorumNodeFigures {
         // PROPOSED(D-136): the clause asked on its own, not behind the checks before it.
         self.seeds_the_fan_out_fell_short += u64::from(report.fan_out().is_err());
         // The answers, the streams and the step-downs are every range's, the system
-        // ranges' with the user ranges' (PROPOSED D-119); the sides are counted apart.
+        // ranges' with the user ranges' (D-119); the sides are counted apart.
         let user_ranges = ranges();
         for hold in holds.values() {
             self.ranges_refused += usize::from(hold.replica_refused);
@@ -4952,7 +4952,7 @@ fn quorum_node_sweep(
 /// it holds (D-077), each re-seeded with a store incarnation of its own; the third
 /// node is then cut off, and check quorum is asked separately of each range's leader
 /// about that one refused node, the root's and the meta range's with the four user
-/// ranges' (PROPOSED D-119, issue #143). On nearly every seed the run carries **both**
+/// ranges' (D-119, issue #143). On nearly every seed the run carries **both**
 /// outcomes at once, which no single-range scenario can: the ranges the keeper leads
 /// keep their leader through the hold and commit what they are given past their commit
 /// index at the cut, on a majority of the keeper and the node the refusal re-seeded;
@@ -4966,9 +4966,9 @@ fn quorum_node_sweep(
 ///
 /// Every counter asserted above zero here is well above D-061's 5 % at every tier: the
 /// per-range ones run about one seed in two (one in three for a system range with an
-/// entry to commit, PROPOSED D-119's table), so the gate's twenty asserts them too.
+/// entry to commit, D-119's table), so the gate's twenty asserts them too.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 #[test]
 fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node() {
     let (violations, figures) = quorum_node_sweep(Variants::default(), NodeVariants::correct());
@@ -4981,7 +4981,7 @@ fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node()
     assert!(violations.is_empty(), "{}", violations[0]);
     // The shape the checks need, asserted rather than assumed: every replica the node
     // hosts refused and re-seeded a seed — six, the root's and the meta range's with
-    // the user ranges' (PROPOSED D-119) — both outcomes reached, and the answers that
+    // the user ranges' (D-119) — both outcomes reached, and the answers that
     // carried the keeper's office actually delivered.
     let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     assert_eq!(
@@ -5038,7 +5038,7 @@ fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node()
     );
 }
 
-/// The system ranges' half of the pair (PROPOSED D-119, issue #143): a re-seeded replica
+/// The system ranges' half of the pair (D-119, issue #143): a re-seeded replica
 /// of `range` that grants votes past its quarantine, and no other replica of the node
 /// doing so. D-035 broken where the cluster's routing lives, which until now passed ten
 /// thousand seeds: the hold's clauses iterated the four user ranges, and on none of those
@@ -5053,13 +5053,13 @@ fn the_sharded_quorum_scenario_asks_every_ranges_leader_about_one_refused_node()
 /// Any other verdict fails this test: the variant is one range's, and every other replica
 /// still keeps D-035. The vote could elect a candidate without an entry the range committed
 /// before the crash, as `RefuseOneRangeOnly`'s amnesiac vote once did on seed 2994, but no
-/// seed of ten thousand shows it here, so that witness is not admitted: PROPOSED D-101's
+/// seed of ten thousand shows it here, so that witness is not admitted: D-101's
 /// rule is to admit what is measured and to read the rest before admitting it.
 ///
-/// Measured before it was asserted (Q39, D-061): see PROPOSED D-119's table. The range's
+/// Measured before it was asserted (Q39, D-061): see D-119's table. The range's
 /// leader is on the far side on about one seed in two and the catch is about as often,
 /// so the catch is asserted at every tier and the rate printed at every tier.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 fn a_reseeded_system_replica_that_votes_is_caught(variant: Variant, range: u64) {
     let outcomes: Vec<(Option<String>, bool, bool)> = sweep(seeds(), |seed| {
         let report = quorum::node_run(seed, variant, NodeVariants::correct());
@@ -5116,7 +5116,7 @@ fn a_reseeded_system_replica_that_votes_is_caught(variant: Variant, range: u64) 
 }
 
 /// `a_reseeded_system_replica_that_votes_is_caught` on the root.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 #[test]
 fn a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
     a_reseeded_system_replica_that_votes_is_caught(
@@ -5126,7 +5126,7 @@ fn a_reseeded_root_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 }
 
 /// `a_reseeded_system_replica_that_votes_is_caught` on the meta range.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-119: the hold clauses ask the system ranges too.
 #[test]
 fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario() {
     a_reseeded_system_replica_that_votes_is_caught(
@@ -5143,8 +5143,8 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 /// one range *is* refusing the node, so the variant does nothing there and D-077
 /// catches it on its own scenario's shape. Here it is caught from this scenario's
 /// side, by the clause that asks the fan-out per range: the store that opens first is
-/// range 0's (PROPOSED D-096), so the variant refuses the root alone, and none of the
-/// five other replicas the clause asks about — the meta range's first, since PROPOSED
+/// range 0's (D-096), so the variant refuses the root alone, and none of the
+/// five other replicas the clause asks about — the meta range's first, since
 /// D-119 — was refused, so none was re-seeded either.
 ///
 /// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
@@ -5157,13 +5157,13 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 /// that state has two witnesses beside the clause, both the one bug — the node's other
 /// replicas serving over an engine that lost state (D-077):
 ///
-/// - **state machine safety on the meta range** (PROPOSED D-098): the replica of range 1,
+/// - **state machine safety on the meta range** (D-098): the replica of range 1,
 ///   never refused and so never given the index-0 state the re-seed writes a refused
 ///   system range, applies the first `MetaUpdate` over nothing and takes every span;
-/// - **leader completeness** on a range the variant left unrefused (PROPOSED D-101): the
+/// - **leader completeness** on a range the variant left unrefused (D-101): the
 ///   empty replica votes again on state its node lost (D-035), and its vote elects a
 ///   candidate missing an entry the range committed before the victim's crash. It was
-///   one seed in ten thousand (seed 2994), and since PROPOSED D-119 moved the cut it is
+///   one seed in ten thousand (seed 2994), and since D-119 moved the cut it is
 ///   none of seeds 0 to 19 999, so its firing is asserted at no tier. It stays admitted
 ///   because the vote that makes it is still there: seed 2994's pin below asserts the vote
 ///   and the harm's absence. Group 0 is excluded: the variant refuses range 0 exactly as
@@ -5175,10 +5175,10 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 /// is printed at every tier.
 ///
 /// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
-/// and before the history and the fan-out clause (PROPOSED D-106, issue #140). Until
+/// and before the history and the fan-out clause (D-106, issue #140). Until
 /// PROPOSED D-136 none of their folds was in violation under the variant on any of seeds
 /// 0 to 999, and at ten thousand the split was D-101's to the seed (3 338 / 6 661 / 1;
-/// 3 338 / 6 662 / 0 since PROPOSED D-119 moved seed 2994). D-136 has check 20 forget at a
+/// 3 338 / 6 662 / 0 since D-119 moved seed 2994). D-136 has check 20 forget at a
 /// node's refusal what the node held (issue #221), and that gives the bug a **fourth
 /// witness**: the variant's unrefused replicas, empty and with no descriptor, are neither
 /// created nor restated after the refusal, and each grant of theirs is check 20's "from a
@@ -5195,7 +5195,7 @@ fn a_reseeded_meta_replica_that_votes_is_caught_on_the_sharded_quorum_scenario()
 /// (the review of D-136, N1). A fold that names any other catch fails this test as "caught
 /// by something other than", and is read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
-// PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
+// D-101: leader completeness off group 0 is the third witness of the one bug.
 // PROPOSED(D-136): check 20 off group 0 is the fourth.
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
@@ -5301,7 +5301,7 @@ fn unheld_grant_range(verdict: &str) -> Option<u64> {
 /// `ananke_raft::invariants` writes — "leader completeness: index {index} of group
 /// {group} (term {entry_term}) was committed in term {in_term} but server {server},
 /// leader of term {term}, does not hold it" — or `None` for any other verdict.
-// PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
+// D-101: leader completeness off group 0 is the third witness of the one bug.
 fn leader_completeness_group(verdict: &str) -> Option<u64> {
     let (_, after) = verdict.split_once(": leader completeness: index ")?;
     let (_, after) = after.split_once(" of group ")?;
@@ -5312,10 +5312,10 @@ fn leader_completeness_group(verdict: &str) -> Option<u64> {
     group.parse().ok()
 }
 
-/// **Seed 2994 is the variant's amnesiac vote, and since PROPOSED D-119 the vote without its
+/// **Seed 2994 is the variant's amnesiac vote, and since D-119 the vote without its
 /// harm.** It was the one seed of the nightly's ten thousand on fdc5fc0 (run 38082122222) that
 /// `RefuseOneRangeOnly` was caught on by leader completeness, which the pair's attribution did
-/// not then admit (PROPOSED D-101).
+/// not then admit (D-101).
 ///
 /// The mechanism, asserted rather than the verdict alone. Before the victim's crash the leader
 /// of range 4's term 1 committed index 14 on a majority that held the victim and not server 2.
@@ -5338,8 +5338,8 @@ fn leader_completeness_group(verdict: &str) -> Option<u64> {
 /// The correct node on the same seed is the other half: the same victim, its replica of range 4
 /// refused with its node, restated refused, granting no vote after the refusal (D-035), and the
 /// seed green. Its cut does not move, since its root has a leader by 1.37 s either way.
-// PROPOSED(D-101): the amnesiac vote, pinned where the nightly found it.
-// PROPOSED(D-119): the hold clauses ask the system ranges too.
+// D-101: the amnesiac vote, pinned where the nightly found it.
+// D-119: the hold clauses ask the system ranges too.
 #[test]
 fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_the_entry() {
     let seed = 2994u64;
@@ -5557,7 +5557,7 @@ fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_th
 /// now, per variant, over the tier's seeds:
 ///
 /// 1. **The refusal landed** — six replicas a seed, the root's and the meta range's with
-///    the four user ranges' (PROPOSED D-119), or nothing below is evidence.
+///    the four user ranges' (D-119), or nothing below is evidence.
 /// 2. **The node sends the mark**: `refused_rejections` is no longer 0. This is the
 ///    assertion that would fail if the key were reverted, if the mark stopped being
 ///    set where a re-seed builds the store, or if it stopped surviving the wire, and
@@ -5585,7 +5585,7 @@ fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_th
 ///    figures say it: over a hundred seeds the node delivered 33 refused rejections
 ///    and 25 010 answers that fitted, and **0** step-downs left anyone `uncounted`.
 ///    A hundred seeds is not all of it: `step_downs_naming_anyone_uncounted` moved from
-///    45 to 126 at ten thousand seeds under PROPOSED D-119, the 126 being 34 on user
+///    45 to 126 at ten thousand seeds under D-119, the 126 being 34 on user
 ///    ranges and 92 on ranges 0 and 1. "Elected 8 to 12 ms before the cut", which is
 ///    D-119's account of the system ranges' step-downs, holds only for the five seeds at
 ///    one thousand: seeds 2605 and 7195 are 1.1 s.
@@ -5607,8 +5607,8 @@ fn seed_2994_is_an_unrefused_empty_replicas_vote_electing_a_leader_that_holds_th
 // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
 #[test]
 fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold() {
-    // Every replica the node hosts, the system ranges' with the user ranges' (PROPOSED
-    // D-119).
+    // Every replica the node hosts, the system ranges' with the user ranges'
+    // (D-119).
     let ranges = u64::try_from(Cluster::Node.hosted().len()).expect("small");
     for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
         let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
@@ -6373,7 +6373,7 @@ fn last_commit_of(report: &raft::Report, range: u64) -> Option<ananke_env::Insta
 
 /// Seed 8885 of the correct node's sweep, which `main`'s nightly on 6c54705 failed
 /// (run 37918619653) with "no client write to k5 completed after the last heal", and
-/// **why the situation it was pinned for is absent on this tree** (PROPOSED D-102).
+/// **why the situation it was pinned for is absent on this tree** (D-102).
 ///
 /// The mechanism was two things. **The run stopped well before its schedule's
 /// total**: `Schedule::total` counts every budgeted wait at its whole budget, and on
@@ -6386,7 +6386,7 @@ fn last_commit_of(report: &raft::Report, range: u64) -> Option<ananke_env::Insta
 /// the total, 2.725 s, over the 2 s bound, and kept it as the wedge.
 ///
 /// On this tree the first half is still reached and is asserted: the run stops
-/// 2.588 s before its total, more than the bound. The second is absent: PROPOSED
+/// 2.588 s before its total, more than the bound. The second is absent:
 /// D-100 put `Fault::Split` and `Fault::SplitFromRestarted` on every node schedule,
 /// which moved this seed's run (last heal 25.867 s, stopped at 28.569 s), and k5 is
 /// written eleven times after the heal with every write completed — no key's
@@ -6397,7 +6397,7 @@ fn last_commit_of(report: &raft::Report, range: u64) -> Option<ananke_env::Insta
 /// is built by hand in `sim/raft.rs`
 /// (`a_write_pending_where_the_run_stopped_is_judged_against_that_instant`), where it
 /// fails against the total and passes against the end.
-// PROPOSED(D-102): seed 8885's end-of-run artefact, its absence on this tree asserted.
+// D-102: seed 8885's end-of-run artefact, its absence on this tree asserted.
 #[test]
 fn seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tail() {
     let report = correct(8885);
@@ -6506,7 +6506,7 @@ fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
 ///   writes and excuses the wedge — as it does seed 54's. Here the liveness clause is
 ///   the first `check()` reports.
 ///
-/// **Seed 8 carried the second shape until the placeholders** (PROPOSED D-109): range 3
+/// **Seed 8 carried the second shape until the placeholders** (D-109): range 3
 /// split at `k3`, its left half wedged on `k2` and its right half completing every
 /// post-heal write to `k3`. The placeholders moved its schedule, and its right half now
 /// completes no post-heal write, so the starting map has nothing to excuse the wedge
@@ -6522,7 +6522,7 @@ fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
 /// 3 split at `k3`, its left half wedged on `k2` while the right half completes post-heal
 /// writes to `k3`, the liveness clause first. The pin is upgraded back to seed 8.
 // PROPOSED(D-102): the exemption keeps the wedges the true end alone would excuse.
-// PROPOSED(D-109): the split range's shape moved from seed 8 to seed 76.
+// D-109: the split range's shape moved from seed 8 to seed 76.
 // PROPOSED(D-127): re-pinned from seeds 12 and 76, whose schedules D-127 moved.
 #[test]
 fn seeds_204_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
@@ -7006,7 +7006,7 @@ fn seed_32_is_a_half_past_the_bound_of_the_heal_and_live_and_seed_300_no_longer_
 /// and `check()` fails on it. The mechanism is built by hand too, in `sim/raft.rs`
 /// (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`).
 ///
-/// **The stall moved key with the placeholders** (PROPOSED D-109): as pinned it was range
+/// **The stall moved key with the placeholders** (D-109): as pinned it was range
 /// 4's, `k4`'s three writes pending from 1.359 s before the end; the placeholders moved
 /// this seed's schedule, and the same shape — every completion of the range before the
 /// pending writes' calls, none after in the 4 s more — was range 2's after them.
@@ -7018,7 +7018,7 @@ fn seed_32_is_a_half_past_the_bound_of_the_heal_and_live_and_seed_300_no_longer_
 /// calls, none answered in the 4 s more, which is what this asserts.
 // PROPOSED(D-127): re-pinned from seed 613, whose schedule D-127 moved.
 // PROPOSED(D-102): the exemption asks for the range shown live after the call.
-// PROPOSED(D-109): re-pinned on the key the stall moved to.
+// D-109: re-pinned on the key the stall moved to.
 #[test]
 fn seed_145_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse() {
     const SEED: u64 = 145;
@@ -7183,7 +7183,7 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
     // answered with store incarnation 0, since it has no store, and the replica its node
     // then made — at its apply of the split, or at its placeholder's install — answers
     // with the fresh incarnation its creation drew (Q26), a change the leader forgets the
-    // follower's progress at, as D-042 says it must (PROPOSED D-109). That change is one
+    // follower's progress at, as D-042 says it must (D-109). That change is one
     // per placeholder and per leader, so the placeholder explains **the first** reset of
     // the follower by each leader of the range after it, and nothing more: a second
     // reset by the same leader after the same placeholder is unexplained (#173's review,
@@ -7292,8 +7292,8 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
 /// and this test pins what the node *does* do, so that a seed where the incarnation
 /// half does something is seen: the equality below fails on it and says to pin it.
 ///
-/// **Since the placeholders the incarnation half has something else to ignore** (PROPOSED
-/// D-111, of D-109's placeholders): a placeholder answers with store incarnation 0, and
+/// **Since the placeholders the incarnation half has something else to ignore**
+/// (D-111, of D-109's placeholders): a placeholder answers with store incarnation 0, and
 /// the replica its node makes next answers with a fresh one, which the correct leader
 /// resets the follower's progress at and `IgnoreIncarnation` does not. The equality became
 /// two claims: the pair's run is the stream half's record for record up to the stream
@@ -7302,7 +7302,7 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
 /// alone is, is pinned: the stream half's own wedge on a schedule the skipped reset moved,
 /// not a wedge needing both bugs.
 // PROPOSED(D-086): the pair on the node is the stream half alone until Q15's re-seed.
-// PROPOSED(D-111): and wherever no placeholder's reset happens.
+// D-111: and wherever no placeholder's reset happens.
 // PROPOSED(D-086): on the merge with `main`, the re-seed is in the tree and rare here.
 // PROPOSED(D-091): a catch is attributed to the variant's own violation.
 #[derive(Debug)]
@@ -7326,10 +7326,10 @@ struct Outcome {
     load: usize,
     /// Resets under `SharedSnapshotDir` alone that a placeholder explains
     /// ([`resets_past_placeholders`]): what the incarnation half ignores on this node
-    /// where no store is refused (D-109; PROPOSED D-111).
+    /// where no store is refused (D-109; D-111).
     placeholder_resets: usize,
     /// Whether the pair's run is the stream half's record for record up to the stream
-    /// half's first reset, and wholly where it has none (PROPOSED D-111).
+    /// half's first reset, and wholly where it has none (D-111).
     same_up_to_the_reset: bool,
     /// Store refusals on the two compared runs, the pair's and the stream half's: where
     /// the incarnation half has a re-seed to ignore (#179's review, N2).
@@ -7344,7 +7344,7 @@ struct Outcome {
 /// first** reset of its follower by each leader of the range after it, and nothing more
 /// (#173's review, N1). The incarnation test and the pair's test read the one function,
 /// so the two bounds cannot drift apart (#179's review, N3).
-// PROPOSED(D-111)
+// D-111
 fn resets_past_placeholders(records: &[TraceRecord]) -> (usize, usize) {
     // (range, node) → how many placeholders the node has made of the range.
     let mut placeholders: BTreeMap<(u64, u64), usize> = BTreeMap::new();
@@ -7389,7 +7389,7 @@ fn first_reset(records: &[TraceRecord]) -> Option<usize> {
 }
 
 /// Whether the pair's run is the stream half's record for record up to the stream half's
-/// first `RaftProgressReset`, and the whole of it where there is none (PROPOSED D-111).
+/// first `RaftProgressReset`, and the whole of it where there is none (D-111).
 /// `IgnoreIncarnation` acts only where a follower's store incarnation changes, and the
 /// stream half's leader traces its reset exactly there; before that point the two runs
 /// draw the same schedule from the same seed.
@@ -7527,7 +7527,7 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_n
         refused.len(),
         past_a_placeholder.len()
     );
-    // What the incarnation half has to ignore on this node (PROPOSED D-111). Before the
+    // What the incarnation half has to ignore on this node (D-111). Before the
     // placeholders a store's incarnation changed only at a re-seed, so the pair was the
     // stream half seed for seed. A placeholder answers with store incarnation 0, and the
     // replica its node then makes answers with the fresh one its creation drew (Q26): a
@@ -7598,7 +7598,7 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_n
 }
 
 /// What the pre-vote check reads of a placeholder's install that straddles an
-/// isolation's start (PROPOSED D-112), asserted on `report`'s trace: the replica of
+/// isolation's start (D-112), asserted on `report`'s trace: the replica of
 /// `range` on `server` was created by an install traced before the isolation from `from`
 /// to `until` (with the install's own `RaftSnapshot`, the skip's event, before it too),
 /// its core first stated its term inside the window (`RaftRecovered`, then `RaftTerm`
@@ -7710,7 +7710,7 @@ fn assert_an_installs_restatement_straddles(
 }
 
 /// Every (server, range) whose install, created and traced before an isolation of `server`
-/// began, is first restated inside it: the straddle PROPOSED D-112 reads by the
+/// began, is first restated inside it: the straddle D-112 reads by the
 /// restatement's term, as (server, range, the stream's term, the snapshot's floor term).
 // PROPOSED(D-127): the straddle's absence on seeds 1817 and 248.
 fn installs_straddling_an_isolation(report: &raft::Report) -> Vec<(u64, u64, u64, u64)> {
@@ -7760,7 +7760,7 @@ fn installs_straddling_an_isolation(report: &raft::Report) -> Vec<(u64, u64, u64
 }
 
 /// **Seed 1817 of the correct node: a placeholder's install straddles an isolation's
-/// start, and pre-vote's property holds** (PROPOSED D-112). The nightly on 0e07274 (run
+/// start, and pre-vote's property holds** (D-112). The nightly on 0e07274 (run
 /// 40220930109) failed the correct node's sweep and `RefusedReadLeft`'s test on it with
 /// "pre-vote: server 3 raised its term from 0 to 2 while isolated from Instant(15.76s) to
 /// Instant(16.628s)". Range 2 splits into 70 while node 3 is down; node 3 restarts and
@@ -7772,7 +7772,7 @@ fn installs_straddling_an_isolation(report: &raft::Report) -> Vec<(u64, u64, u64
 /// window began with as 0: an install's creation was no term source and the
 /// restatement came after the window's start. It now reads the restatement's term,
 /// which is the term 2 of the stream the install completed.
-// PROPOSED(D-112)
+// D-112
 ///
 /// **PROPOSED D-127 moved the seed off the shape**, its answers to the chunks a node holds
 /// moving every node schedule: node 3 is created no replica of range 70 by an install now, and
@@ -7794,7 +7794,7 @@ fn seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term() 
 }
 
 /// **Seed 248 under `ApplyIgnoresSpan`: the same straddle, at a stream term above the
-/// snapshot's** (PROPOSED D-112). The nightly failed `ApplyIgnoresSpan`'s test on it with
+/// snapshot's** (D-112). The nightly failed `ApplyIgnoresSpan`'s test on it with
 /// "pre-vote: server 3 raised its term from 0 to 5 while isolated from Instant(15.674s)
 /// to Instant(16.602s)", counted as a catch by something other than check 9. Node 3's
 /// install of range 38 is created at 15.608 s and its `RaftSnapshot` traced at 15.652 s,
@@ -7802,7 +7802,7 @@ fn seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term() 
 /// the stream, where the snapshot's own last term, the creation's `floor_term`, is 2. So
 /// the creation's floor term cannot stand for the replica's term; the stream's does.
 /// The variant has nothing to do with it, and no check but check 9 may catch it here.
-// PROPOSED(D-112)
+// D-112
 ///
 /// **PROPOSED D-127 moved the seed off the shape**, its answers to the chunks a node holds
 /// moving every node schedule: under the variant no install's restatement at a stream term
@@ -7836,7 +7836,7 @@ fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
 }
 
 /// **Seed 57: the pair is the stream half's wedge, on a schedule its skipped reset moved**
-/// (PROPOSED D-111; #179's review, B1). Not D-045's wedge: the ignoring leader's stale
+/// (D-111; #179's review, B1). Not D-045's wedge: the ignoring leader's stale
 /// progress is not what stalls. Step by step, as asserted:
 ///
 /// 1. Range 5's split at index 37 makes right half 14 (`[k7, k8)`), led by node 3. Node 2
@@ -7876,7 +7876,7 @@ fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
 /// step and each fails a step, the stream half taking the right half again after its reset on
 /// most; the other four fail the pair on something else first. The day a seed's schedule
 /// reaches the shape again, this or the pair's sweep says so, and the pin is upgraded back.
-// PROPOSED(D-111): the pair on the node, past a placeholder's skipped reset.
+// D-111: the pair on the node, past a placeholder's skipped reset.
 // PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 #[test]
 fn seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved() {
@@ -8040,7 +8040,7 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
 /// of one range went past the timer bound without campaigning, while the node held
 /// its core for the **live** install of that range.
 ///
-/// **Since PROPOSED D-096 the situation is absent on both seeds, and that is what
+/// **Since D-096 the situation is absent on both seeds, and that is what
 /// this pins — asserted, with its reason, not a bare green** (CLAUDE.md). The
 /// bootstrap put two more replicas on every node — the root and the meta range, six
 /// Raft groups where there were four — and with them every node's schedule moved:
@@ -8098,11 +8098,11 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
 // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
 // PROPOSED(D-091): the node's live install holds one range, and the replay does not
 // measure a replica whose core is held.
-// PROPOSED(D-096): the bootstrap's two system ranges moved every node schedule; the
+// D-096: the bootstrap's two system ranges moved every node schedule; the
 // hold is absent on both seeds and on a thousand, and the pin asserts the absence.
-// PROPOSED(D-097): the generation on every client request moved every node schedule
+// D-097: the generation on every client request moved every node schedule
 // again (SHARD.md §12); the absence holds on both seeds, at 35 and 29 live installs.
-// PROPOSED(D-098): D-097's descriptor read-back had put an engine read between the
+// D-098: D-097's descriptor read-back had put an engine read between the
 // switch's two records, so `reads_back` matched no node install and the fourth arm
 // counted nothing — the absence D-097 read here was the arm's silence. With the arm
 // reading again the absence holds on both seeds, at 41 and 23 live installs, and the
@@ -8160,9 +8160,9 @@ fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_the
     }
 }
 
-/// **Seed 368 was the hold D-091's pin waited for**, found by PROPOSED D-098's premerge
+/// **Seed 368 was the hold D-091's pin waited for**, found by D-098's premerge
 /// on the correct node under the raft sweep's arms and pinned in the shape the pin
-/// above keeps; **PROPOSED D-099 moved every node schedule** — the run nonce drawn at
+/// above keeps; **D-099 moved every node schedule** — the run nonce drawn at
 /// every start and the refill sent from it (SHARD.md §5, §12) — and the schedule moved
 /// off the hold: no stretch on seed 368 is held past a bound any more. The pin asserts
 /// the absence with that reason, as seeds 272 and 516 do, and keeps the shape for the
@@ -8192,8 +8192,8 @@ fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_the
 /// second premerge. The read-back precedes the state now, and every live install on
 /// this seed's run is asserted to trace the two at one instant, so a read added to the
 /// switch again fails this pin rather than silencing an exemption over a thousand.
-// PROPOSED(D-098): the hold reached; the fourth arm's records at one instant.
-// PROPOSED(D-099): the nonce and the refill moved the schedule off the hold; the
+// D-098: the hold reached; the fourth arm's records at one instant.
+// D-099: the nonce and the refill moved the schedule off the hold; the
 // absence, with its reason, and the one-instant guard over every install.
 #[test]
 fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
@@ -8233,7 +8233,7 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
     );
 }
 
-/// The guard both absence pins keep (PROPOSED D-099, D-100): every live install on
+/// The guard both absence pins keep (D-099, D-100): every live install on
 /// the run traces the state read back, the snapshot and the restatement at one
 /// instant, which is what D-091's fourth arm reads a switch by; how many there were.
 fn live_installs_at_one_instant(seed: u64, report: &raft::Report) -> usize {
@@ -8293,7 +8293,7 @@ fn live_installs_at_one_instant(seed: u64, report: &raft::Report) -> usize {
 /// **Seed 493 was the hold D-091's pin waited for**, named by the correct node's sweep
 /// on D-099's premerge and pinned in the shape D-091's pin keeps: server 2's replica of
 /// range 5 held for a live install past its timer bound, the check with the fourth arm
-/// passing and the check without it flagging exactly that stretch. **PROPOSED D-100
+/// passing and the check without it flagging exactly that stretch. **D-100
 /// moved the schedule off it**: the split arm and the restarted proposer's second
 /// split are drawn among every node schedule's arms, so the seed's installs fall
 /// elsewhere. The pin is the absence with its reason now, as seeds 272, 516 and 368
@@ -8301,7 +8301,7 @@ fn live_installs_at_one_instant(seed: u64, report: &raft::Report) -> usize {
 /// the guard, every live install on the run traced at one instant. The correct node's
 /// sweep counts the holds the arm answers for on every seed and names the first
 /// (`live_install_holds_first`), where the pin moves.
-// PROPOSED(D-100): the schedule moved off D-099's hold; the absence, with its reason.
+// D-100: the schedule moved off D-099's hold; the absence, with its reason.
 #[test]
 fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
     let seed = 493u64;
@@ -8338,7 +8338,7 @@ fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
 }
 
 /// **Seed 633 was the hold D-091's pin waits on until PROPOSED D-127**: the split moved
-/// every node schedule (PROPOSED D-100) and off seed 493's hold, and the correct node's
+/// every node schedule (D-100) and off seed 493's hold, and the correct node's
 /// sweep at the thousand named 633. D-127's answers to the chunks a node holds moved every
 /// node schedule again and off 633's hold, so the pin is the absence with its reason now, as
 /// seeds 272, 516, 368 and 493 are: no stretch the arm answers for, nothing flagged without
@@ -8401,7 +8401,7 @@ fn seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
 /// streaming a follower it stopped appending to. The day the schedule moves off the
 /// hold, this pin becomes the absence with its reason, as seeds 272, 516, 368, 493 and 633
 /// are, and the sweep's counter names the next.
-// PROPOSED(D-100): the hold reached, on the seed the sweep's counter named.
+// D-100: the hold reached, on the seed the sweep's counter named.
 // PROPOSED(D-127): moved from seed 633, whose schedule D-127 moved off the hold.
 #[test]
 fn seed_89_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
@@ -8575,11 +8575,11 @@ struct NodeMembershipCoverage {
     partitions_made: usize,
     /// Snapshot actions traced, and the highest index any replica reached: the takes
     /// and installs that feed the joiners through their placeholders, and the
-    /// compaction this scenario's threshold keeps out (`Report::check`; PROPOSED D-109).
+    /// compaction this scenario's threshold keeps out (`Report::check`; D-109).
     snapshot_actions: usize,
     highest_index: u64,
     /// Seeds on which both joiners' replicas of every range were created by an install
-    /// into their placeholders (PROPOSED D-109).
+    /// into their placeholders (D-109).
     joiners_installed_on_every_range: u64,
     /// Ranges that elected a leader and ranges that applied something, over the tier.
     leaders: BTreeMap<u64, usize>,
@@ -8600,7 +8600,7 @@ struct NodeMembershipCoverage {
     /// the per-range liveness clause has no write to read there and asks only that the
     /// range answered something it was asked, so how often that is the case is printed
     /// at every tier rather than passed over.
-    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence.
+    // D-103: a range not asked for a write after the heal is no evidence.
     ranges_not_asked_after_heal: Vec<(u64, u64)>,
     /// The ranges the run's partitions aimed at, over the tier.
     aimed_ranges: BTreeSet<u64>,
@@ -8651,7 +8651,7 @@ impl NodeMembershipCoverage {
         self.partitions_made += made;
         self.snapshot_actions += report.snapshot_actions();
         self.highest_index = self.highest_index.max(report.highest_index());
-        // PROPOSED(D-109): the joiners fed through their placeholders.
+        // D-109: the joiners fed through their placeholders.
         self.joiners_installed_on_every_range += u64::from(
             (membership::INITIAL_VOTERS + 1..=membership::SERVERS).all(|joiner| {
                 report
@@ -8879,7 +8879,7 @@ impl NodeMembershipCoverage {
         // the tier as well as per seed (`membership::NODE_SNAPSHOT_THRESHOLD`; PROPOSED
         // D-086 says why it stays at `1 << 30` where the raft-arms sweep runs its node at
         // 12).
-        // PROPOSED(D-109)
+        // D-109
         let joiners = (membership::SERVERS - membership::INITIAL_VOTERS) as usize;
         let installs_a_seed = joiners * Cluster::Node.ranges().len();
         assert!(
@@ -9073,7 +9073,7 @@ impl NodeMembershipCoverage {
                 "the node's membership runs never saw elections while joint: {self:?}"
             );
         }
-        // The spread is the user ranges' (PROPOSED D-096): the two system ranges apply
+        // The spread is the user ranges' (D-096): the two system ranges apply
         // their terms' no-ops and nothing else, and are printed with the rest.
         let user_applies: Vec<usize> = self
             .applies
@@ -9100,7 +9100,7 @@ impl NodeMembershipCoverage {
 /// verdict: the trace records a run holds per range per virtual second against
 /// `TRACE_CAP`, the worst gap and first write after a heal any range showed against
 /// their bounds, the snapshot actions that feed the joiners through their placeholders,
-/// and the compaction this scenario's threshold keeps out (PROPOSED D-109).
+/// and the compaction this scenario's threshold keeps out (D-109).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[test]
 fn every_seed_passes_the_membership_scenario_on_the_correct_node() {

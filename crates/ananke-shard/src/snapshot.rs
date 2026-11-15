@@ -381,7 +381,7 @@ pub struct Install {
     /// and disjoint: its Raft state under tenant 0 and its user keys under tenant 2 (D-066,
     /// D-068). A copy, and the correct node's switch reads it nowhere: a replica the node
     /// holds a descriptor of replaces that descriptor's span as the host holds it at the
-    /// switch, and one with none the snapshot's (`install::switched_spans`, PROPOSED D-128,
+    /// switch, and one with none the snapshot's (`install::switched_spans`, D-128,
     /// D-132). `InstallReplacesHostedSpan` and `InstallReplacesCopiedSpan` read it.
     pub spans: Vec<KeyRange<Bytes>>,
     /// Whether the range's repair — term, vote, applied index, snapshot record, log
@@ -612,7 +612,7 @@ impl Snapshots {
 
     /// The spans the plan hosts `range` at, which an install of it copies at its stream's
     /// last chunk.
-    // PROPOSED(D-128): what a test of the install's re-host reads.
+    // D-128: what a test of the install's re-host reads.
     #[must_use]
     pub fn hosted_at(&self, range: RangeId) -> Option<&[KeyRange<Bytes>]> {
         self.hosted.get(&range).map(Vec::as_slice)

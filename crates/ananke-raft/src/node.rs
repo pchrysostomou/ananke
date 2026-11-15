@@ -2163,7 +2163,7 @@ async fn snapshot_task<E: Environment>(
                         // replicates. Unlike the node's sender it does not wait out a
                         // minimum election timeout first: a one-group server has no
                         // other replica a receiver's span could overlap.
-                        // PROPOSED(D-110): the overlap rule's refusal is not a restart.
+                        // D-110: the overlap rule's refusal is not a restart.
                         inbox.push(Event::StreamFailed {
                             to: from,
                             retake: false,

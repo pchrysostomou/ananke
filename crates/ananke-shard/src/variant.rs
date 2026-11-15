@@ -4,7 +4,7 @@
 //! [`ananke_raft::Variant`] is the Raft core's: a protocol bug beside the correct
 //! protocol, caught by the sweeps. [`RangeVariant`](crate::range_variant::RangeVariant)
 //! is the range layer's: SHARD.md §10's twenty-four as the stages build them, and the
-//! test instruments its checks need beside them (Q37, PROPOSED D-105). These are the
+//! test instruments its checks need beside them (Q37, D-105). These are the
 //! *node's* (SHARD.md §4): each is a plausible way to get Q41's round, the node's wire,
 //! its `snapshot` or `apply` task, Q15's whole-node refusal or the node's start wrong,
 //! built beside the correct node and caught by a check that asserts what the correct
@@ -31,7 +31,7 @@
 //! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
 //! seeds rather than on one, because what it breaks depends on which side of the
 //! task's race is polled first: the directed scenario is the set, not a seed.
-// PROPOSED(D-105): the node's set is §4's, and §10's variants are the range layer's.
+// D-105: the node's set is §4's, and §10's variants are the range layer's.
 // PROPOSED(D-108): the two range-layer instruments moved out of the node's set.
 
 use std::fmt;
@@ -178,7 +178,7 @@ pub enum NodeVariant {
     /// switch's wrong span beside the fix, and check 8's install clause what catches them.
     ///
     /// [`Snapshots::on_chunk`]: crate::snapshot::Snapshots::on_chunk
-    // PROPOSED(D-132): what it no longer reaches, corrected.
+    // D-132: what it no longer reaches, corrected.
     InstallWrongRangesSpans,
     /// A chunk naming a range the node does not host taken in and given an assembly,
     /// instead of refused on arrival. `range` is a peer's word: a leader that has not
@@ -207,14 +207,14 @@ pub enum NodeVariant {
     /// to any implementation: the refused directory's marker says lost, so nothing can
     /// open it at all. They are re-created in the *new* engine instead, and because
     /// nothing refused them they are created there as a first start would create them:
-    /// quarantine clear, incarnation 1, empty. Since the bootstrap (PROPOSED D-096) the
+    /// quarantine clear, incarnation 1, empty. Since the bootstrap (D-096) the
     /// store that opens first is range 0's, so the variant refuses the root alone and
     /// leaves every other replica the node hosts unrefused: on a bootstrap node of the
     /// sharded quorum scenario, five, the meta range's and the four user ranges'. That
     /// is the same harm one range along — those replicas voting again on state their
     /// node lost (D-035) and their ranges' leaders keeping a `matched` the rebuilt log
     /// cannot honour (D-042) — reached by the mistake a reader of §11 would actually
-    /// make (PROPOSED D-101; D-104).
+    /// make (D-101; D-104).
     RefuseOneRangeOnly,
     /// The re-seed built in the refused directory instead of a new one beside it,
     /// which opens fresh a directory that held a store (D-041).
@@ -238,7 +238,7 @@ pub enum NodeVariant {
     /// and both of its sweeps then run in a directory D-041 marks lost and never writes
     /// again, until the node's next start opens the new directory (D-066). The node as it
     /// stood before #176: every re-seed's streams stage, sync and are cleared there.
-    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    // D-117: the start's tasks run on the directory the re-seed built.
     TasksOnTheRefusedDir,
     /// A range whose live install is between its decision and its manifest switch is
     /// stepped anyway, rather than held. The replica being replaced is behind its
@@ -417,7 +417,7 @@ pub enum NodeVariant {
     /// measured apply lag asks for it, and never by waiting: this is the shape that
     /// measurement exists to rule out, and what `sim/folds.rs`'s apply-lag and
     /// cross-range hold folds trip on.
-    // PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
+    // D-095: the variant the apply-lag and cross-range hold folds trip on.
     ApplyWaitsForEveryRange,
     /// A stream refused under the overlap rule is never retaken: at every wait's end the
     /// leader streams the same checkpoint again, where SHARD.md §5 (Q27) streams "from a
@@ -426,8 +426,8 @@ pub enum NodeVariant {
     /// from before R's own split names `[k1, k2)`; once R's right half is installed on
     /// the refusing node it overlaps it there, and on an idle range, which takes nothing
     /// by its threshold, it is refused for ever. The resplit run (`sim/split.rs`) catches
-    /// it by its liveness: the node never makes R (PROPOSED D-110, #185's review, NB2).
-    // PROPOSED(D-110): the fresh take's variant.
+    /// it by its liveness: the node never makes R (D-110, #185's review, NB2).
+    // D-110: the fresh take's variant.
     RetakeNeverAfterOverlap,
     /// An install onto a replica with no descriptor replaces every span its plan hosts it
     /// at, configuration's, where SHARD.md §11 (storage 5) has an install remove "the
@@ -437,8 +437,8 @@ pub enum NodeVariant {
     /// Then the switch removes the keys of a right half the node got back through its
     /// placeholder first, and nothing traced says so, since every descriptor is right.
     /// Check 8's install clause sees the switch's spans, and `reseed::run_after_split`
-    /// the keys gone from the engine (PROPOSED D-128).
-    // PROPOSED(D-128)
+    /// the keys gone from the engine (D-128).
+    // D-128
     InstallReplacesHostedSpan,
     /// A split's apply on a quarantined replica of its parent makes the right half with
     /// no quarantine, the node as it stood before D-130. The node re-seeded from a
@@ -446,7 +446,7 @@ pub enum NodeVariant {
     /// right half again and votes in it, with the votes of the replica it lost gone
     /// with the engine that held them (D-035; #175). Seeds 3870 and 5303 of the sharded
     /// sweep lose committed entries that way.
-    // PROPOSED(D-130)
+    // D-130
     SplitLeavesQuarantineBehind,
     /// The tree before D-132: an install onto a replica the node holds a descriptor of
     /// replaces the plan's copy of its spans, taken at the stream's last chunk, and asks
@@ -454,7 +454,7 @@ pub enum NodeVariant {
     /// applied through the log after that chunk, or a second stream's copy of configuration's
     /// span stepped after the first's `Switched` (#215), then has it remove the keys of a
     /// right half the node holds, with every descriptor right. Check 8's install clause sees
-    /// the switch's spans (PROPOSED D-132). A replica with no descriptor is D-128's and
+    /// the switch's spans (D-132). A replica with no descriptor is D-128's and
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
     ///
     /// Its store can then stand at or past the snapshot when the switch is numbered, with
@@ -464,7 +464,7 @@ pub enum NodeVariant {
     /// variant it takes the store and the `apply` task back to the snapshot, as the tree
     /// before D-132 did, so those entries are handed out again rather than lost (PROPOSED
     /// D-126, #113's second review, N1).
-    // PROPOSED(D-132)
+    // D-132
     // PROPOSED(D-126)
     InstallReplacesCopiedSpan,
     /// The tree before D-133: an install's switch and a split's apply of the same range do
@@ -592,7 +592,7 @@ impl NodeVariant {
     /// directories, which needs a node that is re-seeded and runs on, streams arriving,
     /// with no start between.
     // PROPOSED(D-108): D-077's sixth moved to the range layer's set.
-    // PROPOSED(D-117): the start's tasks on the refused directory.
+    // D-117: the start's tasks on the refused directory.
     pub const RESEED: &'static [NodeVariant] = &[
         NodeVariant::RefuseOneRangeOnly,
         NodeVariant::ReseedIntoRefusedDir,
@@ -737,7 +737,7 @@ impl NodeVariant {
             NodeVariant::ServeBeforeRefusedMark => 1 << 24,
             // PROPOSED(D-108): bit 25 held D-077's sixth, `IncarnationPerRangeStream`,
             // until it moved to the range layer's set.
-            // PROPOSED(D-117): bit 25 is D-117's, the start's tasks on the refused
+            // D-117: bit 25 is D-117's, the start's tasks on the refused
             // directory.
             NodeVariant::TasksOnTheRefusedDir => 1 << 25,
             // Bits 20 to 25 were D-077's six, which `main` took while the snapshot
@@ -773,29 +773,29 @@ impl NodeVariant {
             // seed for every core. Seventeen bits are left.
             NodeVariant::RefusedReadLeft => 1 << 45,
             NodeVariant::OneSeedForEveryCore => 1 << 46,
-            // PROPOSED(D-095): the apply task that waits for every range. Sixteen bits are
+            // D-095: the apply task that waits for every range. Sixteen bits are
             // left.
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
-            // Bit 48 held PROPOSED D-096's `AnyFreshNodeBootstraps`, a fresh store taken
+            // Bit 48 held D-096's `AnyFreshNodeBootstraps`, a fresh store taken
             // for a bootstrap, until PROPOSED D-108 moved it to the range layer's set.
-            // PROPOSED(D-105): bits 49 to 53 held §10's five — D-097's three for
+            // D-105: bits 49 to 53 held §10's five — D-097's three for
             // routing, D-098's one for the meta range and D-099's one for the range-id
             // blocks — until D-105 moved them to the range layer's own set
             // (`crate::range_variant`).
             // PROPOSED(D-108): bits 25 and 48 to 53 are free, and seventeen bits are
             // left.
-            // PROPOSED(D-110): the overlap rule's fresh take never made. Bits 25 and 49
+            // D-110: the overlap rule's fresh take never made. Bits 25 and 49
             // to 53 are free, and sixteen bits are left.
-            // PROPOSED(D-117): bit 25 taken above; the free bits are named below.
+            // D-117: bit 25 taken above; the free bits are named below.
             NodeVariant::RetakeNeverAfterOverlap => 1 << 48,
-            // PROPOSED(D-128): a span-less replica's install replacing what it is hosted
+            // D-128: a span-less replica's install replacing what it is hosted
             // at. Bit 25 is D-117's, above; bits 50 to 53 are free, and fourteen bits are
             // left.
             NodeVariant::InstallReplacesHostedSpan => 1 << 49,
-            // PROPOSED(D-130): a right half made on a quarantined parent with no
+            // D-130: a right half made on a quarantined parent with no
             // quarantine. Bits 51 to 53 are free, and thirteen bits are left.
             NodeVariant::SplitLeavesQuarantineBehind => 1 << 50,
-            // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
+            // D-132: an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
             // PROPOSED(D-133): a split's apply landing inside its range's switch.
@@ -966,7 +966,7 @@ mod tests {
         // the snapshot wiring, D-081's three for the directed re-seed shape, D-090's two
         // for a stream's bounds, D-076's review's two and D-095's one for the `apply`
         // task that waits for every range. §10's five that D-097 to D-099 built here are
-        // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
+        // the range layer's since D-105 (`crate::range_variant`), and no
         // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
         // instruments outside §10's count, are the range layer's since PROPOSED D-108.
         // D-110's one is the overlap rule's fresh take never made, and D-128's one a
@@ -979,11 +979,11 @@ mod tests {
         // one is a replica with no descriptor refusing a split its log brings, and D-127's
         // one, the bounds' third, a receiver silent while it installs.
         // PROPOSED(D-108)
-        // PROPOSED(D-110)
-        // PROPOSED(D-117)
-        // PROPOSED(D-128)
-        // PROPOSED(D-130)
-        // PROPOSED(D-132)
+        // D-110
+        // D-117
+        // D-128
+        // D-130
+        // D-132
         // PROPOSED(D-133)
         // PROPOSED(D-126)
         // PROPOSED(D-138)

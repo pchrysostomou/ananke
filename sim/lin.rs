@@ -20,7 +20,7 @@
 //! independent registers and a key's register is one register whichever range
 //! served it, so a split, a merge or a move changes no partition (SHARD.md §9).
 //!
-//! Two more things the closure reads, since routing (SHARD.md §3, §9; PROPOSED
+//! Two more things the closure reads, since routing (SHARD.md §3, §9;
 //! D-097). An operation's proposals are gathered by `invoked`: a write refused with
 //! `RangeMismatch` is sent again under a fresh sequence number, each `ClientSend`
 //! names the `seq` of its operation's `ClientInvoke`, and a `RaftProposed` under a
@@ -114,11 +114,11 @@ impl History {
         let mut applied_at: BTreeMap<EntryId, Instant> = BTreeMap::new();
         // Each send's operation, by (client, seq): what a resend's proposals are
         // gathered under (SHARD.md §9).
-        // PROPOSED(D-097)
+        // D-097
         let mut invoked_by: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         // Entries that applied to an effect other than `applied`: a proposal that did
         // not take effect (SHARD.md §9).
-        // PROPOSED(D-097)
+        // D-097
         let mut applied_as_nothing: BTreeSet<EntryId> = BTreeSet::new();
         for record in records {
             match &record.event {

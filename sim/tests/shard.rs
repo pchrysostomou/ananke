@@ -9,7 +9,7 @@
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
 //! and per range the run ended with and the meta convergence bound — and, beside them, check
 //! 8's right half's clause under the owner's reading R of D-107 (PROPOSED D-141); that nodes 4
-//! and 5 hold nothing, that each of the workload's shapes reached its window (PROPOSED D-131),
+//! and 5 hold nothing, that each of the workload's shapes reached its window (D-131),
 //! and that `Fault::MetaReorder` fired and reordered meta's updates (PROPOSED D-135); over the
 //! thousand, that it reordered more than half the seeds meta applied its second split's update
 //! on. It prints the driver's work, the refusals by the loss that made them (#45), the empty
@@ -17,7 +17,7 @@
 //! reordered, the bounds' margins, how often an install lets a hold go with no replica restored
 //! (PROPOSED D-134) and the installed voters' waits against a candidate bound that is not
 //! asserted (PROPOSED D-141).
-// PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
+// D-113: `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -53,15 +53,18 @@ struct Seen {
     meta_lags: Vec<Option<Duration>>,
     /// The descriptors #220's exception excused from that bound, each with its seed.
     meta_excused: Vec<(u64, shard::MetaLag)>,
+    /// Those of them only D-142's reading excuses: a replica quarantined under D-130 counted as
+    /// a voter that cannot vote, by the owner's ruling of 2026-11-15.
+    meta_excused_by_the_quarantine: Vec<(u64, shard::MetaLag)>,
     /// Whether every key the fixed map would ask is asked by the write bound.
     keys_asked: Result<(), String>,
     slowest_write: Option<Duration>,
     recovery_from_heal: Option<Duration>,
     recovery_from_call: Option<Duration>,
     /// The whole keyspace's first completion from the heal, where it is asked: the reading
-    /// from the heal (PROPOSED D-113 §5).
+    /// from the heal (D-113 §5).
     keyspace_from_heal: Option<Duration>,
-    /// How long each asker D-092's assertion asks of took (PROPOSED D-113 §8).
+    /// How long each asker D-092's assertion asks of took (D-113 §8).
     retries_asked: Vec<Duration>,
     /// What each of those askers was answered: `done`, or the refusal it stopped on; whether its
     /// split had applied by then, and whether its key was outside its range by then
@@ -91,7 +94,7 @@ struct Seen {
     crashes: usize,
     lease_reads: usize,
     placeholders: usize,
-    /// What the workload's shapes reached on this seed (PROPOSED D-131).
+    /// What the workload's shapes reached on this seed (D-131).
     shapes: shard::Shapes,
     /// Which shapes this seed drew: a write burst, a read burst, the stale cache, the restart.
     drawn: [bool; 4],
@@ -183,7 +186,7 @@ fn print_released<'a>(name: &str, runs: impl Iterator<Item = &'a Released>) {
 /// after the heal has one too, so every key the old reading asks is still asked, under the same
 /// constant. It is about which keys are asked and not about when a reading's clock starts; the
 /// reading from the heal, kept beside the one from each range's first call, is what answers for
-/// that (PROPOSED D-113 §5).
+/// that (D-113 §5).
 fn every_key_still_asked(report: &shard::Report) -> Result<(), String> {
     let checked = &report.checked;
     let live = checked.ranges_with_a_majority_up();
@@ -293,6 +296,11 @@ fn seen_of(seed: u64) -> Seen {
             .into_iter()
             .map(|lag| (seed, lag))
             .collect(),
+        meta_excused_by_the_quarantine: report
+            .meta_lags_excused_by_the_quarantine()
+            .into_iter()
+            .map(|lag| (seed, lag))
+            .collect(),
         keys_asked: every_key_still_asked(&report),
         slowest_write,
         recovery_from_heal: from_heal,
@@ -378,7 +386,10 @@ fn seen_of(seed: u64) -> Seen {
 /// parent takes the quarantine (D-130), and are pinned below on that mechanism.
 /// Seeds 2272 and 7949, a right half with no possible majority, pass under the owner's ruling
 /// of 2026-11-09, which excuses exactly that shape from the meta convergence bound and from
-/// nothing else, and which this prints (#220; PROPOSED D-113 §6, §11).
+/// nothing else, and which this prints (#220; D-113 §6, §11). Seed 1137, that shape
+/// with a replica quarantined under D-130 in a placeholder's place, passes under the owner's
+/// ruling of 2026-11-15, which counts that replica as a voter that cannot vote in the exception
+/// alone, and this prints what that reading added (D-142).
 #[test]
 fn every_seed_passes_on_the_correct_sharded_sweep() {
     let seen = sweep(seeds(), seen_of);
@@ -485,6 +496,30 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
             .filter(|(_, lag)| lag.named.is_none())
             .count(),
         excused
+            .iter()
+            .map(|(seed, lag)| (*seed, lag.range, lag.generation))
+            .collect::<Vec<_>>(),
+    );
+    // D-142: what the owner's ruling of 2026-11-15 added to the exception.
+    let by_the_quarantine: Vec<&(u64, shard::MetaLag)> = seen
+        .iter()
+        .flat_map(|s| &s.meta_excused_by_the_quarantine)
+        .collect();
+    println!(
+        "shard: of those, {} descriptors on {} seeds excused only because a voter's replica \
+         quarantined under D-130 counts as one that cannot vote (D-142), {} of them never named; \
+         as (seed, range, generation): {:?}",
+        by_the_quarantine.len(),
+        by_the_quarantine
+            .iter()
+            .map(|(seed, _)| *seed)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        by_the_quarantine
+            .iter()
+            .filter(|(_, lag)| lag.named.is_none())
+            .count(),
+        by_the_quarantine
             .iter()
             .map(|(seed, lag)| (*seed, lag.range, lag.generation))
             .collect::<Vec<_>>(),
@@ -608,7 +643,7 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     // PROPOSED(D-134): how often an install lets a hold go with no replica restored.
     print_released("the correct node", seen.iter().map(|s| &s.released));
 
-    // PROPOSED(D-131): each shape, seeds that drew it and seeds that reached its window, each
+    // D-131: each shape, seeds that drew it and seeds that reached its window, each
     // reached well above D-061's 5 % over the seeds that draw it.
     let drawn = |i: usize| seen.iter().filter(|s| s.drawn[i]).count();
     let reached =
@@ -739,7 +774,7 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
              §8's reading give one verdict (PROPOSED D-141)"
         );
     }
-    // PROPOSED(D-131): the shapes, each asserted reached at every tier, each well above D-061's
+    // D-131: the shapes, each asserted reached at every tier, each well above D-061's
     // 5 % of the seeds that draw it.
     assert!(
         reached_writes > 0,
@@ -798,11 +833,11 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
 }
 
 // --- The pair rule on this sweep (CLAUDE.md; SHARD.md §10): the correct system above, and
-// below the variants the sweep's own faults, driver and workload shapes (PROPOSED D-131) reach,
+// below the variants the sweep's own faults, driver and workload shapes (D-131) reach,
 // each caught by the check that names it. `Fault::MetaReorder` is S12's (PROPOSED D-135).
 
 /// A variant's run of one seed: what the verdict said, and what each of the range layer's
-/// folds found on its own (PROPOSED D-106), since the verdict names only the first.
+/// folds found on its own (D-106), since the verdict names only the first.
 struct Under {
     why: Option<String>,
     tripped: BTreeSet<Fold>,
@@ -930,9 +965,9 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_sharded_sweep()
 /// through while its cache is stale. On 12 of 500 uniform seeds no write of any key completed
 /// after the heal, and on 6 more the first completion anywhere came later than the bound from
 /// the heal, which the arm from each range's first call passes and only the reading from the heal
-/// says (PROPOSED D-113 §5). Each is under D-061's 5 %, so each is asserted over the thousand and
+/// says (D-113 §5). Each is under D-061's 5 %, so each is asserted over the thousand and
 /// printed below it.
-// PROPOSED(D-113): §10's second catch, and the reading from the heal on a variant.
+// D-113: §10's second catch, and the reading from the heal on a variant.
 #[test]
 fn a_client_that_ignores_a_mismatch_trips_the_write_bound_on_the_sharded_sweep() {
     let run = if seeds() >= 1000 {
@@ -1008,11 +1043,11 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_s
 }
 
 /// §10's `ReadCheckAtReceiptOnly`, the pair's buggy half (the correct half is the sweep above,
-/// which reaches this window and refuses every such read at serving: PROPOSED D-131): 57 of 100
+/// which reaches this window and refuses every such read at serving: D-131): 57 of 100
 /// seeds and 13 of the gate's 20 by check 9, the variant's named catch, at a `RaftRead` served for a right-half key at
 /// or past the split it let in. Every failure is that catch, and none trips first on anything else,
 /// so the words are asserted of every one.
-// PROPOSED(D-131)
+// D-131
 #[test]
 fn a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep() {
     let found = range_variant(
@@ -1078,7 +1113,7 @@ fn a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep()
 /// replaced: 28 of 1 000 seeds, under D-061's 5 %, so asserted over the thousand and printed
 /// below it, on the sweep's own seeds taken to their ends as check 9 would otherwise stop them
 /// first (as the write bound's catch does for `ClientIgnoresMismatch`).
-// PROPOSED(D-131)
+// D-131
 #[test]
 fn a_server_that_trusts_a_stale_descriptor_serves_what_a_write_through_r_replaced() {
     let run = if seeds() >= 1000 {
@@ -1135,7 +1170,7 @@ fn a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep() 
 /// grants, each grant judged by check 20 on its own: the fold fed every record before it and
 /// none of the run's other grants, so a grant behind another's violation is still judged.
 /// A placeholder is folded from its node's `RangeReplicaCreated` of the range to the node's
-/// `RangeCreated` of it or the node's crash, which no placeholder survives (PROPOSED D-109).
+/// `RangeCreated` of it or the node's crash, which no placeholder survives (D-109).
 // PROPOSED(D-136): issue #221's plant, on the sharded sweep.
 #[derive(Debug, Default)]
 struct PlaceholderGrants {
@@ -1377,7 +1412,7 @@ fn a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_
 }
 
 /// §10's `IdBlockResumed`: 61 of 100 seeds and 8 of the gate's 20 by check 18, on the restart arm's shape
-/// (`Fault::SplitFromRestarted`, PROPOSED D-131), where it was 10 of 100 on the restarts the faults
+/// (`Fault::SplitFromRestarted`, D-131), where it was 10 of 100 on the restarts the faults
 /// drew and the splits that landed on them by chance before the arm. So the catch is asserted at
 /// every tier, in the words of §12's "wrong if": a tier that runs this and catches nothing says
 /// the sweep does not reach the variant. The shape the variant aims at is asserted too: a split that
@@ -1389,8 +1424,8 @@ fn a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_
 /// the variant only where an id was then taken twice, 42 of 100 and 4 of 20. Its split clause now
 /// names the run on 28 of 100 and 6 of the gate's 20, and an id taken twice on 33 and 2, the words of
 /// whichever split it met first; so the run's catch is asserted at every tier too.
-// PROPOSED(D-113): §10, the shape at every tier.
-// PROPOSED(D-131): §12's "wrong if", at every tier the arm reaches it.
+// D-113: §10, the shape at every tier.
+// D-131: §12's "wrong if", at every tier the arm reaches it.
 // PROPOSED(D-137): the run compared, at every tier.
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sharded_sweep() {
@@ -1446,7 +1481,7 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sh
 /// newer one (`shard::meta_resends_stored_of`), 993 of 1 000 seeds, the correct meta range storing
 /// none; the arm's reorder; and check 16 on every seed the arm reordered, since the first split's
 /// left half, applied over the second's records, lowers the generation meta names.
-// PROPOSED(D-113): §10, the shape at every tier.
+// D-113: §10, the shape at every tier.
 // PROPOSED(D-135): check 16 at every tier under `Fault::MetaReorder`.
 #[test]
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep() {
@@ -1590,8 +1625,8 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep() {
 /// 100 seeds, by this check and no other. Re-measured once the retry has to take effect (PROPOSED
 /// D-137): 32 of 100 and 8 of the gate's 20, every one with no answer and none by a retry answered
 /// with no effect, since this variant's askers are never answered at all.
-// PROPOSED(D-092): answer A; the asker retries.
-// PROPOSED(D-113): §8's pair for the check read from the heal.
+// D-092: answer A; the asker retries.
+// D-113: §8's pair for the check read from the heal.
 #[test]
 fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered() {
     let found = range_variant("RefillNotResent", share(), RangeVariant::RefillNotResent);
@@ -1704,13 +1739,13 @@ fn a_node_that_refuses_splits_once_its_refill_lands_leaves_the_retry_without_eff
 }
 
 /// The write bound read from the heal, D-076's "how long after the heal the range became writable
-/// at all", kept beside the arm read from each range's first call (PROPOSED D-113 §5). The clients
+/// at all", kept beside the arm read from each range's first call (D-113 §5). The clients
 /// are cut off from every node for the bound and 50 ms more of the 2.2 s window, the heal not moved:
 /// a cluster nothing can write to for longer than the bound after the heal. No range's first call
 /// in the history comes before the cut ends, so the arm from the first call is satisfied and this
 /// arm is what is left to say so; where the 150 ms left complete nothing, the clients-wrote-nothing
 /// arm speaks first. Above the 5 % of D-061 on every tier: 41 of 100 seeds, a uniform 41 of 50.
-// PROPOSED(D-113): §5's pair for the reading from the heal.
+// D-113: §5's pair for the reading from the heal.
 #[test]
 fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal() {
     let held = raft::election_max() * raft::LIVENESS_TIMEOUTS + Duration::from_millis(50);
@@ -2027,9 +2062,9 @@ fn pinned_to_the_end(
 
 /// Seed 286, no store refused, so D-128 and D-129 leave it where it is: node 1 restarts, leads
 /// a range the driver then asks it to split, and holds no id, since a new run holds none until
-/// its refill lands (SHARD.md §5's second rule). The split is refused `NoRangeId` (PROPOSED
-/// D-092's A); range 0 grants the block within a minimum election timeout; the asker's retry
-/// gets its answer. What the block's size cannot change (PROPOSED D-113 §8).
+/// its refill lands (SHARD.md §5's second rule). The split is refused `NoRangeId`
+/// (D-092's A); range 0 grants the block within a minimum election timeout; the asker's retry
+/// gets its answer. What the block's size cannot change (D-113 §8).
 #[test]
 fn seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands() {
     let report = pinned(286);
@@ -2057,7 +2092,7 @@ fn seed_286_a_new_runs_empty_block_refuses_a_split_until_its_refill_lands() {
 /// the other way a split finds an empty block. Range 0 has already granted node 2's block,
 /// traced before the refusal, and the answer has not reached the node, so the node still holds
 /// no id. Trace says a block was granted; the node says `NoRangeId`; neither is wrong
-/// (PROPOSED D-113 §8).
+/// (D-113 §8).
 ///
 /// **PROPOSED D-127 moved the seed off the shape**: with the node answering the chunks it holds,
 /// seed 368's run answers no split `NoRangeId` at all, and no plain schedule of the first ten
@@ -2083,7 +2118,7 @@ fn seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split() {
 /// configuration's `[k, l)` and took 19's keys with it, so node 2 later led 19's right half and
 /// answered `k15` with nothing. Since #200 the switch replaces the snapshot's span and the run
 /// is green; under `InstallReplacesHostedSpan` check 8's install clause names that switch
-/// (PROPOSED D-128). Since D-130 a right half made on a quarantined parent is quarantined, which
+/// (D-128). Since D-130 a right half made on a quarantined parent is quarantined, which
 /// moved this seed's schedule: a second store, node 1's, is refused after node 2's, and node 2's
 /// is the first and the one this pins.
 #[test]
@@ -2171,7 +2206,7 @@ fn seeds_128_643_and_986_no_longer_reach_a_leader_that_cannot_confirm_a_read() {
 
 /// Seed 1068, D-113's (b) where it stands since PROPOSED D-127 moved seed 463 off it, as D-130
 /// moved seed 986 and #200 seeds 128 and 643: two stores refused and a leader left unable to
-/// confirm a read, which it refuses at the step and drops (PROPOSED D-129). Under
+/// confirm a read, which it refuses at the step and drops (D-129). Under
 /// `UnconfirmableReadKept` nothing answers them, the clients' retries pile up and the node fails
 /// itself at `READS_OUTSTANDING`. Seed 1068 is the lowest of the plain schedules with two stores
 /// refused, a read refused and the variant caught there on D-127's tree.
@@ -2218,7 +2253,7 @@ fn node_of(record: &TraceRecord) -> Option<u64> {
 }
 
 /// The window seed 3291 showed, the sweep's first failure of check 20 on the correct system, at
-/// the nightly's ten thousand, and seed 88 the payload oracle (PROPOSED D-113 §5): a node commits
+/// the nightly's ten thousand, and seed 88 the payload oracle (D-113 §5): a node commits
 /// a split, crashes with the apply's batch durable and neither `RangeSplit` nor `RangeCreated`
 /// traced, and at its restart restates a replica of the right half before any node has traced
 /// that split. It then grants for it, from a core and not from a placeholder, and no node ever
@@ -2526,7 +2561,7 @@ fn seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_w
 /// 0 at the placeholder's answer, a reset back at the store's next and a first rise again. D-042
 /// names the 0 delayed past a store's first answer as a change that costs a round trip. The
 /// fold said a retired incarnation had come back; the fold never read a reset, so with the
-/// trace's `RaftProgressReset`s taken out it says so again (PROPOSED D-113 §5).
+/// trace's `RaftProgressReset`s taken out it says so again (D-113 §5).
 ///
 /// **PROPOSED D-127 moved the seed off the shape**: with the node answering the chunks it holds,
 /// seed 8934's leader traces no first rise that only a reset excuses, and the fold without the
@@ -2573,7 +2608,7 @@ fn seed_8934_a_placeholders_answer_overtaken_by_the_new_stores_begins_the_tracki
 /// in right half 19, committed it to 90, is refused, is re-seeded below the split at 70, replays the
 /// split and makes 19 a second time, stated quarantined. Under the variant it grants node 1 term 3
 /// without the 74 committed before its loss: leader completeness. The pair lives on this pin.
-// PROPOSED(D-130)
+// D-130
 // PROPOSED(D-127): re-pinned from seeds 3870 and 5303, whose schedules D-127 moved.
 #[test]
 fn seed_9535_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_entries() {
@@ -2826,14 +2861,14 @@ fn seed_9535_a_right_half_remade_on_a_quarantined_parent_keeps_its_committed_ent
 /// replica of it, and range 51 takes the quarantine in the split's batch and states it. Node 1
 /// then crashes and restarts on the same store, which says quarantined, and the restart says
 /// so. Under `SplitLeavesQuarantineBehind` the same restart states range 51 with no quarantine,
-/// and the replica has already voted (PROPOSED D-130).
+/// and the replica has already voted (D-130).
 ///
 /// **Pinned on seed 2097 until PROPOSED D-127**, where node 2's range 27 took the quarantine at
 /// range 2's split at 143: the node's answers to the chunks it holds moved that schedule off the
 /// shape, and seed 329 is the lowest of the plain schedules to carry it whole on this tree, the
 /// variant's half included (seed 40 carries the correct half, and under the variant its replica
 /// never votes).
-// PROPOSED(D-130)
+// D-130
 // PROPOSED(D-127): re-pinned from seed 2097, whose schedule D-127 moved.
 #[test]
 fn seed_329_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() {
@@ -2955,7 +2990,7 @@ fn seed_329_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() {
 /// stops passing the quarantine on: the store's test shows a right half reopens quarantined, the
 /// other pins that a quarantined parent passes it on, and the sweep's checks pass either way.
 /// Under `SplitLeavesQuarantineBehind` the first link's replica has no quarantine, and votes,
-/// and no right half the node makes by a split after its refusal is quarantined (PROPOSED D-130).
+/// and no right half the node makes by a split after its refusal is quarantined (D-130).
 ///
 /// **Pinned on seed 9 until PROPOSED D-127**, node 2's chain 2, 3, 4, 5 at 57, 76 and 90: the
 /// node's answers to the chunks it holds moved that schedule off the chain, and seed 68 is the
@@ -2963,7 +2998,7 @@ fn seed_329_a_restart_restates_the_quarantine_a_right_half_took_at_its_split() {
 /// link and none on the second. Under the variant seed 9 made the same three right halves; no
 /// seed of the plain schedules searched on D-127's tree does, since the first link's vote moves
 /// the variant's run, so the variant's half asserts the first link and every right half after.
-// PROPOSED(D-130)
+// D-130
 // PROPOSED(D-127): re-pinned from seed 9, whose schedule D-127 moved.
 #[test]
 fn seed_68_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_too() {
@@ -3133,7 +3168,7 @@ fn seed_68_a_right_half_made_on_a_quarantined_right_half_takes_the_quarantine_to
     }
 }
 
-// --- The owner's ruling of 2026-11-09 (#220; PROPOSED D-113 §6): a right half the correct system
+// --- The owner's ruling of 2026-11-09 (#220; D-113 §6): a right half the correct system
 // leaves wedged for good, excused from the meta convergence bound and from nothing else.
 
 /// Seeds 2272 and 7949, the two seeds of ten thousand on which the correct system fails the meta
@@ -3339,6 +3374,242 @@ fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
         "a placeholder an apply should have ended",
         records,
         &|half| half.others == BTreeSet::from([1]),
+    );
+}
+
+// --- The owner's ruling of 2026-11-15 (D-142): in #220's exception alone, and until #220 is fixed,
+// a replica quarantined under D-130 counts as a voter that cannot vote: one D-130's rule
+// quarantined, made by a split's apply on a quarantined replica of its parent.
+
+/// Seed 1137 on the sweep's own schedule (`Schedule::draw`, which draws `Fault::MetaReorder` on it),
+/// which the Stage C integration found failing the correct system on the meta convergence bound
+/// (PROPOSED D-135 §5): "meta does not name range 51 at generation 3 where the run stopped, owed
+/// since 8.157s". Range 51 is the right half of range 2's split at 215. Node 2 alone holds it able
+/// to vote, and pre-votes to the end. Node 1 holds a placeholder: its range 2 was installed past
+/// the split, at 216. Node 3 was refused at 1.357 s and re-seeded, its range 2 installed and
+/// stated quarantined, and its apply of the split made range 51 on that quarantined parent, which
+/// took the quarantine and is stated so (D-130); it grants no vote. #220's exception
+/// as the ruling of 2026-11-09 wrote it kept range 51 asked for node 3, a replica that holds the
+/// range, and meta never names it, since no leader is there to send the update.
+///
+/// Under D-142 the range is excused with able {2}, stuck {1} and quarantined {3}: node 3 is still
+/// in `others`, which every other reading sees as it did, and only the exception counts it as
+/// unable to vote, since D-130's rule quarantined it, and nodes 1 and 2 could elect were #220
+/// fixed. With the same replica made by an install instead, quarantined by another route, and with
+/// its quarantine ended, by a restatement saying the disk carries no mark, the bound trips on
+/// range 51 again.
+// D-142
+#[test]
+fn seed_1137_a_right_half_whose_third_voter_is_quarantined_is_excused_from_the_meta_bound() {
+    use shard::Stuck::ParentPastTheSplit as Past;
+    let (seed, range, parent, split) = (1137, 51, 2, 215);
+    let mut report = shard::run(seed);
+    assert!(
+        report
+            .schedule
+            .faults
+            .iter()
+            .any(|f| matches!(f, shard::Fault::MetaReorder { .. })),
+        "seed {seed}: the sweep's schedule draws `Fault::MetaReorder` on it"
+    );
+    report.check().unwrap();
+    report.meta_converges().unwrap();
+    let records = report.records().to_vec();
+    let at = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
+        records
+            .iter()
+            .position(want)
+            .unwrap_or_else(|| panic!("seed {seed} no longer reaches {what}: read its trace"))
+    };
+
+    // Node 3's quarantine, as D-130 has it: the refusal, range 2 re-seeded and stated quarantined,
+    // range 51 made on it by the split's apply, and range 51 stated quarantined.
+    let refused = at("node 3's refusal", &|r| {
+        matches!(r.event, TraceEvent::RaftRefused { server: 3, .. })
+    });
+    let parent_stated = at("node 3's range 2 stated quarantined", &|r| {
+        matches!(r.event, TraceEvent::RaftRecovered {
+            server: 3,
+            range: of,
+            state: RecoveredAs::Quarantined,
+            ..
+        } if of == parent)
+    });
+    let made = at("node 3's range 51 made by the split's apply", &|r| {
+        node_of(r) == Some(3)
+            && matches!(r.event, TraceEvent::RangeCreated {
+                range: of,
+                cause: RangeCause::Split,
+                parent: Some(from),
+                floor_index,
+                ..
+            } if of == range && from == parent && floor_index == split)
+    });
+    let stated = at("node 3's range 51 stated quarantined", &|r| {
+        matches!(r.event, TraceEvent::RaftRecovered {
+            server: 3,
+            range: of,
+            state: RecoveredAs::Quarantined,
+            ..
+        } if of == range)
+    });
+    assert!(
+        refused < parent_stated && parent_stated < made && made < stated,
+        "seed {seed}: the refusal, the parent's quarantine, the creation and its statement in order"
+    );
+    // Nothing ends it: no later refusal of node 3, and no restatement of its range 51 with no mark.
+    assert!(
+        !records[made..]
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::RaftRefused { server: 3, .. })),
+        "seed {seed}: node 3 refused again"
+    );
+    assert!(
+        !records[made..].iter().any(|r| matches!(r.event,
+            TraceEvent::RaftRecovered { server: 3, range: of, state: RecoveredAs::Neither, .. }
+                if of == range)),
+        "seed {seed}: node 3's range 51 restated with no mark"
+    );
+    assert!(
+        !records[made + 1..].iter().any(|r| node_of(r) == Some(3)
+            && matches!(r.event, TraceEvent::RangeCreated { range: of, .. } if of == range)),
+        "seed {seed}: node 3's range 51 made again"
+    );
+    // The wedge: range 51 never has a leader, node 3 grants no vote in it, and node 2 is a
+    // pre-candidate where the trace ends.
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::RaftLeader { range: of, .. } if of == range)),
+        "seed {seed}: range {range} had a leader"
+    );
+    assert!(
+        !records.iter().any(|r| matches!(r.event,
+            TraceEvent::RaftVote { server: 3, range: of, granted: true, .. } if of == range)),
+        "seed {seed}: node 3's quarantined replica granted a vote"
+    );
+    let last_role = records.iter().rev().find_map(|r| match r.event {
+        TraceEvent::RaftTerm {
+            server: 2,
+            range: of,
+            role,
+            ..
+        } if of == range => Some(role),
+        _ => None,
+    });
+    assert_eq!(
+        last_role,
+        Some("pre-candidate"),
+        "seed {seed}: node 2 at the end"
+    );
+
+    // The reading: excused under the extended exception, and by it alone.
+    assert!(
+        report.checked.ranges_with_a_majority_up().contains(&range),
+        "seed {seed}: range {range} is live by the majority rule, which D-142 leaves alone"
+    );
+    let halves = report.right_halves();
+    let half = &halves[&range];
+    assert_eq!((half.parent, half.split), (parent, split), "seed {seed}");
+    assert_eq!(half.able, BTreeSet::from([2]), "seed {seed}: condition one");
+    assert_eq!(
+        (half.led_since_heal, half.leader_at_end),
+        (0, None),
+        "seed {seed}: condition two"
+    );
+    assert_eq!(
+        half.stuck,
+        BTreeMap::from([(1, Past(216))]),
+        "seed {seed}: node 1's placeholder, its parent installed past the split"
+    );
+    assert_eq!(
+        half.quarantined,
+        BTreeSet::from([3]),
+        "seed {seed}: node 3's replica, quarantined under D-130"
+    );
+    assert_eq!(
+        half.others,
+        BTreeSet::from([3]),
+        "seed {seed}: `others` as every other reading of it sees it"
+    );
+    assert!(
+        half.a_majority_were_220_fixed(),
+        "seed {seed}: nodes 1 and 2 could elect were #220 fixed, so #220 is part of the wedge"
+    );
+    assert!(half.excused(), "seed {seed}: excused under D-142");
+    assert!(half.excused_by_the_quarantine(), "seed {seed}");
+    let mut before = half.clone();
+    before.quarantined.clear();
+    assert!(
+        !before.excused(),
+        "seed {seed}: the exception as it stood before the ruling asks of range {range}"
+    );
+    let has = |lags: Vec<shard::MetaLag>| lags.iter().any(|lag| lag.range == range);
+    assert!(
+        has(report.meta_lags_excused_by_the_quarantine()),
+        "seed {seed}"
+    );
+    assert!(has(report.meta_lags_excused()), "seed {seed}");
+    assert!(!has(report.meta_lags_asked()), "seed {seed}");
+    let without = report
+        .meta_converges_without_the_exception()
+        .expect_err("the bound fails this seed without the exception");
+    assert!(
+        without.contains(&format!(
+            "meta does not name range {range} at generation 3 where the run stopped"
+        )),
+        "seed {seed}: the failure the integration found: {without}"
+    );
+
+    // The same replica made by an install, as D-109 §2 makes one on a re-seeded node, and stated
+    // quarantined just the same: not D-130's rule, so the bound asks of the range. D-142 counts
+    // the rule's quarantine and no other.
+    let creation = report.checked.records[made].clone();
+    if let TraceEvent::RangeCreated { cause, parent, .. } = &mut report.checked.records[made].event
+    {
+        (*cause, *parent) = (RangeCause::Snapshot, None);
+    }
+    let halves = report.right_halves();
+    let half = &halves[&range];
+    assert_eq!(
+        (&half.others, &half.quarantined),
+        (&BTreeSet::from([3]), &BTreeSet::new()),
+        "seed {seed}: quarantined, and not under D-130"
+    );
+    assert!(!half.excused(), "seed {seed}");
+    let tripped = report
+        .meta_converges()
+        .expect_err("the bound asks of range 51 where its third voter is not D-130's");
+    assert!(
+        tripped.contains(&format!("meta does not name range {range} ")),
+        "seed {seed}: {tripped}"
+    );
+    report.checked.records[made] = creation;
+
+    // The quarantine ended where the trace ends, by a restatement of node 3's range 51 with no
+    // mark: node 3 can vote from there by the trace's account, so the bound asks of the range.
+    let mut ended = records[stated].clone();
+    if let TraceEvent::RaftRecovered { state, .. } = &mut ended.event {
+        *state = RecoveredAs::Neither;
+    }
+    let last = records.last().expect("a trace");
+    (ended.at, ended.decided) = (last.at, last.decided);
+    report.checked.records.push(ended);
+    let halves = report.right_halves();
+    let half = &halves[&range];
+    assert_eq!(
+        half.quarantined,
+        BTreeSet::new(),
+        "seed {seed}: its quarantine ended"
+    );
+    assert_eq!(half.others, BTreeSet::from([3]), "seed {seed}");
+    assert!(!half.excused(), "seed {seed}");
+    let tripped = report
+        .meta_converges()
+        .expect_err("the bound asks of range 51 once its third voter can vote");
+    assert!(
+        tripped.contains(&format!("meta does not name range {range} ")),
+        "seed {seed}: {tripped}"
     );
 }
 
@@ -3710,7 +3981,7 @@ fn seed_1248_a_retry_answered_done_is_read_on_the_askers_clock() {
 }
 
 /// Seed 5620, the third shape-drawn seed the correct system failed on, and this one a defect of the
-/// system: a data loss D-132 fixes (PROPOSED D-131, D-132). The restart arm leaves node 3 behind on
+/// system: a data loss D-132 fixes (D-131, D-132). The restart arm leaves node 3 behind on
 /// range 3, node 1 takes a snapshot at 113, the index of its split of range 3 at `k05`, and streams
 /// it to node 3; and node 3's apply of that split, which makes range 20, lands while the stream's
 /// switch is being prepared. The old switch replaced the copy of the span it took at the stream's
@@ -3739,8 +4010,8 @@ fn seed_1248_a_retry_answered_done_is_read_on_the_askers_clock() {
 /// (`InstallReplacesCopiedSpan`, D-132), which no schedule moves. At the Stage C integration
 /// (D-127 beside D-135) the absence is asserted on both schedules, the shaped one D-127 audited
 /// and the sweep's.
-// PROPOSED(D-131)
-// PROPOSED(D-132)
+// D-131
+// D-132
 // PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 // PROPOSED(D-135): on both schedules.
 #[test]
@@ -3825,8 +4096,8 @@ fn seed_13283_a_split_inside_an_install_waits_for_switched_and_nothing_is_applie
     }
 }
 
-/// The stale-cache shape's writer, found on seed 16725 past the nightly's range (PROPOSED
-/// D-131). There node 1 led range 14, proposed the writer's put at index 100, applied it, and
+/// The stale-cache shape's writer, found on seed 16725 past the nightly's range
+/// (D-131). There node 1 led range 14, proposed the writer's put at index 100, applied it, and
 /// crashed before it answered. The writer heard nothing, and asked the next node under the same (client, seq). A
 /// leader's record of an applied (client, seq) is that leader's, so node 3, leading next, proposed
 /// it at 103 and it applied a second time, over a write the history had between the two. The history
@@ -3854,7 +4125,7 @@ fn seed_13283_a_split_inside_an_install_waits_for_switched_and_nothing_is_applie
 /// the sweep's ([`absent_from_the_sweep`]): there node 2 proposes the write at index 113 and the
 /// writer is answered.
 // PROPOSED(D-127): re-pinned from seed 16725, whose schedule D-127 moved.
-// PROPOSED(D-131)
+// D-131
 // PROPOSED(D-135): on the shaped schedule it was found on; the situation absent from the sweep's.
 #[test]
 fn seed_73_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice() {
@@ -4024,8 +4295,8 @@ fn seed_16725_a_hold_let_go_with_no_switch_is_held_to_its_release_by_the_timer_c
     );
 }
 
-/// Seed 18925, D-092's check on an asker that had not asked, found past the nightly's range (PROPOSED
-/// D-131). Right after the restart arm's transfer the split's asker bounced between nodes on
+/// Seed 18925, D-092's check on an asker that had not asked, found past the nightly's range
+/// (D-131). Right after the restart arm's transfer the split's asker bounced between nodes on
 /// `NotLeader`; its twelve asks went on those bounces, and its first `NoRangeId` came on the last, so
 /// it made no retry and the check reported it as stopping with no answer: a report of the asker's
 /// count, not of the system. Its first `NoRangeId` now starts the count again, so a retry is made.
@@ -4045,7 +4316,7 @@ fn seed_16725_a_hold_let_go_with_no_switch_is_held_to_its_release_by_the_timer_c
 /// does again this says so; the asker's count starting again at its first `NoRangeId` is D-131's
 /// and no schedule moves it. At the Stage C integration (D-127 beside D-135) the absence is
 /// asserted on both schedules, the shaped one D-127 audited and the sweep's.
-// PROPOSED(D-131)
+// D-131
 // PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 // PROPOSED(D-135): on both schedules.
 #[test]

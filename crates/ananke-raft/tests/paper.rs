@@ -1663,7 +1663,7 @@ fn leadership_transfer_makes_the_target_leader_without_a_pre_vote() {
 
 /// A leader of three with its no-op and a write committed and applied, no message in
 /// flight and no lease: the guard trusts a follower only from its second window.
-// PROPOSED(D-129)
+// D-129
 fn reading_leader(variants: impl Into<Variants>) -> Cluster {
     let members = vec![s(1), s(2), s(3)];
     let mut cluster = Cluster::new(&members, &config(variants), &[]);
@@ -1678,7 +1678,7 @@ fn reading_leader(variants: impl Into<Variants>) -> Cluster {
 
 /// What a follower says of an AppendEntries that left it holding everything the
 /// leader has: a success from `incarnation`'s store with `echo`.
-// PROPOSED(D-129)
+// D-129
 fn answered(cluster: &mut Cluster, from: ServerId, echo: u64, incarnation: u64) -> Vec<Output> {
     let term = cluster.term(s(1));
     let now = cluster.local_clock(s(1));
@@ -1705,7 +1705,7 @@ fn answered(cluster: &mut Cluster, from: ServerId, echo: u64, incarnation: u64) 
 
 /// What a refused server or a placeholder says of every AppendEntries (RAFT.md §3): a
 /// rejection, an echo of 0, a hint of 1 and the mark.
-// PROPOSED(D-129)
+// D-129
 fn answered_refused(cluster: &mut Cluster, from: ServerId) -> Vec<Output> {
     let term = cluster.term(s(1));
     let now = cluster.local_clock(s(1));
@@ -1731,14 +1731,14 @@ fn answered_refused(cluster: &mut Cluster, from: ServerId) -> Vec<Output> {
 }
 
 /// A read at the harness's clock.
-// PROPOSED(D-129)
+// D-129
 fn read(cluster: &mut Cluster, id: u64) -> Vec<Output> {
     let now = cluster.local_clock(s(1));
     cluster.step(s(1), Input::Read { id, now })
 }
 
 /// Whether the step refused the read, naming nobody.
-// PROPOSED(D-129)
+// D-129
 fn refused(outputs: &[Output]) -> bool {
     outputs
         .iter()
@@ -1746,7 +1746,7 @@ fn refused(outputs: &[Output]) -> bool {
 }
 
 /// The leader's changes of side, as the trace says them: confirmable, follower, dropped.
-// PROPOSED(D-129)
+// D-129
 fn sides(cluster: &Cluster) -> Vec<(bool, u64, u64)> {
     cluster
         .events
@@ -1769,7 +1769,7 @@ fn sides(cluster: &Cluster) -> Vec<(bool, u64, u64)> {
 /// no registration, no round. Naming itself would send a hint-following client straight
 /// back with no sleep. Writes still commit and check quorum still holds, which is what
 /// D-035's asymmetry leaves standing, and that is the state nothing else ends.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_leader_refuses_a_read_it_can_never_confirm_and_names_nobody() {
     let mut cluster = reading_leader(Variant::Correct);
@@ -1837,7 +1837,7 @@ fn a_leader_refuses_a_read_it_can_never_confirm_and_names_nobody() {
 /// dropped, which is what stops the reads registered between the second follower's crash
 /// and its first answer after it from waiting for ever (three of them on `sim/shard.rs`'s
 /// seed 128).
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_silent_follower_counts_as_able_until_an_answer_says_otherwise() {
     let mut cluster = reading_leader(Variant::Correct);
@@ -1879,7 +1879,7 @@ fn a_silent_follower_counts_as_able_until_an_answer_says_otherwise() {
 
 /// The flag is about the latest answer. Any other echo clears it, whoever sends it and
 /// however it answered, and the leader confirms again by that follower's round.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn an_echo_that_is_not_zero_makes_a_follower_able_again() {
     let mut cluster = reading_leader(Variant::Correct);
@@ -1922,7 +1922,7 @@ fn an_echo_that_is_not_zero_makes_a_follower_able_again() {
 /// `confirmable == self.reads_confirmable` and return early too, so neither edge of the
 /// window is in the trace. The install drops nothing, which is the other half of the
 /// claim: it only ever clears `echoed_zero`, so the able set only widens.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_new_incarnation_forgets_what_the_old_store_said() {
     let mut cluster = reading_leader(Variant::Correct);
@@ -1980,12 +1980,12 @@ fn a_new_incarnation_forgets_what_the_old_store_said() {
 }
 
 /// A refused server's answer counts the same as a quarantined one's, which is the decision
-/// PROPOSED D-129 records: its store is on its way to the quarantine, which is for good, so
+/// D-129 records: its store is on its way to the quarantine, which is for good, so
 /// the read was never going to be confirmed through it; a stream to it can stall for as
 /// long as the leader's other follower keeps it in office; and a registration that waits
 /// out a re-seed is the leak over again. A placeholder answers the same bytes. It alone can
 /// later confirm, and an install's answer and its next echo say so when it does.
-// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
+// D-129: a refused follower's echo of 0 counts as a quarantined one's.
 #[test]
 fn a_refused_followers_echo_of_zero_counts_as_a_quarantined_ones() {
     let mut both = reading_leader(Variant::Correct);
@@ -2012,7 +2012,7 @@ fn a_refused_followers_echo_of_zero_counts_as_a_quarantined_ones() {
 /// What the drop leaves: a read the lease or a majority confirmed waits only for its
 /// state, and a read whose acknowledgements still make a majority was sent back while it
 /// was this leader's to confirm. Only a read no round can confirm goes.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn the_drop_takes_only_a_read_no_round_can_confirm() {
     // Unapplied, so a confirmed read has something to wait for.
@@ -2114,7 +2114,7 @@ fn the_drop_takes_only_a_read_no_round_can_confirm() {
 /// While a change is joint each voter set is counted, as for every other majority (thesis
 /// §4.3): one merged majority of the union would keep a read neither set can confirm.
 /// A leader outside `C_new` counts nothing for itself there.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn while_joint_each_voter_set_must_be_able_to_confirm() {
     let joint = |new: &[u64]| {
@@ -2168,7 +2168,7 @@ fn while_joint_each_voter_set_must_be_able_to_confirm() {
 /// A lease read is confirmed by promises already made, whatever a follower has said since:
 /// the rule refuses non-lease reads, and a read the lease covers is served. Once the lease
 /// has run out, it is refused like any other.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_lease_still_serves_until_it_runs_out() {
     let members = vec![s(1), s(2), s(3)];
@@ -2199,7 +2199,7 @@ fn a_lease_still_serves_until_it_runs_out() {
 
 /// A new term starts over: no follower has said anything to this leader yet, so all count
 /// as able until they answer it (RAFT.md §1), and its first answers settle it.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_new_leader_starts_with_every_follower_able() {
     // A leader nothing has answered: its AppendEntries go nowhere and its votes came in.
@@ -2250,7 +2250,7 @@ fn a_new_leader_starts_with_every_follower_able() {
 
 /// The variant is the leader as it was: the same state, traced, and the read kept. It is
 /// what the bound on the node has to catch (`sim/tests/reseed.rs`).
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn the_variant_keeps_the_read_it_can_never_confirm() {
     let mut cluster = reading_leader(Variant::UnconfirmableReadKept);

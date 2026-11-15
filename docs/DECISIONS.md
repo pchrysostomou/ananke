@@ -15310,7 +15310,7 @@ one-group binary green at the gate; seed 3164 green under both nodes. The readin
 D-076's review's and the change is its stated intent made true; the owner can overturn
 it on sight, and the nightly is re-dispatched on the fixed tip.
 
-**Superseded in part by PROPOSED D-102.** The run's end above — "the schedule's whole
+**Superseded in part by D-102.** The run's end above — "the schedule's whole
 duration, where the simulation stops" — is not where the simulation stops: the
 schedule's total counts every budgeted wait at its whole budget and lies past the end
 of every run of the correct node's sweep, by more than the bound on 4 008 of ten
@@ -17024,12 +17024,12 @@ own catch and report anything else as the node's own failure.
 
 ---
 
-## PROPOSED D-092 — A split on a node whose block of range ids has run out is refused at proposal, and a block at or below its threshold keeps a refill outstanding
+## D-092 — A split on a node whose block of range ids has run out is refused at proposal, and a block at or below its threshold keeps a refill outstanding
 
 **The number.** The footer reads D-092 and no open branch takes a number: PR #127 edits
 D-069's text and not the footer, and PR #128 moves D-040 and adds nothing. D-092 and
 D-093 are taken from the footer, which moves to D-094. No code site carries either yet;
-the Stage C slice that builds the lease marks its site `// PROPOSED(D-092)`.
+the Stage C slice that builds the lease marks its site `// D-092`.
 
 **Context.** Stage C's first question before code (SHARD.md:2427-2429). Q17 leases range
 ids to nodes in blocks: range 0 holds the counter and a lease record per node, a split
@@ -17067,7 +17067,7 @@ the leader of P does with a split when its node's block is empty and no grant ha
 - *D. A provisional id.* The split proposes with an id the node chooses, which range 0
   confirms later.
 
-**Proposed: A.**
+**Decided: A** — the owner's ruling of 2026-11-14, recorded in D-139.
 
 - It is the shape the split already has. §5's checks at proposal are "for liveness only"
   and every one of them refuses at proposal (SHARD.md:619-627); Q23's catching-up refusal
@@ -17134,7 +17134,7 @@ see one, that is one addition for both reasons and is proposed when it is needed
   that depends on it, as §12 asks (SHARD.md:2065-2068).
 
 **Where this stands, recorded by D-104.** No ruling on this question is recorded, in this
-file or on PR #129. PR #136 (PROPOSED D-100) built answer A as proposed before one: a
+file or on PR #129. PR #136 (D-100) built answer A as proposed before one: a
 split asked of a leader whose block holds no id is refused `NoRangeId` at proposal
 (crates/ananke-shard/src/server.rs:1255-1260,
 1302-1307), the reason is on the wire as
@@ -17149,7 +17149,7 @@ Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
-## PROPOSED D-093 — Check 19's tripping variant is a test instrument of the range layer's own, `SplitLeavesGap`, outside §10's count
+## D-093 — Check 19's tripping variant is a test instrument of the range layer's own, `SplitLeavesGap`, outside §10's count
 
 **Context.** Stage C's second question before code (SHARD.md:2430-2437). §11's raft item
 12 asks every new fold of §8 to run under the incremental checker's equivalence test with
@@ -17192,7 +17192,7 @@ happen to be.
 - *C. §11's raft item 12 amended for check 19.* Exempts one fold from the rule that exists
   because an incremental fold's bugs hide on traces with no violation (D-046).
 
-**Proposed: A**, with B kept as a measurement in Stage E and not as the assertion, and C
+**Decided: A** — the owner's ruling of 2026-11-14, recorded in D-139 — with B kept as a measurement in Stage E and not as the assertion, and C
 not taken.
 
 **The variant, `SplitLeavesGap`.** Every replica of P applies the split with the right
@@ -17253,7 +17253,7 @@ strengthening the measurement earns and not a condition this entry sets.
 - No schedule, no pinned hash, no code in this entry.
 
 **Where this stands, and one sentence corrected, by D-104.** No ruling on this question
-is recorded. The split's apply landed in PR #136 (PROPOSED D-100) without check 19 and
+is recorded. The split's apply landed in PR #136 (D-100) without check 19 and
 without `SplitLeavesGap`, where this entry's consequences have the two land in that
 slice: the range layer's `Checker` folds checks 7, 9, 10, 16, 17 and 18 and nothing of
 check 19 (crates/ananke-shard/src/invariants.rs), and no variant `SplitLeavesGap`
@@ -17274,14 +17274,14 @@ Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
-## PROPOSED D-094 — The released phases' sweeps run at CI's hundred under the premerge: `released_seeds()`, and the premerge's thousand is the current phase's
+## D-094 — The released phases' sweeps run at CI's hundred under the premerge: `released_seeds()`, and the premerge's thousand is the current phase's
 
 **The number.** The footer on `main` reads D-092, and PR #129 (`phase-3-stage-c-questions`)
 takes D-092 and D-093 for Stage C's two questions and moves it to D-094. This branch is
 off `main` and not stacked on #129, since the owner approved this change in advance and
 it may merge first; it takes **D-094**, past #129's two, and moves the footer to D-095.
 Whichever merges second resolves the footer as the union, as D-088 did. Every code site
-carries `// PROPOSED(D-094)`.
+carries `// D-094`.
 
 **Context.** D-040 set the premerge at a thousand seeds of every sweep, in release, on the
 machine in front of you, in about a quarter of an hour (DECISIONS.md:1735-1739), and §12
@@ -17418,18 +17418,18 @@ not carry these over.
 - Stage A's engine tests are the next 22.9 % and are not moved here: they sweep primitives
   Phase 3 built, the owner weighed their tiers on PR #70 (D-068) with the budget in view,
   and the ruling names Phase 1 and Phase 2. Whether Stage A's join them when Stage C's
-  scenarios land is the owner's, with the figure above beside the question.
+  scenarios land is the owner's, with the figure above beside the question. **Still PROPOSED** (D-139).
 - A later phase re-tiers Phase 3's sweeps the same way: `released_seeds()` is the switch,
   and a test moves by naming it.
 
 ---
 
-## PROPOSED D-095 — The node's apply-lag, cross-range hold and coverage folds run under the equivalence test, and the variant that trips the two with a verdict
+## D-095 — The node's apply-lag, cross-range hold and coverage folds run under the equivalence test, and the variant that trips the two with a verdict
 
 **The number.** Off `main` at 527adcd, whose footer reads D-092. PR #129 takes D-092 and
 D-093 and PR #130 takes D-094, each on its own branch; this one takes **D-095** past
 all three and moves the footer to D-096. Whichever merges later resolves the footer as
-the union, as D-088 did. Every code site carries `// PROPOSED(D-095)`.
+the union, as D-088 did. Every code site carries `// D-095`.
 
 **Context.** §12 asks that every new fold run under the incremental checker's
 equivalence test with a variant that trips it (SHARD.md:2051-2056; §11, raft 12,
@@ -17560,12 +17560,12 @@ measurement item 2 rests on.
 
 ---
 
-## PROPOSED D-096 — Bootstrap: the bootstrap nodes named in configuration write the initial state in one batch, host ranges 0 and 1, and every range starts with a descriptor of its own
+## D-096 — Bootstrap: the bootstrap nodes named in configuration write the initial state in one batch, host ranges 0 and 1, and every range starts with a descriptor of its own
 
 **The number.** Off `main` at 527adcd, whose footer reads D-092. Three branches take
 numbers ahead of this one: PR #129 D-092 and D-093, PR #130 D-094, PR #131 D-095. This
 takes **D-096** and moves the footer to D-097; whichever merges later resolves the
-footer as the union, as D-088 did. Every code site carries `// PROPOSED(D-096)`.
+footer as the union, as D-088 did. Every code site carries `// D-096`.
 
 **Context.** Stage C's first build (SHARD.md:2439-2470): "Bootstrap (§2; Q7, Q9, Q32):
 exactly three bootstrap nodes, each with a fresh store writing the same initial state
@@ -17825,11 +17825,11 @@ tests, which pin determinism and not a hash.
 
 ---
 
-## PROPOSED D-097 — Routing: a request carries its range and generation, a server checks the key against its own descriptor at receipt, at a read's serving and at apply, and a client merges what `RangeMismatch` tells it
+## D-097 — Routing: a request carries its range and generation, a server checks the key against its own descriptor at receipt, at a read's serving and at apply, and a client merges what `RangeMismatch` tells it
 
 **The number.** Off `main` at 527adcd, stacked on PR #132 (D-096), whose footer reads
 D-097. This takes **D-097** and moves the footer to D-098. Every code site carries
-`// PROPOSED(D-097)`.
+`// D-097`.
 
 **Context.** Stage C's second build (SHARD.md:2447-2456): "Routing (§3; §11, raft 4, 5,
 16): a request carries (range, generation) (Q10); the checks at receipt, at a read's
@@ -18177,10 +18177,10 @@ Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
-## PROPOSED D-098 — The root and the meta range: `MetaUpdate` applied as a maximum by generation, sent by each leader on taking office and resent until acknowledged, and lookups through ranges 0 and 1 by the bounded seek
+## D-098 — The root and the meta range: `MetaUpdate` applied as a maximum by generation, sent by each leader on taking office and resent until acknowledged, and lookups through ranges 0 and 1 by the bounded seek
 
 **The number.** Stacked on PR #133 (D-097), whose footer reads D-098. This takes
-**D-098** and moves the footer to D-099. Every code site carries `// PROPOSED(D-098)`.
+**D-098** and moves the footer to D-099. Every code site carries `// D-098`.
 
 **Context.** Stage C's fourth build (SHARD.md:2457-2461): "The root and the meta range
 (§1; Q3, Q4): `MetaUpdate` applied as a maximum by generation, records keyed by end key
@@ -18558,12 +18558,12 @@ Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
-## PROPOSED D-099 — Range ids leased in blocks: a refill to range 0 carrying the run's nonce, granted at the counter in one batch and traced, adopted only by the run that asked, and kept outstanding at or below the threshold
+## D-099 — Range ids leased in blocks: a refill to range 0 carrying the run's nonce, granted at the counter in one batch and traced, adopted only by the run that asked, and kept outstanding at or below the threshold
 
 **The number.** Stacked on PR #134 (D-098), whose footer reads D-099. This takes
-**D-099** and moves the footer to D-100. Every code site carries `// PROPOSED(D-099)`.
+**D-099** and moves the footer to D-100. Every code site carries `// D-099`.
 Stage C's first question, what a split does when its node's block has run out while
-range 0 cannot refill it, is PROPOSED D-092 on PR #129 and unanswered; this slice
+range 0 cannot refill it, is D-092 on PR #129 and unanswered; this slice
 builds nothing that depends on it — nothing on this tree takes an id — and the split
 slice takes the answer as the owner rules.
 
@@ -18613,7 +18613,7 @@ no block leased, and D-069 defined `RangeIdsLeased`.
    the node holds a replica of range 0, it reads its lease record back: a grant of this
    run already applied there is adopted and the refill is done, which is §5's second
    rule's other case and what keeps a lost answer from costing a block. A block at or
-   below its threshold thus keeps a refill outstanding at all times (PROPOSED D-092's
+   below its threshold thus keeps a refill outstanding at all times (D-092's
    restatement of §5, which this slice builds whichever answer question 1 takes). The
    block size and the threshold are `ServerConfig`'s, tunable (Q17): eight and two on
    every node scenario, a first pair; the sharded sweep's measurement, how often a
@@ -18797,7 +18797,7 @@ draws no nonce and sends no refill.
 
 - Range ids are leased and never taken on this tree: every node holds a block of eight
   from its start, and the split slice is the first to call `IdBlocks::take`. The
-  exhausted block's answer is the split slice's, as PROPOSED D-092 is ruled.
+  exhausted block's answer is the split slice's, as D-092 is ruled.
 - `Command` has one more variant the one-group server never receives; its studio view
   names it.
 - The `meta` task runs two errands — the meta range's updates and range 0's refills —
@@ -18806,11 +18806,11 @@ draws no nonce and sends no refill.
 
 ---
 
-## PROPOSED D-100 — The split: proposed by a range's leader with an id from its node's block, re-checked and applied by every replica in one batch that writes both halves' descriptors and the right half's Raft state, the right half's core started from its floor and hurried to its first election, and check 18's split clause
+## D-100 — The split: proposed by a range's leader with an id from its node's block, re-checked and applied by every replica in one batch that writes both halves' descriptors and the right half's Raft state, the right half's core started from its floor and hurried to its first election, and check 18's split clause
 
 **The number.** Stacked on PR #135 (D-099), whose footer reads D-100. This takes
-**D-100** and moves the footer to D-101. Every code site carries `// PROPOSED(D-100)`.
-The exhausted block's answer is Stage C's question 1, PROPOSED D-092 on PR #129 and
+**D-100** and moves the footer to D-101. Every code site carries `// D-100`.
+The exhausted block's answer is Stage C's question 1, D-092 on PR #129 and
 unanswered: this slice builds D-092's proposed A — a split asked while the node's block
 holds no id is refused `NoRangeId` at proposal and the asker retries — marked as
 proposed, and the owner's ruling replaces it in place.
@@ -18847,7 +18847,7 @@ have applied `s`.
    `ConfigurationChanging` (Q23); a descriptor not `Live` refuses `NotLive`, a key not
    strictly inside the span `KeyOutsideSpan`; then the right half's id is taken from the
    node's block (`IdBlocks::take`, D-099) and a block with none left refuses
-   `NoRangeId`, PROPOSED D-092's A, built as proposed and replaced in place by the
+   `NoRangeId`, D-092's A, built as proposed and replaced in place by the
    owner's ruling. A refusal is answered with no entry; otherwise the refill is asked
    for where the block has reached its threshold, and `Split { key, right }` is
    proposed under the asker's client id and sequence number.
@@ -19052,7 +19052,7 @@ each on every seed.
 **The split at a thousand, on the correct node**: the admins asked **1 941 splits and 1 540
 were done**, 25 refused `KeyOutsideSpan` (the second split aimed at a range already
 cut), 187 refused `NoRangeId` — the restarted proposer asked before its new run's
-block landed, PROPOSED D-092's shape, and the asker's retry after it is what the
+block landed, D-092's shape, and the asker's retry after it is what the
 `no-range-id` count counts — and 361 unanswered within the round; **1 630 splits took
 effect**, 4 874 right-half replicas created, 4 262 terms led by a right half, **101 072
 writes applied through a right half**, **3 906 right halves reopened by a restart**
@@ -19140,7 +19140,7 @@ window. Seed 42's one-group JSONL is #133's.
   task and the `snapshot` task share is behind a lock. The one-group server is
   untouched.
 - `IdBlocks::take` is called for the first time, and a block that has run out refuses
-  the split `NoRangeId` at proposal with the asker retrying — PROPOSED D-092's A, built
+  the split `NoRangeId` at proposal with the asker retrying — D-092's A, built
   as proposed; the owner's ruling on question 1 replaces it in place.
 - A right half elects among the replicas of P that have applied `s`; a replica that
   has not yet grants nothing and is streamed to once it has. The placeholders (Q22) and
@@ -19174,12 +19174,12 @@ Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
-## PROPOSED D-101 — `RefuseOneRangeOnly`'s third witness: leader completeness on any range but the root, because the verdict asks the invariants before the fan-out clause
+## D-101 — `RefuseOneRangeOnly`'s third witness: leader completeness on any range but the root, because the verdict asks the invariants before the fan-out clause
 
 **The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: this takes
 **D-101**, the two beside it take D-102 and D-103, and the footer here moves to D-102. At the
 merge the entries are a union in numerical order with one footer, highest + 1. Every code
-site carries `// PROPOSED(D-101)`.
+site carries `// D-101`.
 
 **Context.** The nightly on `main` at fdc5fc0 (run 38082122222) is red on one test alone:
 shard 3's `a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario`,
@@ -19194,10 +19194,10 @@ The attribution was too strict from the start. D-085 (17f042f, PR #104) asserted
 every catch was the fan-out clause's own words, measured at 1 000 of 1 000. Under
 `RefuseOneRangeOnly` the replicas the variant leaves unrefused have always come back empty
 and able to vote; what kept the assertion green was that no measured seed had reached a
-violation the verdict names first. PROPOSED D-096 (PR #132) made the store that opens
+violation the verdict names first. D-096 (PR #132) made the store that opens
 first range 0's, so the variant refuses the root alone and leaves every user range
 unrefused, and moved every schedule: the nightly on 6c54705 (run 37918619653) went red on
-seed 3352, leader completeness on group 3. PR #133 moved the schedules off it. PROPOSED
+seed 3352, leader completeness on group 3. PR #133 moved the schedules off it.
 D-098 (PR #134, e4a8063) then met the meta range's own witness — state machine safety on
 group 1, 664 of 1 000 — and widened the assertion to admit it, **and to admit that
 alone**. On fdc5fc0 seed 2994 reaches leader completeness again, on group 4. **D-098's
@@ -19333,7 +19333,7 @@ shard, shard 5 (1 623.8 → 1 623.9).
 
 ### Asks
 
-- **PROPOSED**: admit leader completeness alone, as measured, and fail on any other
+- **Approved (D-139)**: admit leader completeness alone, as measured, and fail on any other
   invariant until it is read — recommended. The alternative, every safety invariant from
   `invariants_of` off group 0, would admit witnesses no tree has shown.
 
@@ -19351,7 +19351,7 @@ seed is still caught, and #143 stands as filed.
 
 ---
 
-## PROPOSED D-102 — The run's end is where the simulation stopped, and a write pending there is evidence unless its client was still waiting or the range serving its key showed itself live after the write was called: D-086's end-of-run reading superseded
+## D-102 — The run's end is where the simulation stopped, and (PROPOSED) a write pending there is evidence unless its client was still waiting or the range serving its key showed itself live after the write was called: D-086's end-of-run reading superseded
 
 **The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: D-101 and
 D-103 beside it have merged (#144, #149), and this takes **D-102**, between them in
@@ -19360,7 +19360,7 @@ footer stayed D-104; merged with `main` at 8496ca3, which brought D-105 (#152), 
 are a union in numerical order and the footer is D-106. #154 merged at e782365; this entry
 was amended in place after #157's review. #157 itself merged at 681165a (bc102d6), so the
 amendment is #159, merged with `main` at 7564917 (#153, D-104), and the footer stays
-D-106. Every code site carries `// PROPOSED(D-102)`.
+D-106. Every code site carried `// PROPOSED(D-102)`. Since D-139 the sites of the run's end carry `// D-102`, and those of what excuses a write pending at the end, still the owner's, keep `// PROPOSED(D-102)`.
 
 **Context.** `main`'s nightly on 6c54705 (#132, run 37918619653) failed seed 8885 of the
 correct node's raft-arms sweep — *"liveness: no client write to k5 completed after the
@@ -19845,12 +19845,12 @@ was meant.
 
 ---
 
-## PROPOSED D-103 — The membership scenario's per-range liveness reads what the clients asked: a range asked for no write after the heal is no evidence, a range asked for anything and answering nothing still fails, and the range bound that cannot trip goes to the owner (amends D-084)
+## D-103 — The membership scenario's per-range liveness reads what the clients asked: a range asked for no write after the heal is no evidence, a range asked for anything and answering nothing still fails, and the range bound that cannot trip goes to the owner (amends D-084)
 
 **The number.** This branch is off `main` at fdc5fc0, whose footer reads D-101. Two fix
 branches open beside it take D-101 and D-102, and PR #137 restores D-092 to D-094; the
 brief that assigned this one gives it **D-103**, and the footer moves to D-104. Every code
-site carries `// PROPOSED(D-103)`. At the merge the entries are a union in numerical
+site carries `// D-103`, and the two at the bound that cannot trip `// PROPOSED(D-103)` (D-139). At the merge the entries are a union in numerical
 order with one footer: merged with `main` at 195f965, which brought D-101 (#144) and
 #137's D-092 to D-094, the footer stays D-104.
 
@@ -20057,19 +20057,19 @@ owner's ruling. Issue #145.
 
 ### What the PR asks
 
-- **PROPOSED, this entry's:** the not-asked arm and the strengthening, as built.
+- **Approved (D-139), this entry's:** the not-asked arm and the strengthening, as built.
 - **PROPOSED, for the owner:** the scenario change above (#145).
 
 ---
 
-## PROPOSED D-104 — Stage C's record: the node sweep's split arms in place of `sim/shard.rs`'s driver, D-092's answer shipped before its ruling and D-093's instrument not shipped, two bundled commits, and what D-093, D-097, D-098, D-100 and D-101 got wrong
+## D-104 — Stage C's record: the node sweep's split arms in place of `sim/shard.rs`'s driver, D-092's answer shipped before its ruling and D-093's instrument not shipped, two bundled commits, and what D-093, D-097, D-098, D-100 and D-101 got wrong
 
 **The number.** Off `main` at b01db39, whose footer reads D-104. Three slices run beside
 each other off that tip: fix A takes D-102, this takes **D-104**, and the range layer's
 variant set takes D-105. D-105 merged first (#152, 8496ca3); this branch merged that tip
 in with the entries as a union in numerical order, so the footer reads D-106. This entry
 changes documents and comments only — no code line, draw, trace event, bound, assertion
-or pinned hash. Its one PROPOSED point is marked `// PROPOSED(D-104)` at the split arms'
+or pinned hash. Its one PROPOSED point, approved by D-139, is marked `// D-104` at the split arms'
 draw (`Schedule::draw_on_the_node`, sim/raft.rs:1583-1584), a comment like the rest; the
 comments it corrects cite it as `D-104`.
 
@@ -20087,7 +20087,7 @@ DECISIONS.md they are the same tree's. Another entry's body is never rewritten h
 correction is a note appended at the end of the entry it corrects, and this entry says
 what each note says and why.
 
-### 1. PROPOSED: the node sweep's split arms stand in for `sim/shard.rs`'s driver, and stay when it lands
+### 1. Approved (D-139): the node sweep's split arms stand in for `sim/shard.rs`'s driver, and stay when it lands
 
 **What §12 says.** Stage C splits "by operator's `Command::Split` and by the driver
 (Q18)" (SHARD.md:2465). The driver is `sim/shard.rs`'s: five nodes, three of them
@@ -20142,9 +20142,9 @@ reach both variants.
 So `sim/shard.rs` is owed in full: Stage C's first exit line (SHARD.md:2504-2507), its
 stream, and `Fault::MetaReorder`, whose second split of a left half the arms never draw.
 
-**Proposed: keep the arms after `sim/shard.rs` lands, as interim coverage that departs
+**Approved (D-139): keep the arms after `sim/shard.rs` lands, as interim coverage that departs
 from §12's text and then stays as the node sweep's own.** The point is marked
-`// PROPOSED(D-104)` above the draw (sim/raft.rs:1583-1584).
+`// D-104` above the draw (sim/raft.rs:1583-1584).
 
 - Removing them moves every node-sweep schedule, and with them every pin re-audited on
   those schedules: seeds 272, 516, 368, 493 and 633.
@@ -20160,7 +20160,7 @@ Recommendation: keep.
 either is recorded, in DECISIONS.md or on #129. Stage C's entry criteria include
 "Questions 1 and 2 approved" (SHARD.md:2499-2500).
 
-**What #136 built (PROPOSED D-100, merged 2026-10-10 at fdc5fc0).** It built D-092's
+**What #136 built (D-100, merged 2026-10-10 at fdc5fc0).** It built D-092's
 answer A "as proposed, … the owner's ruling replaces it in place" (D-100's number
 paragraph):
 
@@ -20332,7 +20332,7 @@ Each is a comment or a document. None is a code line.
 
 ### Asks
 
-- **PROPOSED, this entry's:** keep the node sweep's split arms after `sim/shard.rs` lands,
+- **Approved (D-139), this entry's:** keep the node sweep's split arms after `sim/shard.rs` lands,
   as the node sweep's own. Recommended.
 - **For the owner, unchanged by this entry:**
   - Question 1 (D-092; A is built).
@@ -20340,12 +20340,12 @@ Each is a comment or a document. None is a code line.
 
 ---
 
-## PROPOSED D-105 — The range layer's own variant set: `RangeVariants`, a `u64` in `ananke-shard` beside the node's set and `ananke-raft`'s unchanged `Variants(u32)`, holding §10's five built so far; Q37 and Q38 as built
+## D-105 — The range layer's own variant set: `RangeVariants`, a `u64` in `ananke-shard` beside the node's set and `ananke-raft`'s unchanged `Variants(u32)`, holding §10's five built so far; Q37 and Q38 as built
 
 **The number.** This branch is off `main` at b01db39, whose footer reads D-104. Two
 branches open beside it take D-102 (a fix) and D-104 (Stage C's docs record); the brief
 that assigned this one gives it **D-105**, and the footer moves to D-106. Every code site
-carries `// PROPOSED(D-105)`. At the merge the entries are a union in numerical order with
+carries `// D-105`. At the merge the entries are a union in numerical order with
 one footer, the highest plus one.
 
 **Context.** Q37 answers where Phase 3's variants live: "a variant set of the range
@@ -20380,7 +20380,7 @@ reasons.
    every site reads one bit.
 2. **The five move there, unchanged in meaning, doc and marker.** Their arms leave
    `NodeVariant` (whose `BUGS` is forty-nine now, its test says so, and bits 49 to 53 are
-   recorded as freed); `RangeVariant` gives them bits 0 to 4. Each `// PROPOSED(D-097)`,
+   recorded as freed); `RangeVariant` gives them bits 0 to 4. Each `// D-097`,
    `(D-098)` and `(D-099)` stays on its arm.
 3. **Carried through the node's configuration beside the other two.**
    `ServerConfig::range_variants` beside `ServerConfig::node` and the cores'
@@ -20448,7 +20448,7 @@ shares a name with a node variant.
 - **§10's twenty-four**, five built: `TrustStaleDescriptor`, `ApplyIgnoresSpan`,
   `ClientIgnoresMismatch`, `MetaOverwritesByArrival`, `IdBlockResumed`. The other
   nineteen come with the stages that build their paths, into this set.
-- **Instruments outside the count**, none built: PROPOSED D-093's `SplitLeavesGap`, which
+- **Instruments outside the count**, none built: D-093's `SplitLeavesGap`, which
   D-093 already places "in `ananke-shard`'s range-layer variant set (Q37) … marked as a
   test instrument outside §10's count", and Stage D's re-add window variant. Both are
   range-layer instruments by what they break — a split's span, a replica's incarnation at
@@ -20561,7 +20561,7 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 
 ### What the PR asks
 
-- **PROPOSED, this entry's:** Q37's set as built, a `u64`, with §10's five in it and
+- **Approved (D-139), this entry's:** Q37's set as built, a `u64`, with §10's five in it and
   `in_section_10` classifying every member; Q38 recorded as built.
 - **PROPOSED, for the owner:** `AnyFreshNodeBootstraps`'s place (issue #151).
 - **For the owner, from #97:** seed 42's one-group trace pinned by its body hash, as
@@ -20606,13 +20606,13 @@ check 18 and 1 by check 16 among its `"something else": 500`. The totals agree.
 
 ---
 
-## PROPOSED D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
+## D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
 
 **The number.** Off `main` at 6633266, whose footer reads D-106, and merged with it at
 f627399 (#161) and again after #164 (6370823, D-108). Two slices ran beside this one, S6
 (D-107, #166, open) and H1 (D-108, #164, merged first); this takes **D-106**. The entries are
 a union in numerical order with one footer, the highest taken plus one, so the footer reads
-D-109 with D-107 reserved for #166. Every code site carries `// PROPOSED(D-106)`.
+D-109 with D-107 reserved for #166. Every code site carries `// D-106`.
 
 **Context.** Stage C's exit asks for "the equivalence test, each fold against the variant
 of this stage that trips it": checks 9 and 10 against `ApplyIgnoresSpan`, check 9 also
@@ -20700,7 +20700,7 @@ plain configuration in force at or below it (Q23)". Neither was reached — the 
 arms split each configured range once at a fixed key (D-104) — and both are reached the
 day `sim/shard.rs`'s driver splits from the current spans.
 
-Decided, marked `// PROPOSED(D-106)`:
+Decided, marked `// D-106`:
 
 - **A configuration counts at an index only when the range committed the entry that
   carried it.** The fold holds each `RaftConfig` with the entry its own server's
@@ -20887,9 +20887,9 @@ failing the day a schedule move takes it off that shape, so the pin is re-audite
 shape's absence with its reason. And the variant's own test reads the clause fold by fold
 and asserts it from the nightly's share (34 of 1 000).
 
-PROPOSED, recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted
+Approved (D-139), as recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted
 where the nightly's share supports it and compared on its pins at every tier. Both are built
-ahead of the owner's ruling — additive, and marked PROPOSED — and go if the owner picks an
+ahead of the owner's ruling — additive, and marked PROPOSED until D-139 — and go if the owner picks an
 alternative: a test instrument of the range layer that grants a block twice, outside §10's
 count as D-093 proposes for check 19, which would reach the disjointness branch; or §11's
 raft item 12 read with check 18 as one check, which `IdBlockResumed` trips.
@@ -21008,7 +21008,7 @@ the first measurement's.
 
 ### What the PR asks
 
-- **PROPOSED, this entry's**, each recommended as built: a verdict per fold with the
+- **Approved (D-139), this entry's**, each recommended as built: a verdict per fold with the
   checker's one verdict unchanged (item 1); check 18's configuration history keyed on the
   committed configuration, with a creation's at its floor (item 3); the equivalence test
   as one test per pair over `min(seeds, 100)` seeds, each pair asserted at the tier its
@@ -21027,14 +21027,14 @@ the first measurement's.
 
 ---
 
-## PROPOSED D-107 — A node restates every replica's descriptor at its start, an install traces the descriptor it puts in place, check 7 holds each statement to the map at its applied index, check 8's two Stage C clauses, and a split's non-voter removes the right span in the split's one switch
+## D-107 — A node restates every replica's descriptor at its start, an install traces the descriptor it puts in place, check 7 holds each statement to the map at its applied index, check 8's two Stage C clauses, and a split's non-voter removes the right span in the split's one switch
 
 **The number.** Off `main` at 6633266, whose footer reads D-106. Three slices ran beside
 each other off that tip, as tracking issue #162 assigns them: the per-fold equivalence
 took D-106 (#163) and the variant set's follow-ups D-108 (#164), both merged first, and
 this takes **D-107**. Merged with `main` at 5e3d575, the entries are a union in numerical
 order with one footer, the highest taken plus one: D-109 (section 8). Every code site
-carries `// PROPOSED(D-107)`. The entry is written step by step with the slice's
+carries `// D-107`. The entry is written step by step with the slice's
 commits, each section in the commit that builds what it describes (PR for #162's S6).
 
 **Context.** Stage C's folds (SHARD.md §12): "check 7; check 8's clause that no two of a
@@ -21167,7 +21167,7 @@ voter's path is the code it was, and the non-voter's is reached by no scenario.
    statement at `applied`. The studio cannot: an apply's change, a restatement and an
    install's change export as the same `ananke.range.descriptor` record, told apart only
    by the `RaftRecovered` before them (#166's review, N11; issue #171, a `cause` field,
-   the owner's call).
+   the owner's call; still PROPOSED, D-139).
 5. **No read, no draw, no await.** The start has already read every descriptor into the
    host's map and the switch has already read its own back, so each statement is a trace
    record and nothing the schedule can see.
@@ -21272,7 +21272,7 @@ argued and not exercised, until a scenario re-seeds a node after a split.
 **What the tree had.** The `snapshot` task's plan holds, per range, the spans an install
 of it replaces: hosted at the start from the descriptor the store holds, or at
 configuration's span for a replica without one, and moved by a split's apply on every
-replica that applies it (`SnapJob::Host`, PROPOSED D-100's fourth finding: with the span
+replica that applies it (`SnapJob::Host`, D-100's fourth finding: with the span
 configuration named, an install of P wrote over R's keys). A live install that put a
 descriptor of another span in place left the plan where it was: P's post-split snapshot
 onto a replica of P that lagged the split, and a re-seeded replica, hosted at
@@ -21416,7 +21416,7 @@ clause and not this one. §10 names Stage D's `SplitNotAtomicWithDescriptor` for
 (SHARD.md:1728), so the clause has no tripping variant in Stage C, and "a fold that no
 variant trips is a question to the owner" (SHARD.md:2051-2056): it is put here.
 
-**For the owner (PROPOSED), rewritten after the review.** The clause as §8 words it is
+**For the owner (decided: the reading recommended here, the owner's ruling of 2026-11-14 recorded in D-139), rewritten after the review.** The clause as §8 words it is
 right about every planted bug above and wrong about the voter installed past `s`, and it
 says nothing of that voter until it restarts. **Recommended**: owe R from an apply of `s` —
 `RangeSplit`, or the `RaftApply` of `s` — kept across restarts until R's `RangeRemoved` or
@@ -21605,7 +21605,7 @@ variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12).
 
 ### Asks
 
-- **PROPOSED, this entry's**: the non-voter's removal riding the install's switch rather
+- **Approved (D-139), this entry's**: the non-voter's removal riding the install's switch rather
   than a range delete in `WriteBatch` (section 1); a statement's `index` its applied index
   (section 2, item 4); the plan re-hosted at a switch that moves the span (section 4); the
   overlap clause last in the checker's order (section 5). Recommended as built.
@@ -21617,7 +21617,7 @@ variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12).
   since its last refusal; the installed voter held to R by a check of its own once the
   placeholders make R reachable for it (#170); both asserted from the placeholders' slice,
   and the clause against `SplitNotAtomicWithDescriptor` in Stage D.
-- **For the owner, from #166's review**: a `cause` on `RangeDescriptor` (#171).
+- **For the owner (still PROPOSED, D-139), from #166's review**: a `cause` on `RangeDescriptor` (#171).
 - **For the owner, #126**: the order #167 gives, the inbox's receipt stamp before the
   restatement's `taken`.
 
@@ -21645,8 +21645,8 @@ These are `spawn_server`, `spawn_node`, `spawn_node_of`, `server_config`,
 `server_config_of`'s signature, `run_on`, `run_on_with`, `alone_of`, `run_with_of` and
 `server::run`'s call of `reseed`.
 
-**Context.** PROPOSED D-105 moved §10's five built variants into the range layer's own
-set and left `NodeVariant::AnyFreshNodeBootstraps` (PROPOSED D-096) in the node's,
+**Context.** D-105 moved §10's five built variants into the range layer's own
+set and left `NodeVariant::AnyFreshNodeBootstraps` (D-096) in the node's,
 though it breaks §2's rule for which node writes the initial state and is check 7's
 instrument on the membership scenario. By D-093's reasoning (`SplitLeavesGap` is placed
 in the range layer's set as an instrument outside §10's count) that makes it a
@@ -22039,14 +22039,14 @@ never committed. Their rows are in PR #164.
 
 ---
 
-## PROPOSED D-109 — Placeholders: a node that holds no replica of a range keeps a placeholder for it, which grants nothing, answers as a refused server does and takes only a snapshot that overlaps no replica on the node; `UninitialisedReplicaVotes` and check 20
+## D-109 — Placeholders: a node that holds no replica of a range keeps a placeholder for it, which grants nothing, answers as a refused server does and takes only a snapshot that overlaps no replica on the node; `UninitialisedReplicaVotes` and check 20
 
 **The number.** Off `phase-3-stage-c-restatement-check8` at b21d76e (PR #166, D-107), whose
 footer reads D-108. Tracking issue #162 gives the per-fold equivalence D-106 (#163), the
 restatement and check 8 D-107 (#166) and the variant set's follow-ups D-108 (#164, merged),
 and the placeholders' slice, S8, **D-109**; the footer here moves to D-110, and at the merge
 the entries are a union in numerical order with one footer, the highest plus one. Every
-code site carries `// PROPOSED(D-109)`. The slice is three changes, each its own PR stacked
+code site carries `// D-109`. The slice is three changes, each its own PR stacked
 on the one before, each with its own gate, checklist and sections of this entry: (a) the
 placeholder, `UninitialisedReplicaVotes` and check 20 (this PR, sections 1 to 6); (b)
 `sim/split.rs` (ii), the joining nodes that hold nothing and exactly three bootstrap
@@ -22147,7 +22147,7 @@ waits for the crashed node instead.
    is finished in the task's plan and the failure is traced `RaftServerFailed`. A restart
    opens the replica from its keys. No test injects a failed open (#173's review, N5).
 
-**PROPOSED, settled here** (SHARD.md does not say): the placeholder lives in the host as a
+**Approved (D-139), settled here** (SHARD.md does not say): the placeholder lives in the host as a
 set, not as a core in a placeholder mode of `ananke-raft` (Q40: that crate names no range,
 and "no Raft state" is a core's whole content); it is made by any message of its range, not
 only a leader's, as §8's re-add window already reads it ("a placeholder of X is also made
@@ -22218,7 +22218,7 @@ The cost is that such a node also quarantines a range it never held: a right hal
 after its loss, or in Stage D one moved to it. That is the "replicas added later" cost §5
 gives per-node quarantine (SHARD.md:725-726), taken here only for what a placeholder's
 install creates. Stage D's rebalancer moves quarantined replicas off first (Q33).
-**PROPOSED.**
+**Approved (D-139).**
 
 **Tested** by `reseed::run_after_split`, a directed run on the re-seed shape's three servers
 (`a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined`):
@@ -22288,10 +22288,10 @@ a thousand see none about 5 times in 10^9. The tier it asserts at does not move.
 nightly's run is unchanged, since its share is already a thousand. The premerge runs 900
 more seeds of it. Below the premerge it runs the share and asserts the split's landing, as
 it did. The rates D-098 and D-108 record for this variant are the trace-order fold's.
-**PROPOSED**, for the owner: the variant is now a low-rate one, and the alternative is a
+**Approved (D-139)**, for the owner: the variant is now a low-rate one, and the alternative is a
 shape that aims a resend past the split, which no scenario has.
 
-**For the owner (PROPOSED, #175): a re-seeded node that replays a split.** The other way R
+**For the owner (#175, decided: the owner's ruling of 2026-11-09; relabelled by D-139): a re-seeded node that replays a split.** The other way R
 comes back to a re-seeded node is unsafe in the same way. Suppose P's re-seed is installed
 from a checkpoint below the split's index `s`. The node's P replays `s`, and its apply
 creates R again at term 1 with no vote and, by Q26's "a split does not copy P's quarantine
@@ -22330,7 +22330,7 @@ node's first thousand seeds, and on none of them a second owner. The rule's own 
 `Overlaps`, the leader's wait of a minimum election timeout before it streams again, the
 fresh take where its checkpoint predates the last split, the same rule for an install onto
 an initialised replica, and `SnapshotOverlapsReplica` are S9's (D-110), which replaces this
-start-over. **PROPOSED**: the receiver's half here, answered as a start-over.
+start-over. **Approved (D-139)**: the receiver's half here, answered as a start-over.
 
 **What the start-over costs until S9** (#173's review, N2; #177). The refusal is
 answered `SnapshotStatus::Restart`, the one status the wire has for "start over". The
@@ -22624,7 +22624,7 @@ twenty.
 
 **Measured.** With §2's quarantine forced off, 20 of 20 gate seeds fail, seed 0 on range 2
 not stated quarantined. With it on, 20 of 20 pass, and 1 000 of 1 000 at ANANKE_SEEDS=1000
-uncapped. Its tier is capped at 200 (**PROPOSED**, as D-081 caps the re-seed shape's): a
+uncapped. Its tier is capped at 200 (**approved, D-139**, as D-081 caps the re-seed shape's): a
 seed weighs about 0.26 cpu s in release.
 
 ### 8. `sim/split.rs` (ii), *vote*
@@ -22671,7 +22671,7 @@ node, as before. The variant's grants are 66, 316 and 3 036. Both sweeps are ass
 every tier. Their nightly rows are in shard 5 and 6, the directed bootstrap test's in shard
 4.
 
-**PROPOSED, settled here**: the anchor store; the bootstrap count enforced as a node
+**Approved (D-139), settled here**: the anchor store; the bootstrap count enforced as a node
 failure at the start; `sim/install.rs`'s late nodes added by an operator's change rather
 than bootstrapped; and `sim/split.rs` (ii) without linearizability, which needs a client
 history this shape's writer does not keep and which SPEC §4's exit asks of `sim/split.rs`
@@ -22679,14 +22679,14 @@ in Stage E (SHARD.md §12).
 
 ---
 
-## PROPOSED D-110 — The overlap rule: a refusal answered `Overlaps`, which ends the stream and counts against no bound, the leader's wait of a minimum election timeout and its fresh take where the checkpoint's generation is not the range's, the same rule on an install onto an initialised replica, `SnapshotOverlapsReplica`, check 8 against it and `sim/split.rs` (i)
+## D-110 — The overlap rule: a refusal answered `Overlaps`, which ends the stream and counts against no bound, the leader's wait of a minimum election timeout and its fresh take where the checkpoint's generation is not the range's, the same rule on an install onto an initialised replica, `SnapshotOverlapsReplica`, check 8 against it and `sim/split.rs` (i)
 
 **The number.** Off `main` at 2d59c96 (#173 and #174 merged, D-109), whose footer reads
 D-110. Tracking issue #162 reserves **D-110** for S9, the overlap rule, and another slice
 may take D-111; the footer here moves to D-111, and at the merge the entries are a union in
 numerical order with one footer, the highest plus one. #179 took D-111 and merged first,
 so at the merge of `main` at 292cafc the footer is D-112. Every code site carries
-`// PROPOSED(D-110)`. Closes #177.
+`// D-110`. Closes #177.
 
 **Context.** SHARD.md §5 (SHARD.md:789-810), Q27: "A snapshot is installed on a node only
 if its span overlaps no other initialised replica there; otherwise it is refused and asked
@@ -22711,7 +22711,7 @@ existing answers that end or restart a stream say the checkpoint or the ground c
 bad, and this one says neither. **`ananke-raft` gains a status its own receiver never
 sends** (it holds one group); its sender, heard one, ends the stream with no retake and
 counts nothing, and the sim's re-seed progress model (`sim/raft.rs`) ends the stream there.
-A released phase's crate carries a wire addition, as D-090 made one. **PROPOSED.**
+A released phase's crate carries a wire addition, as D-090 made one. **Approved (D-139).**
 
 ### 2. The receiver: one rule, two install paths
 
@@ -22756,7 +22756,7 @@ A released phase's crate carries a wire addition, as D-090 made one. **PROPOSED.
   refuses. Merges (Stage D) and re-adds make it reachable. **The check itself runs on
   every live install** (*corrected after #180 merged*, #185's review, NB5): the decision
   is asked of each, and a walk that missed the descriptor would refuse each, so `x`'s P
-  is never installed past its split in (i) and in (ii) under that plant. **PROPOSED.**
+  is never installed past its split in (i) and in (ii) under that plant. **Approved (D-139).**
 
 ### 3. The leader: the stream ends, a wait, and the fresh take
 
@@ -22781,7 +22781,7 @@ merge, which is Q27's words read exactly. Every doubt is a retake: a version tha
 be read, a range holding no descriptor, a generation above the range's own. A wrong "no"
 streams the same refused checkpoint after every wait for as long as nothing else moves
 the range's record on, which on an idle range is for ever; a wrong "yes" costs one take.
-**PROPOSED, recommended**: by generation.
+**Approved (D-139), as recommended**: by generation.
 
 *Corrected after #180 merged* (#180's review, B1 and N2). As first built the test was by
 span: `retake` when the checkpoint's span was not the range's. It is the same answer for
@@ -22931,7 +22931,7 @@ D-061: twenty seeds at 60 % all miss about once in 10^8). The correct system's r
 it makes R on every seed. As first written this section built no variant, on the reading
 that whether `x` makes R depends on order and so the run could catch the variant only by
 reading the decision; measured, the order decides only whether `x` is left without R, and
-on most seeds it is, which is B1's harm itself. **PROPOSED.**
+on most seeds it is, which is B1's harm itself. **Approved (D-139).**
 
 ### 6. Check 8 under the equivalence test against its variant
 
@@ -22950,7 +22950,7 @@ the shape on under one seed in a hundred. This closes the deferral D-107 made fr
   above shows it is the variant's harm on the node sweep too. Keyed on an install — the
   failure only where R's store was made by a snapshot — would need the node to know, across
   a restart, which replicas an install made, which nothing durable records. **Not built;
-  PROPOSED**, with #181: recommended, a fold rather than a node failure — a `RangeCreated
+  approved (D-139)**, with #181: recommended, a fold rather than a node failure — a `RangeCreated
   { cause: split }` of R on a node that already holds R initialised is a violation of check
   8 — which needs no node state and does not stop the node before check 18 sees a reused id.
 - **Stage D's halves of Q27**: collection, and an install of a merged L's snapshot at or
@@ -22976,7 +22976,7 @@ run (NB2), *after #180 merged*: the resplit run re-weighed in place at 335.8 cpu
 7.24, load 10 to 17; the review measured 328.2), the variant's at 318.8 (311.80 + 6.98) into
 shard 3, the lightest.
 
-### 10. What is PROPOSED here, for the owner
+### 10. What was PROPOSED here, for the owner, approved by D-139
 
 1. `Overlaps` as a wire status of `ananke-raft`'s, tag 4 (§1).
 2. The leader's wait in the node's `snapshot` task, the core's ask held through it, and a
@@ -23095,13 +23095,13 @@ Unplanted, all are green: the shard's 14, the raft's 2, the split sweeps' 4.
 
 ---
 
-## PROPOSED D-111 — D-045's pair on the node is the stream half's record for record up to the stream half's first progress reset, and is caught differently only past a refused store or a placeholder's reset; seed 57 pinned as the stream half's wedge on a schedule the skipped reset moved
+## D-111 — D-045's pair on the node is the stream half's record for record up to the stream half's first progress reset, and is caught differently only past a refused store or a placeholder's reset; seed 57 pinned as the stream half's wedge on a schedule the skipped reset moved
 
 **The number.** Off `main` at 2d59c96 (#173 and #174 merged, D-109), whose footer reads
 D-110. D-110 is reserved for S9, the overlap rule, which D-109 §2 names and another slice is
 building. This entry takes D-111, and the footer moves to D-112. At S9's merge the entries
 are a union in numerical order with one footer, the highest plus one. Every code site
-carries `// PROPOSED(D-111)`.
+carries `// D-111`.
 
 **Context.** #174's premerge at 0e07274 failed
 `the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused` on seed 57 of its
@@ -23195,13 +23195,13 @@ caught on no seed (0 of 1 000).
 **Corrects** D-086's "the pair on the node is the stream half alone until Q15's re-seed",
 which D-109's placeholders made false. SHARD.md's Stage B search for a seed where the pair
 wedges and neither half does still has no answer on the node: seed 57 is not one. D-109 is
-unchanged; this entry records its placeholders' effect on the pair. **PROPOSED.**
-## PROPOSED D-112 — The pre-vote fold reads an install's creation as a term source: a replica an install created before an isolation, whose core first states its term inside it, takes that restatement's term, where it equals the term of the stream the install completed
+unchanged; this entry records its placeholders' effect on the pair. **Approved (D-139).**
+## D-112 — The pre-vote fold reads an install's creation as a term source: a replica an install created before an isolation, whose core first states its term inside it, takes that restatement's term, where it equals the term of the stream the install completed
 
 **The number.** Off `main` at 2aab845, whose footer reads D-112. D-110 is S9's, in #180, not
 yet merged; D-111 is on `main`. This entry takes D-112 and the footer moves to D-113; at
 S9's merge the entries are a union in numerical order with one footer, the highest plus
-one. Every code site carries `// PROPOSED(D-112)`.
+one. Every code site carries `// D-112`.
 
 **Context: a correct-server failure, and a check defect.** The 10 000-seed nightly on
 0e07274 (run 40220930109, on what is now `main`) failed three tests on one mechanism:
@@ -23340,15 +23340,15 @@ creation's own. The trace format is not changed for this.
 - **Before the fix**, with the new source switched off, both pins fail in the nightly's
   exact words, and so does the unit test's first case.
 - **The tiers.** The correct node's sweep passes at a thousand in release, and the three
-  tests the nightly failed pass at ANANKE_SEEDS=10000 in release on this tree. **PROPOSED.**
+  tests the nightly failed pass at ANANKE_SEEDS=10000 in release on this tree. **Approved (D-139).**
 
 ---
 
-## PROPOSED D-113 — `sim/shard.rs`, Stage C's sharded sweep (S10): five nodes, a driver on stream `shard`, four clients over sixteen keys and Phase 2's faults; stopped at its first measurement on a correct-server failure, an install onto a re-seeded replica that deletes the right halves beside it
+## D-113 — `sim/shard.rs`, Stage C's sharded sweep (S10): five nodes, a driver on stream `shard`, four clients over sixteen keys and Phase 2's faults; stopped at its first measurement on a correct-server failure, an install onto a re-seeded replica that deletes the right halves beside it
 
 **The number.** Off `main` at b1da6ec, whose footer reads D-113. D-113 is reserved for this
 slice (#162's S10); the footer moves past it, and the slices beside it (#185, S8 (c), #181)
-take D-114 and up. Every code site carries `// PROPOSED(D-113)`. **This entry is in
+take D-114 and up. Every code site carries `// D-113`. **This entry is in
 progress**: it records what is built and why the slice stopped, and it grows as the slice
 resumes.
 
@@ -23483,7 +23483,7 @@ ones #200's premerge named (217, 253, 281, 309, 329, 361, 376, 465, 657, 769), a
 
 **Corrected after #188 merged:** every item is done, in §5 to §11. Nothing was moved out.
 
-### 4. PROPOSED, for the owner
+### 4. Approved (D-139), for the owner
 
 - **(a)'s fix**, S8 (c)'s: the install's switch replaces the snapshot descriptor's span
   for a replica that holds none — a re-seeded one, as a placeholder's install already
@@ -23826,7 +23826,7 @@ then taken twice, and `IdBlockResumed`'s catch is that double use and not the re
 folds the run. Over the thousand seeds the correct system takes such an id on none: the 2 seeds the
 reading of §10 names are splits proposed before their holder's restart and first applied after it.
 
-**PROPOSED: the tier of the coverage.** D-092 asks the count asserted non-zero from CI's hundred and
+**Approved (D-139): the tier of the coverage.** D-092 asks the count asserted non-zero from CI's hundred and
 calls a hundred seeds' zero a hole in the driver's draw. At 6 of 1 000 a hundred seeds see none about
 half the time, and D-061, the owner's rule, puts a counter under 5 % at the thousand. It is asserted
 at the thousand and printed below it; S11's restart-then-split shape should raise the rate. D-092
@@ -23877,7 +23877,7 @@ the sweep reaches without them. **Not on this sweep:** `LeaseTrustsTheClock`, ca
 drift-exceeded seeds (the clocks are there, and 79 023 lease reads are served over the thousand, 1 973 of
 them past the drift bound, but the catch takes the raft sweep's lease trials, which the node sweep keeps),
 and `CountOlderTermForCommit`, which takes the Figure 8 driver. Check 6 here is check 5 under those clocks.
-**PROPOSED**: neither arm is drawn here. Recommended: keep it so, since each would add a cost for a catch
+**Approved (D-139)**: neither arm is drawn here. Recommended: keep it so, since each would add a cost for a catch
 the node sweep already has.
 
 ### 11. What the merged tree shows, and the first Phase 3 seeds pinned (added after #188 merged)
@@ -23942,14 +23942,14 @@ not the clause's. The clause's question stays the one D-107 puts to the owner.
 
 ---
 
-## PROPOSED D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
+## D-114 — A split's apply puts both halves' descriptors in the host's table in one acquisition of it
 
 **The number.** Off `main` at b1da6ec, whose footer read D-113. #162 records the
 reservations of 2026-11-01: D-113 for S10, D-114 for #186 (this, #183), D-115 for #187
 (#172), D-116 for #181 and D-117 for #176 (*corrected after #186 merged*, #186's review,
 N2: this first cited #162 for a reservation it did not then record). This entry took D-114
 and moved the footer to D-115. At a merge the entries are a union in numerical order with
-one footer, the highest plus one. Every code site carries `// PROPOSED(D-114)`. #186 closed
+one footer, the highest plus one. Every code site carries `// D-114`. #186 closed
 #183. It merged at c7040b3 before its review's fixes, #191 delivered those and merged at
 8a4cdad before its own review's fixes, and each correction is marked where it stands.
 
@@ -24038,7 +24038,7 @@ voter's path:
 | a non-voter's P in two acquisitions | | | **the non-voter's test fails** on the count, 2 acquisitions; the voter's is green |
 | the correct tree | | | both pass, 1 acquisition each; 179 lib tests, clippy and `check-direct-io.sh` clean |
 
-**What remains.** **PROPOSED.**
+**What remains.** **Approved (D-139).**
 - **A direct `self.descriptors.lock()` bypasses the hook.** A grep finds no direct lock of the
   descriptors table in the crate today. Not every lock in the crate goes through `lock`:
   `install.rs` locks the `applied` table directly, twice, and `inbox.rs` locks its own state
@@ -24068,14 +24068,14 @@ placeholder (#186's review, N3; issue #189).
 
 ---
 
-## PROPOSED D-115 — A re-seed after a split holds an install creation's generation: P's install on the re-seeded node is created at the split's generation over its left half, check 7 holds it at its floor, and reverting the creation's generation fails the run
+## D-115 — A re-seed after a split holds an install creation's generation: P's install on the re-seeded node is created at the split's generation over its left half, check 7 holds it at its floor, and reverting the creation's generation fails the run
 
 **The number.** Off `main` at b1da6ec, whose footer read D-113. #162 records the
 reservations of 2026-11-01: D-113 for S10, D-114 for #186 (#183), D-115 for #187 (this,
 #172), D-116 for #181 and D-117 for #176 (*corrected after #187 merged*, #187's review, N3:
 this first cited #162 for a reservation it did not then record). This entry took D-115 and
 moved the footer to D-116. At a merge the entries are a union in numerical order with one
-footer, the highest plus one. Every code site carries `// PROPOSED(D-115)` (*corrected after
+footer, the highest plus one. Every code site carries `// D-115` (*corrected after
 #187 merged*, N3: this said so first, and only `sim/reseed.rs` did). #187 closed #172. It
 merged at 2d9e8ad (`main` de9f4d7) before its review's fixes, and each correction is marked
 where it stands.
@@ -24157,7 +24157,7 @@ where the range's descriptor there is Held { …, generation: 2, voters: [1, 2, 
 Live }". The voters agree here, since P's configuration has not changed. The generation is
 what check 7 catches. The rate is 100 %, so the catch would hold at every tier (D-061). It
 is not a standing variant: #172 asks that the revert be seen to fail the run, and the
-plant is not shipped. **PROPOSED.**
+plant is not shipped. **Approved (D-139).**
 
 **The tier: capped, on this run's own figures.** *Corrected after #187 merged* (#187's
 review, N2): this first cited D-081 for the cap, and D-081's case is `run`'s cost, 0.40 to
@@ -24175,7 +24175,7 @@ binary's `TIER_CAP`, and that cap is put to the owner with D-081's. The line the
 names this entry, where it named D-081 (#195's review, N5). The cap samples the run's
 rarer schedules thinly: 5 of 200 seeds install P at floor 192, after a second compaction,
 against 127 to 129 on the rest (counted by the review, and again here), and nothing asserted
-reads that schedule apart. **PROPOSED.**
+reads that schedule apart. **Approved (D-139).**
 
 **What is not here.** #175 is the other half of a re-seed after a split, a node that replays
 the split from a pre-split snapshot and creates R unquarantined; it is the owner's question
@@ -24193,13 +24193,13 @@ if anything high. Shard 6's header is recomputed from its rows: 2202.8 -> 2182.2
 
 ---
 
-## PROPOSED D-116 — Check 8's created-twice clause: a `RangeCreated` of a range on a node that holds it initialised is a violation whatever made either creation, which is §5's "the apply asserts it" asked of the trace; `IdBlockResumed` trips it under the equivalence test, and seed 219 of the node sweep under `SnapshotOverlapsReplica` is pinned
+## D-116 — Check 8's created-twice clause: a `RangeCreated` of a range on a node that holds it initialised is a violation whatever made either creation, which is §5's "the apply asserts it" asked of the trace; `IdBlockResumed` trips it under the equivalence test, and seed 219 of the node sweep under `SnapshotOverlapsReplica` is pinned
 
 **The number.** Off `main` at b1da6ec and merged with `main` at de9f4d7 (§10), whose footer
 reads D-116. D-113 is S10's, still open in #188; D-114 and D-115 are on `main`. This entry
 takes D-116, and the footer moves to D-117. At each merge the entries are a union in
 numerical order with one footer, the highest plus one. Every code site carries
-`// PROPOSED(D-116)`. Closes #181.
+`// D-116`. Closes #181.
 
 **Context.** SHARD.md §5 said the overlap rule makes the apply's "R already initialised
 here" unreachable (SHARD.md:808-810 before this entry), and then: "The apply asserts it."
@@ -24252,7 +24252,7 @@ here", since the node does not hold R. It is a creation that did not survive a r
 mirror of check 21's removal. On the correct system the two readings agree: every creation
 is traced once its batch is durable (a split's apply is a synced batch, an install's
 creation is traced at its switch), so a restart restates it. Measured at the gate's twenty
-on every node binary (§7, M5). **PROPOSED**: check 8's reading, as #181 recommends ("since
+on every node binary (§7, M5). **Approved (D-139)**: check 8's reading, as #181 recommends ("since
 its last crash and restatement"); the stronger one is the owner's.
 
 **SHARD.md is amended to say so.**
@@ -24518,7 +24518,7 @@ Every figure of §3 to §5 is unchanged:
 `RetakeNeverAfterOverlap`'s test reads `x`'s creations and its waits, not the run's verdict,
 so the clause does not touch it.
 
-### 9. For the owner (PROPOSED)
+### 9. For the owner (approved, D-139)
 
 1. The assertion as a clause of check 8, not a fold of its own (§2).
 2. Asked by the checker's verdict, last (§3).
@@ -24535,13 +24535,13 @@ so the clause does not touch it.
 
 ---
 
-## PROPOSED D-117 — The start that re-seeded runs its tasks on the directory the re-seed built: `engine` rebound for the `apply` task's takes, the `snapshot` task's staging and its sweeps, so the refused directory is never written again (#176)
+## D-117 — The start that re-seeded runs its tasks on the directory the re-seed built: `engine` rebound for the `apply` task's takes, the `snapshot` task's staging and its sweeps, so the refused directory is never written again (#176)
 
 **The number.** This branch is merged with `main` at 8a4cdad, whose footer reads D-116.
 D-116 is reserved for #181, not merged yet; D-113 (#188), D-114 (#186) and D-115 (#187) are
 on `main`. D-117 was reserved for #176. This entry takes it and sets the footer to D-118,
 the next after this one. At D-116's merge the entries are a union in numerical order with
-one footer, the highest number plus one. Every code site carries `// PROPOSED(D-117)`.
+one footer, the highest number plus one. Every code site carries `// D-117`.
 
 **Context: a correct-server failure against D-041.** D-041 and D-044, as Q15 applies them on
 the node (SHARD.md §11, storage 8; D-077), say a refused directory stays marked lost and
@@ -24603,7 +24603,7 @@ the fix.** A checkpoint take, and the sweep that follows it, need a replica on t
 leads.
 - In the start that re-seeded, every replica the re-seed rebuilt is quarantined, and a
   quarantined core never campaigns (D-035; `core.rs` 1369-1371 and 1527-1529).
-- So is every replica a placeholder's install creates on that node (PROPOSED D-109 §2).
+- So is every replica a placeholder's install creates on that node (D-109 §2).
 - What is left is a split's right half created **after** the re-seed. The split writes no
   quarantine for it (Q20, Q26), so it may lead. It then takes checkpoints into
   `snap-r<id>-…` under whatever directory it was handed, and sweeps its own versions there.
@@ -24751,7 +24751,7 @@ a retake. No check of the trace sees it.
 
 **What this does not change.** The re-seed shape's `run()` and its (e) are as they were.
 Giving them `audit_tree` moves that shape's schedules and its pins, which is #190's work.
-**PROPOSED.**
+**Approved (D-139).**
 
 ---
 
@@ -24765,7 +24765,7 @@ thousand on this slice's tip, which no run has measured yet (the nightly, below)
 
 **Context.** PROPOSED D-089 aimed `Fault::CrashInstalling` per range, and
 `SnapshotWithoutCurrentLast` was then injected at its moment on the node and caught by nothing
-(#126). PROPOSED D-107 §6 measured why and shipped nothing: the node's `restate` traced
+(#126). D-107 §6 measured why and shipped nothing: the node's `restate` traced
 `RaftSnapshot { taken: false }` for every record, so a restart onto a switch made without its
 repair read as an install, the floor rose to the leader's record and the applied index needed no
 log. Restating the flag alone caught the variant and failed the correct node on seed 358, because
@@ -24936,12 +24936,12 @@ shard, shard 4 at 2231.2 -> 2232.2.
 
 ---
 
-## PROPOSED D-119 — The sharded quorum scenario asks its hold of the root and the meta range: a re-seeded replica of either that votes is caught on nearly one seed in two, where it passed ten thousand (#143)
+## D-119 — The sharded quorum scenario asks its hold of the root and the meta range: a re-seeded replica of either that votes is caught on nearly one seed in two, where it passed ten thousand (#143)
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-118 are held by
 other branches, and D-119 was reserved for this one. The footer moves to D-120. At a
 merge the entries are a union in numerical order with one footer, the highest plus one.
-Every code site carries `// PROPOSED(D-119)`. Closes #143.
+Every code site carries `// D-119`. Closes #143.
 
 **Context.** #143, filed from D-101's plants. `NodeReport::holds` and every per-range clause
 of `NodeReport::check` iterated `Cluster::Node.ranges()`, the user ranges 2 to 5. Ranges 0
@@ -25120,16 +25120,16 @@ Two `node` rows, weighed from the built release binary at ANANKE_SEEDS=1000
 ANANKE_DEEP_SEEDS=100, as user + sys, at load averages 400 to 540, so if anything high: the
 meta range's at 61.3 (54.34 + 6.91) and the root's at 60.4 (53.59 + 6.82). Longest-first into
 the lightest shard: shard 1 at 1977.1 -> 2038.4, then shard 5 at 1981.0 -> 2041.4. The correct
-node's row and seed 2994's are renamed in place. **PROPOSED.**
+node's row and seed 2994's are renamed in place. **Approved (D-139).**
 
 ---
 
-## PROPOSED D-120 — `Fault::SplitFromRestarted` with no split done is a wait of its settle alone, by design: `last_heal` stays where the arm before it left it and no gap follows (answers #147)
+## D-120 — `Fault::SplitFromRestarted` with no split done is a wait of its settle alone, by design: `last_heal` stays where the arm before it left it and no gap follows (answers #147)
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. The brief that assigned
 this branch reserved **D-120** for it; other open branches hold the numbers between. The
 footer moves to D-121, and at a merge the entries are a union in numerical order with one
-footer, the highest plus one. Every code site carries `// PROPOSED(D-120)`. Closes #147.
+footer, the highest plus one. Every code site carries `// D-120`. Closes #147.
 
 **Context.** When no split is done yet, `Fault::SplitFromRestarted` (`run_on`,
 `sim/raft.rs`) waits its `settle` and `continue`s, past the `last_heal = sim.now()` and the
@@ -25339,7 +25339,7 @@ asked a key on, keyed a write by `Report::key_range`, the map the run started wi
 were one range: the recovery per range took the first completion over both, and a wedged half
 beside a live sibling passed it.
 
-**What #216 already did, and what was left.** PROPOSED D-113 §5 gave `sim/shard.rs` its own
+**What #216 already did, and what was left.** D-113 §5 gave `sim/shard.rs` its own
 reading, `liveness_by_final_range`: each key asked on the majority of the range serving it at
 the run's end, and each final range read from its first post-heal call, with the starting
 map's reading from the heal kept beside. It is asked by that sweep alone. On `main`:
@@ -25643,12 +25643,12 @@ pin is the answer. Every plant was taken out and the tree compared clean of it b
 
 ---
 
-## PROPOSED D-123 — `IncarnationPerRangeStream`'s read at a split's right half is run: under it every right half a split creates on a voter restates its stream's draw and the correct node's restates none, asserted of the draw itself
+## D-123 — `IncarnationPerRangeStream`'s read at a split's right half is run: under it every right half a split creates on a voter restates its stream's draw and the correct node's restates none, asserted of the draw itself
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. D-116 to D-122 are held by
 the slices beside this one, and the brief that assigned this one gives it **D-123**. The
 footer moves to D-124, and at a merge the entries are a union in numerical order with one
-footer, the highest plus one. The test carries `// PROPOSED(D-123)`, and `// PROPOSED(D-108)`
+footer, the highest plus one. The test carries `// D-123`, and `// PROPOSED(D-108)`
 beside it, since D-108 marks the tests that run the two instruments and this is a third.
 Closes #160.
 
@@ -25657,7 +25657,7 @@ fails when it is wrong: its M6, the split's draw reading the correct set, failed
 (#160). #160 and its second comment leave two routes open: assert the draw at the split, as
 the directed refusal test does at the re-seed, or remove the read if the owner rules the
 variant is the re-seed's alone. This entry takes the first. It moves no code, so the second
-stays the owner's to take.
+stays the owner's to take. **Still PROPOSED** (D-139).
 
 **Why the draw and not a check.** `range_rng` continues across draws, handles and restarts,
 so the variant repeats no incarnation, and a right half is new on every node anyway (D-108).
@@ -25748,7 +25748,7 @@ claim from the variant's own doc: the stream continues, so it repeats no number.
 a finding with the third read, since it is that site's comment.
 
 **Nothing moves.** No code outside a test changes, only doc comments in `range_variant.rs`, so
-no schedule, trace or pinned hash can. **PROPOSED.**
+no schedule, trace or pinned hash can. **Approved (D-139).**
 
 **The nightly's rows (D-064).** One `node` row, weighed in release from the built binary at
 ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs a hundred seeds of both systems: 111.5 cpu s,
@@ -25837,8 +25837,8 @@ treat that as a model error to fix, never a bound to widen, as the issue says.
 `phase-3-stage-b-membership`, where servers 4 and 5 created their replicas with no voters. On this
 tree no creation names none, and each creation site shows why:
 
-- A bootstrap creation names the bootstrap nodes on every node (`server.rs`, PROPOSED(D-097)).
-- A node that joins holds nothing at its start (PROPOSED D-109).
+- A bootstrap creation names the bootstrap nodes on every node (`server.rs`, D-097).
+- A node that joins holds nothing at its start (D-109).
 - A split's right half names the voters of the configuration its parent's replica has in force,
   and only a voter of that configuration traces it (`server.rs`, the split's apply).
 - An install's creation names the descriptor its snapshot carried (`install.rs`, and
@@ -26631,12 +26631,12 @@ before any apply is evidence for its key under the per-key liveness reading (#25
 
 ---
 
-## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
+## D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,
 #188) and D-116 to D-127, and D-128 is reserved for this correction; the footer moves to
 D-129. At a merge the entries are a union in numerical order with one footer, the highest
-plus one. Every code site carries `// PROPOSED(D-128)`.
+plus one. Every code site carries `// D-128`.
 
 **This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps
 one owner per key per node and installs a snapshot only where its span overlaps no other
@@ -26952,7 +26952,7 @@ shard 5 at 1981.0 -> 2012.8; `node`
 a read of the disk at its end: the quarantine row 27.8 -> 36.9, and D-115's row 34.7 -> 35.2, shard
 6 at 2202.8 -> 2212.4. The `reseed` rows run the binary's `TIER_CAP` of 200.
 
-### 11. For the owner (PROPOSED)
+### 11. For the owner (approved, D-139)
 
 The outcome is settled by the documents, as above, so what is the owner's is the shape:
 
@@ -26971,11 +26971,11 @@ The outcome is settled by the documents, as above, so what is the owner's is the
 **The number.** Reserved for this slice in #162 (D-116 to D-128 are other slices' and not yet
 merged); off `main` at de9f4d7, whose footer reads D-116. The footer here moves to D-130, and
 at the merges the entries are a union in numerical order with one footer, the highest plus
-one. Every code site carries `// PROPOSED(D-129)`.
+one. Every code site carries `// D-129`.
 
 **The owner's ruling (2026-11-06).** The leader **refuses** reads it can never confirm, and
 `READS_OUTSTANDING` stays at 38, unchanged in meaning. That is the owner's and amends D-035's
-consequences; everything below marked PROPOSED is how this slice carried it out.
+consequences; everything below marked approved (D-139), PROPOSED until then, is how this slice carried it out.
 
 **Context.** S10's sweep (#188, D-113 §2 (b)), reproduced by two independent verifiers. On
 seed 128 node 1 leads range 2, and nodes 2 and 3 are refused and installed quarantined. A
@@ -26998,7 +26998,7 @@ RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with 
    operator replaces can confirm again. Taking office starts every follower clear. A crashed,
    partitioned or silent follower keeps what it last said, so one that has not said it counts as
    **able**: that transient is what D-076's measured figure covers.
-2. *A refused follower counts as a quarantined one* (**PROPOSED**; the verifiers read this two
+2. *A refused follower counts as a quarantined one* (**approved, D-139**; the verifiers read this two
    ways, "last answer echoed 0" and "echo 0 and no refused mark"). It takes the first. See
    "How a refused follower counts" below.
 3. *The rule.* `Raft::can_confirm(acks)`: the leader, the followers able to confirm and the
@@ -27012,17 +27012,17 @@ RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with 
    `NotLeader { leader: None }`. Naming itself would make `sim/raft.rs`'s client retry the same
    server with no sleep (`ananke-raft`'s `node.rs`, where a read's `Rejected` is answered).
    A lease read is confirmed by promises already made and is served: the ruling is about reads
-   no round can confirm (**PROPOSED** reading).
+   no round can confirm (a reading **approved, D-139**).
 5. *The drop.* As soon as an answer shows the state, `note_reads_confirmable` drops every pending
    read no round can now confirm, `Output::ReadDropped`, which both servers answer `NotLeader`
    naming nobody. Otherwise the reads registered between the second follower's crash and its
    first quarantined answer wait for ever (seed 128: about seven by the verifiers' count; three
    here, dropped at its first refused answer). Not every pending read goes
-   (**PROPOSED**): a read a lease or a majority confirmed waits only for its state, and one whose
+   (**approved, D-139**): a read a lease or a majority confirmed waits only for its state, and one whose
    acknowledgements still make a majority with those able was acknowledged while this leader
    could confirm it, and needs only the no-op's commit. So this is not `drop_reads`, which drops
    them all because the server stopped leading.
-6. *The trace* (**PROPOSED**; CLAUDE.md, every transition that matters). `RaftReadsConfirmable {
+6. *The trace* (**approved, D-139**; CLAUDE.md, every transition that matters). `RaftReadsConfirmable {
    confirmable, follower, dropped }`, at a follower's latest word that changed sides or dropped a
    read, and `RaftReadRefused` per refusal, which is all a client of the node sees of it. Both
    appear only in the state, so a run that never reaches it traces what it traced. Two words change
@@ -27034,7 +27034,7 @@ RAFT.md §1 and §3 decide the asymmetry and do not say what a leader does with 
    refused-read leak: "nothing is answering or refusing them, whether a registration was left
    behind or the core is holding reads it cannot confirm". "registered reads" stays in it, which
    the sweeps' attribution reads.
-8. *The variant* (**PROPOSED**): `Variant::UnconfirmableReadKept`, bit 17 of the core's set, the
+8. *The variant* (**approved, D-139**): `Variant::UnconfirmableReadKept`, bit 17 of the core's set, the
    next free one: the rule is the core's, so it is not one of `NodeVariant`'s (#176 proposes bit
    25 there) or `RangeVariant`'s (D-128 is adding one). No open branch touches the core's bits.
    It keeps the flag and the trace of the state and removes the refusal and the drop.
@@ -27252,13 +27252,13 @@ and the variant 6.3, each on its twenty, into shard 5 at 1981.0 -> 1993.9.
 ## D-130 — A right half a split's apply makes on a quarantined replica of its parent takes the quarantine (#175); Q26 amended
 
 **The number.** Off 91a1946, the merge of the eight open Stage C PRs, whose footer reads D-130.
-The footer here moves to D-131. Every code site carries `// PROPOSED(D-130)`.
+The footer here moves to D-131. Every code site carries `// D-130`.
 
 **The owner's ruling (2026-11-09, #175).** A replica of a right half R that a split's apply
 creates on a quarantined replica of its parent P takes P's quarantine, in its own PR after the
 open PRs have merged. It is the recommendation of D-109 §2 and of #175, built as written, and it
 amends Q26 for that case. The owner chose the cost knowingly: a wedge can be repaired later and
-acknowledged data lost cannot. Everything below marked PROPOSED is how this slice carried it out.
+acknowledged data lost cannot. Everything below marked approved (D-139), PROPOSED until then, is how this slice carried it out.
 
 **The problem.** Q26 and SHARD.md §5 say a split does not copy P's quarantine to R, because no
 store held a vote of R's before the split's apply, so a re-seed of P *before* the split lost
@@ -27294,7 +27294,7 @@ server and `SplitLeavesQuarantineBehind`, which is the server as it stood before
   Grants from a replica with no quarantine on a node that has been refused: 0, where the variant
   has 9 676.
 
-**Decision.** PROPOSED: how the ruling is carried out.
+**Decision.** Approved (D-139): how the ruling is carried out.
 
 1. *The store.* `RaftStore` keeps a `quarantined` flag in memory, set from the disk at the open and
    by `mark_reseeded`, read through `RaftStore::quarantined()` with no I/O. An install's repair
@@ -27431,8 +27431,8 @@ test keeps its 22.7: it runs the runs it ran, and one weighing here read 23.9.
 
 ## D-131 — The workload's shapes on the sharded sweep, and `ReadCheckAtReceiptOnly` (S11)
 
-PROPOSED. **The number.** Off aa5e46c, #224's tip, whose footer reads D-131. D-132, which seed 5620
-below needed, is merged into this branch after this entry, so the one footer reads D-133. Every code site carries `// PROPOSED(D-131)`. Issue #162's S11, on `sim/shard.rs` (D-113),
+**The number.** Off aa5e46c, #224's tip, whose footer reads D-131. D-132, which seed 5620
+below needed, is merged into this branch after this entry, so the one footer reads D-133. Every code site carries `// D-131` since D-139, and the sites of the five questions below `// PROPOSED(D-131)`. Issue #162's S11, on `sim/shard.rs` (D-113),
 for SHARD.md §10, §11 and §12's Stage C list.
 
 **The shapes (§10's "the workload itself", as the Figure 8 driver's burst is, D-031).** Each draws
@@ -27592,7 +27592,7 @@ the pins on seeds 992 and 707, 0.1 each, into shard 4. Seed 5620's pin came with
 0.2 (user + sys 0.20 + 0.01, 0.17 + 0.00, 0.17 + 0.00, the median rounded up to a tenth) into shard 4. The review's two
 pins, on seeds 16725 and 18925, 0.2 each, into shard 4, 2230.8 -> 2231.2, under a load average of 3.
 
-**Questions for the owner, each with this entry's recommendation.**
+**Questions for the owner, each with this entry's recommendation (still PROPOSED, D-139).**
 
 1. *`ApplyIgnoresSpan`'s linearizability clause.* §10 names three catches; check 9 and check 10 are
    measured (81 of 100, 72 of 100) and asserted, and linearizability has been reached on 0 of 333
@@ -27629,9 +27629,9 @@ pins, on seeds 16725 and 18925, 0.2 each, into shard 4, 2230.8 -> 2231.2, under 
 
 ---
 
-## PROPOSED D-132 — An install onto a replica the node holds a descriptor of replaces the host's descriptor's span at the switch and asks the store again there, not the plan's copy from the stream's last chunk: `InstallReplacesCopiedSpan` keeps the copy beside the fix, and check 8's install clause catches it; closes #215 and D-128 §9's window
+## D-132 — An install onto a replica the node holds a descriptor of replaces the host's descriptor's span at the switch and asks the store again there, not the plan's copy from the stream's last chunk: `InstallReplacesCopiedSpan` keeps the copy beside the fix, and check 8's install clause catches it; closes #215 and D-128 §9's window
 
-**The number.** Off aa5e46c, whose footer reads D-131. D-131 is S11's, on a local branch and absent from the tree this was written on, so this entry is D-132. The two meet on S11's branch, in numerical order with one footer, D-133. Every code site carries `// PROPOSED(D-132)`.
+**The number.** Off aa5e46c, whose footer reads D-131. D-131 is S11's, on a local branch and absent from the tree this was written on, so this entry is D-132. The two meet on S11's branch, in numerical order with one footer, D-133. Every code site carries `// D-132`.
 
 **This is a correction, and the documents settle its outcome.** SHARD.md §5 (Q22, Q27) keeps one owner per key per node, §11, storage 5, has an install remove "the span's keys", and check 8's install clause (D-128 §3) forbids a switch removing another replica's. D-128 closed that for one stream at a time and §9 named what it left, an initialised replica replacing the plan's copy. This entry closes it. D-128's path for a replica with no descriptor is unchanged.
 
@@ -27711,7 +27711,7 @@ Two instrumented scratch copies, release, counting at the switch:
 
 So off aa5e46c nothing moves: no correct node's schedule changes at these seeds, the new reads being a lock and an atomic. On S11's schedule the four seeds whose install the re-check turned into an answer are the only ones that move. S11's sweep at 10 000 passes with the fix applied, zero failures, against the seed 5620 failure before it; past the nightly's range the last column is not zero (section 5). D-128's own window (the first bullet of its §9) is closed on the same read, as the correction there says.
 
-### 7. For the owner (PROPOSED)
+### 7. For the owner (approved, D-139)
 
 The outcome is settled by the documents, so what is the owner's is the shape:
 
@@ -28112,7 +28112,10 @@ the bound asks of range 51. Seed 1137 passes on the shaped schedule. #240's own 
 passed, without D-127's answers, and D-127's sweep runs the shaped schedule, so it takes both
 entries. It lies inside the nightly's 10 000, so the nightly's correct sharded sweep fails on it.
 Excusing it would widen #220's exception, which is the owner's ruling to make; a bound is never
-widened here. It is left to the owner, pending an issue.
+widened here. It is left to the owner, pending an issue. *The owner ruled on 2026-11-15, in chat
+during this integration (D-142):* in #220's exception alone, and until #220 is fixed, a replica
+quarantined under D-130 counts as a voter that cannot vote. Node 3's range 51 is one D-130's rule
+quarantined, so seed 1137 passes there, and is pinned on the sweep's schedule on that mechanism.
 
 The node sweep's pins (seeds 48 and 66 under check 16's comparison) run `raft::run_on_the_node` and
 did not move.
@@ -28183,9 +28186,9 @@ owner's next one, on a quiet machine.
 
 **The number.** Off 0d67f99, S11's tip (PR #228, which carries #226), whose highest entry is D-132 and whose footer reads D-133. D-133 to D-135 are taken by branches open beside this one, so this entry is D-136, and the footer names D-137, the next after the highest entry in this tree. Every code site carries `// PROPOSED(D-136)`.
 
-**This is a check's defect, and the documents settle its outcome.** RAFT.md §3 and Q15: a refused node lost its state, and every replica it held is refused with it. D-077's re-seed rebuilds the ranges configuration names in a fresh engine, each empty and quarantined, a user range with no descriptor until its install traces its `RangeCreated` anew (§8). A split's right half is found in the engine at a start (SHARD.md §5), and the refused engine is one the start cannot read, so the re-seed rebuilds no store of it and the first message of that range on the refused node makes a placeholder (`unheld`, PROPOSED D-109). Check 20 (SHARD.md §8, Q22) kept a range held from a `RangeCreated` of it or a `RangesRestated` naming it to the node's `RangeRemoved` of it, and nothing cleared it at a refusal. Under `UninitialisedReplicaVotes` that placeholder grants, and check 20, still holding the range from before the loss, said nothing.
+**This is a check's defect, and the documents settle its outcome.** RAFT.md §3 and Q15: a refused node lost its state, and every replica it held is refused with it. D-077's re-seed rebuilds the ranges configuration names in a fresh engine, each empty and quarantined, a user range with no descriptor until its install traces its `RangeCreated` anew (§8). A split's right half is found in the engine at a start (SHARD.md §5), and the refused engine is one the start cannot read, so the re-seed rebuilds no store of it and the first message of that range on the refused node makes a placeholder (`unheld`, D-109). Check 20 (SHARD.md §8, Q22) kept a range held from a `RangeCreated` of it or a `RangesRestated` naming it to the node's `RangeRemoved` of it, and nothing cleared it at a refusal. Under `UninitialisedReplicaVotes` that placeholder grants, and check 20, still holding the range from before the loss, said nothing.
 
-**The fix.** `PlaceholderGrantsNothing` folds `RaftRefused`: every range its node held is forgotten there. What the node holds after is what its own start restates, the re-seed having written a descriptor for each system range it rebuilds and the start tracing its `RangesRestated` after its `RaftRefused`, or what an install creates. A crash still ends nothing, since a replica outlives it. SHARD.md §8's check 20 says so, and the violation's words now name both kinds of evidence and both ends. The fold stays in `Checker` and `Fold::ALL`, so the fold-by-fold equivalence test (`sim/tests/node.rs`, PROPOSED D-106) compares it as before.
+**The fix.** `PlaceholderGrantsNothing` folds `RaftRefused`: every range its node held is forgotten there. What the node holds after is what its own start restates, the re-seed having written a descriptor for each system range it rebuilds and the start tracing its `RangesRestated` after its `RaftRefused`, or what an install creates. A crash still ends nothing, since a replica outlives it. SHARD.md §8's check 20 says so, and the violation's words now name both kinds of evidence and both ends. The fold stays in `Checker` and `Fold::ALL`, so the fold-by-fold equivalence test (`sim/tests/node.rs`, D-106) compares it as before.
 
 Forgetting at the node's `RaftRefused` rather than at each `RaftReplicaRefused` is the choice that closes #221: the ranges its placeholders are of are the split-made ones, which a re-seed neither rebuilds nor names in a `RaftReplicaRefused`.
 
@@ -28484,6 +28487,62 @@ The outcome is settled by the documents, as above, so what is the owner's is the
 
 ---
 
+## D-139 — The owner's rulings of 2026-11-14: D-093 and D-092 answered A, check 8's right-half clause read as R (D-107), and D-092 to D-132 approved as built but for the questions still open
+
+**The number.** Built off `main` at 8760c49, whose highest entry was D-134, and recorded at the Stage C integration (`integ-stage-c-2026-11-15`), after its second round and D-142. D-118, D-121, D-124 to D-127, D-133 and D-135 to D-138 were held by PRs in flight on 2026-11-14, D-140 by S7 and D-141 by S8 (c); every one of them, and D-142, lands in the same merge as this entry, so **D-139**, reserved for it, sits in number order between D-138 and D-140, and the footer stays D-143. It records rulings and builds nothing, so it is not PROPOSED and no code site is marked with its number; two comments cite it, `sim/tests/install.rs`'s joiner cap and `crates/ananke-shard/src/ids.rs`'s note on question 1.
+
+**The rulings**, the owner's, of 2026-11-14, given in the session's chat, relayed in substance to the brief this branch was built from, and posted on #162 (comment 6886257054), whose words the fourth quotes:
+
+1. **D-093**, check 19's tripping variant: option A, `SplitLeavesGap`, a test instrument of the range layer's own outside §10's count, asserted from Stage C. B (`UnfreezeBeforeAbortCommitted`) stays a Stage E measurement; C (exempting check 19) is not taken.
+2. **D-092**, a split whose node's id block is empty: option A, refuse at proposal with `NoRangeId` and the asker retries, as built.
+3. **D-107**, check 8's right-half clause and a voter installed past the split: reading R, which is D-107 §5's *Recommended*: "owe R from an apply of `s` — `RangeSplit`, or the `RaftApply` of `s` — kept across restarts until R's `RangeRemoved` or a refusal, and from a restatement past `s` only where the node's replica of P was not installed at or past `s` since its last refusal (the crash between the split's durable batch and its trace, which the restated form is there for)"; and the installed voter gets a check of its own, "R installed on it within a bound measured on the correct system (#170)".
+4. As posted: "**D-092 to D-132 approved as built**, each with its own recommendation, except the questions still open: D-108, #220, #178, #158 (with D-102's excuse form), #145 (D-103), D-131's five questions, and the items whose entry makes no recommendation."
+
+The first three are each the entry's own recommendation: D-093's and D-092's *Proposed: A*, and D-107 §5's *Recommended*, which also asks both checks asserted from the placeholders' slice and the clause against `SplitNotAtomicWithDescriptor` in Stage D. "As built" is the tree's: where a later entry in the range built or corrected an earlier one's point, the point is approved as the later entry left it (D-113 §4's (a) and (b), built by D-128 and D-129; D-110 §10's item 7, built by D-116). D-105's place for `AnyFreshNodeBootstraps`, which D-108 moved, is not among them: it is D-108's question, which stays open (below).
+
+**The ruling of 2026-11-15, recorded as D-142.** Given in chat during the Stage C integration, in answer to seed 1137 of the sharded sweep: in #220's exception to the meta convergence bound alone, and until #220 is fixed, a replica quarantined under D-130 counts as a voter that cannot vote. It approves no entry and answers none of the open items below. D-142 records it, builds its narrowest reading in `sim/shard.rs` (only a replica D-130's rule quarantined, and only where the voters able to vote and the placeholders are a majority) and puts the wider reading to the owner; #220 stays open, and so does D-141's question (S8 (c)), the installed voter's bound. The exception it extends is D-113 §6's, the owner's ruling of 2026-11-09, which these rulings approve with D-113.
+
+**Approved.** D-092 to D-107, D-109 to D-117, D-119, D-120, D-123 and D-128 to D-132, every entry `main` held in the range on 2026-11-14 but D-108, which the ruling names among the questions still open and which keeps PROPOSED whole (below). D-118, D-121 and D-124 to D-127 sit in the range but were PRs in flight that day, as were D-133 to D-138, D-140 and D-141: none of them is approved by these rulings, and each keeps PROPOSED in its heading and at its code sites. D-122 has no entry. Each approved entry is approved whole but for the open points below, which sit in D-094, D-102, D-103, D-105, D-107, D-109, D-123 and D-131.
+
+**How an approval is marked**, as the owner's approval of Phase 2's entries was on 2026-09-13 (b43423e, 87a768f): an approved entry's heading and its labels drop PROPOSED, its code sites' `PROPOSED(D-0xx)` read `D-0xx`, and prose that names it "PROPOSED D-0xx" names it "D-0xx"; where the owner chose between options, the label reads *Decided*, the owner's, with the date (31b37f4, D-065 to D-067). In this range:
+
+- *Headings.* D-092 to D-101, D-103 to D-107, D-109 to D-117, D-119, D-120, D-123, D-128 and D-132 drop PROPOSED; D-129, D-130 and D-131 carried none in theirs. D-102's heading states an open question in a clause of its own, "a write pending there is evidence unless …", and keeps PROPOSED at that clause. D-108's keeps PROPOSED whole.
+- *Labels.* A PROPOSED label on an approved point reads *Approved (D-139)*. D-092's and D-093's *Proposed: A* read *Decided: A*, the owner's ruling of 2026-11-14; D-107 §5's *For the owner (PROPOSED)* names the reading decided; D-109's #175 section names the owner's ruling of 2026-11-09, which D-130 built. D-129's and D-130's "everything below marked PROPOSED is how this slice carried it out" read *approved (D-139)*, and D-131's opening PROPOSED moves to its questions. D-105's two asks on `AnyFreshNodeBootstraps`'s place keep PROPOSED with D-108.
+- *Not edited*: text that quotes or reports what a marker or label said when it was written (D-104's account of `ServerConfig::id_block` and its question 1's code sites "marked `PROPOSED D-092`", D-108's account of D-105's markers and its grep (#155), D-109's note that it was PROPOSED on its branch, D-113 §11's "D-109's PROPOSED section"), and the asks lists that say what an entry put to the owner (D-104's, D-107's). D-099's and D-100's "D-092 … unanswered" keep their tense: they say what stood when they were written.
+- *Code and the other documents.* Under `crates/`, `sim/` and `scripts/`, and in RAFT.md, a comment's `PROPOSED(D-0xx)` or "PROPOSED D-0xx" naming an approved entry reads `D-0xx`: on this tree 1 241 comment lines in 49 files, 40 of them lines the integration's PRs wrote after 8760c49. Where this was first built, on 8760c49, D-108 was counted approved and 1 277 lines in 48 files changed; without D-108's sites the same script changes 1 235 there. Each change is the word and nothing else, a parenthesis moved down a line where the number had wrapped, and `sim/tests/install.rs`'s joiner cap, which read **PROPOSED**, reads approved. A script made the change, reading a list of entries wrapped across two lines as one marker and reproducing the first build's exactly on 8760c49 when D-108 is counted approved, and checked that nothing before a comment's marker moved on any line. String literals, the twenty-two assertion and print messages that name an entry "PROPOSED D-0xx" (nineteen on 8760c49), are code, and are left as they are, so nothing a test prints or asserts moves. A marker naming an approved entry beside one still PROPOSED keeps the label the other needs: RAFT.md's "PROPOSED D-076, D-129", and in comments "PROPOSED D-076, D-096", "PROPOSED D-086, D-102", "PROPOSED D-096, D-108" (twice, once wrapped across two lines), "PROPOSED D-102, D-121", "PROPOSED D-107, D-133", "PROPOSED D-107, D-141" and "PROPOSED D-108, D-109". In this file, the prose of the integration's own entries that named an approved entry "PROPOSED D-0xx" names it "D-0xx" (seven places, in D-118, D-121, D-125, D-136 and D-140). SHARD.md is the owner's to edit (#165), and its labels of approved entries (D-129 in §5's placeholder paragraph, D-113 beside #220 twice) stay; BOOTSTRAP_PROMPT.md's branch lines are a dated record. Neither is edited for this. `crates/ananke-shard/src/ids.rs`, which said the owner had not ruled on question 1, now says it was answered A.
+
+**What stays PROPOSED, and where it sits.**
+
+- *D-108, whole*: the ruling names D-108 among the questions still open and names no part of it, where it names a part of #158 ("with D-102's excuse form") and of D-131 ("five questions"). #162's list of what waited on the owner gives D-108 two parts: "the instruments' place in RangeVariants, outside §10's count; and Stage D's question 1". Reading the exception as Stage D's question 1 alone, as this entry's first build did, could approve more than the ruling says, so until the owner says which is meant D-108 keeps PROPOSED whole: its heading, its labels, and its 43 comment lines in 8 files (42 of them as they were, and the comment on `range_variant.rs`'s count of `RangeVariant::BUGS`, where only the D-113 marker after D-108's drops its PROPOSED). Among them is the one code site of Stage D's question 1, `range_variant.rs`'s module doc on Stage D's re-add variant, "not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108)". D-105's two asks on `AnyFreshNodeBootstraps`'s place, which D-108 answered by the move, keep PROPOSED with it, and D-117's "free since PROPOSED D-108" and D-123's account of its test's `// PROPOSED(D-108)` keep the label.
+- *#158, with D-102's excuse form*: D-102's two labels on what excuses a write pending at the end, and the heading's clause. The run's end, where the simulation stopped, with D-086's end-of-run reading superseded, is approved and its sites read `D-102`; the exemption's sites in `sim/raft.rs` and `sim/tests/node.rs` (the serving range's evidence, a completion after the write's call, the client's own wait, and the pins of seed 2809 and of the wedges the exemption keeps) keep `PROPOSED(D-102)`.
+- *#145, D-103*: the section "PROPOSED: the per-range liveness bound cannot trip …" and its ask, and the two sites at `RANGE_LIVENESS_TIMEOUTS` in `sim/membership.rs`. The not-asked arm and the strengthening are approved. D-102 names the same driver write as the cure for the node sweep's in-flight class and does not take it; that stays with #145.
+- *#178*: D-109 §2's "For the owner (PROPOSED, #178)". The quarantine that closes the double vote is approved; the refused mark for the replicas configuration does not name is not built and stays the owner's, as D-109 §7, D-115 and D-128 §9 say.
+- *#220*: the system fix the issue tracks, a placeholder on a clean engine becoming a voter without a leader. The question is the issue's, and no entry carries a label for it. D-113 §6's narrow exception is the owner's ruling of 2026-11-09 and is approved with D-113. Approving D-109's placeholders as built does not answer #220, whose fix would reverse Q22 for clean engines.
+- *D-131's five questions*: their heading reads still PROPOSED, and the sites of four of them keep `PROPOSED(D-131)`: `Logs`' change (`ananke-raft`'s invariants and its test of seed 707, seed 707's pin in `sim/tests/shard.rs`, and the line of the 3870 pin's doc on which check now names it), the asker asking anew (`ASK_ANEW`, the paragraph on seed 992 and its pin, and the copy answered once), the plain schedule (`PLAIN_ONE_IN`, `Schedule::plain`'s doc, the draw's test and the pins that run on it), and `ApplyIgnoresSpan`'s linearizability (its test, which measures it and asserts nothing of it). `ReadBurst`'s reading has no site of its own. The rest of D-131 is approved, the asker's budget given again at its first `NoRangeId` (seed 18925) among it.
+- *No recommendation*, the ruling's last clause, "the items whose entry makes no recommendation". The ruling names none of them. Which items the clause covers is this entry's reading, and not the owner's words:
+  - D-094's Stage A half, whether Stage A's engine tests join the released phases' cut: its consequence line reads still PROPOSED.
+  - D-068's revisit trigger: D-068 is outside the range and keeps its PROPOSED whole.
+  - D-107 §2 item 4's `cause` on `RangeDescriptor` (#171): the item and its ask read still PROPOSED.
+  - #93's `Timeline` and the install-hold item #162 lists unverified: no entry carries either, so this file has nothing of them to mark.
+  - D-123's removal of `IncarnationPerRangeStream`'s read at a split, which D-123 leaves "the owner's to take" with no recommendation: it reads still PROPOSED there, while D-123's assertion of the draw is approved.
+  - N1, N3, N4 and N5 of #198's review, which D-129 leaves the owner's issues without a recommendation: approving D-129 does not answer them.
+
+**What the blanket carries that the owner did not name**, each its entry's recommendation and now approved: D-104 item 1, the node sweep's split arms kept as its own coverage; D-106 item 4, `AnyFreshNodeBootstraps` as `IdsUnique`'s tripping variant, asserted from the nightly's share; D-109 §2, `MetaOverwritesByArrival` as a low-rate variant asserted at the thousand; D-113 §8, the empty-block coverage asserted at the thousand where D-092 asks CI's hundred; D-113 §10, the two arms the sharded sweep does not draw; D-116, "holds" read as check 8's spans; D-095, the coverage fold read value for value; D-100, `ApplyIgnoresSpan`'s catch on the node asserted from the nightly; D-101, leader completeness as the third witness alone; D-105, seed 42's one-group trace pinned by its body hash; D-107, the order #167 gives for #126; D-132 §5, the window left open and named, with the exclusion it recommends, which #225 tracks. The caps: D-109 §7's joiner cap of 200 and D-115's run under `TIER_CAP` are approved with their entries; `TIER_CAP` as D-081 set it for `run` is D-081's, outside the range, and is not.
+
+**What the rulings unblock.**
+
+- **S7, D-140**: check 19 and `SplitLeavesGap`, which #162 held on D-093's ruling. Under A the instrument and the fold land in one slice; since D-104 corrected D-093's "every seed", the fold's own test reads the set of seeds on which a split took effect and asserts it non-empty. Built since, as D-140, and in this merge.
+- **S8 (c), D-141**: check 8's right-half clause asserted under reading R, folded and printed until now and asserted nowhere (D-107's *Consequences*), and the installed voter's check of its own, its bound measured on the correct system before it is asserted (#170). D-113 §11's 9 of 1 000 on the sharded sweep are D-107's mechanism. Its clause half was built since, as D-141, and is in this merge: the clause asserted under reading R, and the installed voter's bound measured, failed by the correct system on #220's wedge and put to the owner, so that question is open.
+- **Stage C's entry criterion**, "Questions 1 and 2 approved" (SHARD.md §12, Stage C): both are. D-092's A is the code as built, so its sites (`NoRangeId` at proposal, the asker's retry) change only their markers, and S13's tag need not name the criterion unmet.
+
+**Consequences.**
+
+- No code line, draw, trace event, bound, assertion, pinned hash or nightly row moves: comments and documents only, so no schedule moves and no pin is re-audited.
+- On this tree a grep of `crates`, `sim` and `scripts` for "PROPOSED" before an entry this one approves finds 71 lines: the 44 comment lines that mark an approved entry's open question above, the twenty-two string literals, and five comment lines whose marker names an approved entry first beside one still PROPOSED (D-096 with D-108 twice, D-102 with D-121, D-107 with D-133 and with D-141). D-108's own markers name an entry not approved, and the grep does not count them.
+- A branch in flight that writes "PROPOSED D-0xx" of an entry approved here carries the old label until its merge resolves it the same way.
+
+---
+
 ## PROPOSED D-140 — Check 19, the ranges tile the keyspace, folded with its instrument `SplitLeavesGap`, as the owner ruled on D-093 (#162's S7)
 
 **The number.** Off 8760c49 (#236 merged on c5cd18d), whose highest entry is D-134. D-135 to D-138 are taken by PRs in flight, D-139 records the owner's rulings of 2026-11-14, and this slice, Stage C's S7, is given **D-140**; none of D-135 to D-139 is in this tree, and the footer names the number after the highest entry here, D-141. Every code site carries `// PROPOSED(D-140)`.
@@ -28501,7 +28560,7 @@ The outcome is settled by the documents, as above, so what is the owner's is the
 
 ### What D-093 got wrong, said here and not in its text
 
-D-093 has `SplitLeavesGap` silent to every check but 19 ("the gap is the one shape of a wrong split that only the tiling sees"), with the liveness bound the only other reporter. It was written before check 18's split clause landed (PROPOSED D-100), which holds R's creation at a split's first apply to `[k, y)` at g + 1 (`SplitLineage::check_values`): that clause sees the short right half **at the same `RaftApply`** the gap clause does, on every seed check 19 trips. So the instrument is not one only the tiling sees; what it remains is the instrument the tiling's fold is held to, its own verdict compared fold by fold, which is what the ruling asks of it. The run's verdict under it names check 18, check 19 being asked after it (above). D-093 is merged PROPOSED text and the ruling's record is D-139's, in flight, so D-093 is not edited here.
+D-093 has `SplitLeavesGap` silent to every check but 19 ("the gap is the one shape of a wrong split that only the tiling sees"), with the liveness bound the only other reporter. It was written before check 18's split clause landed (D-100), which holds R's creation at a split's first apply to `[k, y)` at g + 1 (`SplitLineage::check_values`): that clause sees the short right half **at the same `RaftApply`** the gap clause does, on every seed check 19 trips. So the instrument is not one only the tiling sees; what it remains is the instrument the tiling's fold is held to, its own verdict compared fold by fold, which is what the ruling asks of it. The run's verdict under it names check 18, check 19 being asked after it (above). D-093 is merged PROPOSED text and the ruling's record is D-139's, in flight, so D-093 is not edited here.
 
 ### What says so
 
@@ -28733,6 +28792,104 @@ The review of the staged tree found two must-fix defects and six nits. Each is f
 
 ---
 
-_D-139 (the owner's rulings of 2026-11-14) and D-142 (the owner's ruling of 2026-11-15) are held for later commits, so the gaps they leave are reserved and not free._
+## D-142 — In #220's exception to the meta convergence bound alone, and until #220 is fixed, a replica quarantined under D-130 counts as a voter that cannot vote (seed 1137)
+
+**Decided** — the owner's, of 2026-11-15, in chat during the Stage C integration. What is built is the narrowest reading of its words, below. A wider reading is put to the owner at the end, as a question; nothing here builds it.
+
+**The number.** D-142, after D-141 in number order (a tree without D-141 kept it as a reserved gap; at the Stage C integration it follows D-141's entry). The footer moves to D-143. Every code site carries `// D-142`.
+
+**The ruling, verbatim**, given in answer to seed 1137: "Επέκταση #220 (Recommended): Το replica σε quarantine (D-130) μετράει ως voter που δεν μπορεί να ψηφίσει, μόνο για την εξαίρεση του #220 στο όριο σύγκλισης του meta, μέχρι να διορθωθεί το #220. Καταγράφεται ως δική σου απόφαση." In English: a replica quarantined under D-130 counts as a voter that cannot vote, only for #220's exception to the meta convergence bound, until #220 is fixed; recorded as the owner's decision.
+
+**What it does not rule on.** D-141's question, the bound on the installed voter's wait (S8 (c)), stays open. Nothing here reads or changes it: `RightHalf::others` keeps the quarantined replica, so every reading of it other than the exception's, D-141's measurement of the late voters among them when it lands, sees what it saw before.
+
+**Seed 1137.** On the sharded sweep's own schedule (`Schedule::draw`, which draws `Fault::MetaReorder` on it) the correct system failed the meta convergence bound: "meta does not name range 51 at generation 3 where the run stopped, owed since 8.157s" (D-135 §5, found at the integration). Range 51 is the right half of range 2's split at 215. `right_halves()` read it as able {2}, stuck {1: `ParentPastTheSplit(216)`} and others {3}:
+- Node 2 alone holds it able to vote. It pre-votes from 5.88 s to the end at term 1, and range 51 never has a leader.
+- Node 1 holds a placeholder: its range 2 was installed at 216, past the split, so no apply will make 51 there.
+- Node 3 was refused at 1.357 s (a damaged log record) and re-seeded. Its range 2 was installed at 59 and stated quarantined at 1.663 s. Its apply of the split at 5.752 s made range 51 on that quarantined parent, which took the quarantine and was stated so at 5.757 s (D-130). It grants no vote.
+
+The exception's condition three asked that every other voter be a placeholder no apply can end, and its unit test said a quarantined replica holding the range is not one, so the bound asked of range 51, and meta never names it, since no leader is there to send the update. Excusing it would have widened the exception, so the integration left it to the owner.
+
+**What changed** (`sim/shard.rs`):
+1. `RightHalf::quarantined`: the voters of `others` holding a replica quarantined under D-130 where the trace ends, read as D-130's rule (below).
+2. `RightHalf::excused` asks condition three of `others_that_keep_it_asked()`, which is `others` less `quarantined`, where it asked of `others`. With it, it asks `a_majority_were_220_fixed()`: the voters able to vote and the placeholders no apply can end are a majority of the range's voters (below). Conditions one and two are unchanged: fewer than two voters able to vote, and no leader since the last heal or at the end.
+3. `RightHalf::excused_by_the_quarantine` and `Report::meta_lags_excused_by_the_quarantine` name what only this reading excuses. The sweep prints them.
+
+Nothing else moves. `able`, `stuck` and `others` are read as before, and `others` still names the quarantined replica. Where `others` is empty, every voter is able or a placeholder, so `a_majority_were_220_fixed()` holds and the exception as it stood excuses what it excused. The majority rule (`impaired_voters`, `ranges_with_a_majority_up`), every other check, the bound's constant and the bound without the exception are unchanged. The exception stays this bound's alone. No schedule and no trace moves, since only a fold over the trace changed.
+
+**Quarantined under D-130: D-130's rule, and nothing wider.** The ruling names "the replica in quarantine (D-130)". D-130's rule is that a replica of a right half R that a split's apply makes on a quarantined replica of its parent P takes P's quarantine. That is what the fold counts:
+- A replica of R on node `n` is quarantined under D-130 from its creation by a split's apply (`RangeCreated` with cause `split` and its parent P) while `n`'s replica of P is quarantined. `n`'s own replica of P is the one read, not another node's.
+- P's quarantine may come by any route: a `RaftReseeded` of it, a `RaftRecovered` stating it `quarantined` (a re-seed, D-109 §2's install, a restart's restatement), or D-130's rule itself. So the rule is read recursively, and a right half of a right half made that way is quarantined under D-130 too, even before either statement.
+- R's own statements, `RaftReseeded` and `RaftRecovered { state: quarantined }`, carry that quarantine and make none. A replica of R quarantined only by its own re-seed (D-035), or by an install onto a re-seeded node's placeholder (D-109 §2), is stated the same way and can no more vote. It is not D-130's, though, so it keeps the range asked.
+- The creation covers the window before the statement, which a crash leaves to the next start (D-130: seeds 4148 and 7113 of its ten thousand). The reading counts a voter only where it holds the replica and the rest of the fold already put it in `others`. A replica in the window that the majority rule reads as able stays in `able`, as before.
+
+**When it ends.** D-035's quarantine lasts for the rest of the replica's life on its store. The trace shows its ends:
+- Its node's `RaftRefused` ends the store and everything the node held. The node holds a replica after it only from a later creation, which reads D-130's rule afresh, and a parent it holds after it is quarantined only by its own statement.
+- Each creation of a replica decides the matter for it. One made otherwise than by the rule, for example by an install after a replica the rule made was collected, is not quarantined under D-130, whatever it states after.
+- A `RaftRecovered` stating `neither` says the disk carries no mark. The replica can vote from there, and a parent so restated passes no quarantine on. Only a store that lost its mark says that of a quarantined replica: `ReseedMarkNotSynced`'s shape, never the correct node's.
+
+`RaftRecovered { state: refused }` ends nothing. The `quarantined` set the fold's `able` reads, and the majority rule's, never forget a quarantine, and are left that way. So a replica whose quarantine ended is still not able to vote by their reading, but it is no longer counted as unable for the exception, and it keeps the range asked. That is the narrower of the two readings.
+
+**#220 part of the wedge.** "Only for #220's exception ... until #220 is fixed" is read as: the exception excuses a wedge that #220 is part of. A range wedged by quarantined replicas alone would stay wedged were #220 fixed, so the bound asks of it. One example is one voter able and two quarantined under D-130, with no placeholder. Another is one placeholder and two quarantined, with none able. `a_majority_were_220_fixed()` asks that the voters able to vote and the placeholders be a majority of the voters. The placeholders are what #220's fix would end, so with them ended the range could elect. Today the majority rule also keeps such a range out of the bound, since two quarantined voters of three leave it no majority, but the exception does not rest on that.
+
+**The tests.** Each was seen to fail with its plant and passes without it. The plants and what each failed are listed after the tests.
+- *Changed:* `a_range_with_two_voters_able_to_vote_is_not_excused` keeps its case from before D-142: a replica stated quarantined by its own `RaftReseeded`, holding the range, is not excused, now with quarantined {}. Beside it, a replica made by the split's apply on a re-seeded parent and stated quarantined after is excused, citing D-142, with others {1} and quarantined {1}. `a_right_half_stated_quarantined_at_a_recovery_cannot_vote` (#223) likewise keeps its `RaftRecovered { state: quarantined }` case asked. It adds a parent stated quarantined by `RaftRecovered` alone, whose split's apply makes a replica the exception counts. `a_right_half_with_no_possible_majority_is_excused` asserts that the range is not excused by this reading alone, since `others` is empty.
+- `a_replica_quarantined_otherwise_than_by_d130s_rule_keeps_the_range_asked`: a replica made by D-109 §2's install and stated quarantined keeps the range asked. So does a replica the rule made, collected, and made again by such an install.
+- `an_other_voter_not_quarantined_still_keeps_the_range_asked`: a holder impaired with no quarantine keeps the range asked, and so does a placeholder whose parent applied the split beside a replica quarantined under D-130. With three voters the majority condition keeps that second shape asked as well. So a five-voter case is added: one voter able, two placeholders, one replica quarantined under D-130, and one holding the parent with no install. Three of five could elect were #220 fixed, so condition three alone keeps it asked.
+- `a_range_with_a_quarantined_replica_and_two_voters_able_to_vote_is_not_excused`: two voters able to vote and a third quarantined under D-130, so a majority was possible.
+- `a_right_half_wedged_by_quarantine_alone_is_not_excused`: one voter able and two quarantined under D-130 with no placeholder, then one placeholder and two quarantined with none able. Condition three holds of each, and neither is excused.
+- `a_replica_whose_quarantine_ended_keeps_the_range_asked` has five cases:
+  - a refusal, then a replica made by the split's apply on a parent made after it with no quarantine;
+  - a refusal, then the parent alone;
+  - a replica made on a parent re-seeded after the refusal, which is quarantined again;
+  - a restatement with no mark;
+  - a parent restated with no mark before the split's apply.
+- `a_right_half_made_on_a_quarantined_parent_is_quarantined_before_its_statement`: the creation clause with no statement yet. Its control is a parent not quarantined. A second control is the parent quarantined on another node only. The recursion is a right half of that right half, made on node 3 before either statement.
+- `seed_1137_a_right_half_whose_third_voter_is_quarantined_is_excused_from_the_meta_bound` pins seed 1137 on the sweep's schedule. It asserts:
+  - the arm is drawn, and the seed passes `check()` and the bound;
+  - D-130's quarantine in order: node 3's refusal, its range 2 stated quarantined, range 51 made on it by the split at 215, and range 51 stated quarantined;
+  - nothing ends that quarantine: no later refusal of node 3, no restatement with no mark, and no later creation of its range 51;
+  - the wedge: no leader of 51 ever, no vote granted by node 3, and node 2 a pre-candidate at the end;
+  - range 51 live by the majority rule, read as able {2}, stuck {1: `ParentPastTheSplit(216)`}, quarantined {3} and `others` {3}, with no leader since the heal or at the end, a majority were #220 fixed, excused, and excused by this reading alone;
+  - the exception as it stood keeps range 51 asked, and the bound without the exception fails in the integration's words;
+  - with node 3's range 51 made by an install instead, and stated quarantined just the same, the bound trips on range 51;
+  - with a restatement of node 3's range 51 with no mark appended to the trace, the bound trips on range 51 again.
+
+*The plants*, each on `sim/shard.rs`, with the unit tests at ANANKE_SEEDS=20 and the pin in release:
+- The ruling planted out (`excused` asking `others.is_empty()`): the two changed tests, the ended test, the creation clause's test, and the pin at `check()`.
+- The wider reading, any replica stated quarantined counted: the two changed tests and the other-route test, and the pin at the install. With only `RaftReseeded`, or only `RaftRecovered { state: quarantined }`, making a D-130 quarantine, the changed test of that arm and the other-route test fail, and so does the pin.
+- No fresh reading at a creation: the ended test (the refusal) and the other-route test (the re-creation).
+- The `holds` check dropped: the ended test (the parent alone).
+- A restatement with no mark ending neither the replica's nor the parent's: the ended test, each; the replica's also fails the pin.
+- The refusal not ending the parent's: the ended test.
+- The rule not recursive: the creation clause's test. The rule planted out entirely: eight of the unit tests and the pin at `check()`.
+- The parent read on any node: the creation clause's test.
+- `excused_by_the_quarantine` as `excused`: `a_right_half_with_no_possible_majority_is_excused`.
+- The majority condition dropped: the quarantine-alone test. As "some placeholder", the quarantine-alone test's second case and `a_range_with_a_quarantined_replica_and_two_voters_able_to_vote_is_not_excused`.
+- Any quarantined voter excusing the range: the other-voter test's five voters.
+- Every holder in `others` counted as unable: six unit tests and the pin at the install.
+- Condition one waived where a voter is quarantined: `a_range_with_a_quarantined_replica_and_two_voters_able_to_vote_is_not_excused`.
+
+**Measured, on this tree, in release,** on an Apple M2 of 8 cores beside other slices' runs, at load averages up to about 30. "This tree" is the change's own, c3723c9 with it (the integration's first round); what was run on the integrated tree is noted after the list.
+- **The correct sharded sweep at ANANKE_SEEDS=10000** (`every_seed_passes_on_the_correct_sharded_sweep`, the sweep's own schedule): **0 of 10 000 seeds failed**, in 616 s of wall and 3 685 s user plus 81 s sys.
+  - Meta convergence was asked of 27 682 descriptors. None was left unnamed: median 0, p99 40 ms, worst 834 ms against the bound's 2 s.
+  - The exception excused 64 descriptors, 2 of them never named. Of those, **20 descriptors on 16 seeds are excused only by this reading, 1 never named**, as (seed, range, generation): (1137, 51, 3), (1349, 4, 3), (1349, 5, 4), (1453, 19, 2), (1453, 20, 3), (1536, 36, 4), (1536, 37, 5), (2116, 35, 2), (2436, 5, 4), (2613, 43, 3), (2804, 20, 3), (3025, 59, 5), (5488, 11, 3), (6248, 11, 2), (6605, 19, 2), (6605, 20, 3), (6669, 28, 3), (7073, 4, 3), (7989, 43, 3), (8724, 7, 3).
+  - The exception as it stood therefore excuses 44 on this tree, 1 never named. The integration's ten thousand, run on a binary built before its finish, counted 45 and 4.
+  - Only seed 1137's verdict moves. Meta named the other 19 with a lag of 0, before the heal, and each of their 15 seeds passes the bound without the exception at all.
+  - Each of the 20 is the same shape: one voter able to vote, one placeholder `ParentPastTheSplit`, and one replica made by a split's apply on a quarantined replica of its parent and stated quarantined after it, which the majority rule reads as impaired. None needed the creation clause before its statement, and none met an end of a quarantine.
+  - The wider reading, which counted any replica stated quarantined and asked no majority were #220 fixed, excused the same 20 on the same tree. So the narrowing moves nothing measured here.
+- **The shard binary at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100**: all 46 tests pass, in 275 s of wall and 1 593 s user plus 42 s sys. Its correct sweep asked meta convergence of 2 707 descriptors and excused 6, none by this reading alone.
+- **The correct node sweep** (`every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`) does not read `right_halves` or the meta bound, so nothing in it can move. It passed at 1000 on the wider reading's tree, in 333 s of wall.
+- **The variant the bound catches**, `MetaOverwritesByArrival` (`a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep`, the only test that asserts the bound): it passes at 1000 in that run, where the bound's catch is asserted (D-061), with check 16 on 357 and the bound on 27, 19 of them reordered by the arm, as on the wider reading's tree. On the wider reading's tree a probe over the same thousand, each run to its end, found the bound tripping on 27 seeds with that reading and on 27 without it, the variant's runs excusing 7 descriptors and none by that reading alone. This reading excuses a subset of what that one did, so it excuses nothing more there either.
+- **On the integrated tree** (round 2, with D-141 and D-139 beside this entry), in release: seed 1137's pin passes, and fails under three of the plants above, the ruling planted out and D-130's rule planted out each at `check()` and the wider reading at the install; seed 1137 also passes the sharded sweep's whole verdict, D-141's clause with it, in a probe not kept; and the gate's twenty pass across the workspace. Neither sweep was run at 10 000 seeds on it.
+
+**The nightly's row (D-064).** One `shard` row, seed 1137's pin: 0.2 cpu s (0.17 + 0.01, 0.18 + 0.01, 0.18 + 0.01 from the built release binary at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, the median rounded up to a tenth, under a load average of about 30). On its own tree it went into the lightest shard, shard 4 at 2418.6 -> 2418.8. At the Stage C integration, where D-141's row had put shard 4 at 2452.1, it goes into the integrated table's lightest, shard 3 at 2428.6 -> 2428.8, and that header is recomputed. The sweep's row keeps its figure. The unit tests are in the crate's lib, in the `rest` job. `scripts/check-nightly-shards.sh` passes.
+
+**What it costs.** The bound now names nothing of a right half wedged with a third voter quarantined under D-130 beside a placeholder, as it already named nothing of one wedged with two placeholders. The sweep's printed line is what shows them: 20 at 10 000 seeds. A bug that leaves such a replica's range without its update is no longer caught there when the range has no possible majority.
+
+**Until #220 is fixed.** The reading is the ruling's for as long as #220 is open. The change that fixes #220 takes `quarantined` and `a_majority_were_220_fixed()` out of `excused`, or puts the question to the owner again.
+
+**For the owner: a wider reading, not built.** A replica of a right half quarantined by another route than D-130's rule cannot vote either. That is its own re-seed (D-035), or an install onto a re-seeded node's placeholder (D-109 §2), and the trace states both the same way as D-130's. The ruling names D-130, so this entry does not count them, and a range wedged by one keeps being asked. Should #220's exception count them too? At 10 000 seeds on this tree, the reading that counted them excused the same 20 descriptors as this one, so the answer moves nothing measured today. It is the owner's to rule, and until then the bound asks.
+
+---
 
 _Next entry: D-143. Add one before implementing anything not covered above._

@@ -17,7 +17,7 @@
 //! end key to descriptor with a leader hint per range, merged by §1's generation rule.
 //! It is advisory — a server checks every key against its own descriptor, never the
 //! client's — so a stale cache costs a round trip and never a wrong answer (§3).
-// PROPOSED(D-097): the generation on every request, and the client's cache.
+// D-097: the generation on every request, and the client's cache.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -59,7 +59,7 @@ pub struct RangedRequest {
     pub range: RangeId,
     /// The generation the client believes that range is at: what the trace's
     /// `ClientSend` carries, and what check 17 reads a resend against (§8).
-    // PROPOSED(D-097)
+    // D-097
     pub generation: u64,
     /// The request.
     pub request: Request,

@@ -101,6 +101,7 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Stage C integration, the rulings commit (2026-11-15): **D-139** records the owner's rulings of 2026-11-14 (D-093 and D-092 answered A, D-107 read as R, D-092 to D-132 approved as built but for the open questions), and approved headings and 1 241 comment lines in 49 files drop PROPOSED, the entries then in flight and the open questions keeping it; D-108, which the ruling names bare among the open questions, keeps PROPOSED whole until the owner says whether only Stage D's question 1 is meant; **D-142** (the ruling of 2026-11-15, seed 1137) follows D-141, its row in shard 3. Not pushed.
 - Stage C integration (2026-11-15), branch `integ-stage-c-2026-11-15` off `main` at 3030e34: one tree
   holding #242, #253, #246, #247, #237, #238, #240, #254, #244, #239, #249, #251, #243 and #252,
   and in a second round the updated tips of #240, #249 and #243 and #255 (D-118, D-121, D-124 to
@@ -138,7 +139,17 @@ _Update this section at the end of every session._
   replica (node 3, re-seeded, its quarantine taken from range 2 by D-130), and #220's exception does
   not excuse that. D-127's own sweep runs the shaped schedule, where 1137 passes, and D-135's ten
   thousand ran without D-127's answers, so it takes both. Widening the exception is the owner's
-  ruling (D-135 §5's note). Not pushed.
+  ruling (D-135 §5's note). Not pushed. **Ruled 2026-11-15 (D-142, the owner's):** in #220's
+  exception alone, and until #220 is fixed, a replica quarantined under D-130 counts as a voter that
+  cannot vote. Read narrowly: only a replica D-130's rule quarantined (made by a split's apply on a
+  quarantined replica of its parent), and only where the voters able to vote and the placeholders
+  are a majority. A replica quarantined by its own re-seed or by D-109's install keeps the range
+  asked; counting it is put to the owner in D-142. Seed 1137 passes and is pinned on the sweep's
+  schedule; on D-142's own tree the correct sharded sweep passes all 10 000, the reading newly
+  excusing 20 descriptors on 16 seeds, of which only 1137's range 51 was never named. D-141's
+  question (S8 (c)) stays open. Built off c3723c9 (branch `r220-scratch`) and carried here after
+  round 2: D-142 after D-141, its nightly row into the integrated table's lightest shard, shard 3
+  (2428.6 -> 2428.8). Not pushed.
 - Branch `phase-3-stage-c-right-half-clause` (2026-11-15), off 8760c49 (#236), **PROPOSED D-141,
   #162's S8 (c), the clause half.** Check 8's right half's clause under the owner's reading R of
   D-107 (2026-11-14): R owed from a voter's apply of the split and kept across its restarts, from a

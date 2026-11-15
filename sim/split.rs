@@ -50,10 +50,10 @@
 //!
 //! **A follower cut off from its first start** ([`run_cut_from_the_start`]) is no shape of
 //! §10's. It is the directed run for an install onto an empty replica that holds a
-//! descriptor, which creates nothing (PROPOSED D-116 §4).
-// PROPOSED(D-109): `sim/split.rs` (ii).
-// PROPOSED(D-110): `sim/split.rs` (i).
-// PROPOSED(D-116): the run cut off from the first start.
+//! descriptor, which creates nothing (D-116 §4).
+// D-109: `sim/split.rs` (ii).
+// D-110: `sim/split.rs` (i).
+// D-116: the run cut off from the first start.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -97,19 +97,19 @@ const LEFT_KEY: &str = "k0";
 const RIGHT_KEY: &str = "k1";
 /// Shape (i)'s snapshot chunk: P's left half is written larger than one, R's right half
 /// smaller (SHARD.md:1617).
-// PROPOSED(D-110)
+// D-110
 pub const OVERLAP_CHUNK: usize = 16 * 1024;
 /// Shape (i)'s frame-length limit toward `x`, between R's largest chunk frame and P's
 /// (SHARD.md:1617-1619; §12, "measured before asserted"). See D-110 for the measure.
-// PROPOSED(D-110)
+// D-110
 pub const FRAME_LIMIT: usize = 8 * 1024;
 /// How long the limit holds after `x` first refused R's install for overlap, or under
 /// the variant installed it: long enough for R's leader to wait out a minimum election
 /// timeout and stream again several times.
-// PROPOSED(D-110)
+// D-110
 pub const OVERLAP_HOLD: Duration = Duration::from_millis(1_000);
 /// The key R splits at in the resplit run: R′ is `[k15, k2)`, R keeps `[k1, k15)`.
-// PROPOSED(D-110)
+// D-110
 pub const RESPLIT_KEY: &str = "k15";
 /// How long the limited heal may take to show the shape.
 const LIMIT_BUDGET: Duration = Duration::from_secs(6);
@@ -123,7 +123,7 @@ pub enum Shape {
     Overlap,
     /// (i) with R split again while the limit holds, so that a stream of R's refused for
     /// overlap is of a checkpoint from before R's split: the overlap rule's fresh take
-    /// (PROPOSED D-110, #180's review, B1).
+    /// (D-110, #180's review, B1).
     Resplit,
     /// (ii), *vote*.
     Vote,
@@ -154,7 +154,7 @@ const VOTE_LOAD: Load = Load { keys: 1, bytes: 0 };
 /// (i)'s: sixteen left keys of two KiB each, so P's left half is about two of
 /// [`OVERLAP_CHUNK`] and its chunk frames run past [`FRAME_LIMIT`]; R's one key keeps its
 /// short values.
-// PROPOSED(D-110)
+// D-110
 const OVERLAP_LOAD: Load = Load {
     keys: 16,
     bytes: 2 * 1024,
@@ -190,7 +190,7 @@ pub fn server_config_of(id: u64, range_variants: RangeVariants, shape: Shape) ->
 }
 
 /// One node's configuration for `shape` under the node's variants `node` too: the resplit
-/// run's pair (PROPOSED D-110, #185's review, NB2).
+/// run's pair (D-110, #185's review, NB2).
 #[must_use]
 pub fn server_config_with(
     id: u64,
@@ -248,7 +248,7 @@ pub fn config(seed: u64) -> SimConfig {
 }
 
 /// Shape (i)'s simulator: (ii)'s, with its own run length.
-// PROPOSED(D-110)
+// D-110
 #[must_use]
 pub fn overlap_config(seed: u64) -> SimConfig {
     let mut config = config(seed);
@@ -260,7 +260,7 @@ pub fn overlap_config(seed: u64) -> SimConfig {
 }
 
 /// The resplit run's simulator: (i)'s, with R's split's time in its run length.
-// PROPOSED(D-110)
+// D-110
 #[must_use]
 pub fn resplit_config(seed: u64) -> SimConfig {
     let mut config = config(seed);
@@ -382,7 +382,7 @@ impl Report {
     }
 
     /// The largest frame carrying a chunk of `range`'s snapshot sent toward `x`, in bytes:
-    /// what (i)'s frame-length limit is measured against (PROPOSED D-110).
+    /// what (i)'s frame-length limit is measured against (D-110).
     #[must_use]
     pub fn largest_chunk_frame_to_x(&self, range: u64) -> Option<usize> {
         self.records
@@ -489,7 +489,7 @@ impl Report {
         })
     }
 
-    /// Every leader's wait after an overlap refusal of R toward `x` (PROPOSED D-110): each
+    /// Every leader's wait after an overlap refusal of R toward `x` (D-110): each
     /// `RaftSnapshotOverlapped` of R toward `x` with the `RaftSnapshotRestream` that
     /// ended it, as (refused at, restreamed at, retake), and the next stream that leader
     /// opened toward `x` for R, if any, which must not precede the wait's end.
@@ -687,7 +687,7 @@ impl Report {
     /// # Errors
     ///
     /// What was not built or not reached, with the seed.
-    // PROPOSED(D-110)
+    // D-110
     pub fn overlap_shape(&self) -> Result<(), String> {
         let seed = self.seed;
         if let Some(why) = &self.unbuilt {
@@ -1146,7 +1146,7 @@ fn restreamed_to(records: &[TraceRecord], x: u64, right: u64) -> bool {
 }
 
 /// Runs shape (i) for `seed` under `range_variants`.
-// PROPOSED(D-110)
+// D-110
 #[must_use]
 pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
     let Prefix {
@@ -1192,7 +1192,7 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
 }
 
 /// Runs shape (i) with R split again while the limit holds, for `seed` under the node's
-/// variants `node` (PROPOSED D-110; #180's review, B1; #185's review, NB1 and NB2): the
+/// variants `node` (D-110; #180's review, B1; #185's review, NB1 and NB2): the
 /// overlap rule's fresh take.
 ///
 /// (i)'s prefix and limited heal, R left idle from the heal, so its record stays the
@@ -1206,7 +1206,7 @@ pub fn run_overlap(seed: u64, range_variants: RangeVariants) -> Report {
 /// `NodeVariant::RetakeNeverAfterOverlap` the leader streams the refused checkpoint again
 /// instead, offering `x` R over `[k1, k2)`: where R′ reaches `x` first, that overlaps R′
 /// there for as long as R stays idle, and `x` never makes R.
-// PROPOSED(D-110)
+// D-110
 #[must_use]
 pub fn run_overlap_resplit(seed: u64, node: NodeVariants) -> Report {
     let range_variants = RangeVariants::correct();
@@ -1275,10 +1275,10 @@ pub fn run_overlap_resplit(seed: u64, node: NodeVariants) -> Report {
 /// A follower of P cut off from its first start, until P's leader has compacted, and then
 /// healed: its P holds the descriptor its bootstrap wrote and has applied nothing when P's
 /// snapshot reaches it, so the install lands on an empty replica that is initialised and
-/// creates nothing (SHARD.md §8; PROPOSED D-116 §4). No split is asked and no limit put on:
+/// creates nothing (SHARD.md §8; D-116 §4). No split is asked and no limit put on:
 /// [`Report::split`] stays `None`, and [`Report::x`] is the follower, a draw on stream
 /// `split-cut` from the bootstrap nodes.
-// PROPOSED(D-116)
+// D-116
 #[must_use]
 pub fn run_cut_from_the_start(seed: u64) -> Report {
     let range_variants = RangeVariants::correct();

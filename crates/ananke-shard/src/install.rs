@@ -125,7 +125,7 @@ pub enum SnapJob {
         /// the install is decided (D-047): the switch is traced as decided here and
         /// not when this task gets to the repair, since a node behind on every range
         /// queues an install per range and the last one's hold began a queue ago.
-        // PROPOSED(D-098)
+        // D-098
         held: Decision,
     },
     /// A take of `range` completed: its versions are swept, and only its own
@@ -135,7 +135,7 @@ pub enum SnapJob {
         range: RangeId,
     },
     /// The node holds `range` from now: a split's right half, with the spans an
-    /// install of it switches (SHARD.md §5; PROPOSED D-100).
+    /// install of it switches (SHARD.md §5; D-100).
     Host {
         /// The range.
         range: RangeId,
@@ -210,7 +210,7 @@ pub enum SnapAnswer {
         config: Box<Configuration>,
         /// The descriptor the switch put in place, read back from the store: what
         /// the host's receipt check reads for this range from here on (SHARD.md §3).
-        // PROPOSED(D-097)
+        // D-097
         descriptor: Option<Box<RangeDescriptor>>,
         /// The install's decision: for a range the node held, the step that took the
         /// hold (D-047). A switch that rebuilds no replica lets the hold go with the
@@ -450,7 +450,7 @@ enum Step {
     /// Until D-110 this answer was a [`Step::Restart`], which spent RAFT.md:210-212's
     /// bound on a checkpoint nothing was wrong with: at the third refusal the leader
     /// counted it unusable and retook (#177).
-    // PROPOSED(D-110): the overlap rule's refusal ends the stream and counts nothing.
+    // D-110: the overlap rule's refusal ends the stream and counts nothing.
     Overlapped,
 }
 
@@ -470,7 +470,7 @@ fn step_for(status: SnapshotStatus, restarts: u32, variants: NodeVariants) -> St
         SnapshotStatus::More => Step::Resume,
         SnapshotStatus::Installed => Step::Done,
         SnapshotStatus::Waiting => Step::Wait,
-        // PROPOSED(D-110): the overlap rule's refusal, counted against no bound.
+        // D-110: the overlap rule's refusal, counted against no bound.
         SnapshotStatus::Overlaps => Step::Overlapped,
         SnapshotStatus::Restart if bounded && restarts >= STREAM_RESTARTS => Step::Unusable,
         SnapshotStatus::Restart => Step::Restart,
@@ -509,7 +509,7 @@ fn booked(step: Step, counted: Counted) -> Counted {
         },
         // The stream ends here, and its bookkeeping ends with it. An overlap refusal
         // ends it too and counts nothing: the next stream after the wait opens with
-        // counters of its own (PROPOSED D-110).
+        // counters of its own (D-110).
         Step::Done | Step::Unusable | Step::Overlapped => counted,
     }
 }
@@ -528,7 +528,7 @@ fn booked(step: Step, counted: Counted) -> Counted {
 fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
     match status {
         SnapshotStatus::Waiting => snapshot::waiting(term, at),
-        // PROPOSED(D-110): the overlap rule's refusal says so on the wire.
+        // D-110: the overlap rule's refusal says so on the wire.
         SnapshotStatus::Overlaps => snapshot::overlaps(term, at),
         _ => snapshot::start_over(term, at),
     }
@@ -567,7 +567,7 @@ fn answered_in(snaps: &Queue<SnapJob>, range: RangeId, to: ServerId) -> bool {
 /// A free function for the reason [`step_for`] and [`booked`] are (D-090), and #180's
 /// review is why: inside the task's loop the decision was one expression that no test
 /// could fail, since no run of the tree computed anything but "no".
-// PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+// D-110: the fresh take, read by the checkpoint's generation.
 fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDescriptor>) -> bool {
     match (streamed, now) {
         (Some(streamed), Some(now)) => streamed.generation != now.generation,
@@ -577,8 +577,8 @@ fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDe
 
 /// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
 /// node whose initialised replicas' descriptors are `held`.
-// PROPOSED(D-110): one decision for both install paths, failing closed.
-// PROPOSED(D-114): read by the split's test in `server.rs`.
+// D-110: one decision for both install paths, failing closed.
+// D-114: read by the split's test in `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
     /// Install it.
@@ -606,8 +606,8 @@ pub(crate) enum Admission {
 /// overlaps; it keeps the refusal of a placeholder's install of a range created on the
 /// node meanwhile, which is the same replica made twice rather than an overlap, and it
 /// keeps the refusal of a snapshot that names no span.
-// PROPOSED(D-110): one decision for both install paths, failing closed.
-// PROPOSED(D-114): read by the split's test in `server.rs`, which holds what a reader of
+// D-110: one decision for both install paths, failing closed.
+// D-114: read by the split's test in `server.rs`, which holds what a reader of
 // the host's table sees at a split against this rule.
 pub(crate) fn admission(
     range: RangeId,
@@ -648,7 +648,7 @@ pub(crate) fn admission(
 /// replica no longer holds and the keys of a right half beside it. P's post-split snapshot
 /// onto a P that never applied the split takes the right half's keys out with the rest,
 /// since no replica on the node owns them (the overlap rule keeps it so, SHARD.md §5,
-/// Q27). [`NodeVariant::InstallReplacesCopiedSpan`] replaces the copy (PROPOSED D-132).
+/// Q27). [`NodeVariant::InstallReplacesCopiedSpan`] replaces the copy (D-132).
 ///
 /// **A replica with none** holds no key the node can call its own: a re-seeded user
 /// range, or a joining node's replica, hosted at configuration's span only because
@@ -663,8 +663,8 @@ pub(crate) fn admission(
 /// A free function for the reason [`admission`] is: inside `finish` this was one field
 /// of the install read at one call, and no run of the tree told the two apart until the
 /// sharded sweep linearized a key that span had removed.
-// PROPOSED(D-128): a span-less replica's install replaces the snapshot's span alone.
-// PROPOSED(D-132): an initialised replica's, the host's descriptor's span at the switch.
+// D-128: a span-less replica's install replaces the snapshot's span alone.
+// D-132: an initialised replica's, the host's descriptor's span at the switch.
 fn switched_spans(
     prefix: &KeyPrefix,
     hosted: &[KeyRange<Bytes>],
@@ -798,7 +798,7 @@ fn cap_status(variants: NodeVariants) -> SnapshotStatus {
 
 /// A stream its receiver refused under the overlap rule (SHARD.md §5, Q27), ended and
 /// waiting out a minimum election timeout before its range's core may stream again.
-// PROPOSED(D-110): the leader's wait.
+// D-110: the leader's wait.
 struct Overlapped {
     /// When the wait is over.
     due: ananke_env::Instant,
@@ -840,7 +840,7 @@ pub struct Task<E: Environment> {
     variants: NodeVariants,
     engine_dir: PathBuf,
     /// The host's descriptors: a switched range's span is read here (SHARD.md §3;
-    /// PROPOSED D-100, where the node's ranges stopped being configuration's).
+    /// D-100, where the node's ranges stopped being configuration's).
     descriptors: Arc<std::sync::Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// Shared with the `apply` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
@@ -853,24 +853,24 @@ pub struct Task<E: Environment> {
     receiving: BTreeMap<(RangeId, ServerId), Inbound>,
     /// The streams refused under the overlap rule, waiting out a minimum election
     /// timeout before their range's core may ask for them again (SHARD.md §5, Q27).
-    // PROPOSED(D-110): the leader's wait.
+    // D-110: the leader's wait.
     overlapped: BTreeMap<(RangeId, ServerId), Overlapped>,
     /// The host's placeholders (SHARD.md §5, Q22): the ranges this node holds no
     /// replica of and has had messages for, whose streams this task assembles and
     /// installs into a replica of its own creating.
-    // PROPOSED(D-109)
+    // D-109
     placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
     /// The ranges the plan hosts as placeholders, at their Raft interval alone: a
     /// placeholder's span is the snapshot's, and unknown until its stream completes.
-    // PROPOSED(D-109)
+    // D-109
     as_placeholder: BTreeSet<RangeId>,
     /// The store the node's engine was opened through — its first range's, or its
     /// anchor on a node that hosts none — which a placeholder's install opens the new
-    /// replica's store beside (PROPOSED D-109).
+    /// replica's store beside (D-109).
     anchor: Arc<RaftStore<E>>,
     /// Whether the node runs on an engine a re-seed built: a placeholder's install then
     /// writes the quarantine (the host's `on_a_reseed`; D-035).
-    // PROPOSED(D-109)
+    // D-109
     on_a_reseed: bool,
     /// The range layer's variants: a placeholder's install is a creation, and draws its
     /// incarnation as `IncarnationPerRangeStream` says (PROPOSED D-108, D-109).
@@ -881,7 +881,7 @@ pub struct Task<E: Environment> {
     /// What a directed test lands at the switch, after the last await of the task's own
     /// and before what the switch reads: where an apply job queued before the hold lands.
     /// Timing it by the simulator's disk would move with every read on the path.
-    // PROPOSED(D-132)
+    // D-132
     #[cfg(test)]
     at_the_switch:
         std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
@@ -999,7 +999,7 @@ impl<E: Environment> Task<E> {
 
     /// The nearest deadline of a chunk outstanding on any stream, or of a wait after
     /// an overlap refusal.
-    // PROPOSED(D-110): the leader's wait is a deadline of the task's loop.
+    // D-110: the leader's wait is a deadline of the task's loop.
     fn deadline(&self) -> Option<ananke_env::Instant> {
         self.sending
             .values()
@@ -1043,7 +1043,7 @@ impl<E: Environment> Task<E> {
     /// another's.
     async fn due(&mut self) {
         let now = self.env.clock().now();
-        // PROPOSED(D-110): every overlap refusal's wait that is over, first.
+        // D-110: every overlap refusal's wait that is over, first.
         self.waited(now).await;
         let due: Vec<(RangeId, ServerId)> = self
             .sending
@@ -1120,7 +1120,7 @@ impl<E: Environment> Task<E> {
         // A stream refused under the overlap rule waits out its minimum election
         // timeout whoever asks meanwhile — a core that changed role asks again at once
         // — and the wait's end lets the core ask again (`waited`).
-        // PROPOSED(D-110): the leader's wait.
+        // D-110: the leader's wait.
         if self.overlapped.contains_key(&(range, to)) {
             return;
         }
@@ -1293,7 +1293,7 @@ impl<E: Environment> Task<E> {
         // and whose store is not yet is being created here — a split's apply traced its
         // creation and is opening its store — and is no placeholder's any more: the
         // chunk goes unanswered, and the sender's resend lands on the replica.
-        // PROPOSED(D-109)
+        // D-109
         let creating = store.is_none() && lock(&self.descriptors).contains_key(&range);
         let placeholder = store.is_none() && !creating && lock(&self.placeholders).contains(&range);
         if store.is_none() && !placeholder {
@@ -1444,7 +1444,7 @@ impl<E: Environment> Task<E> {
                 if placeholder {
                     // No core to hold and no replica's state to repair: the install is
                     // made here (SHARD.md §5, Q22).
-                    // PROPOSED(D-109)
+                    // D-109
                     return self.install_placeholder(range, from, *install).await;
                 }
                 self.receiving.entry((range, from)).or_default().pending = Some(install);
@@ -1548,7 +1548,7 @@ impl<E: Environment> Task<E> {
                 // core is let ask again, and `waited` says whether from a fresh take.
                 // The core's own ask stays outstanding meanwhile, so it asks nothing
                 // else of this follower until then.
-                // PROPOSED(D-110): the leader's half of the overlap rule.
+                // D-110: the leader's half of the overlap rule.
                 let version = out.sender.dir().to_path_buf();
                 self.sending.remove(&(range, from));
                 self.plan.sent(range, from);
@@ -1613,7 +1613,7 @@ impl<E: Environment> Task<E> {
         }
         // D-047: the install is decided when the `raft` task hands the repair over
         // and takes the range's hold, and it is traced once the manifest switch that
-        // carries it is durable. The decision was this task's own until PROPOSED
+        // carries it is durable. The decision was this task's own until
         // D-098, taken when it got to the repair: on a node behind on every range —
         // five streams landing at once, the meta range's among them for the first
         // time — the fifth's hold began a queue of installs earlier, and the timer
@@ -1627,7 +1627,7 @@ impl<E: Environment> Task<E> {
         // descriptor beside it, read in the record's own walk
         // so the walk's reads, and the run's schedule, are what they were before the
         // overlap rule read it (`staged_record_and_next`).
-        // PROPOSED(D-110)
+        // D-110
         let (config, streamed) = match snapshot::staged_record_and_next(
             &self.env,
             &install.source,
@@ -1656,7 +1656,7 @@ impl<E: Environment> Task<E> {
         // descriptor cannot be found is refused** as a start-over, as the placeholder's
         // path refuses one (`admission`): it was installed "as before" until #180's
         // review, so a walk that missed the descriptor switched the rule off unseen.
-        // PROPOSED(D-110): the same rule for an install onto an initialised replica,
+        // D-110: the same rule for an install onto an initialised replica,
         // failing closed.
         let admitted = admission(
             range,
@@ -1687,7 +1687,7 @@ impl<E: Environment> Task<E> {
         }
         // Admitted, so the descriptor names a span (`admission`): the snapshot's, which a
         // replica with no descriptor is made of, and what its switch replaces.
-        // PROPOSED(D-128)
+        // D-128
         let Some(streamed) = streamed else {
             return self
                 .restart(range, from, &install, &store, installing)
@@ -1722,7 +1722,7 @@ impl<E: Environment> Task<E> {
         // `[k03, k05)` with the right half made. So the store is asked again, which keeps a
         // snapshot at or below an entry applied meanwhile from taking the replica
         // backwards, and the span is what the host holds now. `InstallReplacesCopiedSpan`
-        // asks neither (PROPOSED D-132).
+        // asks neither (D-132).
         //
         // And from here to the host's `Switched` the range is held against its split's apply,
         // which waits for it, as this waits for a split in flight: the engine numbers the
@@ -1911,7 +1911,7 @@ impl<E: Environment> Task<E> {
         // replica. The host's comparison at `Switched` is for a replica it holds a
         // descriptor of; waiting for it left the plan at configuration's span for as long
         // as the raft task took to step.
-        // PROPOSED(D-128): the re-host in this task.
+        // D-128: the re-host in this task.
         if !initialised {
             self.plan
                 .host(range, vec![store.prefix().span(), span.clone()]);
@@ -1925,7 +1925,7 @@ impl<E: Environment> Task<E> {
         //
         // The descriptor the switch put in place, for the host's receipt check
         // (SHARD.md §3), read back rather than carried in the stream's record: it is
-        // what the store holds now, whatever the take put in (PROPOSED D-097). It is
+        // what the store holds now, whatever the take put in (D-097). It is
         // read **before** the state, because the timer check's live-install arm reads
         // `RaftSnapshotState` and `RaftSnapshot` as one switch only at one instant
         // (`Report::reads_back`, D-091), and D-097 put this read between them: every
@@ -1933,7 +1933,7 @@ impl<E: Environment> Task<E> {
         // none of them, and the hold it exempts was measured against the bound again
         // — which seed 368 of the raft sweep's arms found, a node streamed five
         // snapshots at once holding one range through four other installs
-        // (PROPOSED D-098).
+        // (D-098).
         let descriptor = store
             .engine()
             .get(&KeyPrefix::group(range.get()).descriptor_key())
@@ -1945,7 +1945,7 @@ impl<E: Environment> Task<E> {
         // The state, over the span the replica's descriptor names or, on a replica the
         // host holds none of yet, the snapshot's: the host puts it in place at `Switched`,
         // after this (D-083).
-        // PROPOSED(D-128): the creation's read-back reads the streamed span.
+        // D-128: the creation's read-back reads the streamed span.
         let read = self.user_span(range).unwrap_or(span);
         self.state_of(range, install.at, &store, read).await;
         self.env.trace_decided(
@@ -2004,7 +2004,7 @@ impl<E: Environment> Task<E> {
     /// as a placeholder that has a store now — its node applied the split that makes it
     /// — is hosted at its descriptor's span, as the split's own `Host` job hosts it, so
     /// a stream that completes into it replaces its whole span.
-    // PROPOSED(D-109)
+    // D-109
     fn host_as(&mut self, range: RangeId, placeholder: bool) {
         if placeholder {
             if self.as_placeholder.insert(range) {
@@ -2032,7 +2032,7 @@ impl<E: Environment> Task<E> {
     /// installing it would put two owners on the right half's keys until the parent
     /// moved on. The refusal is answered `Overlaps` (traced `StartOver::Overlaps`), and
     /// the leader streams again after a minimum election timeout, counting nothing
-    /// against its restart bound (PROPOSED D-110): by then the parent here may have
+    /// against its restart bound (D-110): by then the parent here may have
     /// applied the split, which creates the right half and ends the placeholder, or
     /// installed a snapshot past it, which moves its span off the right half's.
     ///
@@ -2048,7 +2048,7 @@ impl<E: Environment> Task<E> {
     /// never held, and quarantines both (D-035). The switch writes the replica's whole
     /// state under its prefix and replaces its span's keys, in one manifest switch
     /// (D-066), and the store is opened on what it wrote.
-    // PROPOSED(D-109): a placeholder's install creates the replica, quarantined on a
+    // D-109: a placeholder's install creates the replica, quarantined on a
     // re-seeded node, and is refused where it would overlap.
     async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
         // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
@@ -2079,7 +2079,7 @@ impl<E: Environment> Task<E> {
         // range itself initialised meanwhile — this node applied the split that makes it
         // while the stream was read — is refused as an overlap: the replica is here now,
         // and the sender's next stream lands on it (`admission`).
-        // PROPOSED(D-110): the overlap rule's one decision.
+        // D-110: the overlap rule's one decision.
         let admitted = admission(
             range,
             descriptor.as_ref(),
@@ -2112,7 +2112,7 @@ impl<E: Environment> Task<E> {
         // generator, or, under `RangeVariant::IncarnationPerRangeStream`, from the range's own stream,
         // which gives a replica created again for the same (range, node) the number its
         // predecessor drew, as the split's creation and the re-seed's do.
-        // PROPOSED(D-109)
+        // D-109
         let incarnation = if self
             .range_variants
             .contains(RangeVariant::IncarnationPerRangeStream)
@@ -2179,7 +2179,7 @@ impl<E: Environment> Task<E> {
         // answer them as its placeholder's, and a chunk of it is no placeholder's either
         // (SHARD.md §5: the placeholder becomes a replica at the install). It is what the
         // host's receipt check reads from here on.
-        // PROPOSED(D-109)
+        // D-109
         lock(&self.descriptors).insert(range, descriptor.clone());
         // What landed, read back out of the engine before the store is opened on it
         // (`read_back`): counting events says a stream flowed, and nothing about what is
@@ -2255,9 +2255,9 @@ impl<E: Environment> Task<E> {
     /// A placeholder's install refused: its staged bytes go, and the sender is asked
     /// for the stream again, saying why. A refusal under the overlap rule is answered
     /// `Overlaps`, which the sender counts against no bound and streams again after a
-    /// minimum election timeout (PROPOSED D-110); every other is a start-over.
-    // PROPOSED(D-109)
-    // PROPOSED(D-110): the overlap rule's refusal answered as itself.
+    /// minimum election timeout (D-110); every other is a start-over.
+    // D-109
+    // D-110: the overlap rule's refusal answered as itself.
     async fn placeholder_refused(
         &mut self,
         range: RangeId,
@@ -2352,7 +2352,7 @@ impl<E: Environment> Task<E> {
             }
         }
         // And a version an overlap refusal's wait will read, until the wait is over.
-        // PROPOSED(D-110)
+        // D-110
         for (key, wait) in &self.overlapped {
             if key.0 == range
                 && let Some((_, index, take)) = wait
@@ -2442,12 +2442,12 @@ impl<E: Environment> Task<E> {
     /// rather than its store: what a placeholder's install reads back before the store
     /// is opened on what it wrote, since the open itself deletes the log keys it finds
     /// at or below the snapshot's index, and a take that streamed the log would be read
-    /// back already tidied (`TakeStreamsTheLogToo`; PROPOSED D-109). What it reads there
+    /// back already tidied (`TakeStreamsTheLogToo`; D-109). What it reads there
     /// is therefore the state the switch left, which no opened store serves: the log
     /// keys at or below the snapshot's index it counts are gone once the open runs, and
     /// everything else it reads the open leaves as it is. `span` is the range's: the
     /// caller's to say, since a creation's descriptor is not yet the host's when this
-    /// reads it (PROPOSED D-128). `None` where the scan of its user keys fails, and
+    /// reads it (D-128). `None` where the scan of its user keys fails, and
     /// nothing is traced.
     async fn read_back(
         &self,
@@ -2648,7 +2648,7 @@ impl<E: Environment> Task<E> {
 
     /// A minimum election timeout: how long a stream refused under the overlap rule
     /// waits before its range's core may stream again (SHARD.md §5, Q27).
-    // PROPOSED(D-110)
+    // D-110
     fn election_min(&self) -> Duration {
         Duration::from_nanos(self.config.tick_nanos * self.config.election_ticks.0)
     }
@@ -2661,7 +2661,7 @@ impl<E: Environment> Task<E> {
     /// "Predates" is read off the checkpoint itself: its descriptor, out of the version
     /// directory the refused stream read, is at a generation below the one the range's
     /// descriptor is at now ([`retake_after_overlap`]).
-    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    // D-110: the leader's wait, and the fresh take.
     async fn waited(&mut self, now: ananke_env::Instant) {
         let over: Vec<(RangeId, ServerId)> = self
             .overlapped
@@ -2684,7 +2684,7 @@ impl<E: Environment> Task<E> {
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
             let now = lock(&self.descriptors).get(&range).cloned();
             // The variant: the refused checkpoint is streamed again, whatever it is.
-            // PROPOSED(D-110): the fresh take's variant (#185's review, NB2).
+            // D-110: the fresh take's variant (#185's review, NB2).
             let retake = !self.variants.contains(NodeVariant::RetakeNeverAfterOverlap)
                 && retake_after_overlap(streamed.as_ref(), now.as_ref());
             self.env.trace(TraceEvent::RaftSnapshotRestream {
@@ -3351,7 +3351,7 @@ mod tests {
     /// stream, and on the wire is an `Overlaps` and not a start-over: the done-when of
     /// #177, where the refusal was a `Restart` that spent RAFT.md:210-212's bound, so
     /// that at the third refusal of a sound checkpoint the leader retook it.
-    // PROPOSED(D-110): the overlap rule's refusal is counted against no bound.
+    // D-110: the overlap rule's refusal is counted against no bound.
     #[test]
     fn an_overlap_refusal_ends_the_stream_and_leaves_the_restart_count_unchanged() {
         let correct = NodeVariants::correct();
@@ -3444,7 +3444,7 @@ mod tests {
         );
     }
 
-    // --- The overlap rule (SHARD.md §5, Q27; PROPOSED D-110, #180's review) ---
+    // --- The overlap rule (SHARD.md §5, Q27; D-110, #180's review) ---
 
     fn key(name: &str) -> Bytes {
         ananke_raft::apply::user_key(name.as_bytes())
@@ -3469,7 +3469,7 @@ mod tests {
     /// task's loop, read by span, and no run of the tree computed anything but "no", so
     /// `||` planted as `&&` — the bug a split's left half meets, its start kept and its
     /// end moved — passed everything. Each case here is one that reading gets wrong.
-    // PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+    // D-110: the fresh take, read by the checkpoint's generation.
     #[test]
     fn a_refused_checkpoint_is_retaken_exactly_when_its_generation_is_not_the_ranges() {
         let before = described(R2, "k0", "k2", 1);
@@ -3502,7 +3502,7 @@ mod tests {
     /// snapshot is installed only where its span overlaps no other initialised replica
     /// on the node, a snapshot naming no span is refused on both, and the variant
     /// installs whatever its span overlaps and nothing else.
-    // PROPOSED(D-110): one decision for both install paths, failing closed.
+    // D-110: one decision for both install paths, failing closed.
     #[test]
     fn the_overlap_rule_admits_an_install_only_where_its_span_overlaps_no_other_replica() {
         let correct = RangeVariants::correct();
@@ -3736,7 +3736,7 @@ mod tests {
 
     /// [`checkpoint_of`], over the descriptor's span too where `user` names keys to put
     /// in it: what a take of a range holding those keys leaves.
-    // PROPOSED(D-128)
+    // D-128
     async fn checkpoint_with<E: Environment>(
         env: &E,
         range: RangeId,
@@ -3984,7 +3984,7 @@ mod tests {
     /// with the same figures, because no core of the tree asks inside a wait. The
     /// control is the same ask outside a wait, which gets as far as finding no version
     /// of the index and giving the stream up for a take.
-    // PROPOSED(D-110): the leader's wait drops an ask inside it.
+    // D-110: the leader's wait drops an ask inside it.
     #[test]
     fn a_cores_ask_for_a_stream_inside_an_overlap_refusals_wait_is_dropped() {
         let ((outside, inside), _) = on_a_node(|env| async move {
@@ -4025,7 +4025,7 @@ mod tests {
     /// core is told to retake one from before the range's last split, to stream again
     /// one at its present generation, and to retake one that cannot be read — and each
     /// is traced as it is told.
-    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    // D-110: the leader's wait, and the fresh take.
     #[test]
     fn a_waits_end_retakes_a_checkpoint_from_before_the_ranges_split_and_no_other() {
         let left = described(R2, "k0", "k1", 2);
@@ -4087,7 +4087,7 @@ mod tests {
     /// start-over, failing closed; and P's post-split snapshot, overlapping nothing,
     /// switches. Before the review a walk that never found the descriptor installed the
     /// first two with every test green.
-    // PROPOSED(D-110): the overlap rule on an install onto an initialised replica.
+    // D-110: the overlap rule on an install onto an initialised replica.
     #[test]
     fn an_install_onto_a_held_replica_is_refused_where_it_overlaps_another_or_names_no_span() {
         let before = described(R2, "k0", "k2", 1);
@@ -4174,13 +4174,13 @@ mod tests {
     }
 
     /// What the switch of an install replaces, read off the things that decide it
-    /// (PROPOSED D-128, D-132): a replica the node holds a descriptor of replaces that
+    /// (D-128, D-132): a replica the node holds a descriptor of replaces that
     /// descriptor's span, whatever the plan's copy says, and one with none the snapshot's
     /// span, however wide configuration's, unless a variant says to read the copy.
     /// `an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of`
     /// until D-132, which made its name false.
-    // PROPOSED(D-128)
-    // PROPOSED(D-132)
+    // D-128
+    // D-132
     #[test]
     fn an_install_replaces_the_hosts_descriptors_span_and_the_snapshots_where_it_holds_none() {
         let prefix = KeyPrefix::group(R2.get());
@@ -4273,7 +4273,7 @@ mod tests {
     /// `[k0, k9)`, and R9's key is gone, with every descriptor right, and check 8's install
     /// clause reads that off the switch's spans. (`review-200-two-streams-test.rs`, which
     /// #215 names, is not on this machine; this is built from the issue's account of it.)
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn a_second_streams_copy_of_configurations_span_leaves_the_right_half_beside_it() {
         for (variants, second_end, right_kept) in [
@@ -4384,7 +4384,7 @@ mod tests {
     /// A split applied through the log between a stream's last chunk and its switch, through
     /// the real [`ServerApplier::split`](crate::server::split_applied): the route seed 5620 of
     /// S11's sweep found, where node 3 applied range 3's split at 113 during the install of
-    /// range 3's snapshot at 113 and the switch removed range 20's keys (PROPOSED D-132). R2
+    /// range 3's snapshot at 113 and the switch removed range 20's keys (D-132). R2
     /// over `[k0, k9)` holds `k7x`; the split cuts at `k5` and makes R9.
     ///
     /// Four cases on the correct node, and all four under the variant. A snapshot past the
@@ -4395,7 +4395,7 @@ mod tests {
     /// add and is the only install whose span is wider than the replica's. Under
     /// `InstallReplacesCopiedSpan` each replaces the copy from its last chunk, `[k0, k9)`, and
     /// R9's key is gone with every descriptor right, and check 8's install clause names it.
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn a_split_applied_through_the_log_before_a_switch_leaves_the_right_halfs_keys() {
         #[derive(Clone, Copy, Debug)]
@@ -5021,7 +5021,7 @@ mod tests {
     /// the key beyond the snapshot's span goes with the rest. A plant at the call site that
     /// replaced the snapshot's span alone passed every test of the tree, and left that key in
     /// the engine with no replica on the node owning it.
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn an_install_onto_a_replica_with_a_descriptor_replaces_that_descriptors_whole_span() {
         let ((past_snapshot, in_snapshot), trace) = on_a_node(|env| async move {
@@ -5057,7 +5057,7 @@ mod tests {
         assert!(in_snapshot.is_some(), "the snapshot's key is installed");
     }
 
-    /// An install onto a replica with no descriptor, through the task (PROPOSED D-128):
+    /// An install onto a replica with no descriptor, through the task (D-128):
     /// node `/n1` hosts R2 at configuration's `[k0, k9)` with no descriptor of it, as a
     /// re-seed leaves a user range, and holds R9 over `[k1, k2)`, as R9's placeholder's
     /// install left it, with a key. R2's post-split snapshot names `[k0, k1)`, which
@@ -5069,7 +5069,7 @@ mod tests {
     /// `Switched`. Under the variant the switch replaces what the plan hosts and R9's key
     /// is gone, with every descriptor as it was; check 8's install clause reads the
     /// switch's spans off the same trace.
-    // PROPOSED(D-128)
+    // D-128
     #[test]
     fn an_install_onto_a_replica_with_no_descriptor_replaces_the_snapshots_span_alone() {
         struct Case {
@@ -5229,7 +5229,7 @@ mod tests {
     /// `into_placeholder: true` to `admission`, which is what refuses the first: planted as
     /// `false` the refusal went, every test green, and with it the guard against the double
     /// creation D-110 §4 records for seed 219 under the variant.
-    // PROPOSED(D-110): the placeholder's path asks the decision as itself.
+    // D-110: the placeholder's path asks the decision as itself.
     #[test]
     fn a_placeholders_install_of_a_range_made_here_meanwhile_is_refused() {
         let right = described(R9, "k1", "k2", 2);

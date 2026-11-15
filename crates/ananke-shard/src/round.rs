@@ -103,7 +103,7 @@ pub struct Submission {
 /// *placeholder* for the range — no descriptor, no span, no Raft state — and answers
 /// for it as a refused server answers, so the leader that sent it feeds the node the
 /// range's snapshot (`Host::unheld`).
-// PROPOSED(D-109): a message for a range not held is the placeholder's.
+// D-109: a message for a range not held is the placeholder's.
 #[derive(Clone, Debug)]
 pub struct Unheld {
     /// The range the message names, which the node does not hold.
@@ -135,7 +135,7 @@ pub struct Round {
     /// The round's messages for ranges this node holds no core of, in the order they
     /// arrived: each a placeholder's to answer before the round's sync, since a
     /// placeholder has nothing to persist (SHARD.md §5, Q22).
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     pub unheld: Vec<Unheld>,
 }
 
@@ -613,7 +613,7 @@ impl Cores {
             // A message for a range this node does not hold: counted, never silent, and
             // handed to the node, whose placeholder for the range answers it (SHARD.md
             // §5, Q22).
-            // PROPOSED(D-109): a message for a range not held is the placeholder's.
+            // D-109: a message for a range not held is the placeholder's.
             self.meters.messages_for_ranges_not_held += 1;
             if let Input::Message { from, message, .. } = input {
                 round.unheld.push(Unheld {
@@ -1330,7 +1330,7 @@ mod tests {
     /// silence: with four ranges to a node and a rebalancer moving them, a frame
     /// routed by a stale map must not look like no frame at all. And it is handed on,
     /// whole, for the placeholder that answers it (SHARD.md §5, Q22).
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     #[test]
     fn a_message_for_a_range_the_node_does_not_hold_is_counted() {
         let env = env();

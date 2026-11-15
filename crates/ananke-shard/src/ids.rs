@@ -14,10 +14,10 @@
 //! and harmless; so is a block abandoned at a restart, or one a node stopped using.
 //!
 //! What a split does on a node whose block has run out while range 0 is unreachable
-//! is Stage C's first question (PROPOSED D-092), which the owner has not ruled on. A
-//! split's leader takes its right half's id here ([`IdBlocks::take`], PROPOSED D-100),
-//! and a block with none left refuses the split `NoRangeId` at proposal: D-092's
-//! answer A, built as proposed before a ruling, which replaces it in place (D-104).
+//! is Stage C's first question (D-092), which the owner answered A on 2026-11-14 (D-139).
+//! A split's leader takes its right half's id here ([`IdBlocks::take`], D-100), and a
+//! block with none left refuses the split `NoRangeId` at proposal: answer A, built as
+//! proposed before the ruling (D-104).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -37,7 +37,7 @@ use crate::system::{self, FIRST_USER_RANGE, LeaseRecord};
 /// # Errors
 ///
 /// The engine's, or a counter that does not decode; a counter at the end of `u64`.
-// PROPOSED(D-099)
+// D-099
 pub async fn grant<E: Environment>(
     engine: &Engine<E>,
     node: ServerId,
@@ -61,7 +61,7 @@ pub async fn grant<E: Environment>(
 
 /// The node's block of range ids for one run (SHARD.md §5): the run's nonce, the
 /// block it takes from and its position in it, and the blocks it adopted, each once.
-// PROPOSED(D-099)
+// D-099
 #[derive(Debug)]
 pub struct IdBlocks {
     /// The nonce drawn at this run's start; every refill carries it.

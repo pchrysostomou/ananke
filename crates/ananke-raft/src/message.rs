@@ -218,7 +218,7 @@ pub enum SnapshotStatus {
     /// one-group server holds one group, so no receiver of its ever sends it; its sender,
     /// were it to hear one, ends the stream with no retake and no wait, and its core asks
     /// again at its next replication (`node.rs`). That arm is reached by no run.
-    // PROPOSED(D-110): the overlap rule's refusal is its own status.
+    // D-110: the overlap rule's refusal is its own status.
     Overlaps,
 }
 
@@ -966,7 +966,7 @@ mod tests {
     /// trip is a sender told to start over when it was told to wait. `Overlaps` is tag
     /// 4, added by D-110.
     // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
-    // PROPOSED(D-110): and so is the overlap rule's refusal.
+    // D-110: and so is the overlap rule's refusal.
     #[test]
     fn every_snapshot_status_round_trips_through_its_tag() {
         let every = [

@@ -1,5 +1,5 @@
 //! The node's measurement folds in incremental form (SHARD.md §12, Stage B's
-//! measurements; the owner's ruling (b) at the stage's close, 2026-09-25; PROPOSED
+//! measurements; the owner's ruling (b) at the stage's close, 2026-09-25;
 //! D-095): the apply lag per range, the hold one range's applies put on the node's
 //! others, and the coverage counters `sim/tests/node.rs` reads off a run's trace.
 //!
@@ -57,7 +57,7 @@ pub fn median(sorted: &[Duration]) -> Option<Duration> {
 /// The apply lag per range, incrementally: from a range's `RaftCommit` reaching an
 /// index on a node to that node's `RaftApply` of it, in virtual time
 /// ([`raft::apply_lags_of`] is the whole-trace reading).
-// PROPOSED(D-095): the apply lag as an incremental fold under the equivalence test.
+// D-095: the apply lag as an incremental fold under the equivalence test.
 #[derive(Default)]
 pub struct ApplyLagFold {
     committed: BTreeMap<(u64, u64), Committed>,
@@ -163,7 +163,7 @@ pub fn medians_of(
 /// folds the applies; this one takes them as they come, and can, because a hold's
 /// window `[from, t1]` ends at or before the apply that reports it, so every crash
 /// inside it has been traced by then.
-// PROPOSED(D-095): the cross-range hold as an incremental fold under the equivalence
+// D-095: the cross-range hold as an incremental fold under the equivalence
 // test, in one pass.
 #[derive(Default)]
 pub struct CrossRangeHoldFold {
@@ -314,27 +314,27 @@ pub struct NodeCoverage {
     /// See `puts`.
     pub cas: u64,
     /// `RangeMismatchSent`, by where the server saw it (SHARD.md §3).
-    // PROPOSED(D-097)
+    // D-097
     pub mismatches_at: BTreeMap<MismatchAt, usize>,
     /// `ClientMismatch` received, and `ClientSend` made.
-    // PROPOSED(D-097)
+    // D-097
     pub client_mismatches: usize,
     /// See `client_mismatches`.
     pub client_sends: usize,
     /// `RaftRead` served by range 0 or range 1: the lookups (SHARD.md §1, §3).
-    // PROPOSED(D-098)
+    // D-098
     pub lookups_served: usize,
     /// `MetaApplied` after the bootstrap, and how many of them won something.
-    // PROPOSED(D-098)
+    // D-098
     pub meta_applies: usize,
     /// See `meta_applies`.
     pub meta_took: usize,
     /// `RangeIdsLeased` records: every replica of range 0's apply of a refill
     /// (SHARD.md §5, Q17).
-    // PROPOSED(D-099)
+    // D-099
     pub ids_leased: usize,
     /// `RangeSplit` records: every replica's apply of a split that took effect
-    /// (SHARD.md §5; PROPOSED D-100).
+    /// (SHARD.md §5; D-100).
     pub splits: usize,
 }
 
@@ -435,7 +435,7 @@ impl NodeCoverage {
 
 /// The coverage counters folded one record at a time ([`NodeCoverage::read`] is the
 /// whole-trace reading).
-// PROPOSED(D-095): the node's coverage as an incremental fold under the equivalence
+// D-095: the node's coverage as an incremental fold under the equivalence
 // test.
 #[derive(Default)]
 pub struct NodeCoverageFold {
@@ -577,7 +577,7 @@ mod tests {
 
     /// A commit at 10 ms applied at 25 ms is a lag of 15 ms for its range; an apply
     /// of an index no commit stamped is no sample; and both readings say so.
-    // PROPOSED(D-095)
+    // D-095
     #[test]
     fn the_lag_fold_measures_commit_to_apply_per_range_and_agrees_with_the_reading() {
         let records = vec![
@@ -607,7 +607,7 @@ mod tests {
     /// uses (sim/raft.rs): a wait across ranges is one hold, a crash inside the
     /// window drops it, one range alone holds nothing, and another node's applies
     /// are not this node's.
-    // PROPOSED(D-095)
+    // D-095
     #[test]
     fn the_hold_fold_in_one_pass_agrees_with_the_two_pass_reading() {
         let across = vec![
@@ -671,7 +671,7 @@ mod tests {
 
     /// The coverage fold counts what the reading counts, on a trace with one of each
     /// kind it reads, and the two are equal as values.
-    // PROPOSED(D-095)
+    // D-095
     #[test]
     fn the_coverage_fold_agrees_with_the_reading_value_for_value() {
         let records = vec![

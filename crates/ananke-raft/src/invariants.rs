@@ -637,10 +637,10 @@ impl Checker {
     /// since `0 * 2 > 0` is false (issue #105). Which node's creation the trace holds
     /// first is the scheduler's, not the configuration's, so the first that names
     /// voters is taken whichever order the two were traced in. No creation of this
-    /// tree names none — a bootstrap's names the bootstrap nodes (PROPOSED D-097), a
+    /// tree names none — a bootstrap's names the bootstrap nodes (D-097), a
     /// split's the voters its parent has in force, an install's the descriptor its
-    /// snapshot carried, and a node that joins holds nothing at its start (PROPOSED
-    /// D-109) — so this is what the check says of a trace the sweeps do not reach, not
+    /// snapshot carried, and a node that joins holds nothing at its start
+    /// (D-109) — so this is what the check says of a trace the sweeps do not reach, not
     /// a path they run. Only the first that names voters counts: a later creation is
     /// another node's of the same birth, or an install's, which names the descriptor
     /// its snapshot carried.
