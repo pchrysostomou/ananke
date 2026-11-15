@@ -26341,4 +26341,186 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+## PROPOSED D-138 — A split's apply on a replica that holds no descriptor, a re-seeded user range its log brought back, applies from the descriptor configuration names, which is the one its replay implies: `ReplayedRangeRefusesItsSplit` keeps the refusal beside the fix (#199)
+
+**The number.** Off `main` at c5cd18d, whose footer reads D-133 and whose highest entry is D-132.
+Open work holds D-133 to D-137, so this entry is D-138 and the footer moves to D-139. At a merge
+the entries are a union in numerical order with one footer, the highest plus one. Every code site
+carries `// PROPOSED(D-138)`.
+
+**This is a correction, and the documents settle its outcome.** Raft's State Machine Safety
+property is that a server that has applied an entry at an index applies the same entry there as
+every other (Ongaro and Ousterhout, "In Search of an Understandable Consensus Algorithm", 2014,
+§5.4.3 and Figure 3), and check 4 compares the effect of each apply as well as its entry (D-069).
+SHARD.md §5 says of a split that "each applies `s` to the same state", and §2 computes the
+index-0 state, a configured range's descriptor at the first generation among it, from
+configuration alone. D-098 met the same fault in a system range: a replica rebuilt in a fresh
+engine started its state machine empty, "since the index-0 state is in no log", and the re-seed
+writes a system range's index-0 state for it. So a replica its log brings back from the first
+entry must take a split the others take. What the documents do not settle is where that
+replica's descriptor comes from, which is section 3's question.
+
+**The bug, on a correct server (#199).** Found by #192's review. The re-seed (`server::reseed`)
+writes a descriptor for the system ranges only. A user range whose leader never compacted comes
+back to the node by its log, from index 1, and never by a stream, so the replica holds no
+descriptor. When the range next splits, the replica's apply reads none and refuses the split,
+`NotLive` (`ServerApplier::split`), while every other replica holds configuration's descriptor
+from its bootstrap and takes it. #199's probe at 8fe74a6 failed state machine safety on 40 of 40
+seeds, and D-128 §9 measured its own fix to leave that unchanged.
+
+### 1. The directed run
+
+`reseed::run_split_of_a_replayed_range` is `run_after_split`'s shape with one more step
+(`after_split`'s third mode, `Again::Replayed`). Range 3, `[k2, k4)`, has no writer, so its leader
+never passes its threshold and `x`'s re-seeded replica of it is brought up by the log alone. Once
+`x`'s re-seeding start has run `SPLIT_AFTER`, an operator splits range 3 at `k3`; the run waits up
+to `SECOND_SPLIT_BUDGET` for `x` to apply the split and then gives every replica
+`SECOND_SPLIT_SETTLE`. `AfterSplit::replayed_reached` is the situation, per seed: the run was
+built, `x` was refused, `x` installed no snapshot of range 3 after its refusal, the split was
+traced, and `x` applied the split's entry. `split_operator` and `rights_on` take the range they
+are about, so `run_split_after_reseed` (D-117) is unchanged in what it does.
+
+**Reproduced first.** `ReplayedRangeRefusesItsSplit` (section 4) restores the split's path as
+`main` has it, byte for byte: a store with no descriptor is refused. On this run it fails state
+machine safety on 20 of 20 seeds, every one at the split's entry of range 3, "applied to effect
+took on one server and refused on server" `x` or the reverse, with `x`'s apply `refused` and no
+right half made on `x`.
+
+### 2. What is built
+
+- **`ServerApplier::configured`** (`server.rs`): the descriptor each range configuration names
+  starts with on a bootstrap node, `bootstrap_descriptor`, D-098's piece. It is built at the start
+  from the same `hosted` list and bootstrap set `initial_state` writes from, before the right
+  halves found on the disk are added to `hosted`, so it holds configuration's ranges and nothing
+  else. A node that joins hosts no range at its start (D-109) and its table is empty.
+- **The split's parent.** Where the store holds no descriptor, `split` takes configuration's for
+  the range, and everything after is a first apply's path, unchanged: the key strictly inside the
+  span, `Live`, the configuration plain, a right id; one batch with both halves' descriptors and,
+  on a voter, R's Raft state, with the quarantine D-130 gives a right half made on a quarantined
+  parent, which a re-seeded replica is; both descriptors into the host's table in one acquisition
+  (D-114); the re-host of P at its left half; R's store and core. A range configuration does not
+  name is refused as before.
+
+The fallback is exact, not a guess. A replica holds a descriptor once a bootstrap, a split's
+batch or an install has written one, so one that holds none is a re-seeded replica of a user range
+configuration names; and one that applies entries holding none has applied every entry from 1
+over the empty state, since an install would have written one. The only entry that changes a
+descriptor through the log is a split's (no merge is applied in this phase, and a configuration
+change does not touch the descriptor), and its first split writes one. So the descriptor in force
+before the entry is the index-0 one, configuration's, which every replica that was never re-seeded
+holds at that index.
+
+**No schedule moves where the fallback is not taken.** The fallback is a read of a table built at
+the start, with no await and no draw, and the table's construction draws nothing. Where it is
+taken, the tree before this entry failed state machine safety.
+
+**The apply check is unchanged** (D-097, "one without is checked against nothing"), and needs no
+fallback. Every keyed entry in a configured range's log was let in at receipt against a descriptor
+of that range, and every such span lies within configuration's, spans only narrowing by splits.
+So before the replica's first split every keyed entry it applies is inside the descriptor its
+replay implies, as it is inside the descriptor in force on every other replica at that index, and
+it takes there as here; after it, the replica holds what the split wrote and the check reads that.
+
+### 3. Where the descriptor comes from (a question for the owner)
+
+Three places would give the replica the descriptor its replay implies. This entry builds the
+first and recommends it.
+
+1. **At the split's apply, from configuration (built).** It changes nothing until the replica's
+   first split, which is the first entry whose apply reads the descriptor and differs.
+2. **At the re-seed, as D-098 does for a system range.** The replica would be initialised at
+   configuration's span from its start, and the overlap rule (Q27) would refuse every right half's
+   install beside it until its own install or replay moved it. That undoes D-128's design, in
+   which SHARD.md §5 has a re-seeded user range not initialised so that a right half comes back
+   beside it, and it removes the order D-128's tests rest on:
+   `a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first` asserts that the
+   right half's install lands before P's on some seed, and `InstallReplacesHostedSpan` is caught
+   exactly there. Neither could hold.
+3. **At the replica's first apply.** The replica would be initialised from its first entry, which
+   is closer to Q27 for the replay, but it moves the host's table, the overlap rule's answers and
+   the snapshot plan on every re-seeded user range that replays, which no fault here needs, and
+   it leaves section 5's window where it is.
+
+### 4. The pair
+
+- **`NodeVariant::ReplayedRangeRefusesItsSplit`, node bit 52.** Bit 53 is free, and eleven bits
+  are left. It skips the fallback, which is the tree before this entry.
+- **The directed test,** `a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back`
+  (`sim/tests/reseed.rs`), on the tier's seeds under the binary's `TIER_CAP`: on every seed
+  `replayed_reached`, every check of the trace (state machine safety among them), and
+  `AfterSplit::replayed_split_taken`: `x`'s apply of the entry took, `x` traced the split with the
+  right half the first applier named and range 3's descriptor at the entry over `[k2, k3)` at the
+  second generation, and created that right half over `[k3, k4)` at the second generation, the
+  entry its floor and every server its voter.
+- **The variant's test,**
+  `a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught`, on
+  `HIGH_RATE_SHARE`, the first twenty of the same seeds: on every seed `replayed_reached`, `x`'s
+  apply `refused` and no right half made, and the trace's checks failing first at state machine
+  safety, at the split's index of range 3, naming `took` and `refused`. Caught on 20 of 20 here and
+  on 40 of 40 in #199, so asserted at every tier (D-061).
+- **The unit test,**
+  `a_replica_with_no_descriptor_takes_a_split_from_the_descriptor_configuration_names`
+  (`server.rs`), on the real `ServerApplier::split` over a store that applied 1 to 8 with nothing
+  in them: the correct node takes it, writes P's left half and R and puts both in the host's
+  table; the variant refuses it, `NotLive`, and writes nothing but the applied index; and a range
+  configuration does not name is refused as before.
+
+### 5. What is not here
+
+- **A right half installed beside such a replica before it replays to the split.** The overlap
+  rule admits R's install beside a replica with no descriptor, which is not initialised (D-128).
+  If R's leader streams R to the node before the replica's log reaches the split, the split's
+  apply then makes R a second time on a node that holds it initialised, and writes R's Raft state
+  over at the floor. Check 8 names it: a `RangeCreated` of a range its node holds initialised.
+  Before this entry the same schedule failed state machine safety at the split, so nothing
+  regresses. It is not reached. On `main` every replay of a split on a replica with no descriptor
+  failed state machine safety, and S11's sweep passed its 10 000 seeds there (D-131), so no seed
+  of 0 to 9 999 replays one; this entry moves no schedule that does not, and this tree's sweep at
+  10 000 says the same (section 6). D-128 §9's last bullet, a replica with no descriptor replaying
+  keyed entries below a split with R beside it, is the same window and is unchanged. Recommended,
+  for its own issue in #178's family: the split's apply that finds R initialised in the host's
+  table takes P's half and leaves R as its install made it, since R's install carries R's state
+  from at or past the split, as D-107 leaves to P's own install an entry it moved past.
+
+### 6. What the sweeps say
+
+Measured on this tree from the built release binaries, under load averages of 100 to 260 on an
+Apple machine of 8 cores, other agents' sweeps beside them.
+
+- **The `reseed` binary at `ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100`**, every test, so each at the
+  binary's `TIER_CAP` of 200 or at `HIGH_RATE_SHARE`'s 20: **18 passed, 0 failed** (426.19 user +
+  41.63 sys). The directed test passed on 200 of 200 seeds. `ReplayedRangeRefusesItsSplit` failed
+  state machine safety at the split of range 3 on 20 of 20. D-128's two rows say what they said: the
+  right half's install landed before P's on 54 of 200 seeds, and `InstallReplacesHostedSpan` lost the
+  right half's keys and tripped check 8's install clause on those 54 and on no other.
+- **The sharded sweep, `every_seed_passes_on_the_correct_sharded_sweep`, at
+  `ANANKE_SEEDS=10000 ANANKE_DEEP_SEEDS=1000`: passed, 0 failures of 10 000**, with 43 250 splits taken
+  and 4 969 store refusals on 4 047 seeds (2 776.45 user + 218.12 sys). As section 5 argues, no seed of
+  it replays a split on a replica with no descriptor, so its schedule is `main`'s.
+- **The crate's unit tests** of the split and the variant set: the new one, the D-114 and D-107 split
+  tests beside it, and `every_variant_takes_a_bit_of_its_own` at 53 variants.
+
+`scripts/premerge.sh` has not run on this tree.
+
+### 7. The nightly's rows (D-064)
+
+Two `reseed` rows, from the built release binary at `ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100`, three
+runs each, medians of user + sys, under load averages of 150 to 180 with the sharded sweep of section 6
+beside them, so if anything high: the directed test at 46.9 (41.55 + 5.37, 41.34 + 5.57, 41.03 + 5.64),
+into shard 4 at 2231.2 -> 2278.1; the variant's at 20.6 (15.22 + 6.55, 14.90 + 4.99, 15.55 + 5.03), into
+shard 3 at 2237.4 -> 2258.0. `scripts/nightly-shards.txt` says the same.
+
+### 8. For the owner (PROPOSED)
+
+The outcome is settled by the documents, as above, so what is the owner's is the shape:
+
+1. Section 3's question: the descriptor taken from configuration at the split's apply, rather than
+   written at the re-seed or at the replica's first apply. Recommended and built.
+2. Bit 52, and the variant restoring the refusal.
+3. The window in section 5, left open and named, with the recommendation there.
+4. The directed run's tiers: the correct node on the binary's capped tier and the variant on
+   `HIGH_RATE_SHARE`, as `TasksOnTheRefusedDir` is run (D-115's cap, still the owner's).
+
+---
+
+_Next entry: D-139. Add one before implementing anything not covered above._

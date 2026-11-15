@@ -32,9 +32,13 @@
 //!   the right half's lands first (PROPOSED D-128);
 //! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
 //!   on committing, and the leader as it was is caught by the read bound
-//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
+//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129);
+//! - a re-seeded node takes the split of a range its log brought back, which holds no
+//!   descriptor, from the descriptor configuration names, and `ReplayedRangeRefusesItsSplit`,
+//!   the refusal it made before, is caught by state machine safety on every seed
+//!   (`reseed::run_split_of_a_replayed_range`, #199, PROPOSED D-138).
 
-use ananke_env::{RecoveredAs, TraceEvent};
+use ananke_env::{ApplyEffect, RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_shard::invariants::Fold;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -763,8 +767,9 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 /// `run_after_split` cannot: the `apply` task's `engine_dir`, by where the versions are, and
 /// the `snapshot` task's, by the sweep that empties nothing (PROPOSED D-117 gives the table).
 ///
-/// It splits P's left half and not a range the log rebuilt, whose split fails state machine
-/// safety on the re-seeded node, which is #199's.
+/// It splits P's left half, which came back by a stream. A range the log rebuilt is
+/// `a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back`'s, whose split failed
+/// state machine safety on the re-seeded node until D-138 (#199).
 // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
 // PROPOSED(D-130): on a node that may lead a right half made after its re-seed, the variant's.
 #[test]
@@ -858,4 +863,97 @@ fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_no
         Ok(())
     });
     verdict(&verdicts).expect("a right half made after a re-seed is quarantined on every seed");
+}
+
+/// A re-seeded node takes the split of a range its log brought back (#199; PROPOSED D-138):
+/// `reseed::run_split_of_a_replayed_range`, on every seed of the tier.
+///
+/// The re-seed writes a user range no descriptor, and range 3, which no writer writes and
+/// whose leader never compacts, comes back to `x` by its log from the first entry, never by
+/// a stream, so `x`'s replica of it holds none when the split reaches it. On every seed the
+/// run reaches that (`replayed_reached`: `x` installed no snapshot of range 3 after its
+/// refusal and applied the split's entry), every check of the trace passes, state machine
+/// safety among them, and `x` applies the split as a first apply does
+/// (`replayed_split_taken`): its apply took, it traced the split and range 3's descriptor
+/// over `[k2, k3)` at the second generation, and it created the right half over `[k3, k4)`
+/// with every server its voter.
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back() {
+    let run = shape_seeds();
+    tier_under(
+        "the split of a range the log rebuilt, correct",
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct());
+        report.replayed_reached()?;
+        report.check()?;
+        report.replayed_split_taken()
+    });
+    verdict(&verdicts)
+        .expect("a re-seeded node takes the split of a range its log brought back on every seed");
+}
+
+/// The pair's buggy half (CLAUDE.md; PROPOSED D-138): `ReplayedRangeRefusesItsSplit` on
+/// `reseed::run_split_of_a_replayed_range`, on [`HIGH_RATE_SHARE`] seeds, the first of the
+/// correct node's above.
+///
+/// On every seed the run reaches its situation as the correct node's does, `x` applies the
+/// split's entry to `refused` and traces no split of range 3, and state machine safety
+/// names that entry of range 3 applied to `took` on one server and `refused` on another.
+/// #199 measured it on 40 of 40 seeds, so it is asserted at every tier (D-061).
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught() {
+    let run = HIGH_RATE_SHARE;
+    let variant = NodeVariant::ReplayedRangeRefusesItsSplit;
+    tier_under(
+        &format!("the split of a range the log rebuilt, {variant}"),
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report =
+            reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct().with(variant));
+        report.replayed_reached()?;
+        let x = report.x;
+        let range = reseed::REPLAYED_RANGE;
+        let (index, _) = report
+            .replayed_split()
+            .expect("`replayed_reached` names the split");
+        let effect = report.applied_after_refusal(range, index);
+        if effect != Some(ApplyEffect::Refused) || report.second_right.is_some() {
+            return Err(format!(
+                "seed {seed}: {variant}: node {x} applied entry {index} of range {range} to \
+                 {effect:?} and made the right half {:?}: it should refuse it and make none",
+                report.second_right
+            ));
+        }
+        let expected = format!(
+            "seed {seed}: state machine safety: index {index} of group {range} was applied to \
+             effect "
+        );
+        match report.check() {
+            Err(words)
+                if words.starts_with(&expected)
+                    && words.contains("took")
+                    && words.contains("refused") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "seed {seed}: {variant} should fail state machine safety at entry {index} of \
+                 range {range}, and the checks said {other:?}"
+            )),
+        }
+    });
+    let caught = verdicts.iter().filter(|verdict| verdict.is_ok()).count();
+    println!(
+        "reseed: {variant} failed state machine safety at the split of range {} on {caught} of \
+         {run} seeds",
+        reseed::REPLAYED_RANGE
+    );
+    verdict(&verdicts).expect("the refusal is caught by state machine safety on every seed");
 }

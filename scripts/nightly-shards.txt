@@ -695,6 +695,14 @@
 # of 3: seed 16725's 0.2 (0.15 + 0.01, 0.12 + 0.00, 0.12 + 0.00, the median rounded up to a tenth), seed 18925's 0.2 (0.17 +
 # 0.00 three times), each into the lightest shard, shard 4 at 2230.8 -> 2231.0 -> 2231.2. No row moved and nothing was
 # re-weighed; the merge of D-132's text changed no row. Every header is recomputed.
+# PROPOSED D-138 (#199, a split of a range a re-seeded node's log brought back) added two `reseed` rows, weighed
+# on its tree from the built release binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, three runs each, medians of user + sys, under load averages of 150 to 180 with the
+# 10 000-seed sharded sweep running beside them, so if anything high: the correct node's directed run, the
+# binary's TIER_CAP of 200 seeds, 46.9 (41.55 + 5.37, 41.34 + 5.57, 41.03 + 5.64); the variant's catch on
+# HIGH_RATE_SHARE's 20 seeds, 20.6 (15.22 + 6.55, 14.90 + 4.99, 15.55 + 5.03). Longest-first into the lightest
+# shard: shard 4 at 2231.2 -> 2278.1, then shard 3 at 2237.4 -> 2258.0. No row moved and nothing was
+# re-weighed. Every header is recomputed.
 # shard 1: 2689.1 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -748,7 +756,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	179.0	an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node
-# shard 3: 2237.4 cpu s
+# shard 3: 2258.0 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -774,7 +782,8 @@
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
-# shard 4: 2231.2 cpu s
+3	reseed	20.6	a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught
+# shard 4: 2278.1 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -819,6 +828,7 @@
 4	shard	0.2	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
 4	shard	0.2	seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
 4	shard	0.2	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
+4	reseed	46.9	a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back
 # shard 5: 2252.7 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.3	seeds_2272_and_7949_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound

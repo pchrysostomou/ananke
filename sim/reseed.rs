@@ -1340,10 +1340,18 @@ const RIGHT_KEYS: u64 = 100;
 const RIGHT_EVERY: Duration = Duration::from_millis(40);
 /// The key the split after the re-seed splits P's left half at: its right half is
 /// `[k0a, k1)`. P's left half and not another range because `x` got it back by a stream,
-/// which carries its descriptor; a range the log rebuilt holds none, and its next split
-/// fails state machine safety on `x` (#199).
+/// which carries its descriptor. A range the log rebuilt held none, and its next split
+/// failed state machine safety on `x` until D-138 (#199); [`REPLAYED_RANGE`] is that one's.
 // PROPOSED(D-117)
 const LEFT_SPLIT_KEY: &str = "k0a";
+/// The range [`run_split_of_a_replayed_range`] splits: the second user range, `[k2, k4)`,
+/// which no writer of the run writes, so its leader never compacts and a re-seeded replica
+/// of it is brought up by its log from the first entry (#199).
+// PROPOSED(D-138)
+pub const REPLAYED_RANGE: u64 = FIRST_RANGE + 1;
+/// The key that run splits it at: its right half is `[k3, k4)`.
+// PROPOSED(D-138)
+pub const REPLAYED_SPLIT_KEY: &str = "k3";
 /// The key the writer of that right half writes.
 // PROPOSED(D-117)
 const LEFT_RIGHT_KEY: &str = "k0b";
@@ -1396,7 +1404,7 @@ pub struct AfterSplit {
     /// audit did not finish.
     pub fresh_at_end: Option<DirAudit>,
     /// The right half of the split after the re-seed, where this run asked for one and
-    /// `x` applied it ([`run_split_after_reseed`]).
+    /// `x` applied it ([`run_split_after_reseed`], [`run_split_of_a_replayed_range`]).
     pub second_right: Option<u64>,
 }
 
@@ -2034,6 +2042,177 @@ impl AfterSplit {
             })
             .count()
     }
+
+    /// The split of [`REPLAYED_RANGE`] the run asked for, as the trace first names it: its
+    /// index and its right half. That range splits nowhere else in the run.
+    // PROPOSED(D-138)
+    #[must_use]
+    pub fn replayed_split(&self) -> Option<(u64, u64)> {
+        self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } if *range == REPLAYED_RANGE => Some((*index, *right)),
+            _ => None,
+        })
+    }
+
+    /// The effect `x` applied entry `index` of `range` to after its refusal, if it did.
+    // PROPOSED(D-138)
+    #[must_use]
+    pub fn applied_after_refusal(&self, range: u64, index: u64) -> Option<ApplyEffect> {
+        let refused = self.refused_at()?;
+        self.records[refused..]
+            .iter()
+            .find_map(|record| match &record.event {
+                TraceEvent::RaftApply {
+                    server,
+                    range: r,
+                    index: i,
+                    effect,
+                    ..
+                } if *server == self.x && *r == range && *i == index => Some(*effect),
+                _ => None,
+            })
+    }
+
+    /// How many snapshots `x` installed of `range` after its refusal.
+    // PROPOSED(D-138)
+    #[must_use]
+    pub fn installs_after_refusal(&self, range: u64) -> usize {
+        let Some(refused) = self.refused_at() else {
+            return 0;
+        };
+        self.records[refused..]
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftSnapshot { server, range: r, taken: false, .. }
+                    if server == self.x && r == range)
+            })
+            .count()
+    }
+
+    /// The case [`run_split_of_a_replayed_range`] is for, per seed: the run was built, `x`
+    /// was refused and re-seeded, `x` installed no snapshot of [`REPLAYED_RANGE`] after its
+    /// refusal, so its replica came back by the log alone and holds no descriptor from a
+    /// stream, the split the run asked for was traced, and `x` applied the split's entry,
+    /// to whatever effect. With that the comparison state machine safety makes of the entry
+    /// includes `x`'s apply of it.
+    ///
+    /// # Errors
+    ///
+    /// What was not built or not reached, with the seed.
+    // PROPOSED(D-138)
+    pub fn replayed_reached(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        let range = REPLAYED_RANGE;
+        if let Some(why) = &self.unbuilt {
+            return Err(format!(
+                "seed {seed}: the re-seed after a split was not built: {why}"
+            ));
+        }
+        if self.refused_at().is_none() {
+            return Err(format!("seed {seed}: node {x} was never refused"));
+        }
+        let installs = self.installs_after_refusal(range);
+        if installs != 0 {
+            return Err(format!(
+                "seed {seed}: node {x} installed {installs} snapshots of range {range} after its \
+                 refusal, so its replica did not come back by the log alone"
+            ));
+        }
+        let Some((index, _)) = self.replayed_split() else {
+            return Err(format!("seed {seed}: no split of range {range} was traced"));
+        };
+        if self.applied_after_refusal(range, index).is_none() {
+            return Err(format!(
+                "seed {seed}: node {x} never applied entry {index} of range {range}, the split"
+            ));
+        }
+        Ok(())
+    }
+
+    /// What D-138 builds, per seed, asked after [`replayed_reached`](Self::replayed_reached):
+    /// `x` applied the split of the range its log rebuilt as a first apply does. Its apply of
+    /// the entry took; it traced the split with the right half the first applier named; it
+    /// traced the range's descriptor at the entry, `[k2, k3)` at the second generation; and
+    /// it created that right half, `[k3, k4)` at the second generation with the entry as its
+    /// floor and every server its voter.
+    ///
+    /// # Errors
+    ///
+    /// What `x` did not do, with the seed.
+    // PROPOSED(D-138)
+    pub fn replayed_split_taken(&self) -> Result<(), String> {
+        let seed = self.seed;
+        let x = self.x;
+        let range = REPLAYED_RANGE;
+        let Some((index, right)) = self.replayed_split() else {
+            return Err(format!("seed {seed}: no split of range {range} was traced"));
+        };
+        let effect = self.applied_after_refusal(range, index);
+        if effect != Some(ApplyEffect::Took) {
+            return Err(format!(
+                "seed {seed}: node {x} applied entry {index} of range {range}, the split, to \
+                 {effect:?} and not took"
+            ));
+        }
+        let refused = self.refused_at().unwrap_or(self.records.len());
+        let mine = || {
+            self.records[refused..]
+                .iter()
+                .filter(|record| self.on_x(record))
+        };
+        let split = mine().find_map(|record| match &record.event {
+            TraceEvent::RangeSplit {
+                range: r,
+                right,
+                index: i,
+                ..
+            } if *r == range => Some((*i, *right)),
+            _ => None,
+        });
+        if split != Some((index, right)) {
+            return Err(format!(
+                "seed {seed}: node {x} traced the split of range {range} as {split:?}, not as \
+                 {:?}",
+                Some((index, right))
+            ));
+        }
+        let start = ananke_raft::apply::user_key(b"k2");
+        let cut = ananke_raft::apply::user_key(REPLAYED_SPLIT_KEY.as_bytes());
+        let end = ananke_raft::apply::user_key(b"k4");
+        let generation = FIRST_GENERATION + 1;
+        let left = mine().any(|record| {
+            matches!(&record.event, TraceEvent::RangeDescriptor {
+                range: r, index: i, start: s, end: e, generation: g, ..
+            } if *r == range && *i == index && *s == start && *e == cut && *g == generation)
+        });
+        if !left {
+            return Err(format!(
+                "seed {seed}: node {x} traced no descriptor of range {range} at {index} over \
+                 its left half at generation {generation}"
+            ));
+        }
+        let voters: Vec<u64> = (1..=SERVERS).collect();
+        let created = mine().any(|record| {
+            matches!(&record.event, TraceEvent::RangeCreated {
+                range: r, cause: RangeCause::Split, parent, start: s, end: e, generation: g,
+                voters: v, floor_index, ..
+            } if *r == right && *parent == Some(range) && *s == cut && *e == end
+                && *g == generation && *v == voters && *floor_index == index)
+        });
+        if !created {
+            return Err(format!(
+                "seed {seed}: node {x} did not create range {right} over [k3, k4) at \
+                 generation {generation} from the split at {index}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The take a version directory's name carries, as an audit lists it.
@@ -2231,14 +2410,22 @@ fn keys_on_disk(
 /// `operator` says which: each split is asked on an address of its own and by a client of
 /// its own, since a replica does not propose a copy of a request it proposed, by client and
 /// sequence number (`Replica::proposed`).
-async fn split_operator<E: Environment>(env: E, mut target: u64, operator: u64, key: &'static str) {
+// PROPOSED(D-138): the range it splits is its caller's, so a run can split a range other
+// than P.
+async fn split_operator<E: Environment>(
+    env: E,
+    mut target: u64,
+    operator: u64,
+    range: u64,
+    key: &'static str,
+) {
     let Ok(sock) = env.net().bind(crate::raft::admin_addr(operator)).await else {
         return;
     };
     for _ in 0..SERVERS * 4 {
         let request = RangedRequest {
             generation: FIRST_GENERATION,
-            range: RangeId(SPLIT_PARENT),
+            range: RangeId(range),
             request: Request {
                 client: (u64::MAX >> 2) - (operator - 1),
                 seq: 1,
@@ -2361,7 +2548,7 @@ pub fn run_after_split(seed: u64) -> AfterSplit {
 // PROPOSED(D-128)
 #[must_use]
 pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSplit {
-    after_split(seed, node_variants, false)
+    after_split(seed, node_variants, Again::Nothing)
 }
 
 /// [`run_after_split`], and then a split of P's left half with `x` still in the start that
@@ -2378,16 +2565,47 @@ pub fn run_after_split_under(seed: u64, node_variants: NodeVariants) -> AfterSpl
 /// checkpoints and sweeps the earlier ones, which is the `apply` task's and the `snapshot`
 /// task's use of the directory no other run reaches (PROPOSED D-117; #176).
 ///
-/// P's left half, which came back to `x` by a stream, and not a range the log rebuilt,
-/// whose split fails state machine safety on `x` (#199).
+/// P's left half, which came back to `x` by a stream, and not a range the log rebuilt:
+/// [`run_split_of_a_replayed_range`] splits one of those.
 // PROPOSED(D-117)
 #[must_use]
 pub fn run_split_after_reseed(seed: u64, node_variants: NodeVariants) -> AfterSplit {
-    after_split(seed, node_variants, true)
+    after_split(seed, node_variants, Again::LeftHalf)
 }
 
-/// The runs above; `split_again` is [`run_split_after_reseed`]'s.
-fn after_split(seed: u64, node_variants: NodeVariants, split_again: bool) -> AfterSplit {
+/// [`run_after_split`], and then a split of [`REPLAYED_RANGE`] at [`REPLAYED_SPLIT_KEY`] with
+/// `x` still in the start that re-seeded (#199).
+///
+/// No writer writes that range, so its leader never passes its threshold and never compacts,
+/// and `x`'s re-seeded replica of it is brought up by its log from the first entry and never
+/// streamed. The re-seed writes a user range no descriptor (only the system ranges' index-0
+/// state, D-098), so that replica holds none when the split reaches it. Every other replica
+/// holds configuration's descriptor from its bootstrap and takes the split. The run asks for
+/// the split once the re-seed's start has run `SPLIT_AFTER`, waits up to
+/// `SECOND_SPLIT_BUDGET` for `x` to apply it, and gives every replica `SECOND_SPLIT_SETTLE`
+/// more. Before D-138 `x` refused it, `NotLive`, and state machine safety saw the split's
+/// entry applied to `took` on the others and to `refused` on `x`;
+/// `NodeVariant::ReplayedRangeRefusesItsSplit` keeps that.
+// PROPOSED(D-138)
+#[must_use]
+pub fn run_split_of_a_replayed_range(seed: u64, node_variants: NodeVariants) -> AfterSplit {
+    after_split(seed, node_variants, Again::Replayed)
+}
+
+/// What a run of [`after_split`] does once `x` has started again on its lost store.
+// PROPOSED(D-138): the two splits after the re-seed, named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Again {
+    /// Nothing more: [`run_after_split`].
+    Nothing,
+    /// A split of P's left half, which `x` is made to lead: [`run_split_after_reseed`].
+    LeftHalf,
+    /// A split of a range `x` got back by its log: [`run_split_of_a_replayed_range`].
+    Replayed,
+}
+
+/// The runs above; `again` says which.
+fn after_split(seed: u64, node_variants: NodeVariants, again: Again) -> AfterSplit {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
@@ -2430,7 +2648,10 @@ fn after_split(seed: u64, node_variants: NodeVariants, split_again: bool) -> Aft
     {
         let env = sim.env(client);
         let inner = env.clone();
-        env.spawn("split", split_operator(inner, leader, 1, SPLIT_KEY));
+        env.spawn(
+            "split",
+            split_operator(inner, leader, 1, SPLIT_PARENT, SPLIT_KEY),
+        );
     }
     let deadline = sim.now() + SPLIT_BUDGET;
     let applied_by_x = |records: &[TraceRecord]| {
@@ -2493,21 +2714,40 @@ fn after_split(seed: u64, node_variants: NodeVariants, split_again: bool) -> Aft
     sim.restart(at);
     spawn(&sim, at, x, variants, node_variants, true);
     sim.run_for(SPLIT_AFTER);
-    if split_again {
+    if again == Again::Replayed {
+        // PROPOSED(D-138): a split of a range `x` got back by its log (#199). `x` made no
+        // right half of it before, so its first is this split's.
+        let target = leader_of(&sim.trace(), REPLAYED_RANGE).unwrap_or(1);
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn(
+            "split-replayed",
+            split_operator(inner, target, 2, REPLAYED_RANGE, REPLAYED_SPLIT_KEY),
+        );
+        let deadline = sim.now() + SECOND_SPLIT_BUDGET;
+        while sim.now() < deadline && report.second_right.is_none() {
+            sim.run_for(SPLIT_SLICE);
+            report.second_right = rights_on(&sim.trace(), x, REPLAYED_RANGE).first().copied();
+        }
+        sim.run_for(SECOND_SPLIT_SETTLE);
+    }
+    if again == Again::LeftHalf {
         // PROPOSED(D-117): a right half made after the re-seed, led by `x`, written past
         // its threshold.
-        let before = rights_on(&sim.trace(), x).len();
+        let before = rights_on(&sim.trace(), x, SPLIT_PARENT).len();
         let target = leader_of(&sim.trace(), SPLIT_PARENT).unwrap_or(1);
         let env = sim.env(client);
         let inner = env.clone();
         env.spawn(
             "split-again",
-            split_operator(inner, target, 2, LEFT_SPLIT_KEY),
+            split_operator(inner, target, 2, SPLIT_PARENT, LEFT_SPLIT_KEY),
         );
         let deadline = sim.now() + SECOND_SPLIT_BUDGET;
         while sim.now() < deadline && report.second_right.is_none() {
             sim.run_for(SPLIT_SLICE);
-            report.second_right = rights_on(&sim.trace(), x).get(before).copied();
+            report.second_right = rights_on(&sim.trace(), x, SPLIT_PARENT)
+                .get(before)
+                .copied();
         }
         if let Some(right) = report.second_right {
             sim.run_for(SECOND_SPLIT_SETTLE);
@@ -3175,15 +3415,15 @@ fn unconfirmable_reads(seed: u64, variants: Variants, stall: bool) -> Unconfirma
     report
 }
 
-/// The right halves of P's splits node `x` applied, in the order it applied them.
+/// The right halves of `parent`'s splits node `x` applied, in the order it applied them.
 // PROPOSED(D-117)
-fn rights_on(records: &[TraceRecord], x: u64) -> Vec<u64> {
+// PROPOSED(D-138): of any parent, so the split of a range the log rebuilt is read too.
+fn rights_on(records: &[TraceRecord], x: u64, parent: u64) -> Vec<u64> {
     records
         .iter()
         .filter_map(|record| match &record.event {
             TraceEvent::RangeSplit { range, right, .. }
-                if *range == SPLIT_PARENT
-                    && record.node.map(|node| u64::from(node.get())) == Some(x) =>
+                if *range == parent && record.node.map(|node| u64::from(node.get())) == Some(x) =>
             {
                 Some(*right)
             }

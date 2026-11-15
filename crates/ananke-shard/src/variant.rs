@@ -458,6 +458,14 @@ pub enum NodeVariant {
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
     // PROPOSED(D-132)
     InstallReplacesCopiedSpan,
+    /// The tree before D-138: a split's apply on a replica that holds no descriptor is
+    /// refused, `NotLive`, as a split of a range the node does not hold live. Such a replica
+    /// is a re-seeded user range its log brought back from the first entry, so every other
+    /// replica applies the same entry over configuration's descriptor and takes it, and state
+    /// machine safety sees the entry applied to `took` on them and `refused` on this one
+    /// (#199). The correct node applies it from the descriptor configuration names.
+    // PROPOSED(D-138)
+    ReplayedRangeRefusesItsSplit,
 }
 
 impl NodeVariant {
@@ -515,6 +523,7 @@ impl NodeVariant {
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
         NodeVariant::InstallReplacesCopiedSpan,
+        NodeVariant::ReplayedRangeRefusesItsSplit,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -724,6 +733,9 @@ impl NodeVariant {
             // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
+            // PROPOSED(D-138): a replica with no descriptor refusing a split. Bit 53 is
+            // free, and eleven bits are left.
+            NodeVariant::ReplayedRangeRefusesItsSplit => 1 << 52,
         }
     }
 
@@ -783,6 +795,7 @@ impl NodeVariant {
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
             NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
+            NodeVariant::ReplayedRangeRefusesItsSplit => "ReplayedRangeRefusesItsSplit",
         }
     }
 }
@@ -881,14 +894,16 @@ mod tests {
         // replica with no descriptor whose install replaces what it is hosted at.
         // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
         // one is a right half made on a quarantined parent with no quarantine. D-132's one
-        // is an initialised replica's install replacing the plan's copy of its spans.
+        // is an initialised replica's install replacing the plan's copy of its spans. D-138's
+        // one is a replica with no descriptor refusing a split its log brings.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
         // PROPOSED(D-130)
         // PROPOSED(D-132)
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        // PROPOSED(D-138)
+        assert_eq!(NodeVariant::BUGS.len(), 53);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

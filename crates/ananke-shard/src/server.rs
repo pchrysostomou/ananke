@@ -2099,6 +2099,12 @@ struct ServerApplier<E: Environment> {
     id_block: u64,
     /// The cores' parameters, for the right half's core at a split (PROPOSED D-100).
     raft: RaftConfig,
+    /// The descriptor each range configuration names starts with on a bootstrap node, its
+    /// index-0 state's (SHARD.md §2, [`bootstrap_descriptor`]); empty on a node that joins,
+    /// which holds no such replica (PROPOSED D-109). A split's apply reads it on a replica
+    /// that holds no descriptor of its own, a re-seeded user range its log brought back.
+    // PROPOSED(D-138)
+    configured: Arc<BTreeMap<RangeId, RangeDescriptor>>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -2143,6 +2149,29 @@ impl<E: Environment> ServerApplier<E> {
             .await?
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
         let refuse = |reason: SplitRefusal| (ApplyEffect::Refused, Outcome::Refused(reason));
+        // A replica that holds no descriptor is a re-seeded replica of a range
+        // configuration names that its log brought back from the first entry: a bootstrap,
+        // a split's batch and an install each write one, and the re-seed writes none for a
+        // user range (it writes a system range's index-0 state, PROPOSED D-098). Its state machine
+        // started from index 0, whose state is configuration's alone (SHARD.md §2), and it
+        // has applied no split since, the first having written one. So the descriptor in
+        // force before `index` is the one configuration names, which every replica that
+        // was never re-seeded holds from its bootstrap, and the split is applied here as it
+        // is there. Refused here, `NotLive`, the entry took everywhere else and state
+        // machine safety saw it (#199). `ReplayedRangeRefusesItsSplit` keeps the refusal.
+        // A range configuration does not name has no replica without a descriptor, and is
+        // refused as before.
+        // PROPOSED(D-138)
+        let held = held.or_else(|| {
+            if self
+                .node_variants
+                .contains(NodeVariant::ReplayedRangeRefusesItsSplit)
+            {
+                None
+            } else {
+                self.configured.get(&range).cloned()
+            }
+        });
         let Some(parent) = held else {
             store.apply(index, WriteBatch::new()).await?;
             return Ok(Some(refuse(SplitRefusal::NotLive)));
@@ -3337,6 +3366,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } else {
         Vec::new()
     };
+    // The descriptors those ranges start with, for the `apply` task: a split of a replica
+    // its re-seed left without one applies from these (SHARD.md §2).
+    // PROPOSED(D-138)
+    let configured: Arc<BTreeMap<RangeId, RangeDescriptor>> = Arc::new(
+        hosted
+            .iter()
+            .map(|range| (range.id, bootstrap_descriptor(range, &bootstrap)))
+            .collect(),
+    );
     // The store's recovery must never hand back a state with a hole (RAFT.md §3).
     let engine = EngineConfig {
         allow_manifest_fallback: false,
@@ -3848,6 +3886,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             cores: variants,
             descriptors: descriptors.clone(),
             applied: applied_at.clone(),
+            configured: configured.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -4419,6 +4458,7 @@ pub(crate) async fn split_applied<E: Environment>(
         )),
         id_block: 8,
         raft: RaftConfig::default(),
+        configured: Arc::default(),
     };
     matches!(
         applier
@@ -4698,6 +4738,7 @@ mod tests {
                     )),
                     id_block: 8,
                     raft: RaftConfig::default(),
+                    configured: Arc::default(),
                 };
                 let outcome = applier
                     .split(
@@ -5075,5 +5116,169 @@ mod tests {
         // `answer_read` takes it when the answer comes.
         assert!(replica.reads.remove(&id).is_some());
         assert!(replica.reads.is_empty());
+    }
+
+    /// What [`split_with_no_descriptor`] found once the split's apply was done: its effect
+    /// and outcome, P's and R's descriptors as the store holds them, the host's table, and
+    /// the store's applied index.
+    type NoDescriptor = (
+        Option<(ApplyEffect, Outcome)>,
+        Option<RangeDescriptor>,
+        Option<RangeDescriptor>,
+        BTreeMap<RangeId, RangeDescriptor>,
+        Index,
+    );
+
+    /// [`split_case`]'s split at index 9, on a voter of three whose replica of P holds no
+    /// descriptor and has applied 1 to 8 with nothing in them, as a re-seeded replica its
+    /// log brings back does; `configured` is what configuration names, and `node_variants`
+    /// the node's set.
+    // PROPOSED(D-138)
+    fn split_with_no_descriptor(
+        configured: BTreeMap<RangeId, RangeDescriptor>,
+        node_variants: NodeVariants,
+    ) -> NoDescriptor {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let mut sim = Sim::new(SimConfig::new(7));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let table: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
+        let found: Arc<Mutex<Option<NoDescriptor>>> = Arc::default();
+        env.clone().spawn("test", {
+            let (env, table, found) = (env.clone(), table.clone(), found.clone());
+            async move {
+                let prefix = KeyPrefix::group(p.get());
+                let (store, _) = RaftStore::open_dir(
+                    env.clone(),
+                    EngineConfig::new(PathBuf::from("/n1")),
+                    prefix.clone(),
+                )
+                .await
+                .expect("the store opens");
+                let store = Arc::new(store);
+                for index in 1..=8 {
+                    store
+                        .apply(index, WriteBatch::new())
+                        .await
+                        .expect("an empty apply");
+                }
+                let sock = env
+                    .net()
+                    .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                    .await
+                    .expect("a bind");
+                let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+                let applier = ServerApplier {
+                    env: env.clone(),
+                    id: ServerId(1),
+                    sock: Arc::new(sock),
+                    stores: Arc::default(),
+                    replicas: Arc::default(),
+                    local: Queue::new(),
+                    snaps: Queue::new(),
+                    engine_dir: PathBuf::from("/n1"),
+                    node_variants,
+                    range_variants: RangeVariants::correct(),
+                    cores: Variants::default(),
+                    descriptors: table.clone(),
+                    applied: Arc::new(Mutex::new(
+                        [(
+                            p,
+                            Applied {
+                                index: 8,
+                                term: 1,
+                                config,
+                            },
+                        )]
+                        .into(),
+                    )),
+                    id_block: 8,
+                    raft: RaftConfig::default(),
+                    configured: Arc::new(configured),
+                };
+                let answered = applier
+                    .split(p, 9, &Bytes::from_static(b"k5"), r.get(), &store)
+                    .await
+                    .expect("the split's apply");
+                let held = |range: RangeId| {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .engine()
+                            .get(&KeyPrefix::group(range.get()).descriptor_key())
+                            .await
+                            .expect("a read")
+                            .map(|bytes| RangeDescriptor::decode(bytes).expect("a descriptor"))
+                    }
+                };
+                let (left, right) = (held(p).await, held(r).await);
+                let applied = store.applied();
+                *lock(&found) = Some((answered, left, right, lock(&table).clone(), applied));
+            }
+        });
+        sim.run_for(Duration::from_secs(1));
+        lock(&found).take().expect("the split's apply finished")
+    }
+
+    /// #199: a replica of P that holds no descriptor, a re-seeded user range its log brought
+    /// back from the first entry, applies P's split from the descriptor configuration names
+    /// for P, as a replica holding that descriptor from its bootstrap does: it takes it,
+    /// writes P's left half and R at the next generation, and puts both in the host's table.
+    /// Under `ReplayedRangeRefusesItsSplit` it refuses it, `NotLive`, and writes nothing but
+    /// the applied index, which is the effect state machine safety saw differ. A range
+    /// configuration does not name has no descriptor to fall back on, and is refused as before.
+    // PROPOSED(D-138)
+    #[test]
+    fn a_replica_with_no_descriptor_takes_a_split_from_the_descriptor_configuration_names() {
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let configured: BTreeMap<RangeId, RangeDescriptor> = [(p, case.parent.clone())].into();
+        let left = case.after.get(&p).cloned().expect("P's left half");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(configured.clone(), NodeVariants::correct());
+        assert_eq!(
+            answered,
+            Some((ApplyEffect::Took, Outcome::Done)),
+            "the split is taken from configuration's descriptor"
+        );
+        assert_eq!(held_left.as_ref(), Some(&left), "P's left half is written");
+        assert_eq!(held_right.as_ref(), Some(&case.right), "R is written");
+        assert_eq!(
+            table,
+            [(p, left), (r, case.right.clone())].into(),
+            "both halves are in the host's table"
+        );
+        assert_eq!(applied, 9);
+
+        let expected = Some((
+            ApplyEffect::Refused,
+            Outcome::Refused(SplitRefusal::NotLive),
+        ));
+        let (answered, held_left, held_right, table, applied) = split_with_no_descriptor(
+            configured,
+            NodeVariants::of(&[NodeVariant::ReplayedRangeRefusesItsSplit]),
+        );
+        assert_eq!(answered, expected, "the variant refuses the split");
+        assert_eq!(
+            (held_left, held_right),
+            (None, None),
+            "and writes neither half"
+        );
+        assert!(table.is_empty(), "and puts nothing in the host's table");
+        assert_eq!(applied, 9, "and applies the entry as nothing");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(BTreeMap::new(), NodeVariants::correct());
+        assert_eq!(
+            answered, expected,
+            "a range configuration does not name is refused as before"
+        );
+        assert_eq!((held_left, held_right), (None, None));
+        assert!(table.is_empty());
+        assert_eq!(applied, 9);
     }
 }

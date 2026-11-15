@@ -830,8 +830,12 @@ snapshot answers it installed without switching (RAFT.md:222-224), asked at the 
 as when the stream completes (D-132), so a replica of P that applied `s` is never set
 back below it. The same rule makes the apply's "R already initialised here" unreachable:
 R could have been installed on the node only if no initialised replica of P covered its
-span, and then no initialised replica of P is there to apply `s`; a replica with no
-descriptor that replays to `s` refuses the split instead (#199). Check 8 asserts it, of the
+span, and then no initialised replica of P is there to apply `s`. A replica with no
+descriptor that replays to `s` is a re-seeded replica of a range configuration names, whose
+log brought it back from the first entry; it applies `s` from the descriptor configuration
+names, which is the one its replay implies, as every other replica of P applies it (D-138,
+#199). Where R's install landed beside it before it replayed to `s`, which no run has
+reached, that apply would make R a second time (D-138 names the window). Check 8 asserts it, of the
 trace and whatever made either creation: a `RangeCreated` of a range on a node that holds it
 initialised is a violation (§8). The node does not fail on it, which would stop every voter
 of a split whose right half's id was taken twice before check 18 read the reused id (D-109,

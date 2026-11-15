@@ -101,6 +101,19 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-replayed-range-split` (2026-11-14), off c5cd18d (`main`), PROPOSED **D-138**
+  (footer D-139; D-133 to D-137 are other open branches'), Closes #199: **a correct-server state
+  machine safety failure**, a re-seeded node refusing the split of a user range its log brought back,
+  which holds no descriptor, while every other replica takes it. The split's apply on a replica with
+  no descriptor now applies from the descriptor configuration names, the index-0 one its replay
+  implies (SHARD.md §2, D-098's precedent), and makes the right half as a first apply does. Where that
+  descriptor comes from is put to the owner (D-138 §3: at the split, built; not at the re-seed, which
+  would undo D-128's order and its tests). The pair is `ReplayedRangeRefusesItsSplit` (node bit 52) on
+  `reseed::run_split_of_a_replayed_range`, caught by state machine safety on 20 of 20, beside a
+  directed test of the correct node on the binary's 200 and a unit test of `ServerApplier::split`. On
+  this tree the `reseed` binary at `ANANKE_SEEDS=1000` passes, 18 of 18, and the sharded sweep at
+  10 000 seeds passes with 0 failures. Not closed, named in D-138 §5 and reached on no seed: a right half
+  installed beside such a replica before it replays to the split. The premerge has not run.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
