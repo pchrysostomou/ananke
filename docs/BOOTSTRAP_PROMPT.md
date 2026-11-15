@@ -102,7 +102,7 @@ ananke/
 _Update this section at the end of every session._
 
 - Branch `phase-3-stage-c-install-split-exclusion` (2026-11-14), off 0d67f99 (S11's tip, #228, with
-  #226), **PROPOSED D-133**, Closes #225: **route 1 of #225, a correct-server data loss and a double
+  #226), **PROPOSED D-133**, Refs #225 (not closed): **route 1 of #225, a correct-server data loss and a double
   apply**, a split's apply landing between an install's numbering and its switch (seed 13283 of the
   sharded sweep, past the nightly's range). A range's install and its split's apply now exclude each
   other through `install::SwitchOrSplit`: the switch holds the range from D-132's re-check to the host's
@@ -113,6 +113,11 @@ _Update this section at the end of every session._
   four cases and on seed 13283's pin. Route 2 (#215's related window, a placeholder admitted before the
   host steps `Switched`) is not closed: no split's apply is on it; a directed test asserts it open and
   it needs an issue of its own. Non-split entries applied inside the switch are named in D-133 §5.
+  PR #239's review: "Closes #225" would have closed the only record of route 2, of #225's audit routes
+  1 to 3 for every apply but a split's and of its route 4 (check 8's install clause), so the branch now
+  says "Refs #225"; a820ee1's own message still says "Closes #225" (D-133 §7, question 6). D-133 §5 names
+  each audit route as this tree leaves it, §6 gives the 10 000-seed sweep and seeds 10 000 to 19 999,
+  and §7 asks whether the hold is widened to every job of the range, as the audit proposes.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
