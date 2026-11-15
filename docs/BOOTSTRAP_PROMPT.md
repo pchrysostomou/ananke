@@ -118,8 +118,10 @@ _Update this section at the end of every session._
   review: seed 18925's absence names its own situation (it named 992's, false on either schedule),
   and each of the four asserts its predicate true on its shaped run first; the hold's effect is
   asserted over the thousand, a first's update after the second's on more than half the seeds meta
-  applied the second's on (293 of 383; 3 of 38 at the hundred with the block taken out); the
-  reordered seeds are printed as well as counted. D-135 §9 asks the owner about both.
+  applied the second's on (293 of 383; with the block taken out 3 of 38 at the hundred and 19 of 396
+  at the thousand, where it fails); the reordered seeds are printed as well as counted. D-135 §9 asks
+  the owner about both. After the second review: 18925's predicate also asks for the arm's asker's
+  retry after its first `NoRangeId`, and D-135 §2's estimates are this tree's measures.
 
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a

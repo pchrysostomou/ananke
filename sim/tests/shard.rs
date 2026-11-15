@@ -487,8 +487,9 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     // tier: fired on 482 and reordered on 293 of 1 000 seeds, well above D-061's 5 %. These two say
     // the arm ran and the order was reached, not that the hold made it: with the block taken out
     // the sweep's own drops and resends still reorder meta on 3 of 100 seeds, so both pass at CI's
-    // hundred without it (#240's review). The hold's effect is the variant's test's below the
-    // thousand, and over it the share below's.
+    // hundred without it (#240's review), though on none of the gate's twenty, where the second
+    // fails (#240's second review). The hold's effect is the variant's test's below the thousand,
+    // and over it the share below's.
     assert!(
         reorder_fired > 0,
         "no reorder arm found a range to split twice led off the meta range's leader's node"
@@ -500,8 +501,9 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
     );
     // PROPOSED(D-135): the hold's effect, over the thousand: of the seeds on which meta applied
     // the second split's update, those it then applied a first's update on, 293 of 383 at the
-    // thousand and 2 924 of 3 790 at the ten thousand with the hold, 3 of 38 at the hundred with
-    // the block taken out (#240's review). Under the thousand the sample is too small for a share.
+    // thousand and 2 924 of 3 790 at the ten thousand with the hold; with the block taken out, 3 of
+    // 38 at the hundred (#240's review) and 19 of 396 at the thousand, where this fails (#240's
+    // second review). Under the thousand the sample is too small for a share.
     if seeds() >= 1000 {
         assert!(
             reordered * 2 > second_applied,
@@ -1165,10 +1167,18 @@ fn asks_around(report: &shard::Report, seq: u64, refused: Instant) -> (usize, us
         })
 }
 
-/// Whether the restart arm's split's asker spent all its asks before its first `NoRangeId`, the
-/// driver retrying the arm's range after it: the situation seed 18925 was pinned in. Its first
-/// `NoRangeId` came from a node that had not restarted, so [`restart_arms_split_refused_no_range_id`]
-/// is false on its shaped run as on the sweep's (#240's review).
+/// Whether the restart arm's split's asker spent all its asks before its first `NoRangeId` and
+/// retried after it: the situation seed 18925 was pinned in. Its first `NoRangeId` came from a node
+/// that had not restarted, so [`restart_arms_split_refused_no_range_id`] is false on its shaped run
+/// as on the sweep's (#240's review).
+///
+/// A [`shard::Retried`] names the range, not the asker, and a split's left half keeps the range's
+/// id, so another asker's first refusal on the arm's range can be the one read. What ties it to the
+/// arm's asker is the asker's ask after it: only its own first `NoRangeId` gives it a thirteenth.
+/// One case is left: the arm's own first `NoRangeId` on an earlier ask, and another asker's
+/// landing between the arm's twelfth and thirteenth. That reads as the situation reached where it
+/// is not: on the sweep's schedule a false alarm, never an absence that passes, and on the shaped
+/// run the pin asserts the one retried split and its counts itself (#240's second review).
 // PROPOSED(D-135)
 fn restart_arms_asker_spent_its_asks_before_its_first_no_range_id(report: &shard::Report) -> bool {
     let asks = usize::try_from(shard::BOOTSTRAP * 4).expect("small");
@@ -1176,9 +1186,15 @@ fn restart_arms_asker_spent_its_asks_before_its_first_no_range_id(report: &shard
         let (Some(range), Some(seq)) = (arm.range, arm.seq) else {
             return false;
         };
-        report.driver.retried.iter().any(|retried| {
-            retried.range == range && asks_around(report, seq, retried.refused).0 == asks
-        })
+        report
+            .driver
+            .retried
+            .iter()
+            .filter(|retried| retried.range == range)
+            .any(|retried| {
+                let (before, after) = asks_around(report, seq, retried.refused);
+                before == asks && after >= 1
+            })
     })
 }
 
