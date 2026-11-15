@@ -1868,12 +1868,21 @@ fn routing_variant_on(name: &str, variants: &[RangeVariant], seeds: u64) -> Vec<
          a read; the apply check refused a write on {reached_apply}/{seeds}; a write was \
          applied in the wrong range on {misapplied}/{seeds}; the split landed on \
          {split}/{seeds}; first: {}",
-        outcomes
-            .iter()
-            .find_map(|o| o.why.as_deref())
-            .map_or("none", |why| &why[..why.len().min(200)])
+        first_violation(&outcomes)
     );
     outcomes
+}
+
+/// What a routing variant's print shows of its sweep's first violation: the first 200
+/// characters of the verdict of the first seed that has one, or "none". The cut is on a
+/// character boundary ([`head`]): a cut at byte 200 panicked inside a `§` or a `—` and
+/// failed the variant's test on a print, not on a check (issue #168).
+// PROPOSED(D-124)
+fn first_violation(outcomes: &[Routed]) -> &str {
+    outcomes
+        .iter()
+        .find_map(|o| o.why.as_deref())
+        .map_or("none", |why| head(why, 200))
 }
 
 /// One seed of a routing variant's sweep.
@@ -1891,6 +1900,63 @@ struct Routed {
     /// The range layer's folds in violation over the whole run, each read on its own
     /// (PROPOSED D-106): the run's verdict names only the first in check order.
     tripped: BTreeSet<Fold>,
+}
+
+/// Issue #168: [`first_violation`] was a cut at byte 200, and a verdict names `§` (two
+/// bytes) and `—` (three), so a verdict with either across that byte panicked the print and
+/// failed its variant's test on a print, not on a check. No sweep can be relied on to land a
+/// verdict there, so these verdicts are built to: each character at every offset that puts
+/// byte 200 inside it. On the byte cut every one of them panics.
+// PROPOSED(D-124)
+#[test]
+fn the_first_violation_print_cuts_a_verdict_on_a_character_boundary() {
+    let routed = |why: Option<String>| Routed {
+        seed: 0,
+        why,
+        at_apply: 0,
+        misapplied: 0,
+        splits: 0,
+        resumed: 0,
+        tripped: BTreeSet::new(),
+    };
+    let mut built = 0;
+    for character in ['§', '—'] {
+        for inside in 1..character.len_utf8() {
+            let verdict = format!(
+                "{}{character} and the rest of the verdict",
+                "x".repeat(200 - inside)
+            );
+            assert!(
+                !verdict.is_char_boundary(200),
+                "byte 200 is not inside {character} at offset {inside}: this case tests nothing"
+            );
+            let outcomes = [routed(None), routed(Some(verdict.clone()))];
+            let printed = first_violation(&outcomes);
+            assert_eq!(printed.chars().count(), 200, "{printed}");
+            assert!(verdict.starts_with(printed), "{printed}");
+            // The character byte 200 fell inside is printed whole, not cut or dropped.
+            assert!(printed.contains(character), "{printed}");
+            built += 1;
+        }
+    }
+    // `§`'s one offset and `—`'s two: a loop that stopped building cases says so.
+    assert_eq!(built, 3);
+
+    // A verdict the cut does not reach is printed whole, multibyte characters and all; a
+    // verdict of more than 200 characters is cut to 200 of them, not 200 bytes; the verdict
+    // shown is the first seed's that has one; and a sweep with none says so.
+    let short = "check 9 (§6) — a read served outside the span";
+    let outcomes = [
+        routed(None),
+        routed(Some(short.to_string())),
+        routed(Some("a later seed's verdict".to_string())),
+    ];
+    assert_eq!(first_violation(&outcomes), short);
+    assert_eq!(
+        first_violation(&[routed(Some("§—".repeat(150)))]),
+        "§—".repeat(100)
+    );
+    assert_eq!(first_violation(&[routed(None)]), "none");
 }
 
 #[test]

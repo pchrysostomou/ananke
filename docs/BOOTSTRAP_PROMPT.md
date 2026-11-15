@@ -101,6 +101,13 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-routing-print-utf8` (2026-11-14), off 0d67f99 (S11's tip, #228 with #226),
+  **PROPOSED D-124**, Closes #168. A routing variant's first-violation print cut its verdict at byte
+  200 and could panic inside a `§` or a `—`, failing the variant's test on a print, not on a check; it
+  now cuts at 200 characters with `head`, through `first_violation`. Its unit test builds the three
+  verdicts that put byte 200 inside either character and panics on the old cut (plant M1); a byte cut
+  moved back to a boundary fails it too (M2). One `node` row in the nightly's shard 4. Nothing else
+  moves.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

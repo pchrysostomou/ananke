@@ -25252,6 +25252,64 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
+## PROPOSED D-124 — A routing variant's first-violation print cuts its verdict on a character boundary, not at byte 200 (#168)
+
+**The number.** Off 0d67f99, S11's tip (PR #228, which carries #226), whose footer reads D-133.
+The brief that assigned this slice gives it **D-124**, a number the gap between D-123 and D-128
+leaves free, so it goes after D-123 in numerical order and the footer stays D-133, the highest
+entry plus one. Both code sites carry `// PROPOSED(D-124)`. Closes #168.
+
+**Context.** `routing_variant_on` (`sim/tests/node.rs`) printed its sweep's first violation as
+`&why[..why.len().min(200)]`, a cut at byte 200. A verdict names `§` (two bytes in UTF-8) and
+some name `—` (three), and a verdict with either across byte 200 makes that slice panic: the
+variant's test fails on its print, not on a check, and the panic names a byte index rather than
+the violation. #168 found no verdict on its tree's schedules that lands there, and none fails on
+this one, so nothing is red today; a schedule move or a reworded verdict can make one. A print
+that can fail a sweep is a flake waiting for that move.
+
+**Decided.** The print goes through `first_violation`, which cuts with `head`, the helper D-106's
+equivalence tests already use to cut a verdict to its first N characters on a character
+boundary. It shows the first 200 characters, not the first 200 bytes, so a verdict of multibyte
+characters shows a few more bytes than before and one under 200 characters shows whole, as it
+did. No other print in `sim/` or the crates' tests cuts a string by bytes: the two other
+`[..x.len().min(n)]` cuts, in `sim/tests/split.rs` and `crates/ananke-raft/tests/format.rs`,
+slice `Vec<u64>`s, where every index is a boundary.
+
+### The test
+
+`the_first_violation_print_cuts_a_verdict_on_a_character_boundary` (`sim/tests/node.rs`) builds
+its verdicts instead of sweeping for them, since no sweep can be relied on to put a `§` across
+byte 200. For each of `§` and `—`, at every offset that puts byte 200 inside it, three verdicts in
+all, it asserts that the case is real (byte 200 is not a boundary of the verdict), that the print
+is the verdict's first 200 characters, and that the character byte 200 fell inside is printed
+whole; then that it built the three. It also asserts that a verdict under 200 characters prints
+whole, that one of 300 multibyte characters prints 200 of them, that the verdict shown is the
+first seed's that has one, and "none" for a sweep without one. It runs no scenario and draws no
+seed, so D-061's tiers do not apply: it asserts at no rate, the same at every tier.
+
+**It can fail.** Each plant was put in `first_violation` alone and reverted, the test built in
+debug and run:
+
+| | Plant | The test |
+|---|---|---|
+| | none | passes |
+| M1 | the old cut, `&why[..why.len().min(200)]` | **panics**: *"end byte index 200 is not a char boundary; it is inside '§' (bytes 199..201 of string)"* |
+| M2 | the byte cut moved back to the boundary before it, which cannot panic | **fails**: the first verdict prints 199 characters, not 200 |
+
+M1 is #168's line as it was, so the test panics on the old code. M2 shows the test asks for the
+characters and not only for the absence of a panic.
+
+**Nothing moves.** Only a test's print changes. No scenario, schedule, trace, verdict or pinned
+hash can move. **PROPOSED.**
+
+**The nightly's rows (D-064).** One `node` row, the test above. Weighed on this tree from the
+built debug binary (`node-<hash> <test> --exact`), which can only read high against release, three
+runs under a one-minute load average of 161: user and sys each 0.00 s all three times, below the
+timer's resolution. Rounded up to 0.1, as the cheap rows beside it are. Into the lightest shard,
+shard 4 at 2231.2 -> 2231.3.
+
+---
+
 ## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,
