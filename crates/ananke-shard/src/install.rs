@@ -666,6 +666,14 @@ pub struct Task<E: Environment> {
     #[cfg(test)]
     at_the_switch:
         std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    /// What a directed test lands while the switch is in flight, after the engine has
+    /// numbered it and before this task restates the applied state: where a job the
+    /// replaced core queued before the hold lands when it applies past the snapshot
+    /// during `install_spans` (#113's review, F1).
+    // PROPOSED(D-126)
+    #[cfg(test)]
+    after_the_switch:
+        std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
 }
 
 impl<E: Environment> Task<E> {
@@ -719,6 +727,8 @@ impl<E: Environment> Task<E> {
             range_variants,
             #[cfg(test)]
             at_the_switch: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_the_switch: std::sync::Mutex::new(None),
         }
     }
 
@@ -1495,6 +1505,13 @@ impl<E: Environment> Task<E> {
         if switched.is_err() {
             return self.restart(range, from, &install, &store).await;
         }
+        #[cfg(test)]
+        {
+            let landing = lock(&self.after_the_switch).take();
+            if let Some(landing) = landing {
+                landing.await;
+            }
+        }
         // The switch moved this range's applied index, its term and the configuration
         // in force, without an apply: the store's cached index and the `apply` task's
         // own state are both the replaced replica's until they are told. The first
@@ -1502,15 +1519,42 @@ impl<E: Environment> Task<E> {
         // would have had the next take of this range write a record with the old
         // replica's term and configuration in it.
         // PROPOSED(D-083): a live install moves the applied state with it.
-        store.installed_at(install.at.last_index);
+        //
+        // Up to the snapshot, and never back, as the host's restatement at `Switched`
+        // does. The engine numbered the switch at the call and the hold stops the core,
+        // not the `apply` task, so a job the replaced core queued before the hold can
+        // apply past the snapshot while `install_spans` is in flight: its batches are
+        // numbered above the switch's and survive it, the store's applied-index key
+        // among them (`Engine::install_spans`). Taken back here, both the store and the
+        // task stand at the snapshot, the restatement at `Switched` then finds nothing
+        // past it to keep, and the new replica's first `Apply` hands those entries out a
+        // second time (#113's review, F1). `SwitchForgetsLateApplies` takes it back.
+        // PROPOSED(D-126): the snapshot task's restatement takes nothing back either.
+        if !crate::server::kept_past_the_switch(
+            store.applied(),
+            install.at.last_index,
+            self.variants,
+        ) {
+            store.installed_at(install.at.last_index);
+        }
         if let Ok(mut applied) = self.applied.lock() {
+            let kept = applied
+                .get(&range)
+                .filter(|held| {
+                    crate::server::kept_past_the_switch(
+                        held.index,
+                        install.at.last_index,
+                        self.variants,
+                    )
+                })
+                .cloned();
             applied.insert(
                 range,
-                crate::server::Applied {
+                kept.unwrap_or_else(|| crate::server::Applied {
                     index: install.at.last_index,
                     term: install.at.last_term,
                     config: config.clone(),
-                },
+                }),
             );
         }
         self.clear_staging(&install.source).await;
@@ -4189,6 +4233,107 @@ mod tests {
                     (sent, created, made),
                     (Some(SnapshotStatus::Installed), true, true),
                     "the same install where the range is not held creates it"
+                );
+            }
+        }
+    }
+
+    /// A job the replaced core queued before the hold that applies past the snapshot while
+    /// the switch is in flight is kept by the `snapshot` task's own restatement, as the
+    /// host's at `Switched` keeps it (#113's review, F1). R2's store and its `apply` task
+    /// stand at 28 and the stream's snapshot is at 30, so both re-checks pass and the install
+    /// switches. The job lands after the engine has numbered the switch (`after_the_switch`)
+    /// and applies 29 to 32 as the `apply` task does, the store's batch and then the task's
+    /// state. Its batches are numbered above the switch's and survive it, so the store's
+    /// applied-index key reads 32 on both nodes.
+    ///
+    /// The correct node leaves the store's cached index and the task at 32, the key's own
+    /// value. Under `SwitchForgetsLateApplies`, the tree before this, both go back to 30,
+    /// below the key: the restatement at `Switched` then reads 30 and keeps nothing, and the
+    /// new replica's first `Apply` hands 31 and 32 out a second time. No sweep reaches the
+    /// late job (PROPOSED D-126), so this is the pair of the half that lives here.
+    // PROPOSED(D-126)
+    #[test]
+    fn a_late_job_that_applies_past_the_snapshot_while_the_switch_is_in_flight_is_kept() {
+        for buggy in [false, true] {
+            let variants = if buggy {
+                NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies])
+            } else {
+                NodeVariants::correct()
+            };
+            let ((cached, task_at, on_disk), trace) = on_a_node(move |env| async move {
+                let parent = described(R2, "k0", "k9", 1);
+                let (mut task, store, _local, _follower) =
+                    task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                task.variants = variants;
+                let mut first = ananke_storage::WriteBatch::new();
+                first.put(KeyPrefix::group(R2.get()).descriptor_key(), parent.encode());
+                store.apply(1, first).await.expect("an apply");
+                for index in 2..=28 {
+                    store
+                        .apply(index, ananke_storage::WriteBatch::new())
+                        .await
+                        .expect("an apply");
+                }
+                let held = |index| crate::server::Applied {
+                    index,
+                    term: 2,
+                    config: Configuration::of(&[ServerId(1), ServerId(2), FOLLOWER]),
+                };
+                lock(&task.applied).insert(R2, held(28));
+                let at = Identity {
+                    term: 2,
+                    last_index: 30,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                checkpoint_with(&env, R2, 30, Some(&parent), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                let late = {
+                    let (store, applied) = (store.clone(), task.applied.clone());
+                    async move {
+                        for index in 29..=32 {
+                            store
+                                .apply(index, ananke_storage::WriteBatch::new())
+                                .await
+                                .expect("the late job's apply");
+                            lock(&applied).insert(R2, held(index));
+                        }
+                    }
+                };
+                *lock(&task.after_the_switch) = Some(Box::pin(late));
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let task_at = lock(&task.applied).get(&R2).map(|state| state.index);
+                let on_disk = store
+                    .applied_at(&store.engine().snapshot())
+                    .await
+                    .expect("a read");
+                (store.applied(), task_at, on_disk)
+            });
+            assert_eq!(
+                switches(&trace),
+                vec![r2_replaced("k9")],
+                "buggy: {buggy}: the install switched"
+            );
+            assert_eq!(
+                on_disk, 32,
+                "buggy: {buggy}: the late job's applies were written above the switch"
+            );
+            if buggy {
+                assert_eq!(
+                    (cached, task_at),
+                    (30, Some(30)),
+                    "the variant takes the store and the task back to the snapshot, below \
+                     the store's own key"
+                );
+            } else {
+                assert_eq!(
+                    (cached, task_at),
+                    (32, Some(32)),
+                    "the correct node keeps what the late job applied past the snapshot"
                 );
             }
         }

@@ -25252,7 +25252,7 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
-## PROPOSED D-126 — What a job of the replaced core applies after a live install's switch is kept: the restatement at `Switched` takes nothing back, a compaction carries the applied watermark with it, and `SwitchForgetsLateApplies` keeps both beside the fix; issue #113's second restart is pinned on its seed 26 (closes #113)
+## PROPOSED D-126 — What a job of the replaced core applies after a live install's switch is kept: the restatements at the switch and at `Switched` take nothing back, a compaction carries the applied watermark with it, and `SwitchForgetsLateApplies` keeps both beside the fix; issue #113's second restart is pinned on its seed 26 (closes #113)
 
 **The number.** Off `main` at c5cd18d, whose footer reads D-133. #162's S13 order gives D-125
 to #105 and D-126 to #113, so this entry is D-126, placed in numerical order among the entries;
@@ -25302,7 +25302,8 @@ One thing does that. **The node holds a range's core across its live install, no
 task** (`install.rs`'s `finish` says so: "a job queued before the hold can still land"). A job
 the replaced core queued before the hold can run after the switch. Its entries at or below the
 snapshot are skipped and its entries above it apply, on top of the installed state, since the
-`snapshot` task set the task's applied state to the snapshot at the switch. A record that core
+`snapshot` task set the task's applied state to the snapshot at the switch (a job landing while
+the switch is in flight applies them again, section 7). A record that core
 asked for and queued behind the job is then written at the higher index, and its answer, held
 with the range's other local inputs while the range was held, is stepped into the replica the
 switch built (`Node::restore`, then its replay of the held locals). That core compacts past the
@@ -25317,6 +25318,19 @@ the snapshot. The `snapshot` task had already set both at the switch, and the `r
 snapshot. Taken back, the task applies those entries a second time when the new replica's first
 `Apply` names them. If the watermark alone were raised, that `Apply` would start above where the
 task was taken back to, and the task would fail the range, "apply of 387 after 383".
+
+The job can land earlier too, while the switch is in flight, and there it meets the `snapshot`
+task's own restatement (this entry's review, F1). `Engine::install_spans` numbers the switch at
+the call and makes it tens of milliseconds later (D-107), and a write after the call is numbered
+above every installed one and survives the switch. A job that applies past the snapshot in that
+window writes the store's applied-index key above the switch's; the `snapshot` task, right after
+`install_spans` returns, set the store's cached index and the task's state to the snapshot
+outright until this entry's review (`installed_at`, D-083), below that key. The restatement at `Switched` finds nothing past
+the snapshot to keep, and the new replica's first `Apply` hands those entries out a second time.
+D-132 section 5 records an unmodified schedule on exactly this route, a split's apply in the
+window: on seed 13283 of the sharded sweep, past the nightly's range, node 2's store "at 168, goes
+back to the snapshot's 167", and the sweep's verdict is the second apply, "state machine safety:
+server 2 applied index 168 of group 44 after 168" (section 6 runs it on this tree).
 
 `a_record_the_replaced_core_asked_for_raises_the_watermark_with_its_compaction`
 (`ananke_shard::round`) drives the node's own steps in its order through `Cores`: the hold, the
@@ -25350,36 +25364,53 @@ chunk and the hold. Neither is shown impossible, so the path is fixed, not close
    pin in section 5 fails on its `RestartAppliesFromZero` clause. Narrowed, the variant is caught
    on all 200 (section 5). The pin is what holds the narrowing: D-081's unit pair inserts a core
    and steps none, so it cannot see the difference.
-2. **The restatement at `Switched` takes nothing back** (`ServerHost::installed`,
-   `kept_past_the_switch`). The `apply` task's applied state and the store's applied index move
-   up to the snapshot, as D-086 has them, and an index already past the snapshot is kept: it was
-   applied after the switch, on top of the state it installed, and the store's applied-index key
-   says so too, since the late job's batches were written after the switch's.
-3. **`NodeVariant::SwitchForgetsLateApplies`**, the tree before this entry, both halves at once:
-   the restatement takes the task and the store back to the snapshot and the watermark stays
+2. **The restatements take nothing back**, the `snapshot` task's right after the switch
+   (`install.rs`'s `finish`) and the host's at `Switched` (`ServerHost::installed`), both through
+   `kept_past_the_switch`. The `apply` task's applied state and the store's applied index move
+   up to the snapshot, as D-083 and D-086 have them, and an index already past the snapshot is
+   kept: it was applied after the switch's numbering, on top of the state it installed, and the
+   store's applied-index key says so too, since the late job's batches were numbered above the
+   switch's. The first was added after this entry's review (F1); the placeholder's install
+   (D-109) restates too, and is not a site, since it replaces no core and so no job of one can
+   be queued.
+3. **`NodeVariant::SwitchForgetsLateApplies`**, the tree before this entry, every half at once:
+   both restatements take the task and the store back to the snapshot and the watermark stays
    where the switch put it. It is the node's, at **bit 52**, the next free on this tree; bit 53
    is free and eleven bits are left. It is in `BUGS` and is the fourth of `SHAPE`, the shape's
    own holes, since the shape's second restart was filed with it.
 
-On every path the sweeps reach, the two rules change nothing: the watermark is already at or
-above the prefix, and nothing has applied past the snapshot when `Switched` is stepped (no late
-job, section 1). No step, draw or trace record changes, so no pinned trace hash and no pinned
-seed moves.
+On every path the sweeps reach at their tiers, the rules change nothing: the watermark is
+already at or above the prefix, nothing has applied past the snapshot when `Switched` is stepped
+(no late job, section 1), and nothing applies between a switch's numbering and its switch (D-132
+section 6 counted none on the sharded sweep's seeds 0 to 1 999 or S11's 0 to 9 999). No step,
+draw or trace record changes, so no pinned trace hash and no pinned seed moves. Past the
+nightly's range, seed 13283 is a run the `snapshot` task's rule changes (section 6).
 
 ### 4. The pairs
 
 - `ananke_shard::round`, the watermark: section 2's test, correct and under the variant. The
   correct node hands the task 387 to 389 and its watermark ends at 389; the variant names 384 and
   its watermark stays at 383.
-- `ananke_shard::server`, the restatement:
-  `the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot`. 386 past a snapshot at
-  383 is kept; 383 and 380 move to the snapshot, which is D-086's restatement unchanged; the
-  variant keeps nothing. It holds the rule, as `install_creates`' test holds that reading, and not
-  its two call sites in `installed`, which no sweep reaches.
+- `ananke_shard::server`, the restatement at `Switched`:
+  `the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot` holds the rule, as
+  `install_creates`' test holds that reading: 386 past a snapshot at 383 is kept; 383 and 380
+  move to the snapshot, which is D-086's restatement unchanged; the variant keeps nothing.
+  `the_host_keeps_at_switched_what_the_task_and_the_store_applied_past_the_snapshot` holds its
+  two call sites, through `ServerHost::installed` itself (the review's F2): with the task and the
+  store at 32 and a switch to 30 the correct host leaves both at 32 and the variant takes both
+  to 30; at 28 both move to 30 on either.
+- `ananke_shard::install`, the `snapshot` task's restatement:
+  `a_late_job_that_applies_past_the_snapshot_while_the_switch_is_in_flight_is_kept` (the
+  review's F1). The store and the task stand at 28, the stream's snapshot is at 30, and a job
+  applies 29 to 32 through a `#[cfg(test)]` future the task awaits after `install_spans` returns
+  and before it restates, as D-132's `at_the_switch` lands a split, and for its reason: timing
+  it by the simulator's disk would move with every read on the path. Its applied-index key
+  reads 32 on both nodes; the correct node leaves the store's cached index and the task at 32,
+  and the variant takes both to 30, below the key.
 
-Both are unit pairs, as `RestartAppliesFromZero`'s was (D-081), and for the reason in section 2:
-the late job is an interleaving no sweep in the tree reaches. The variant is caught on every run
-of each, so at every tier.
+All are unit pairs, as `RestartAppliesFromZero`'s was (D-081), and for the reason in section 2:
+the late job is an interleaving no sweep in the tree reaches at its tiers. The variant is caught
+on every run of each, so at every tier.
 
 The reading that says no sweep reaches it is tested too, since the pin in section 5 asserts its
 absence through it: `a_late_job_is_read_from_the_hold_to_the_first_commit` (`sim/reseed.rs`).
@@ -25422,9 +25453,73 @@ cores beside other slices' builds and sweeps (load averages 164 to 172, so the f
 anything high): 1.4 cpu s (1.29 + 0.18, 1.26 + 0.13, 1.27 + 0.15). Into the lightest shard,
 shard 4, at 2231.2 -> 2232.6.
 
+### 6. The review of 8eb7aa2
+
+- **F1, blocking: the `snapshot` task's own restatement took a late job back.** A job that
+  applies past the snapshot while `install_spans` is in flight was set back to the snapshot by
+  the restatement in `finish`, before the one at `Switched` could keep it (section 2). Fixed as
+  the review proposed: that restatement reads `kept_past_the_switch` for the store and for the
+  task too, and `SwitchForgetsLateApplies` takes both back there as well (section 3). Paired by
+  `a_late_job_that_applies_past_the_snapshot_while_the_switch_is_in_flight_is_kept` through the
+  seam the review's plant placed, `after_the_switch` (section 4). No figure of section 1 moves:
+  `reseed::late_applies` opens at the hold, so it already counted applies on this route, and
+  counted none. Seed 13283 of the sharded sweep (D-132 section 5) runs the route on this tree,
+  in release, past the nightly's range. On node 2 the split's apply at 167 and the apply of 168
+  land inside range 44's install at 167, at 8.786 s and 8.790 s, before the switch's
+  `RaftSnapshot` at 8.861 s. Under `SwitchForgetsLateApplies` 168 is applied again at 8.872 s,
+  and the verdict is the old tree's: "state machine safety: server 2 applied index 168 of group 44
+  after 168". On the correct node it is not applied again, the next apply being 169, and the
+  verdict moves to check 8's install clause: range 44's install replaced `[k06, k14)`, which
+  overlaps its replica of range 3. That is section 7's window, #225's, and the seed still fails on
+  it, so it is not pinned here: the correct system fails it on a window this entry does not close.
+- **F2, non-blocking: no test held the restatement at `Switched` at its call sites.** Cheap and
+  done: `the_host_keeps_at_switched_what_the_task_and_the_store_applied_past_the_snapshot` builds
+  a `ServerHost` and steps `installed` itself (section 4).
+
+Plants, applied together to this tree in debug and reverted: every call site made to skip the
+rule, `true ||` before the store's test in `finish` and `false &&` in its task filter, and
+`false &&` at both of `installed`'s. The install test fails with `(30, Some(30))` for
+`(32, Some(32))`, and the host test, at 32 on the correct host, with `(Some(30), 30)` for
+`(Some(32), 32)`; the rule's own test passes, as the review found it did. Unplanted, the crate's
+lib passes, 195 tests.
+
+### 7. What is not here
+
+- **A late job's entries at or below the snapshot, landing while the switch is in flight.** The
+  rules here restate indices and cannot undo writes. Until the `snapshot` task restates, the
+  `apply` task stands where the replaced replica left it, so a job landing between the numbering
+  and that restatement applies its entries from there up to the snapshot again, on top of the
+  installed state, its batches numbered above the switch's. A job that goes on past the snapshot
+  ends on the right state for commands that do not read (`Put`, `Delete`), since every key it
+  touches is written again in order up to its top. A job that ends at or below the snapshot
+  leaves the keys its entries wrote at their older values, under an index restated to the
+  snapshot, and a `Cas` applied again reads a later value than it first did. A throwaway directed
+  test on this tree, the seam above with entry 29 writing `k0x` over a snapshot at 30 that holds
+  it, ends with `k0x` at entry 29's value, the store's cached index at 30 and its applied-index key
+  at 29. It is the window D-132 section 5 names for a split's apply, which #225 tracks, met by
+  any apply: D-132 counted the applied index moving there on 2 of 60 226 switches past the
+  nightly's range, and none within it. An index rule cannot close it. What closes it is the
+  `apply` task's job and the range's install excluding each other, #225's recommendation widened
+  from a split's apply to every apply of the range, which is a change to the `apply` task and the
+  owner's to shape (section 8). This entry does not close it, and it is not #113's failure.
+
+### 8. For the owner (PROPOSED)
+
+1. The two rules' shape: the watermark raised only by a compaction the step took (section 3.1),
+   and both restatements moving only up (section 3.2).
+2. Bit 52, and the variant restoring every half of the old tree at once.
+3. **A question: section 7's window.** Recommended: the exclusion #225 recommends for a split's
+   apply, widened to every apply of the range. The `apply` task waits out an install of the range
+   that is numbered and not yet restated, and the install waits for a job of the range in flight
+   before it is numbered. That closes section 7's window, and F1's route at its root, leaving this
+   entry's rules as guards. Whether it goes under #225 or an issue of its own is the owner's too.
+   Once it lands, seed 13283 (section 6) can be pinned on both: the correct run clean, and
+   `SwitchForgetsLateApplies` applying 168 twice.
+
 **Closes #113.** The issue's failure is not reproduced by search, on this tree or on its own;
-the path its numbers require is reproduced directed, closed and paired; and the recipe is pinned.
-**PROPOSED.**
+the path its numbers require is reproduced directed, closed at the watermark and at both
+restatements, and paired; and the recipe is pinned. Section 7's window is a different failure and
+stays open. **PROPOSED.**
 
 ---
 

@@ -459,10 +459,11 @@ pub enum NodeVariant {
     // PROPOSED(D-132)
     InstallReplacesCopiedSpan,
     /// The tree before D-126: what a job the replaced core queued before a live
-    /// install's hold applies after the switch is forgotten twice over. The restatement
-    /// at `Switched` takes the `apply` task's applied state and the store's applied index
-    /// back to the snapshot below the entries that job applied, so the next `Apply` hands
-    /// them out again, and the applied watermark stays at the snapshot below a compaction
+    /// install's hold applies after the switch is forgotten twice over. The restatements,
+    /// the `snapshot` task's right after the switch and the host's at `Switched`, take the
+    /// `apply` task's applied state and the store's applied index back to the snapshot
+    /// below the entries that job applied, so the next `Apply` hands them out again, and
+    /// the applied watermark stays at the snapshot below a compaction
     /// that job's record makes, so the next `Apply` names an index the replica the switch
     /// built has compacted away and the node stops (issue #113). The node holds a range's
     /// core across its install, not its `apply` task, so such a job can land; a sweep has

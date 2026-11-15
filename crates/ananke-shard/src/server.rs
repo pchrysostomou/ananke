@@ -4356,8 +4356,12 @@ fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Ind
 /// Taking it back hands those entries to the task a second time. A held index at or
 /// below the snapshot is the replaced replica's and moves up to the snapshot, which is
 /// D-086's restatement. [`NodeVariant::SwitchForgetsLateApplies`] keeps nothing.
+///
+/// The `snapshot` task's own restatement, right after the switch, reads it too: a job
+/// that applied past the snapshot while `install_spans` was in flight wrote above the
+/// switch, and is kept there as here (#113's review, F1).
 // PROPOSED(D-126)
-fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
+pub(crate) fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
     held > snapshot && !variants.contains(NodeVariant::SwitchForgetsLateApplies)
 }
 
@@ -5027,9 +5031,10 @@ mod tests {
     /// D-086's restatement unchanged.
     ///
     /// The pair is [`NodeVariant::SwitchForgetsLateApplies`], which takes it back. This
-    /// holds the rule and not its two call sites in `installed`, which no sweep reaches
-    /// (PROPOSED D-126 measures the late job), as `install_creates`' test above holds its
-    /// reading; the watermark's half of the same variant is paired in `round`.
+    /// holds the rule, as `install_creates`' test above holds its reading; its two call
+    /// sites in `installed`, which no sweep reaches (PROPOSED D-126 measures the late job),
+    /// are held by the test below, and the watermark's half of the same variant is paired
+    /// in `round`.
     // PROPOSED(D-126)
     #[test]
     fn the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot() {
@@ -5052,6 +5057,137 @@ mod tests {
             "the variant takes the late job's applies back to the snapshot"
         );
         assert!(!kept_past_the_switch(380, 383, buggy));
+    }
+
+    /// The restatement at `Switched` through `ServerHost::installed` itself, at both of its
+    /// call sites, the `apply` task's applied state and the store's applied index (#113's
+    /// review, F2): the test above holds the rule, and either call site made to skip it
+    /// passed every test of the tree. R2's task and store stand at `held` when the host
+    /// steps a switch to a snapshot at 30. At 32, what a late job applied past the
+    /// snapshot, the correct host leaves both at 32 and `SwitchForgetsLateApplies` takes
+    /// both back to 30. At 28, a replaced replica's index, both move up to 30 on either,
+    /// which is D-086's restatement unchanged.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_host_keeps_at_switched_what_the_task_and_the_store_applied_past_the_snapshot() {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        const R2: RangeId = RangeId(2);
+        /// What the host left: whether it built the switched replica, the `apply` task's
+        /// applied index and the store's.
+        type Restated = Option<(bool, Option<Index>, Index)>;
+        for (held, buggy, expected) in [
+            (32, false, 32),
+            (32, true, 30),
+            (28, false, 30),
+            (28, true, 30),
+        ] {
+            let mut sim = Sim::new(SimConfig::new(7));
+            let node = sim.add_node();
+            let env = sim.env(node);
+            let restated: Arc<Mutex<Restated>> = Arc::default();
+            env.clone().spawn("test", {
+                let (env, restated) = (env.clone(), restated.clone());
+                async move {
+                    let (store, _) = RaftStore::open_dir(
+                        env.clone(),
+                        EngineConfig::new(PathBuf::from("/n1")),
+                        KeyPrefix::group(R2.get()),
+                    )
+                    .await
+                    .expect("the store opens");
+                    let store = Arc::new(store);
+                    store.installed_at(held);
+                    let voters = vec![ServerId(1), ServerId(2), ServerId(3)];
+                    let config = Configuration::of(&voters);
+                    let descriptor = RangeDescriptor {
+                        range: R2,
+                        start: Bytes::from_static(b"k0"),
+                        end: Bytes::from_static(b"k9"),
+                        generation: FIRST_GENERATION,
+                        voters: voters.clone(),
+                        state: RangeState::Live,
+                    };
+                    let sock = env
+                        .net()
+                        .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                        .await
+                        .expect("a bind");
+                    let host = ServerHost {
+                        env: env.clone(),
+                        id: ServerId(1),
+                        sock: Arc::new(sock),
+                        addrs: BTreeMap::new(),
+                        stores: Arc::new(Mutex::new([(R2, store.clone())].into())),
+                        replicas: Arc::default(),
+                        jobs: Queue::new(),
+                        answers: Queue::new(),
+                        snaps: Queue::new(),
+                        ranges: Vec::new(),
+                        initial: voters.clone(),
+                        raft: RaftConfig::default(),
+                        variants: Variants::default(),
+                        node: if buggy {
+                            NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies])
+                        } else {
+                            NodeVariants::correct()
+                        },
+                        range_variants: RangeVariants::correct(),
+                        gaps: Mutex::new(Gaps::default()),
+                        descriptors: Arc::new(Mutex::new([(R2, descriptor.clone())].into())),
+                        led: Mutex::new(BTreeMap::new()),
+                        meta: Queue::new(),
+                        ids: Arc::new(Mutex::new(IdBlocks::new(1))),
+                        refill_at: 0,
+                        applied: Arc::new(Mutex::new(
+                            [(
+                                R2,
+                                Applied {
+                                    index: held,
+                                    term: 2,
+                                    config: config.clone(),
+                                },
+                            )]
+                            .into(),
+                        )),
+                        placeholders: Arc::default(),
+                        on_a_reseed: false,
+                    };
+                    let core = Raft::new(
+                        ServerId(1),
+                        config.clone(),
+                        RaftConfig {
+                            range: R2.get(),
+                            ..RaftConfig::default()
+                        },
+                        7,
+                    );
+                    let at = Identity {
+                        term: 2,
+                        last_index: 30,
+                        last_term: 2,
+                    };
+                    let switched = host.installed(
+                        R2,
+                        &core,
+                        &at,
+                        &config,
+                        Some(&descriptor),
+                        Some(&descriptor),
+                    );
+                    let task = lock(&host.applied).get(&R2).map(|state| state.index);
+                    *lock(&restated) = Some((switched.is_some(), task, store.applied()));
+                }
+            });
+            sim.run_for(Duration::from_secs(1));
+            let restated = lock(&restated).take();
+            assert_eq!(
+                restated,
+                Some((true, Some(expected), expected)),
+                "held {held}, buggy: {buggy}: the replica built, the task's applied index and \
+                 the store's"
+            );
+        }
     }
 
     fn client_addr() -> SocketAddr {

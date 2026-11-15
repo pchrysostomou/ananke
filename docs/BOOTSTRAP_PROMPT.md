@@ -113,7 +113,13 @@ _Update this section at the end of every session._
   New node variant `SwitchForgetsLateApplies` (bit 52, the shape's fourth), paired as units in
   `round` and `server`, since no sweep reaches the late job (0 of 8 892 snapshots, each read from
   its install's hold, `reseed::late_applies`). The recipe is pinned on seed 26, not swept: over the
-  tier its longest trace is 397 564 of the runaway cap's 400 000, and seed 344 passes it.
+  tier its longest trace is 397 564 of the runaway cap's 400 000, and seed 344 passes it. Its review
+  (2026-11-15) found the `snapshot` task's own restatement in `finish` still took back a late job
+  that applies while `install_spans` is in flight (F1): it moves only up now, paired through a test
+  seam after the switch, and the restatement at `Switched` is held at its two call sites (F2). Left
+  open and asked of the owner (D-126 §7, §8): a late job's entries at or below the snapshot,
+  landing in that window, are applied again over the installed state; the recommendation is #225's
+  exclusion widened to every apply of the range.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
