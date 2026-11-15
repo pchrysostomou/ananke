@@ -1600,6 +1600,17 @@ impl<E: Environment> Host for ServerHost<E> {
                         None => Some(SplitRefusal::NotLive),
                     }
                 };
+                // PROPOSED(D-137): `RefusedAfterRefill`, a node whose block a split found
+                // empty refuses every split once its refill lands, `NotLive`.
+                let refused = refused.or_else(|| {
+                    let ids = lock(&self.ids);
+                    (self
+                        .range_variants
+                        .contains(RangeVariant::RefusedAfterRefill)
+                        && ids.emptied()
+                        && ids.left() > 0)
+                        .then_some(SplitRefusal::NotLive)
+                });
                 let right = if refused.is_none() {
                     lock(&self.ids).take()
                 } else {
@@ -3719,10 +3730,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         cores.insert(id_of, core);
     }
     // §8: `RangesRestated` closes the node's restatement, naming every initialised
-    // replica it restated; check 8 reads the node's spans as complete here.
+    // replica it restated; check 8 reads the node's spans as complete here. It states the
+    // run's nonce too, so check 18 can hold a split's right half to a block of the run
+    // that led it.
     // PROPOSED(D-107)
+    // PROPOSED(D-137): the run stated at the node's start.
     restated.sort_unstable();
-    env.trace(TraceEvent::RangesRestated { ranges: restated });
+    let run = lock(&ids).run();
+    env.trace(TraceEvent::RangesRestated {
+        ranges: restated,
+        run,
+    });
     if let Some(descriptors) = bootstrap_meta.or(reseeded_meta) {
         env.trace(TraceEvent::MetaApplied {
             index: 0,

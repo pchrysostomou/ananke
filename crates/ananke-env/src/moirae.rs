@@ -1396,9 +1396,10 @@ fn convert(
                 ("state", Json::str(state.as_str())),
             ])),
         ),
-        TraceEvent::RangesRestated { ranges } => log(
+        // PROPOSED(D-137): the run stated at the node's start.
+        TraceEvent::RangesRestated { ranges, run } => log(
             "ananke.range.restated",
-            Some(Json::obj(vec![("ranges", ids(ranges))])),
+            Some(Json::obj(vec![("ranges", ids(ranges)), ("run", int(*run))])),
         ),
         TraceEvent::RangeReplicaCreated { range } => log(
             "ananke.range.replica-created",

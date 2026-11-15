@@ -26341,4 +26341,73 @@ The outcome is settled by the documents, so what is the owner's is the shape:
 
 ---
 
-_Next entry: D-133. Add one before implementing anything not covered above._
+## PROPOSED D-137 — Check 18 holds a split's right half to a block of the run that led it, a run each start states on `RangesRestated`, and D-092's retry has to take effect, not only be answered: `RefusedAfterRefill` beside it (#222)
+
+**The number.** Off 0d67f99, S11's tip (#228), which carries D-132 (#226); its footer reads D-133. D-133 to D-136 are taken by branches in flight that this tree does not carry, so this entry is D-137 and the footer moves to D-138. Every code site carries `// PROPOSED(D-137)`.
+
+**Context.** #216's review (N1) and its verification at 97b72e4 found two halves of D-092's per-seed assertion that the checks as built do not ask, and D-113 §8 recorded both as limits as of #216. Issue #222 asks for each to be asked, with a pair.
+
+1. D-092: no split follows a `NoRangeId` "until a `RangeIdsLeased` carrying that node's run is traced", which is SHARD.md §5's second rule, a node takes ids only from a block of its current run. Check 18's clause asked that the right half lie in a block granted to the node that led the split. It compared the node (`IdsUnique::holders_of`), not the run, so a split out of a block of that node's earlier run passed unless an id was then taken twice, and `IdBlockResumed` was caught through double use only.
+2. D-092: "the same asker's retry after the heal takes effect within the liveness bound". `Report::retries_take_effect` took any answer but `NoRangeId` for an effect, so a retry refused for another reason passed. With every later ask refused `NotLive` (a plant), 18 askers stayed unanswered of 3 695 retried at 1 000 seeds, and only the 2 with no answer at all tripped the check.
+
+This settles nothing new. §5's second rule and D-092's sentences are the rules; the entry makes the checks ask them as written, and supersedes D-113 §8's two limits.
+
+### 1. The run on the trace
+
+Check 18 needs the run of the node that led P in the split entry's term. Before this entry no event carried a node's run: `RangeIdsLeased` names the run a grant went to, and nothing names the run a node is in. Two ways to get it were weighed.
+
+- *Infer it from the restarts.* A run's grants are traced only after its start, so a run whose first grant is traced after a node's restart could be read as that start's. It is not exact: a refill an earlier run sent can be applied by range 0 after the restart, and its grant would read as the new run's. On the correct node that misreads nothing the node uses, since a run never adopts another's grant, but a variant that adopted it would pass.
+- *State it.* `RangesRestated` is the one record every start of a node traces, and the run's nonce is drawn before it (`server.rs`, the start). It now carries `run`, the nonce this start drew. **Chosen.** Tracing draws nothing from any generator, so no schedule moves; the moirae export gains the field (`ananke.range.restated`); no pinned hash covers a trace that carries the event (`SEED_42_BODY_HASH` is the one-group Raft sweep's, which has no ranges).
+
+**What check 18 reads** (`SplitLineage`, `invariants.rs`). A node's run is the one its last `RangesRestated` stated, until its `NodeCrashed`. The leader of a term is one run of one node, since a restarted node takes office again only in a later term, so the run is read where the leader traced `RaftLeader` and held with that term, beside the node. At the split's first apply the right half must lie in a block granted to that node *and* that run (`IdsUnique` keeps each block's run, and `holders_of` answers (node, run) pairs). A split out of a block of the node's earlier run reads "lies in a block granted to node N's run R, where node N led range P in the split entry's term T in its run R′ (SHARD.md §5's second rule, Q17: a node takes ids only from a block of its current run)". A term whose leader took office with no run stated since its node's last crash is the clause's own violation, since the run it would compare is missing. No correct trace reaches it: a start traces `RangesRestated` before it spawns the tasks that step its cores.
+
+**The correct node's case the run must not trip.** A split proposed by a run and first applied after that node's restart: D-113 §10 found these to be the correct system's only splits from a block of an earlier run (seeds 281 and 781 of the thousand, before S11 moved the schedules). The run read is the term's, the run that proposed, so they pass; `a_split_proposed_before_its_leaders_restart_and_applied_after_it_passes` is the directed case.
+
+SHARD.md is amended where it says otherwise: §8's event table (`RangesRestated`'s fields), check 18's clause (the run that node's last `RangesRestated` before it took office stated) and §10's `IdBlockResumed` row.
+
+**The pair: `IdBlockResumed`, re-measured.** Directed, in `invariants.rs`: one trace but for the block the split takes, a block of node 1's run 7 after node 1 restarted as run 8 (caught, with check 18's grants clause green: no id taken twice) and one of run 8 (passes); the split proposed before the restart; and the leader with no run stated. On the sweeps, over the seeds each test runs:
+
+| Sweep, test | Seeds | Check 18 before | Check 18 now | the run's words latched first | an id taken twice first |
+|---|---|---|---|---|---|
+| sharded, `a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_...` | `share()`, 100 | 42 | **61** | 28 | 33 |
+| same | the gate's 20 | 4 | **8** | 6 | 2 |
+| node, `the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_...` | 100 | — | **85** | 40 | 45 |
+| same | 20 | — | **18** | 8 | 10 |
+| node, `a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split`, the run's verdict | 20, 100, 1 000 | — | **17, 77, 712** | | |
+
+The sharded rows' "before" is this tree's, from D-131. The node sweep's comments carried figures from D-106 and D-116, whose schedules have moved since (check 8's created-twice clause, which this entry does not touch, reads 45 of 100 and 10 of 20 on this tree where D-116 had 71 and 14), so they are no before; its "now" is recorded beside them. The shape the variant aims at on the sharded sweep, a split that took its id from a block of an earlier run of its node, is reached on 62 of the 100 and 8 of the 20; the run's catch is far above 5 % at every tier and asserted there. A split's freshness is asked at its `RangeSplit`, before the run at its apply, so where the clause met an id taken twice first its words are that; the fold latches one violation. `sim/tests/node.rs`'s reading of "check 18's range-id clause" (`by_the_range_id_clause`) takes the run's words too, since they are that clause.
+
+### 2. The retry takes effect
+
+`Retried` now keeps the key the split was asked at and the refusal the asker stopped on. `Report::split_fate` reads off the trace what became of that split: when it first applied (its first `RangeSplit`), and when a value of its range first left its key outside the range's span (a `RangeDescriptor` or `RangeCreated` of the range that does not hold the key strictly inside). `Retried::took_no_effect` asks, of an asker still asking at the last fault's heal, an answer by which the split had applied — done, since a leader answers after its own apply, or a refusal that follows from it, which is seed 992's `KeyOutsideSpan` to an asker that asks anew after the split landed (D-131) — or, answered `KeyOutsideSpan`, by which the key had been left outside; then the bound, as before. Anything else is the new violation, "... was answered `R` at t, ... and took no effect". The effect is read from the trace and not from the answer's name, so a wrong reason stays wrong: `NotLive` is not excused where the key had been left outside.
+
+**Two defects of the check as first built here, found by the correct sweep at ten thousand and shown from the trace.** The first build of this section failed 19 of the 10 000 correct seeds, and both causes were the check's:
+
+- *The clocks (17 askers, seeds 1248, 1757, 3097, 3473, 3748, 4613, 4804, 5052, 5424, 5885, 6461, 6685, 7101, 8825, 8861, 9321, 9709).* Each asker was answered done and read as having had no effect, the split's first apply 1.7 to 36.5 ms after the answer in the records' time and 2.6 to 40.7 ms before it on the asker's clock. The asker reads its times off its own node's clock (`env.clock().now()` on the admins' node), and a node's clock is skewed and drifts like any other, by up to 50 ms on this sweep; the records carry global time. On seed 1248 the apply is 12 ms after the answer in global time and 11 ms before it on the asker's clock. The fate is now read on the admins' clock: `RunHeader::node_time` (`ananke-env`, new) puts a global time on a node's clock by the skew and drift the run drew for it, the formula the simulator's own `node_time` uses, now shared. Seed 1248 is pinned on it (`seed_1248_a_retry_answered_done_is_read_on_the_askers_clock`): the apply is past the answer in global time and before it on the asker's clock, and read across the two the asker takes no effect.
+- *A split superseded (2 askers, seeds 1032 and 3181).* The asker of range 2's split at `k05` is refused `NoRangeId`; before its retry is answered another asker's split of range 2 at `k04` lands, `k05` is the right half's, and range 2's leader answers `KeyOutsideSpan`. The split asked for can no longer take effect, since Stage C has no merge, and the answer is the true one. D-092's "takes effect" cannot be asked of a split another split pre-empted, and the check now reads such an answer as final. Seed 1032 is pinned on it (`seed_1032_a_retry_another_split_left_outside_its_range_is_answered_truly`), and with the outside reading taken out the same asker reads as taking no effect.
+
+Neither moved a schedule: both are the harness's reading of the trace.
+
+**Left as it was, and named.** Which askers are asked (`ended` at or past the heal) and the bound (`took`) still compare the asker's clock with the global `last_fault_healed`, as they did before this entry: up to 50 ms on a 2 s bound. Putting the heal on the admins' clock too changes who is asked, so it is not done here. PROPOSED: a follow-up.
+
+**On the correct system.** Over the ten thousand seeds 631 askers were refused `NoRangeId`, and 76 of them are asked of, still asking at the last fault's heal on a uniform seed with their ranges live: 62 answered done, each with its split applied by the answer on the asker's clock; 12 answered `KeyOutsideSpan` with their split applied, each an asker that asked anew after its split landed; and 2 answered `KeyOutsideSpan` whose split another split had superseded. None took no effect, and the slowest answer came 1.42 s from its origin against the 2 s bound.
+
+**The pair: `RefusedAfterRefill`, an instrument outside §10's count** (range variant bit 11). A node whose block a split has found empty in its run refuses every split once its refill lands, `NotLive`. The empty block still refuses `NoRangeId`, so the asker retries as on the correct node, and once the refill lands it is answered with a reason it does not retry; the split never applies. It needs one bit of run state the correct node reads nothing of, `IdBlocks::emptied`. Measured over seeds 0 to 999: an asker refused `NoRangeId` and then `NotLive` on 43, one the check asks of on 7, and all 7 caught by this check's new words and by nothing else; the reading as first written, asked of the same askers, passes every one. 43 and 7 are under D-061's 5 %, so the variant's firing and its catch are asserted over the thousand and printed below it, where the test sweeps `share()`, the same twenty at the gate and in CI (1 fires, none asked), as D-113 §8 placed `NoRangeId`'s own count. What every tier asserts is a pin: seed 992, the restart arm's asker, is asked of under the variant, refused `NotLive` once the refill lands, its split never applied and its key never left outside, named "took no effect", and passed by the old reading (`seed_992_a_retry_refused_once_the_refill_lands_...`); its correct half, the existing pin, now asserts the split had applied before its `KeyOutsideSpan`.
+
+**`RefillNotResent`, re-measured.** 32 of 100 and 8 of the gate's 20, every one "with no answer" and none by a retry answered with no effect: its askers are refused `NoRangeId` until their asks run out, so none is answered and the new reading is not what catches it.
+
+### 3. What the sweeps say
+
+The correct sharded sweep, `every_seed_passes_on_the_correct_sharded_sweep`, passes its 10 000 seeds: **0 fail** with both checks as built here, where the first build of section 2 failed 19, each the check's (section 2). It took 43 250 splits and answered `NoRangeId` 890 times on 567 seeds, and its shapes are reached on 4 873, 3 785, 4 242, 3 673 and 9 947 seeds, D-131's figures to the seed, so no schedule moved, as section 1 expects of a trace that only states more. The correct node sweep, `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`, passes its 1 000 seeds with the run compared.
+
+### 4. For the owner (PROPOSED)
+
+1. The run stated on `RangesRestated` rather than a new event, or an inference from the restarts.
+2. A leader with no run stated as check 18's own violation, rather than a fallback to the node.
+3. The retry's effect read from the trace on the asker's clock (`split_fate`, `RunHeader::node_time`), and a `KeyOutsideSpan` the trace shows true read as final where another split pre-empted the one asked for.
+4. `RefusedAfterRefill` at bit 11, an instrument, its catch asserted at the thousand with seed 992's pin at every tier, since the situation D-092's check asks about is reached on under 1 % of seeds.
+5. The heal read on the asker's clock as well, as a follow-up.
+
+---
+
+_Next entry: D-138. Add one before implementing anything not covered above._

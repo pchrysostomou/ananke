@@ -29,7 +29,7 @@
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
-//!   §8 has something that trips it where no protocol mistake of §10 does. Three are
+//!   §8 has something that trips it where no protocol mistake of §10 does. Four are
 //!   built. Two were moved here from the node's set by PROPOSED D-108 because each
 //!   breaks a rule of the range layer's and not of the node's:
 //!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
@@ -39,7 +39,9 @@
 //!   of the node's generator, at Q15's re-seed, at a split's right half and at a
 //!   placeholder's install (D-077, PROPOSED D-100, D-109).
 //!   [`RangeVariant::RefillNotResent`] breaks D-092's refill and is the instrument of
-//!   its per-seed assertion on the sharded sweep (PROPOSED D-113). Two more are
+//!   its per-seed assertion on the sharded sweep (PROPOSED D-113), and
+//!   [`RangeVariant::RefusedAfterRefill`] breaks the retry's taking effect that the
+//!   same assertion asks for (PROPOSED D-137). Two more are
 //!   proposed and not built: D-093's `SplitLeavesGap` for check 19's fold, and Stage D's
 //!   variant for the re-add window assertion (§12, Stage D's question 1), which needs a
 //!   stream derived anew at each creation and so is not `IncarnationPerRangeStream` read
@@ -110,7 +112,9 @@ pub enum RangeVariant {
     /// a restart abandons the rest of every block it held, and the ids the earlier
     /// run took from that block are taken twice. Check 18's range-id clause sees it
     /// at the first apply of a split whose right half a `RangeCreated` or `RangeSplit`
-    /// named before (SHARD.md §8, §10). §10's shape for it, a crash and restart of a
+    /// named before, or, an id taken twice or not, whose right half lies in a block of
+    /// another run of the node that led it (SHARD.md §8, §10; PROPOSED D-137). §10's
+    /// shape for it, a crash and restart of a
     /// node that took an id followed by a split led from that node, is `sim/shard.rs`'s
     /// to build (S11); on this tree the node sweep's `Fault::SplitFromRestarted` arm draws
     /// that shape, and `sim/shard.rs` reaches it on the restarts its faults happen to draw
@@ -180,6 +184,17 @@ pub enum RangeVariant {
     /// D-092's rule, and the check needs one (CLAUDE.md's pair rule).
     // PROPOSED(D-113)
     RefillNotResent,
+    /// A node whose block of range ids a split has found empty in this run refuses every
+    /// split after its refill lands, `NotLive`, where D-092 has the refill land and "the
+    /// same asker's retry after the heal take effect". The asker was refused `NoRangeId`,
+    /// retried, and is answered with a reason it does not retry, and the split never
+    /// applies. An empty block still refuses `NoRangeId`, so the asker keeps retrying until
+    /// the refill lands, as on the correct node. D-092's per-seed assertion
+    /// (`sim/shard.rs`'s `retries_take_effect`) sees the retry take no effect; as first
+    /// written it took any answer but `NoRangeId` for one, and passed this (issue #222). A
+    /// test instrument outside §10's count, for the same reason as `RefillNotResent`.
+    // PROPOSED(D-137)
+    RefusedAfterRefill,
 }
 
 impl RangeVariant {
@@ -196,6 +211,7 @@ impl RangeVariant {
         RangeVariant::UninitialisedReplicaVotes,
         RangeVariant::SnapshotOverlapsReplica,
         RangeVariant::RefillNotResent,
+        RangeVariant::RefusedAfterRefill,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -223,6 +239,8 @@ impl RangeVariant {
             RangeVariant::RefillNotResent => 1 << 9,
             // PROPOSED(D-131): a read checked at its receipt and not at its serving.
             RangeVariant::ReadCheckAtReceiptOnly => 1 << 10,
+            // PROPOSED(D-137): every split refused once a refill lands on an emptied block.
+            RangeVariant::RefusedAfterRefill => 1 << 11,
         }
     }
 
@@ -242,7 +260,8 @@ impl RangeVariant {
             | RangeVariant::SnapshotOverlapsReplica => true,
             RangeVariant::AnyFreshNodeBootstraps
             | RangeVariant::IncarnationPerRangeStream
-            | RangeVariant::RefillNotResent => false,
+            | RangeVariant::RefillNotResent
+            | RangeVariant::RefusedAfterRefill => false,
         }
     }
 
@@ -261,6 +280,7 @@ impl RangeVariant {
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
             RangeVariant::SnapshotOverlapsReplica => "SnapshotOverlapsReplica",
             RangeVariant::RefillNotResent => "RefillNotResent",
+            RangeVariant::RefusedAfterRefill => "RefusedAfterRefill",
         }
     }
 }
@@ -378,9 +398,10 @@ mod tests {
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
         // the range-id blocks, D-109's one for placeholders, D-110's one for the
         // overlap rule and D-131's one for the read check, all of them §10's; and
-        // the two instruments PROPOSED D-108 moved here from the node's set and PROPOSED
-        // D-113's one for D-092's refill, none of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 11);
+        // the two instruments PROPOSED D-108 moved here from the node's set, PROPOSED
+        // D-113's one for D-092's refill and PROPOSED D-137's one for its retry, none of
+        // them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 12);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -396,7 +417,8 @@ mod tests {
         assert_eq!(counted, 8, "§10's eight built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
-        // a replica's incarnation at its creation), and D-113's (D-092's refill).
+        // a replica's incarnation at its creation), D-113's (D-092's refill) and
+        // D-137's (D-092's retry).
         let instruments: Vec<&str> = RangeVariant::BUGS
             .iter()
             .filter(|variant| !variant.in_section_10())
@@ -407,7 +429,8 @@ mod tests {
             [
                 "AnyFreshNodeBootstraps",
                 "IncarnationPerRangeStream",
-                "RefillNotResent"
+                "RefillNotResent",
+                "RefusedAfterRefill"
             ],
             "the range layer's instruments outside §10's count"
         );

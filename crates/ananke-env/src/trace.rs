@@ -1119,6 +1119,11 @@ pub enum TraceEvent {
         /// The ranges restated, sorted: every initialised replica the node holds, one
         /// with a descriptor (PROPOSED D-107).
         ranges: Vec<u64>,
+        /// The run nonce this start drew (SHARD.md §5, Q17), which every refill the run
+        /// sends carries and every `RangeIdsLeased` granted to the run names: check 18
+        /// holds a split's right half to a block of the run that led it.
+        // PROPOSED(D-137): the run stated at the node's start.
+        run: u64,
     },
     /// A node made a placeholder for a range it does not hold (SHARD.md §5).
     // PROPOSED(D-069): defined and exported here; emitted by the stage that

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
 use ananke_env::{NodeId, RangeCause, RecoveredAs, TraceEvent};
+use ananke_raft::apply::SplitRefusal;
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::message::Message;
 use ananke_shard::invariants::{self, Fold};
@@ -55,6 +56,10 @@ struct Seen {
     keyspace_from_heal: Option<Duration>,
     /// How long each asker D-092's assertion asks of took (PROPOSED D-113 §8).
     retries_asked: Vec<Duration>,
+    /// What each of those askers was answered: `done`, or the refusal it stopped on; whether its
+    /// split had applied by then, and whether its key was outside its range by then
+    /// (PROPOSED D-137).
+    retries_answered: Vec<(&'static str, bool, bool)>,
     right_half: bool,
     partitions: usize,
     blocks: usize,
@@ -164,6 +169,25 @@ fn seen_of(seed: u64) -> Seen {
             .retries_asked()
             .iter()
             .map(|retried| retried.took(report.last_fault_healed))
+            .collect(),
+        retries_answered: report
+            .retries_asked()
+            .iter()
+            .map(|retried| {
+                let fate = report.split_fate(retried);
+                let by_the_answer =
+                    |at: Option<ananke_env::Instant>| at.is_some_and(|at| at <= retried.ended);
+                let answer = match (retried.answered, retried.refusal) {
+                    (false, _) => "no answer",
+                    (true, None) => "done",
+                    (true, Some(refusal)) => refusal.name(),
+                };
+                (
+                    answer,
+                    by_the_answer(fate.applied),
+                    by_the_answer(fate.outside),
+                )
+            })
             .collect(),
         right_half: invariants::folded(report.records())
             .verdict_of(Fold::RightHalf)
@@ -333,9 +357,15 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         .iter()
         .flat_map(|s| s.retries_asked.iter().copied())
         .collect();
+    let mut answered: BTreeMap<(&str, bool, bool), usize> = BTreeMap::new();
+    for answer in seen.iter().flat_map(|s| &s.retries_answered) {
+        *answered.entry(*answer).or_default() += 1;
+    }
     println!(
         "shard: D-092's asker: {} askers refused `NoRangeId`, {} of them still asking at the last \
-         fault's heal on a uniform seed with their ranges live; the slowest of those took {:?}",
+         fault's heal on a uniform seed with their ranges live; the slowest of those took {:?}; \
+         their answers, with whether the split had applied by then and whether its key was outside \
+         its range by then (PROPOSED D-137): {answered:?}",
         seen.iter().map(|s| s.driver.retried.len()).sum::<usize>(),
         retries.len(),
         retries.iter().max(),
@@ -432,6 +462,8 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
 struct Under {
     why: Option<String>,
     tripped: BTreeSet<Fold>,
+    /// Check 18's split clause's own verdict, where it tripped (PROPOSED D-137).
+    lineage: Option<String>,
     splits: usize,
     /// The splits that took an id from a block of an earlier run of its holder.
     from_an_earlier_run: usize,
@@ -460,13 +492,15 @@ fn under(
 ) -> Vec<Under> {
     let found = sweep(seeds, |seed| {
         let report = shard::run_of(seed, cores, node, range);
+        let folded = invariants::folded(report.records());
         Under {
             why: report.check().err(),
-            tripped: invariants::folded(report.records())
+            tripped: folded
                 .verdicts()
                 .into_iter()
                 .filter_map(|(fold, verdict)| verdict.is_err().then_some(fold))
                 .collect(),
+            lineage: folded.verdict_of(Fold::SplitLineage).err(),
             splits: report.splits(),
             from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
         }
@@ -756,7 +790,7 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
     );
 }
 
-/// §10's `IdBlockResumed`: 42 of 100 seeds and 4 of the gate's 20 by check 18, on the restart arm's shape
+/// §10's `IdBlockResumed`: 61 of 100 seeds and 8 of the gate's 20 by check 18, on the restart arm's shape
 /// (`Fault::SplitFromRestarted`, PROPOSED D-131), where it was 10 of 100 on the restarts the faults
 /// drew and the splits that landed on them by chance before the arm. So the catch is asserted at
 /// every tier, in the words of §12's "wrong if": a tier that runs this and catches nothing says
@@ -764,8 +798,14 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
 /// took an id from a block of an earlier run of its node
 /// (`shard::splits_from_a_block_of_an_earlier_run_of`), on 62 of 100 seeds and 8 of the gate's 20. The correct node's new run
 /// holds none, so that is the variant seen firing.
+///
+/// **Check 18 compares the run** (PROPOSED D-137, issue #222). Compared by the node alone it caught
+/// the variant only where an id was then taken twice, 42 of 100 and 4 of 20. Its split clause now
+/// names the run on 28 of 100 and 6 of the gate's 20, and an id taken twice on 33 and 2, the words of
+/// whichever split it met first; so the run's catch is asserted at every tier too.
 // PROPOSED(D-113): §10, the shape at every tier.
 // PROPOSED(D-131): §12's "wrong if", at every tier the arm reaches it.
+// PROPOSED(D-137): the run compared, at every tier.
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sharded_sweep() {
     let found = range_variant("IdBlockResumed", share(), RangeVariant::IdBlockResumed);
@@ -784,6 +824,26 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_by_check_18_on_the_sh
         tripped(&found, Fold::SplitLineage) > 0,
         "IdBlockResumed was caught by check 18 on no seed: the sharded sweep does not reach it \
          (SHARD.md §12's \"wrong if\")"
+    );
+    // PROPOSED(D-137): what check 18's split clause said, the run compared (issue #222) or an id
+    // taken twice.
+    let lineage = |words: &str| {
+        found
+            .iter()
+            .filter(|u| u.lineage.as_deref().is_some_and(|why| why.contains(words)))
+            .count()
+    };
+    let by_run = lineage("a node takes ids only from a block of its current run");
+    let twice = lineage("which a creation or a split had named before it");
+    println!(
+        "shard: IdBlockResumed: check 18's split clause by the run compared on {by_run}/{}, by an \
+         id taken twice on {twice}",
+        found.len()
+    );
+    assert!(
+        by_run > 0,
+        "check 18 did not compare the run on any seed: no split out of a block of an earlier run \
+         of its leader's node was read as one (issue #222)"
     );
 }
 
@@ -892,16 +952,120 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep() {
 /// refill outstanding, resent "until a grant carrying its current run nonce arrives". Under
 /// `RefillNotResent` a refill sent while range 0 has no leader is the last, every split on that
 /// node is refused `NoRangeId`, and an asker's retries after the heal end with no answer: 32 of
-/// 100 seeds, by this check and no other.
+/// 100 seeds, by this check and no other. Re-measured once the retry has to take effect (PROPOSED
+/// D-137): 32 of 100 and 8 of the gate's 20, every one with no answer and none by a retry answered
+/// with no effect, since this variant's askers are never answered at all.
 // PROPOSED(D-092): answer A; the asker retries.
 // PROPOSED(D-113): §8's pair for the check read from the heal.
 #[test]
 fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered() {
     let found = range_variant("RefillNotResent", share(), RangeVariant::RefillNotResent);
+    // PROPOSED(D-137): which of D-092's two readings named each seed.
+    println!(
+        "shard: RefillNotResent: an asker with no answer on {}, a retry answered with no effect on \
+         {}",
+        said(&found, "with no answer"),
+        said(&found, "and took no effect"),
+    );
     assert!(
         said(&found, "with no answer") > 0,
         "no asker's retries after the heal went unanswered"
     );
+}
+
+/// The reading of D-092's check as first written, which took any answer but `NoRangeId` for the
+/// retry's effect: a fate in which the split applied as the answer came (PROPOSED D-137).
+fn as_first_written(retried: &shard::Retried) -> shard::SplitFate {
+    shard::SplitFate {
+        applied: Some(retried.ended),
+        outside: Some(retried.ended),
+    }
+}
+
+/// D-092's "the same asker's retry after the heal takes effect", broken where the reading as
+/// first written could not see it (issue #222): under `RefusedAfterRefill` a node whose block a
+/// split found empty refuses every split once its refill lands, `NotLive`. The asker refused
+/// `NoRangeId` retries as on the correct node, is answered with a reason it does not retry, and the
+/// split never applies. `retries_take_effect` now asks that the split applied by the answer, and
+/// says "took no effect"; the reading that took any answer but `NoRangeId` for an effect, asked of
+/// the same askers (each read as though its split applied as its answer came), passes every one.
+///
+/// Measured over seeds 0 to 999: an asker refused `NoRangeId` and then `NotLive` on 43, one the
+/// check asks of (still asking at the last fault's heal, on a uniform seed with its ranges live) on
+/// 7, and all 7 caught, in those words and in no others, each one the reading as first written
+/// passes. 7 of 1 000 and 43 of 1 000 are under D-061's 5 %, so both are asserted over the thousand
+/// and printed below it, where it sweeps `share()`, the same twenty at the gate and in CI (1 fires,
+/// none asked), as D-113 §8 placed `NoRangeId`'s own count. Seed 992's pin asserts the catch at
+/// every tier.
+// PROPOSED(D-137): the retry takes effect, not only gets an answer.
+#[test]
+fn a_node_that_refuses_splits_once_its_refill_lands_leaves_the_retry_without_effect() {
+    let run = if seeds() >= 1000 {
+        seeds().min(1000)
+    } else {
+        share()
+    };
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let found = sweep(run, |seed| {
+        let report = shard::run_of(
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::RefusedAfterRefill]),
+        );
+        let heal = report.last_fault_healed;
+        let refused_after = report
+            .driver
+            .retried
+            .iter()
+            .filter(|retried| retried.refusal == Some(SplitRefusal::NotLive))
+            .count();
+        let asked = report.retries_asked();
+        let old_reading = asked
+            .iter()
+            .find_map(|retried| retried.took_no_effect(heal, bound, as_first_written(retried)));
+        (
+            report.check().err(),
+            refused_after,
+            asked.len(),
+            old_reading,
+        )
+    });
+    let no_effect = |why: &Option<String>| {
+        why.as_deref()
+            .is_some_and(|why| why.contains("and took no effect"))
+    };
+    let fired = found.iter().filter(|f| f.1 > 0).count();
+    let asked = found.iter().filter(|f| f.2 > 0).count();
+    let failed = found.iter().filter(|f| f.0.is_some()).count();
+    let caught = found.iter().filter(|f| no_effect(&f.0)).count();
+    let old = found.iter().filter(|f| f.3.is_some()).count();
+    let only_new = found
+        .iter()
+        .filter(|f| f.3.is_none() && no_effect(&f.0))
+        .count();
+    println!(
+        "shard: RefusedAfterRefill over {run}: an asker refused `NoRangeId` and then `NotLive` on \
+         {fired}, one D-092's check asks of on {asked}; failed {failed}, {caught} by the retry taking \
+         no effect, {only_new} of them where the reading as first written passes; that reading \
+         trips {old}"
+    );
+    if seeds() >= 1000 {
+        assert!(
+            fired > 0,
+            "no asker refused `NoRangeId` was then refused `NotLive` over the thousand: the variant \
+             was not seen firing"
+        );
+        assert!(
+            caught > 0,
+            "no asker's retry was read as taking no effect over the thousand"
+        );
+        assert!(
+            only_new > 0,
+            "the reading as first written trips every seed the retry's effect does: the pair no \
+             longer shows what #222 asked of it"
+        );
+    }
 }
 
 /// The write bound read from the heal, D-076's "how long after the heal the range became writable
@@ -1242,7 +1406,7 @@ fn seed_3291_a_replica_restated_before_any_node_traced_its_split_may_grant() {
     });
     let restated = at("`RangesRestated` naming the right half", &|record| {
         on_node(record)
-            && matches!(&record.event, TraceEvent::RangesRestated { ranges }
+            && matches!(&record.event, TraceEvent::RangesRestated { ranges, .. }
                 if ranges.contains(&right))
     });
     let first_traced = at("the split's first trace, on any node", &|record| {
@@ -2231,7 +2395,7 @@ fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_b
         "{:?}",
         report.driver.retried
     );
-    let retried = report.driver.retried[0];
+    let retried = report.driver.retried[0].clone();
     let empties = report.no_range_ids();
     assert_eq!(empties.len(), 1, "one `NoRangeId`: {empties:?}");
     assert_eq!(empties[0].node, arm.victim);
@@ -2276,10 +2440,159 @@ fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_b
         "the asker asked anew and was refused at once: {:?}",
         report.driver.refused
     );
+    // PROPOSED(D-137): the refusal follows from the split's effect, which the check now asks of
+    // the trace: the split had applied before the answer came.
+    assert_eq!(retried.refusal, Some(SplitRefusal::KeyOutsideSpan));
+    assert!(
+        report
+            .split_fate(&retried)
+            .applied
+            .is_some_and(|at| at <= retried.ended),
+        "the retry took effect by its answer: {retried:?}"
+    );
     let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
     assert!(
         retried.took(report.last_fault_healed) <= bound,
         "answered within D-092's bound: {retried:?}"
+    );
+}
+
+/// Seed 992 under `RefusedAfterRefill`, the instrument's pair at every tier (PROPOSED D-137, issue
+/// #222): the restart arm's split, refused `NoRangeId` on node 1's new run, is retried after the
+/// last fault's heal, and once the refill lands the variant refuses it `NotLive`. The asker stops on
+/// that answer and the split never applies. D-092's check names it as taking no effect, and the
+/// reading as first written, which took any answer but `NoRangeId` for one, passes the same asker.
+/// The correct half is the pin above: on the correct node the same asker's retry is proposed and
+/// applied, and the split had applied when it was answered.
+// PROPOSED(D-137)
+#[test]
+fn seed_992_a_retry_refused_once_the_refill_lands_takes_no_effect_and_the_check_says_so() {
+    let report = shard::run_of(
+        992,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::RefusedAfterRefill]),
+    );
+    let asked = report.retries_asked();
+    assert_eq!(
+        asked.len(),
+        1,
+        "seed 992's asker is asked of under the variant: {:?}",
+        report.driver.retried
+    );
+    let retried = &asked[0];
+    assert_eq!(
+        retried.refusal,
+        Some(SplitRefusal::NotLive),
+        "the retry was refused `NotLive` once the refill landed: {retried:?}"
+    );
+    assert_eq!(
+        report.split_fate(retried),
+        shard::SplitFate::default(),
+        "the split never applied, and nothing left its key outside its range"
+    );
+    let why = report.check().expect_err("the retry took no effect");
+    assert!(
+        why.contains("was answered `not-live`") && why.contains("and took no effect"),
+        "seed 992's catch under the variant is the retry's effect: {why}"
+    );
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    assert_eq!(
+        retried.took_no_effect(report.last_fault_healed, bound, as_first_written(retried)),
+        None,
+        "the reading as first written, any answer but `NoRangeId`, passes this asker"
+    );
+}
+
+/// Seed 1032, a correct-system failure of D-092's check as #222 first asked it, a defect of the
+/// check (PROPOSED D-137): the asker of range 2's split at `k05` is refused `NoRangeId`, and before
+/// its retry is answered another asker's split of range 2 at `k04` lands, so `k05` lies in the
+/// right half and range 2's leader answers `KeyOutsideSpan`. The split asked for can no longer
+/// take effect, and that answer is the true one. The check reads it so: the asker's range had left
+/// its key outside before the answer ([`shard::SplitFate`]'s `outside`), and with that reading
+/// taken out the same asker reads as taking no effect.
+// PROPOSED(D-137)
+#[test]
+fn seed_1032_a_retry_another_split_left_outside_its_range_is_answered_truly() {
+    let report = shard::run(1032);
+    report.check().unwrap();
+    let asked = report.retries_asked();
+    assert_eq!(asked.len(), 1, "{:?}", report.driver.retried);
+    let retried = &asked[0];
+    assert_eq!((retried.range, &retried.key[..]), (2, &b"k05"[..]));
+    assert_eq!(retried.refusal, Some(SplitRefusal::KeyOutsideSpan));
+    let fate = report.split_fate(retried);
+    assert_eq!(fate.applied, None, "the split asked for never applied");
+    assert!(
+        fate.outside.is_some_and(|at| at <= retried.ended),
+        "range 2 left `k05` outside before the answer: {fate:?}"
+    );
+    assert!(
+        report.records().iter().any(|record| matches!(&record.event,
+            TraceEvent::RangeSplit { range: 2, key, .. }
+                if key[..] == ananke_raft::apply::user_key(b"k04")[..])),
+        "seed 1032's other split, range 2 at `k04`, is gone: pin it on its mechanism"
+    );
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let without = shard::SplitFate {
+        outside: None,
+        ..fate
+    };
+    let why = retried
+        .took_no_effect(report.last_fault_healed, bound, without)
+        .expect("without the outside reading the asker takes no effect");
+    assert!(why.contains("answered `key-outside-span`"), "{why}");
+}
+
+/// Seed 1248, the other correct-system failure of D-092's check as #222 first asked it, and a
+/// defect of the check (PROPOSED D-137): the asker of range 35's split at `k10` is answered done,
+/// and the records put the split's first apply 12 ms after the answer. The asker reads its times
+/// off its own node's clock, which is skewed and drifts, and the records carry global time; read
+/// on the asker's clock the split applied 11 ms before the answer, as a leader that answers after
+/// its own apply has it. Compared across the two clocks the asker took no effect, as 17 of the 76
+/// askers the correct system's ten thousand seeds ask of did.
+// PROPOSED(D-137)
+#[test]
+fn seed_1248_a_retry_answered_done_is_read_on_the_askers_clock() {
+    let report = shard::run(1248);
+    report.check().unwrap();
+    let asked = report.retries_asked();
+    assert_eq!(asked.len(), 1, "{:?}", report.driver.retried);
+    let retried = &asked[0];
+    assert_eq!((retried.range, &retried.key[..]), (35, &b"k10"[..]));
+    assert_eq!(retried.refusal, None, "answered done");
+    let global = report
+        .records()
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::RangeSplit { range: 35, key, .. }
+                if key[..] == ananke_raft::apply::user_key(b"k10")[..] =>
+            {
+                Some(record.at)
+            }
+            _ => None,
+        })
+        .expect("the split applied");
+    assert!(
+        global > retried.ended,
+        "the records' time of the apply is past the asker's time of its answer: seed 1248's \
+         clocks no longer straddle them, so pin it on its mechanism"
+    );
+    let fate = report.split_fate(retried);
+    assert!(
+        fate.applied.is_some_and(|at| at <= retried.ended),
+        "on the asker's clock the split applied before the answer: {fate:?}"
+    );
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let across = shard::SplitFate {
+        applied: Some(global),
+        outside: Some(global),
+    };
+    assert!(
+        retried
+            .took_no_effect(report.last_fault_healed, bound, across)
+            .is_some(),
+        "read across the two clocks the asker takes no effect"
     );
 }
 
@@ -2556,7 +2869,7 @@ fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first
         "{:?}",
         report.driver.retried
     );
-    let retried = report.driver.retried[0];
+    let retried = report.driver.retried[0].clone();
     assert_eq!(
         Some(retried.range),
         arm.range,

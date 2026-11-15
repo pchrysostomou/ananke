@@ -2184,6 +2184,12 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
 /// proposer — is asserted at every tier too; and the variant is seen injected by
 /// range 0 granting its nodes fewer blocks than the correct node's over the same
 /// crashes, since a restarted node that resumes a block asks for no refill.
+///
+/// Re-measured on D-137's tree, where check 18 compares the run that led the split and
+/// not only its node: caught by any check on 18 of 20, 85 of 100 and 783 of 1 000, by
+/// check 18's range-id clause on 17, 77 and 712, and the restarted proposer's second split
+/// done on 9, 37 and 306. The schedules have moved since the figures above were taken, so they are not this
+/// tree's before; the sharded sweep's, taken on one tree, are (PROPOSED D-137).
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     let outcomes = routing_variant("IdBlockResumed", &[RangeVariant::IdBlockResumed]);
@@ -2210,6 +2216,8 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     // 90, check 9 on 16, log matching on 11, commit by current term on 8, check 7 on 3,
     // check 16 on 1 — and check 18's clause trips beneath every one of them, read fold by
     // fold (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
+    // With the run compared (PROPOSED D-137), the run's words are that clause too, and the
+    // figures on its tree are above.
     // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
@@ -3145,15 +3153,19 @@ fn grants_at_index_2_of(violation: &str) -> Option<(u64, u64)> {
 
 /// Whether `violation` is check 18's **range-id clause**: a right half whose id a
 /// creation or a split had named before (the freshness failure, in
-/// [`Fold::SplitLineage`]'s words), or two grants of one id ([`Fold::RangeIds`]) — and
-/// not a split's values, a wrong generation or wrong voters, which a node that resumes
-/// another run's block does not break and `descriptor lineage:` alone also names (issue
-/// #141). Read off a fold's own verdict or a run's, which names its seed first.
+/// [`Fold::SplitLineage`]'s words), a right half out of a block of another run of the
+/// node that led its split (the run compared, PROPOSED D-137), or two grants of one id
+/// ([`Fold::RangeIds`]) — and not a split's values, a wrong generation or wrong voters,
+/// which a node that resumes another run's block does not break and `descriptor
+/// lineage:` alone also names (issue #141). Read off a fold's own verdict or a run's,
+/// which names its seed first.
 // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
+// PROPOSED(D-137): and the run compared, which is that clause too.
 fn by_the_range_id_clause(violation: &str) -> bool {
     violation.contains(Fold::RangeIds.words())
         || (violation.contains(Fold::SplitLineage.words())
-            && violation.contains("which a creation or a split had named before it"))
+            && (violation.contains("which a creation or a split had named before it")
+                || violation.contains("a node takes ids only from a block of its current run")))
 }
 
 /// Check 18 against `IdBlockResumed` (SHARD.md §12, Stage C's exit): the restarted
@@ -3164,6 +3176,12 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// variant is caught on: the run's own verdict names another check first on 129 of the
 /// 628 (state machine safety, check 9, log matching and others, D-105's table), and the
 /// fold shows check 18 tripped beneath each. Asserted at every tier.
+///
+/// **With the run compared** (PROPOSED D-137), re-measured on its tree, whose schedules have
+/// moved since the figures above: check 18's split clause in violation on 85 of the first
+/// hundred and 18 of the first twenty, the run's words latched first on 40 and 8 and an id
+/// taken twice on 45 and 10. Check 8's created-twice clause, which D-137 does not change, is on
+/// 45 of the hundred (42 over a restatement) and 10 of the twenty (9) on that tree.
 ///
 /// **Check 8's created-twice clause** against the same variant (PROPOSED D-116): a voter
 /// of the second split that holds the right half the first made, created there or
@@ -3198,6 +3216,23 @@ fn the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_blo
     };
     let by_clause = found.iter().filter(|seed| reused(seed)).count();
     println!("range folds: IdBlockResumed: check 18's range-id clause on {by_clause}/{seeds}");
+    // PROPOSED(D-137): which of the clause's words the split clause latched first.
+    let lineage = |words: &str| {
+        found
+            .iter()
+            .filter(|seed| {
+                seed.tripped
+                    .get(&Fold::SplitLineage)
+                    .is_some_and(|said| said.contains(words))
+            })
+            .count()
+    };
+    println!(
+        "range folds: IdBlockResumed: check 18's split clause by the run compared on {}/{seeds}, \
+         by an id taken twice on {}",
+        lineage("a node takes ids only from a block of its current run"),
+        lineage("which a creation or a split had named before it"),
+    );
     assert!(
         by_clause > 0,
         "check 18's range-id clause tripped on no compared seed of IdBlockResumed's {seeds}"
@@ -3390,7 +3425,7 @@ fn without_the_right_half(records: &[TraceRecord], node: u32, right: u64) -> Vec
         .cloned()
         .map(|mut record| {
             if record.node.is_some_and(|n| n.get() == node)
-                && let TraceEvent::RangesRestated { ranges } = &mut record.event
+                && let TraceEvent::RangesRestated { ranges, .. } = &mut record.event
             {
                 ranges.retain(|range| *range != right);
             }
@@ -3502,7 +3537,7 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
     let restated = report.records[crashed..]
         .iter()
         .find_map(|record| match &record.event {
-            TraceEvent::RangesRestated { ranges } if on(record) => Some(ranges.clone()),
+            TraceEvent::RangesRestated { ranges, .. } if on(record) => Some(ranges.clone()),
             _ => None,
         })
         .unwrap_or_else(|| panic!("seed {seed}: node {node} never restated after its crash"));

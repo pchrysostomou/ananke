@@ -72,6 +72,9 @@ pub struct IdBlocks {
     adopted: BTreeSet<u64>,
     /// Whether a refill is outstanding: asked and not yet answered by a grant.
     asked: bool,
+    /// Whether a split has found this run's block empty: what `RefusedAfterRefill`
+    /// reads (PROPOSED D-137). The correct node reads nothing of it.
+    emptied: bool,
 }
 
 impl IdBlocks {
@@ -83,6 +86,7 @@ impl IdBlocks {
             block: None,
             adopted: BTreeSet::new(),
             asked: false,
+            emptied: false,
         }
     }
 
@@ -124,13 +128,21 @@ impl IdBlocks {
         true
     }
 
+    /// Whether a split has found this run's block empty ([`IdBlocks::take`] with no id
+    /// left), whatever was adopted since.
+    // PROPOSED(D-137): what `RefusedAfterRefill` reads.
+    #[must_use]
+    pub fn emptied(&self) -> bool {
+        self.emptied
+    }
+
     /// The next id of the block held, if one is left: what a split's right half takes
     /// (§5). Taken from memory, each id once.
     pub fn take(&mut self) -> Option<u64> {
-        let (next, last) = self.block?;
-        if next > last {
+        let Some((next, last)) = self.block.filter(|(next, last)| next <= last) else {
+            self.emptied = true;
             return None;
-        }
+        };
         self.block = if next == last {
             None
         } else {
@@ -188,5 +200,25 @@ mod tests {
         assert!(ids.adopt(&record(1, 9, 9), false));
         assert_eq!(ids.take(), Some(9));
         assert_eq!(ids.take(), None);
+    }
+
+    // PROPOSED(D-137)
+    #[test]
+    fn a_take_that_finds_the_block_empty_is_remembered_for_the_run() {
+        let mut ids = IdBlocks::new(1);
+        assert!(!ids.emptied(), "a new run has found nothing empty yet");
+        assert!(ids.adopt(&record(1, 3, 3), false));
+        assert_eq!(ids.take(), Some(3));
+        assert!(
+            !ids.emptied(),
+            "the last id taken is not an empty block found"
+        );
+        assert_eq!(ids.take(), None);
+        assert!(ids.emptied());
+        assert!(ids.adopt(&record(1, 9, 10), false));
+        assert!(ids.emptied(), "a refill does not undo what the run found");
+        let mut fresh = IdBlocks::new(2);
+        assert_eq!(fresh.take(), None);
+        assert!(fresh.emptied(), "a run that holds no block finds it empty");
     }
 }

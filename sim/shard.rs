@@ -831,16 +831,23 @@ pub struct NoRangeId {
 }
 
 /// A split `NoRangeId` answered at least once, and what its asker's retries came to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retried {
     /// The range asked of.
     pub range: u64,
+    /// The key the split was asked at, as the asker sent it.
+    // PROPOSED(D-137): what the retry was to take effect as.
+    pub key: Bytes,
     /// When the first `NoRangeId` came.
     pub refused: Instant,
     /// When the asker stopped asking.
     pub ended: Instant,
     /// Whether it stopped on an answer: done, or refused for a reason it does not retry.
     pub answered: bool,
+    /// The refusal it stopped on, where it stopped on one; `None` where it was answered done,
+    /// or not answered.
+    // PROPOSED(D-137): what the retry was answered.
+    pub refusal: Option<SplitRefusal>,
 }
 
 impl Retried {
@@ -857,15 +864,30 @@ impl Retried {
         self.ended.duration_since(self.refused.max(heal))
     }
 
-    /// What D-092 asks of this asker, where the last fault healed at `heal` and the bound is
-    /// `bound`: "the same asker's retry after the heal takes effect within the liveness
-    /// bound". One that stopped before the heal made no retry after it and is asked nothing.
-    /// Any other is asked for an answer, within the bound of the heal, or of its first
-    /// refusal if that came after the heal. The violation, in words, if it did neither.
+    /// What D-092 asks of this asker, where the last fault healed at `heal`, the bound is
+    /// `bound`, and `fate` is what the trace says became of the split it asked for: "the same
+    /// asker's retry after the heal takes effect within the liveness bound". One that stopped
+    /// before the heal made no retry after it and is asked nothing. Any other is asked for an
+    /// answer by which the split had taken effect — a replica applied it, whether the answer
+    /// was done or a refusal that follows from it, such as `KeyOutsideSpan` to an asker that
+    /// asks anew after the split landed — or, answered `KeyOutsideSpan`, by which its range had
+    /// left its key outside its span, a split of that range at another key having landed
+    /// first, so that the split it asked for can no longer take effect and the answer is the
+    /// true one; and for the answer within the bound of the heal, or of its first refusal if
+    /// that came after the heal. The violation, in words, if it did not.
+    ///
+    /// An answer alone was enough until #222: a retry refused for another reason, the split
+    /// never applied, passed.
     // PROPOSED(D-092): answer A; the asker retries.
     // PROPOSED(D-113): read from the heal, §8.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
     #[must_use]
-    pub fn took_no_effect(&self, heal: Instant, bound: Duration) -> Option<String> {
+    pub fn took_no_effect(
+        &self,
+        heal: Instant,
+        bound: Duration,
+        fate: SplitFate,
+    ) -> Option<String> {
         if !self.asking_at(heal) {
             return None;
         }
@@ -877,6 +899,19 @@ impl Retried {
                 self.range, self.refused, self.ended
             ));
         }
+        let by_the_answer = |at: Option<Instant>| at.is_some_and(|at| at <= self.ended);
+        let took_effect = by_the_answer(fate.applied);
+        let superseded =
+            self.refusal == Some(SplitRefusal::KeyOutsideSpan) && by_the_answer(fate.outside);
+        if !took_effect && !superseded {
+            let answer = self.refusal.map_or("done", SplitRefusal::name);
+            return Some(format!(
+                "the split of range {} at {:?} refused at {:?} was answered `{answer}` at {:?}, \
+                 {took:?} past the last heal at {heal:?}, and took no effect: no replica had \
+                 applied it by then ({fate:?})",
+                self.range, self.key, self.refused, self.ended
+            ));
+        }
         (took > bound).then(|| {
             format!(
                 "the split of range {} refused at {:?} was answered {took:?} past the last heal \
@@ -885,6 +920,21 @@ impl Retried {
             )
         })
     }
+}
+
+/// What the trace says became of the split an asker asked for, each time read on the clock of
+/// the node the driver's admins run on, the clock [`Retried`]'s times are on
+/// ([`Report::split_fate`]).
+// PROPOSED(D-137): the retry takes effect, not only gets an answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitFate {
+    /// When it first applied, on any replica: its first `RangeSplit`.
+    pub applied: Option<Instant>,
+    /// When a value of its range first left its key outside the range's span: its own split's
+    /// apply does, and so does a split of that range at another key below it. From then no split
+    /// of that range at that key can take effect, since Stage C has no merge, and
+    /// `KeyOutsideSpan` is the true answer to it.
+    pub outside: Option<Instant>,
 }
 
 type Driver = Arc<Mutex<DriverStats>>;
@@ -933,6 +983,8 @@ async fn split_admin<E: Environment>(
     }
     let mut tries = ASKS;
     let mut done = false;
+    // PROPOSED(D-137): the refusal the asker stopped on, if it stopped on one.
+    let mut refusal: Option<SplitRefusal> = None;
     let mut first_refused: Option<Instant> = None;
     let mut seq = n;
     while tries > 0 && !done {
@@ -994,6 +1046,7 @@ async fn split_admin<E: Environment>(
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
                 }
+                refusal = Some(reason);
                 done = true;
             }
             Reply::Outcome(_) => {
@@ -1016,9 +1069,11 @@ async fn split_admin<E: Environment>(
     if let Some(refused) = first_refused {
         stats.retried.push(Retried {
             range,
+            key,
             refused,
             ended,
             answered: done,
+            refusal,
         });
     }
     stats.outstanding -= 1;
@@ -1413,6 +1468,9 @@ pub struct Report {
     pub last_fault_healed: Instant,
     /// Each [`Fault::SplitFromRestarted`] that found a node to crash.
     pub restart_arms: Vec<RestartArm>,
+    /// The node the driver's admins run on, on whose clock [`Retried`]'s times are read.
+    // PROPOSED(D-137)
+    pub admin: NodeId,
 }
 
 /// Runs the correct system on `seed`.
@@ -1814,6 +1872,7 @@ fn run_watched(
         checked,
         last_fault_healed,
         restart_arms: restart_arms.into_iter().flatten().collect(),
+        admin,
     }
 }
 
@@ -2954,15 +3013,58 @@ impl Report {
             .filter(|retried| {
                 live.contains(&retried.range) && retried.asking_at(self.last_fault_healed)
             })
-            .copied()
+            .cloned()
             .collect()
     }
 
+    /// What became of the split `retried` asked for ([`SplitFate`]), read off the trace, each
+    /// time on the admins' clock, where the asker read its own times. The records' times are
+    /// global and that node's clock is skewed and drifts like any other, by up to 50 ms on this
+    /// sweep, so the two are compared on one clock: compared across them, 17 of the 76 askers the
+    /// correct system's ten thousand seeds ask of read as answered done before their split
+    /// applied, which a leader that answers after its own apply never does (PROPOSED D-137).
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    #[must_use]
+    pub fn split_fate(&self, retried: &Retried) -> SplitFate {
+        let cut = user_key(&retried.key);
+        let on_the_admins_clock = |at: Instant| {
+            self.checked
+                .run
+                .node_time(self.admin, at)
+                .expect("the admins' node is one of the run's")
+        };
+        let leaves_it_outside = |start: &Bytes, end: &Bytes| !(*start < cut && cut < *end);
+        let mut fate = SplitFate::default();
+        for record in self.records() {
+            match &record.event {
+                TraceEvent::RangeSplit { range, key, .. }
+                    if *range == retried.range && *key == cut =>
+                {
+                    fate.applied.get_or_insert(on_the_admins_clock(record.at));
+                }
+                TraceEvent::RangeDescriptor {
+                    range, start, end, ..
+                }
+                | TraceEvent::RangeCreated {
+                    range, start, end, ..
+                } if *range == retried.range && leaves_it_outside(start, end) => {
+                    fate.outside.get_or_insert(on_the_admins_clock(record.at));
+                }
+                _ => {}
+            }
+        }
+        fate
+    }
+
     /// D-092's assertion where a split was refused for want of a range id, per seed: each of
-    /// [`Report::retries_asked`] ends on an answer, and within the write bound of the last
-    /// fault's heal ([`Retried::took_no_effect`]).
+    /// [`Report::retries_asked`] ends on an answer, by which the split it asked for took effect,
+    /// or was answered `KeyOutsideSpan` once another split of its range had left its key outside
+    /// ([`Report::split_fate`]), within the write bound of the last fault's heal
+    /// ([`Retried::took_no_effect`]).
     ///
-    /// An answer is any but `NoRangeId`, so one that refuses the split for another reason passes.
+    /// Until #222 an answer was any but `NoRangeId`, so one that refused the split for another
+    /// reason passed; the retry now has to take effect, which `RefusedAfterRefill` breaks
+    /// (PROPOSED D-137).
     ///
     /// As first written this check could not fail, and the fix changed two things (#216's review,
     /// B6). The origin: it read `checked.last_heal`, which opens the liveness window past the
@@ -2978,11 +3080,13 @@ impl Report {
     /// The first asker whose retries took no effect.
     // PROPOSED(D-092): answer A; the asker retries.
     // PROPOSED(D-113): read from the heal, §8.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
     pub fn retries_take_effect(&self) -> Result<(), String> {
         let seed = self.seed;
         let bound = election_max() * LIVENESS_TIMEOUTS;
         for retried in self.retries_asked() {
-            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound) {
+            let fate = self.split_fate(&retried);
+            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound, fate) {
                 return Err(format!("seed {seed}: NoRangeId: {why}"));
             }
         }
@@ -3226,11 +3330,21 @@ mod tests {
         let (heal, bound) = (at(5000), Duration::from_secs(2));
         let asker = |refused, ended, answered| Retried {
             range: 2,
+            key: Bytes::from_static(b"k05"),
             refused: at(refused),
             ended: at(ended),
             answered,
+            refusal: None,
         };
-        let no_effect = |of: Retried| of.took_no_effect(heal, bound);
+        // The split applied as its answer came, so what is read here is the answer and its
+        // time (PROPOSED D-137).
+        let no_effect = |of: Retried| {
+            let fate = SplitFate {
+                applied: Some(of.ended),
+                outside: Some(of.ended),
+            };
+            of.took_no_effect(heal, bound, fate)
+        };
         assert_eq!(no_effect(asker(4900, 5300, true)), None, "answered in time");
         assert_eq!(
             no_effect(asker(4900, 7000, true)),
@@ -3252,6 +3366,91 @@ mod tests {
         // ...and from its refusal for one refused after it.
         assert_eq!(no_effect(asker(6000, 7900, true)), None);
         let why = no_effect(asker(6000, 8001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+    }
+
+    /// D-092's "the same asker's retry ... takes effect" (issue #222): an answer is not
+    /// enough, the split it asked for has to have applied by then, or, answered
+    /// `KeyOutsideSpan`, to have been left impossible by another split of its range. The
+    /// reading that took any answer but `NoRangeId` passed each of the first three cases.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    #[test]
+    fn an_askers_retry_has_to_take_effect_and_not_only_be_answered() {
+        let (heal, bound) = (at(5000), Duration::from_secs(2));
+        let asker = |ended, refusal| Retried {
+            range: 2,
+            key: Bytes::from_static(b"k05"),
+            refused: at(4900),
+            ended: at(ended),
+            answered: true,
+            refusal,
+        };
+        let fate = |applied: Option<u64>, outside: Option<u64>| SplitFate {
+            applied: applied.map(at),
+            outside: outside.map(at),
+        };
+        let not_live = asker(5300, Some(SplitRefusal::NotLive));
+        let why = not_live
+            .took_no_effect(heal, bound, fate(None, None))
+            .expect("refused for another reason, the split never applied");
+        assert!(
+            why.contains("answered `not-live`") && why.contains("took no effect"),
+            "{why}"
+        );
+        // A wrong reason stays wrong where another split had left the key outside: only the
+        // true one, `KeyOutsideSpan`, is read as final.
+        assert!(
+            not_live
+                .took_no_effect(heal, bound, fate(None, Some(5100)))
+                .is_some()
+        );
+        // A split that applied only after the asker had its answer did not take effect by it.
+        let done = asker(5300, None);
+        let why = done
+            .took_no_effect(heal, bound, fate(Some(5301), Some(5301)))
+            .expect("applied after the answer");
+        assert!(why.contains("answered `done`"), "{why}");
+        // Done, the split applied before the answer: the retry took effect.
+        assert_eq!(
+            done.took_no_effect(heal, bound, fate(Some(5200), Some(5200))),
+            None
+        );
+        // `KeyOutsideSpan` to an asker that asked anew after its split landed: an answer that
+        // follows from the split's effect (seed 992).
+        let outside = asker(5300, Some(SplitRefusal::KeyOutsideSpan));
+        assert_eq!(
+            outside.took_no_effect(heal, bound, fate(Some(5100), Some(5100))),
+            None
+        );
+        // `KeyOutsideSpan` where a split of the range at another key landed first and left the
+        // key outside: the split asked for can no longer take effect, and the answer is true
+        // (seeds 1032 and 3181 of the correct system's ten thousand).
+        assert_eq!(
+            outside.took_no_effect(heal, bound, fate(None, Some(5250))),
+            None
+        );
+        // The same refusal where the trace shows the key still inside, and no split, is none.
+        assert!(
+            outside
+                .took_no_effect(heal, bound, fate(None, None))
+                .is_some()
+        );
+        assert!(
+            outside
+                .took_no_effect(heal, bound, fate(None, Some(5301)))
+                .is_some(),
+            "left outside only after the answer"
+        );
+        // Still not asked: an asker that stopped before the heal, however it ended.
+        assert_eq!(
+            asker(4950, Some(SplitRefusal::NotLive)).took_no_effect(heal, bound, fate(None, None)),
+            None
+        );
+        // And the bound still holds of one that took effect.
+        let late = asker(7001, None);
+        let why = late
+            .took_no_effect(heal, bound, fate(Some(7000), Some(7000)))
+            .expect("over the bound");
         assert!(why.contains("over 2s"), "{why}");
     }
 

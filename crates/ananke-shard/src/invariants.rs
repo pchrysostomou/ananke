@@ -54,7 +54,8 @@
 //! **Check 18**, two folds: [`IdsUnique`], the range-id clause over `RangeIdsLeased`
 //! (PROPOSED D-099), and [`SplitLineage`], the split clause at each split's first
 //! apply, which also holds a right half to a block granted to the node that led its
-//! parent (PROPOSED D-100). The split clause reads P's configuration in force at the
+//! parent (PROPOSED D-100), under the run that node took office in, which each start
+//! states on its `RangesRestated` (PROPOSED D-137). The split clause reads P's configuration in force at the
 //! split's index from a history of the configurations each range committed, which a
 //! right half's creation seeds at its floor (PROPOSED D-106).
 //!
@@ -1023,8 +1024,9 @@ impl GenerationsRise {
 /// folding `RangeIdsLeased` by the first apply of each of range 0's indices, no two
 /// grants share an id, and every replica's apply of an index grants what its first
 /// apply did. The clause's other half — the right half of a split lies in a block
-/// granted before it to the node that led the parent — is [`SplitLineage`]'s, which
-/// reads who holds an id off this fold's grants ([`IdsUnique::holders_of`]).
+/// granted before it to the run of the node that led the parent — is [`SplitLineage`]'s,
+/// which reads which node's run holds an id off this fold's grants
+/// ([`IdsUnique::holders_of`], PROPOSED D-137).
 ///
 /// **The grants are folded after the clause's own violation too**, and only the
 /// violation's message is latched: the split clause reads them, and its verdict is its
@@ -1040,10 +1042,12 @@ pub struct IdsUnique {
     /// The grant at each index of range 0 by its first apply: node, run, first, last.
     granted: BTreeMap<u64, (u64, u64, u64, u64)>,
     /// Every non-empty block granted by the first apply of its index: its first id to
-    /// its last and the node it went to, for each block that starts there. The blocks
-    /// are disjoint while the clause holds, one to a first id; a block granted over
-    /// another's ids is kept beside it, since it was granted all the same.
-    blocks: BTreeMap<u64, Vec<(u64, u64)>>,
+    /// its last, the node it went to and the run its refill carried, for each block that
+    /// starts there. The blocks are disjoint while the clause holds, one to a first id; a
+    /// block granted over another's ids is kept beside it, since it was granted all the
+    /// same.
+    // PROPOSED(D-137): each block kept with its run.
+    blocks: BTreeMap<u64, Vec<(u64, u64, u64)>>,
     violation: Option<String>,
 }
 
@@ -1093,7 +1097,8 @@ impl IdsUnique {
         // shares an id with any of them shares one with the last that starts at or below
         // its own last id.
         if let Some((held_first, held)) = self.blocks.range(..=*last).next_back()
-            && let Some(&(held_last, _)) = held.iter().find(|(held_last, _)| *held_last >= *first)
+            && let Some(&(held_last, _, _)) =
+                held.iter().find(|(held_last, _, _)| *held_last >= *first)
         {
             let held_first = *held_first;
             self.fail(format!(
@@ -1102,27 +1107,33 @@ impl IdsUnique {
                  it (SHARD.md §5: blocks are disjoint)"
             ));
         }
-        self.blocks.entry(*first).or_default().push((*last, *node));
+        self.blocks
+            .entry(*first)
+            .or_default()
+            .push((*last, *node, *run));
     }
 
     /// The blocks granted so far by the first apply of each index, as first id to the
-    /// last id and the node of each block that starts there.
+    /// last id, the node and the run of each block that starts there.
     // PROPOSED(D-106): the grants folded after the clause's violation.
+    // PROPOSED(D-137): each block kept with its run.
     #[must_use]
-    pub fn blocks(&self) -> &BTreeMap<u64, Vec<(u64, u64)>> {
+    pub fn blocks(&self) -> &BTreeMap<u64, Vec<(u64, u64, u64)>> {
         &self.blocks
     }
 
-    /// The nodes a block holding `id` was granted to, in the order of the blocks' first
-    /// ids: one at most while the blocks are disjoint, none if no block holds it.
+    /// The holders of `id`: each block holding it as the node it was granted to and the
+    /// run nonce its refill carried, in the order of the blocks' first ids — one at most
+    /// while the blocks are disjoint, none if no block holds it.
     // PROPOSED(D-106): the grants folded after the clause's violation.
+    // PROPOSED(D-137): a holder is a node's run, not the node.
     #[must_use]
-    pub fn holders_of(&self, id: u64) -> Vec<u64> {
+    pub fn holders_of(&self, id: u64) -> Vec<(u64, u64)> {
         self.blocks
             .range(..=id)
             .flat_map(|(_, held)| held.iter())
-            .filter(|(last, _)| *last >= id)
-            .map(|(_, node)| *node)
+            .filter(|(last, _, _)| *last >= id)
+            .map(|(_, node, run)| (*node, *run))
             .collect()
     }
 
@@ -1157,8 +1168,19 @@ struct Candidate {
 /// of P's plain configuration in force at `s`, floor index `s` and floor term 1 (Q20);
 /// R is fresh — no `RangeCreated` of R and no `RangeSplit` naming R before that split's
 /// first `RangeSplit` — and R lies in a block a `RangeIdsLeased` traced before it
-/// granted to the node that led P in the split entry's term (Q17). Every replica's
-/// `RangeSplit` of (P, `s`) names the same right half and key.
+/// granted to the node that led P in the split entry's term, under the run that node was
+/// in when it took office (Q17). Every replica's `RangeSplit` of (P, `s`) names the same
+/// right half and key.
+///
+/// **The run is compared, not only the node** (PROPOSED D-137, issue #222). §5's second
+/// rule has a node take ids only from a block granted to its current run, and a node's
+/// run is the nonce its start drew, which its `RangesRestated` states; a `NodeCrashed`
+/// ends it. The leader of a term is one run of one node, since a restarted node takes
+/// office again only in a later term, so the run is read where the leader traced
+/// `RaftLeader` and held with that term. A split proposed before its node's restart and
+/// first applied after it is read against the run that proposed it. Compared by the node
+/// alone, a split out of a block of that node's earlier run passed unless an id was then
+/// taken twice.
 ///
 /// **The configuration in force at `s`** is the one the committed log puts there: the
 /// latest configuration at or below `s` that the range committed. The core traces a
@@ -1186,8 +1208,14 @@ pub struct SplitLineage {
     /// The entry each (range, index) holding a configuration was first applied as:
     /// its term and hash, the committed entry there (check 4).
     committed: BTreeMap<(u64, u64), (u64, u64)>,
-    /// The leader of each (range, term).
-    leaders: BTreeMap<(u64, u64), u64>,
+    /// The leader of each (range, term), and the run it was in when it took office, as
+    /// its node's last `RangesRestated` stated it; `None` where no start of that node had
+    /// stated one.
+    // PROPOSED(D-137): the run that led the term.
+    leaders: BTreeMap<(u64, u64), (u64, Option<u64>)>,
+    /// Each node's run, as its last `RangesRestated` stated it, until its `NodeCrashed`.
+    // PROPOSED(D-137): the run stated at the node's start.
+    runs: BTreeMap<u64, u64>,
     /// Ranges a `RangeCreated` or a `RangeSplit` has named.
     named: BTreeSet<u64>,
     /// The first `RangeSplit` of each (parent, index): the right half and the key.
@@ -1291,7 +1319,20 @@ impl SplitLineage {
                 term,
                 ..
             } => {
-                self.leaders.entry((*range, *term)).or_insert(*server);
+                // PROPOSED(D-137): the run that led the term.
+                let run = self.runs.get(server).copied();
+                self.leaders
+                    .entry((*range, *term))
+                    .or_insert((*server, run));
+            }
+            // PROPOSED(D-137): a node's run, from the start that stated it to its crash.
+            TraceEvent::RangesRestated { run, .. } => {
+                if let Some(node) = node {
+                    self.runs.insert(node, *run);
+                }
+            }
+            TraceEvent::NodeCrashed { node: crashed } => {
+                self.runs.remove(&u64::from(crashed.get()));
             }
             TraceEvent::RangeCreated {
                 range,
@@ -1486,17 +1527,37 @@ impl SplitLineage {
                 return;
             }
         }
-        let Some(leader) = self.leaders.get(&(parent, term)).copied() else {
+        let Some((leader, run)) = self.leaders.get(&(parent, term)).copied() else {
             self.fail(format!(
                 "range {parent}'s split at index {index} was proposed in term {term}, whose \
                  leader traced no `RaftLeader`"
             ));
             return;
         };
+        // PROPOSED(D-137): the block's run compared with the run that led the term.
+        let Some(run) = run else {
+            self.fail(format!(
+                "range {parent}'s split at index {index} was proposed in term {term}, which \
+                 node {leader} took office in with no run stated: no `RangesRestated` of \
+                 that node since its last crash (SHARD.md §5, Q17)"
+            ));
+            return;
+        };
         let holders = ids.holders_of(right);
+        if holders.contains(&(leader, run)) {
+            return;
+        }
+        if let Some((_, other)) = holders.iter().find(|(node, _)| *node == leader) {
+            self.fail(format!(
+                "right half {right} of range {parent}'s split at index {index} lies in a \
+                 block granted to node {leader}'s run {other}, where node {leader} led range \
+                 {parent} in the split entry's term {term} in its run {run} (SHARD.md §5's \
+                 second rule, Q17: a node takes ids only from a block of its current run)"
+            ));
+            return;
+        }
         match holders.first() {
-            _ if holders.contains(&leader) => {}
-            Some(holder) => self.fail(format!(
+            Some((holder, _)) => self.fail(format!(
                 "right half {right} of range {parent}'s split at index {index} lies in a \
                  block granted to node {holder}, where node {leader} led range {parent} in \
                  the split entry's term {term} (SHARD.md §5, Q17)"
@@ -1788,7 +1849,7 @@ impl PlaceholderGrantsNothing {
                 self.placeholders.remove(&(node, *range));
             }
             // PROPOSED(D-113): a replica durable before its creation was traced.
-            TraceEvent::RangesRestated { ranges } => {
+            TraceEvent::RangesRestated { ranges, .. } => {
                 for range in ranges {
                     self.held.insert((node, *range));
                     self.placeholders.remove(&(node, *range));
@@ -2378,8 +2439,8 @@ mod tests {
         checker.push(&leased(3, 1, 7, 3, 10, 1));
         assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
         assert_eq!(checker.ids.blocks().len(), 3);
-        assert_eq!(checker.ids.holders_of(12), vec![2]);
-        assert_eq!(checker.ids.holders_of(27), Vec::<u64>::new());
+        assert_eq!(checker.ids.holders_of(12), vec![(2, 9)]);
+        assert_eq!(checker.ids.holders_of(27), Vec::<(u64, u64)>::new());
     }
 
     #[test]
@@ -2482,10 +2543,28 @@ mod tests {
         ]
     }
 
+    /// The run each node's start draws in these records, which its grants carry: node
+    /// 1's 7, node 2's 9 and node 3's 5 (PROPOSED D-137).
+    fn run_of(node: u64) -> u64 {
+        match node {
+            1 => 7,
+            2 => 9,
+            3 => 5,
+            _ => 100 + node,
+        }
+    }
+
     /// The records before a split: the parent's bootstrap creation, its plain
-    /// configuration at index 0, its leader in term 2 on node 1, and node 1's block
-    /// of ids 6 to 13.
+    /// configuration at index 0, node 1's start stating its run 7, its leader in term 2
+    /// on node 1, and node 1's block of ids 6 to 13, granted to that run.
     fn before_a_split() -> Vec<TraceRecord> {
+        before_a_split_after(vec![restated(1, &[2])])
+    }
+
+    /// [`before_a_split`] with `starts` in place of node 1's start: what the nodes trace
+    /// before the parent's leader takes office, as a node's start precedes any office it
+    /// takes (PROPOSED D-137).
+    fn before_a_split_after(starts: Vec<TraceRecord>) -> Vec<TraceRecord> {
         let mut records = vec![created(1, 2, b"a", b"z", 1, &[1, 2, 3])];
         records.push(record(
             1,
@@ -2499,6 +2578,7 @@ mod tests {
                 learners: vec![],
             },
         ));
+        records.extend(starts);
         records.push(record(
             1,
             TraceEvent::RaftLeader {
@@ -2538,6 +2618,94 @@ mod tests {
         other.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 14));
         let verdict = other.verdict().unwrap_err();
         assert!(verdict.contains("granted to node 2"), "{verdict}");
+    }
+
+    /// Node 1 crashed and started again, stating `run`, and took office over range 2 in
+    /// term 3: what a split from that node's new run follows (PROPOSED D-137).
+    fn node_1_restarted_as(run: u64) -> Vec<TraceRecord> {
+        vec![
+            crashed(1),
+            record(
+                1,
+                TraceEvent::RangesRestated {
+                    ranges: vec![2],
+                    run,
+                },
+            ),
+            record(
+                1,
+                TraceEvent::RaftLeader {
+                    server: 1,
+                    range: 2,
+                    term: 3,
+                    last_index: 8,
+                },
+            ),
+        ]
+    }
+
+    /// Check 18 compares the run, not only the node (issue #222): a right half out of a
+    /// block granted to the leader's node under an earlier run is caught, with no id taken
+    /// twice, and the same split from a block of the run that led it passes. Both halves
+    /// of the pair are the one trace but for the block the split takes.
+    // PROPOSED(D-137): the run that led the term.
+    #[test]
+    fn a_right_half_from_a_block_of_the_leaders_earlier_run_is_caught() {
+        let mut earlier = Checker::new(true);
+        earlier.extend(&before_a_split());
+        earlier.extend(&node_1_restarted_as(8));
+        earlier.push(&leased(1, 1, 8, 14, 21, 2));
+        earlier.extend(&split_records(1, 2, 9, 3, b"m", b"a", b"z", 1, 6));
+        let verdict = earlier.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.contains("lies in a block granted to node 1's run 7")
+                && verdict.contains("in its run 8"),
+            "{verdict}"
+        );
+        assert_eq!(
+            earlier.verdict_of(Fold::RangeIds),
+            Ok(()),
+            "no id taken twice"
+        );
+        // The node alone, as the clause compared it before: node 1 holds id 6.
+        assert_eq!(earlier.ids.holders_of(6), vec![(1, 7)]);
+
+        let mut current = Checker::new(true);
+        current.extend(&before_a_split());
+        current.extend(&node_1_restarted_as(8));
+        current.push(&leased(1, 1, 8, 14, 21, 2));
+        current.extend(&split_records(1, 2, 9, 3, b"m", b"a", b"z", 1, 14));
+        assert!(current.verdict().is_ok(), "{:?}", current.verdict());
+    }
+
+    /// The correct node's case that the run must not trip: a split proposed by node 1's
+    /// run 7 in term 2, with an id of run 7's block, and first applied after node 1 crashed
+    /// and started again as run 8. The term's run is the one read, not the node's run at
+    /// the apply.
+    // PROPOSED(D-137): the run that led the term.
+    #[test]
+    fn a_split_proposed_before_its_leaders_restart_and_applied_after_it_passes() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&node_1_restarted_as(8));
+        checker.push(&leased(1, 1, 8, 14, 21, 2));
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+    }
+
+    /// A term whose leader took office with no run stated since its node's last crash is
+    /// the clause's own violation: the run it would compare is not on the trace.
+    // PROPOSED(D-137): the run that led the term.
+    #[test]
+    fn a_split_led_by_a_node_that_stated_no_run_is_caught() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        let restarted = node_1_restarted_as(8);
+        checker.push(&restarted[0]);
+        checker.push(&restarted[2]);
+        checker.extend(&split_records(1, 2, 9, 3, b"m", b"a", b"z", 1, 6));
+        let verdict = checker.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(verdict.contains("with no run stated"), "{verdict}");
     }
 
     #[test]
@@ -2601,11 +2769,13 @@ mod tests {
         )
     }
 
+    /// Node `node`'s restatement, closing a start that drew the run [`run_of`] names.
     fn restated(node: u64, ranges: &[u64]) -> TraceRecord {
         record(
             node,
             TraceEvent::RangesRestated {
                 ranges: ranges.to_vec(),
+                run: run_of(node),
             },
         )
     }
@@ -2622,12 +2792,13 @@ mod tests {
     /// The split of range 2 `[a, z)` at index 9 into `[a, m)` and right half 6 `[m,
     /// z)`, on nodes 1 and 2, each having restated range 2 at its bootstrap first.
     fn a_split_applied() -> Vec<TraceRecord> {
-        let mut records = before_a_split();
+        let mut starts = Vec::new();
         for node in [1, 2] {
-            records.push(recovered(node, 2, 0));
-            records.push(stated(node, 2, 0, b"a", b"z", 1));
-            records.push(restated(node, &[2]));
+            starts.push(recovered(node, 2, 0));
+            starts.push(stated(node, 2, 0, b"a", b"z", 1));
+            starts.push(restated(node, &[2]));
         }
+        let mut records = before_a_split_after(starts);
         records.extend(split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
         records.extend(split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6));
         records
@@ -3814,7 +3985,7 @@ mod tests {
             "{grants}"
         );
         assert_eq!(overlap.verdict_of(Fold::SplitLineage), Ok(()));
-        assert_eq!(overlap.ids.holders_of(12), vec![1, 1]);
+        assert_eq!(overlap.ids.holders_of(12), vec![(1, 7), (1, 7)]);
 
         // And the split clause still judges the grants it reads: a right half in the
         // overlapping block granted to another node is the split clause's own violation.

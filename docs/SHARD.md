@@ -1177,7 +1177,7 @@ New events:
 |---|---|---|
 | `RangeCreated` | a replica of a range is initialised: at bootstrap, at a split's apply, at an install on a node that held no initialised replica of the range | `range`, `cause`, `parent`, `start`, `end`, `generation`, `voters`, `floor_index`, `floor_term`, and `incarnation`, the replica's, drawn at this creation (Q26) |
 | `RangeDescriptor` | a replica's descriptor changes at an apply; an install onto an initialised replica changes it (with `applied` the snapshot's last index); or it is restated at its node's start | `range`, `index`, `applied`, `start`, `end`, `generation`, `voters`, `state` |
-| `RangesRestated` | a node has restated every replica it holds | `ranges` |
+| `RangesRestated` | a node has restated every replica it holds | `ranges`, and `run`, the run nonce this start drew (§5; D-137) |
 | `RangeReplicaCreated` | a node made a placeholder for a range it does not hold (§5) | `range` |
 | `RangeSplit` | a replica applied a split that took effect | `range`, `right`, `key`, `index` |
 | `RangeSubsumed` | a replica of R applied a `Subsume` that took effect | `range`, `into`, `begun`, `index`, `generation`, `voters` |
@@ -1355,7 +1355,9 @@ when its consequence lands.
     effect, with `right` R, no `RangeCreated` of R and no `RangeSplit` whose `range` or
     `right` is R was traced before that split's first `RangeSplit`, and R lies in a
     block a `RangeIdsLeased` traced before it granted to the node that led P in the
-    split entry's term. Cheap, exact.
+    split entry's term, carrying the run that node's last `RangesRestated` before it
+    took office in that term stated (D-137: the run, not only the node, §5's second
+    rule). Cheap, exact.
 19. **The ranges tile the keyspace.** Fold check 7's map, in record order by first apply:
     the latest value of every range, with a range dropped at the first `RangeMerged` that
     names it as `right` until a later new value of it is traced. After every event no two
@@ -1775,7 +1777,7 @@ seed shares are sized so premerge stays near fifteen minutes (Q39):
 | `UninitialisedReplicaVotes` | §5: a placeholder grants no vote or pre-vote (Q22); the variant grants them from a placeholder, with nothing durable | check 20 at the first grant | `sim/split.rs` (ii) |
 | `PlaceholderAcknowledges` | §5: a placeholder acknowledges no append (Q22); the variant answers an AppendEntries at its `next` as matched, with nothing in any log | commit by majority, check 3: a commit counted node 4, which traced no `RaftAppend` of the entry | `sim/move.rs` (a) |
 | `SplitCreatesRightOnNonVoter` | §5: R's state is written only on a voter of P's configuration at `s`, and a learner gets a range delete; the variant writes R on every replica that applies `s` | check 8's clause that a node that is not a voter of P's configuration at `s` traces no `RangeCreated { cause: split }` of R | the sharded sweep's move just after a split |
-| `IdBlockResumed` | §5 and Q17: a node adopts only a block of range ids granted to its current run, so no id is taken twice; the variant's node adopts, at its start, the block its lease record names, whatever run it was granted to, and takes ids from that block's first | check 18 at the first apply of a split whose `right` a `RangeCreated` or `RangeSplit` named before it | the sharded sweep's crash and restart of a node that has taken an id from its block, followed by a split led from that node |
+| `IdBlockResumed` | §5 and Q17: a node adopts only a block of range ids granted to its current run, so no id is taken twice; the variant's node adopts, at its start, the block its lease record names, whatever run it was granted to, and takes ids from that block's first | check 18 at the first apply of a split whose `right` a `RangeCreated` or `RangeSplit` named before it, or whose `right` lies in a block of another run of the node that led it (D-137) | the sharded sweep's crash and restart of a node that has taken an id from its block, followed by a split led from that node |
 | `MergeDivergentReplicas` | SPEC §4 and §6: identical replica sets. The variant drops every voter-set check — the coordinator's, `MergeBegin`'s and `Subsume`'s `voters` re-checks, and `Merge`'s check that L's configuration has R's voters — and keeps adjacency, the states, the wait for every replica of R and each node's own check | check 11 at the first `RangeMerged` anywhere, on a node that holds both: L's configuration at `m − 1` and R's at `f` differ. Not linearizability: each node's own check stalls a replica of L with no R and re-seeds it with the merged range's data | `sim/merge.rs` (a) |
 | `MergeBeforeRightApplied` | §6: the coordinator waits for every replica of R to apply `Subsume`, and `Merge`'s apply checks its own node's; the variant keeps every voter-set check, waits for a majority and checks nothing on the node | check 11: `right_applied` below `f`; linearizability: that node's L lacks writes R committed below `f` and serves reads without them once it leads | `sim/merge.rs` (b) |
 | `MergeTakesLeftGeneration` | §1 and §6: a merged range's generation is max(g_L', g_R) + 1; the variant gives it g_L' + 1 | check 18 at the merge's apply; check 10 at the merged range's first write to a right-span key R wrote at a higher generation; meta's convergence bound, since meta keeps R's record over the merged one | `sim/merge.rs` (a) |

@@ -101,6 +101,25 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-d092-run-and-effect` (2026-11-14), off 0d67f99 (S11's tip, #228, which
+  carries #226), **PROPOSED D-137**, Closes #222: the two halves of D-092's per-seed assertion #216's
+  review found unasked. Check 18 compares the run: each start states the run nonce it drew on
+  `RangesRestated`, `SplitLineage` holds the run each term's leader took office in, and a split's
+  right half has to lie in a block granted to that run, not only that node; a leader with no run
+  stated is the clause's own violation. `IdBlockResumed` on the sharded sweep is caught by check 18
+  on 61 of 100 and 8 of the gate's 20 (42 and 4 before), 28 and 6 of them by the run's words; on the
+  node sweep fold by fold on 85 of 100, 40 by the run's. D-092's retry has to take effect: an asked
+  asker's answer must come with its split applied, or be a `KeyOutsideSpan` the trace shows true
+  because another split of the range left the key outside (`Report::split_fate`), read on the
+  asker's own clock (`RunHeader::node_time`, new). Both readings came from the correct sweep's first
+  ten thousand under this check, 19 seeds failed by the check's defects: 17 by comparing the asker's
+  skewed clock with the records' global time (seed 1248 pinned), 2 by a split another split
+  superseded (seed 1032 pinned). The pair is `RefusedAfterRefill` (range bit 11, an instrument), a
+  node that refuses every split `NotLive` once its refill lands: 7 of 1 000 seeds caught, each passed
+  by the old reading, asserted at the thousand (D-061), seed 992's pin under it at every tier.
+  `RefillNotResent` is unchanged, 32 of 100 and 8 of 20, all with no answer. The correct sharded
+  sweep passes 10 000 seeds, 0 fail, its shapes' figures D-131's to the seed, so no schedule moved;
+  the correct node sweep passes its 1 000. Not merged.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

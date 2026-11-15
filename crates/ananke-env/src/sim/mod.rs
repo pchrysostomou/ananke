@@ -242,6 +242,21 @@ pub struct RunHeader {
     pub(crate) addrs: Vec<(std::net::SocketAddr, NodeId)>,
 }
 
+impl RunHeader {
+    /// What `node`'s clock read when global virtual time was `global`, by the skew and
+    /// drift the run drew for it; `None` for a node the run never added. A harness task
+    /// reads its own node's clock, and the records carry global time: this puts one of
+    /// the records' times on the task's clock, so the two can be compared.
+    // PROPOSED(D-137): D-092's asker read against the trace on one clock.
+    #[must_use]
+    pub fn node_time(&self, node: NodeId, global: Instant) -> Option<Instant> {
+        self.clocks
+            .iter()
+            .find(|(id, _, _)| *id == node)
+            .map(|&(_, skew_nanos, drift_ppm)| state::clock_reads(skew_nanos, drift_ppm, global))
+    }
+}
+
 /// A simulation: the executor, the clock, the fabric, the disks and the trace.
 pub struct Sim {
     shared: Arc<Shared>,
