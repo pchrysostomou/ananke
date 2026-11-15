@@ -458,6 +458,20 @@ pub enum NodeVariant {
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
     // PROPOSED(D-132)
     InstallReplacesCopiedSpan,
+    /// The node as it stood before D-127: a stream it holds and has not finished with
+    /// is answered nothing. Its last chunk goes unanswered until the install it
+    /// completes is made, a chunk of it that arrives while that install is pending is
+    /// dropped without a word, and a chunk that reaches the node while the `snapshot`
+    /// task makes any install waits behind it unanswered. The sender cannot tell that
+    /// silence from a lost chunk, so it counts it against `CHUNK_RESENDS` and gives up
+    /// streams whose installs are being made: on `sim/install.rs`'s 32 seeds, where no
+    /// receiver is ever down, the node before D-127 gave up 21 streams on 14 seeds, and
+    /// this variant on D-127's tree, which keeps the sender's new reading, 21 on 16
+    /// (#120). Nothing else goes red, because the install lands without the stream; what
+    /// the trace shows is the give-up (`RaftSnapshotGaveUp`), which `sim/install.rs`
+    /// asserts never happens.
+    // PROPOSED(D-127)
+    SilentWhileInstalling,
 }
 
 impl NodeVariant {
@@ -515,6 +529,7 @@ impl NodeVariant {
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
         NodeVariant::InstallReplacesCopiedSpan,
+        NodeVariant::SilentWhileInstalling,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -617,8 +632,9 @@ impl NodeVariant {
         NodeVariant::RecordNeverQueued,
     ];
 
-    /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
-    /// from counting the wrong thing: the two ways to get D-090 wrong.
+    /// RAFT.md:209-212's bounds on a stream, and the answers that keep each bound from
+    /// counting the wrong thing: the two ways to get D-090 wrong, and D-127's one way to
+    /// make the resend bound count a receiver's deliberate silence.
     ///
     /// They are neither the `snapshot` task's discipline ([`SNAPSHOT`](Self::SNAPSHOT))
     /// nor its running inside the node ([`WIRING`](Self::WIRING)) but the *sender's*
@@ -626,11 +642,16 @@ impl NodeVariant {
     /// [`CapWaitIsAStartOver`](Self::CapWaitIsAStartOver) is one a node of a single range
     /// could not be wrong about; [`RestartsNotCounted`](Self::RestartsNotCounted) is
     /// wrong with one range too.
+    /// [`SilentWhileInstalling`](Self::SilentWhileInstalling) is the receiver's half of
+    /// the resend bound: the sender's count is right, and what it counts is a silence
+    /// the receiver chose.
     // PROPOSED(D-090): the node honours RAFT.md's restart bound, and a cap-wait is not
     // one of the asks it counts.
+    // PROPOSED(D-127)
     pub const BOUNDS: &'static [NodeVariant] = &[
         NodeVariant::CapWaitIsAStartOver,
         NodeVariant::RestartsNotCounted,
+        NodeVariant::SilentWhileInstalling,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -724,6 +745,9 @@ impl NodeVariant {
             // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
+            // PROPOSED(D-127): a stream the node holds answered nothing while its install
+            // is made. Bit 53 is free, and eleven bits are left.
+            NodeVariant::SilentWhileInstalling => 1 << 52,
         }
     }
 
@@ -783,6 +807,7 @@ impl NodeVariant {
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
             NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
+            NodeVariant::SilentWhileInstalling => "SilentWhileInstalling",
         }
     }
 }
@@ -888,7 +913,8 @@ mod tests {
         // PROPOSED(D-128)
         // PROPOSED(D-130)
         // PROPOSED(D-132)
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        // PROPOSED(D-127)
+        assert_eq!(NodeVariant::BUGS.len(), 53);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -905,7 +931,7 @@ mod tests {
         assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
         assert_eq!(NodeVariant::SHAPE.len(), 3);
-        assert_eq!(NodeVariant::BOUNDS.len(), 2);
+        assert_eq!(NodeVariant::BOUNDS.len(), 3);
         // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise
         // disjoint: a
         // variant is a way to get the `snapshot` task's keys, caps and frames wrong, a
@@ -929,7 +955,7 @@ mod tests {
                 }
             }
         }
-        // D-090's two are a fourth kind: the sender's bookkeeping over a stream's
+        // D-090's two and D-127's one are a fourth kind: a stream's bookkeeping over its
         // answers, which is none of the three above.
         for variant in NodeVariant::BOUNDS {
             assert!(

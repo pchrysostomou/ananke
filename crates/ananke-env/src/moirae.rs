@@ -44,6 +44,7 @@
 //! | `RaftSnapshotDeleted` / `RaftSnapshotReused` / `RaftSnapshotStreams` | `log` `ananke.raft.snapshot-deleted` / `.snapshot-reused` / `.snapshot-streams` |
 //! | `RaftSnapshotStartOver` / `RaftSnapshotState` | `log` `ananke.raft.snapshot-start-over` / `.snapshot-state` |
 //! | `RaftSnapshotOverlapped` / `RaftSnapshotRestream` | `log` `ananke.raft.snapshot-overlapped` / `.snapshot-restream` |
+//! | `RaftSnapshotGaveUp`                     | `log` `ananke.raft.snapshot-gave-up`          |
 //! | `RaftMatchStarted` / `RaftLearnerRound` / `RaftChangeAccepted` | `log` `ananke.raft.match-started` / `.learner-round` / `.change-accepted` |
 //! | `RangeCreated` / `RangeDescriptor` / `RangesRestated` / `RangeReplicaCreated` | `log` `ananke.range.created` / `.descriptor` / `.restated` / `.replica-created` |
 //! | `RangeSplit` / `RangeSubsumed` / `RangeMerged`           | `log` `ananke.range.split` / `.subsumed` / `.merged` |
@@ -1135,6 +1136,15 @@ fn convert(
                 ("range", int(*range)),
                 ("to", int(*to)),
                 ("offset", int(*offset)),
+            ])),
+        ),
+        // PROPOSED(D-127): the resend bound's give-up is traced.
+        TraceEvent::RaftSnapshotGaveUp { server, range, to } => log(
+            "ananke.raft.snapshot-gave-up",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("to", int(*to)),
             ])),
         ),
         // D-042: store incarnations.

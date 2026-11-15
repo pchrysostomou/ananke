@@ -214,6 +214,29 @@ impl Report {
         counts
     }
 
+    /// Every stream given up on RAFT.md's resend bound, as (leader, range, follower),
+    /// once per give-up (`RaftSnapshotGaveUp`).
+    ///
+    /// Nothing in this scenario silences a receiver: no node crashes, nothing is
+    /// partitioned, and a message is lost one time in fifty, so five exchanges of one
+    /// chunk lost in a row is the only way the network alone reaches the bound. A
+    /// stream given up here is a receiver that held the chunk and did not say so —
+    /// #120, which gave up 21 streams on 14 of the 32 seeds before D-127, with every
+    /// install landing regardless. [`Report::check`] asserts there are none.
+    // PROPOSED(D-127): a stream given up here is the bound tripped by a live receiver.
+    #[must_use]
+    pub fn gave_up(&self) -> Vec<(u64, u64, u64)> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshotGaveUp { server, range, to } => {
+                    Some((*server, *range, *to))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Takes made, as (server, range).
     #[must_use]
     pub fn takes(&self) -> BTreeSet<(u64, u64)> {
@@ -425,6 +448,22 @@ impl Report {
                 "seed {seed}: no leader ever had two streams running at once, so a \
                  leader that fed its designated followers one at a time would have \
                  looked exactly like this one (Q14, D-043)"
+            ));
+        }
+
+        // No stream was given up on the resend bound. Every receiver here is up and
+        // answering, so a give-up is a receiver that held the chunk and stayed silent
+        // while it installed, and the sender counting that silence as a lost chunk:
+        // the install lands anyway and nothing above can tell (#120).
+        // PROPOSED(D-127): a stream given up here is the bound tripped by a live receiver.
+        let gave_up = self.gave_up();
+        if let Some(first) = gave_up.first() {
+            return Err(format!(
+                "seed {seed}: {} streams were given up on the resend bound, the first \
+                 (leader, range, follower) {first:?}, in a scenario where no receiver is \
+                 ever down: a receiver that holds a chunk and answers nothing while it \
+                 installs is a lost chunk to its sender (#120, D-127)",
+                gave_up.len()
             ));
         }
 

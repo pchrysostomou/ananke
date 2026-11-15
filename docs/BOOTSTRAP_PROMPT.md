@@ -101,6 +101,28 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-resend-bound` (2026-11-14), off c5cd18d, **PROPOSED D-127** (footer D-133
+  unchanged), Closes #120: **the node's resend bound was tripped by receivers that held the chunk.**
+  Measured on c5cd18d, `sim/install.rs` gave up 21 streams on 14 of 32 seeds with every receiver up,
+  each while the receiver's `snapshot` task was making an install (its own or another range's) and
+  answering nothing; since D-109 that, not #120's pending window, is what tripped there, and the
+  pending window is what trips on the raft sweep's live installs. The node now answers every chunk
+  it holds: `Waiting` while a stream's install is pending, and from the `net` task while the
+  `snapshot` task makes an install; and an answer counts from when it reaches the sender's node,
+  not when it is read (one of the 21 was given up with its answer queued). After: no stream given
+  up on those 32 seeds, longest resend run 3; `CHUNK_RESENDS` stays 4. New trace event
+  `RaftSnapshotGaveUp`, asserted absent by `sim/install.rs`; new variant `SilentWhileInstalling`
+  (node bit 52), caught there on 16 of 32 seeds; one nightly row. **The answers moved every node
+  schedule, and 26 pins with them** (none a correct-system failure): each was re-audited, twelve
+  moved to a seed that carries the shape (463 -> 1068, 3291 -> 9699, 3870/5303 -> 9535,
+  2097 -> 329, 9 -> 68, 992 -> 1314, 16725 -> 73, 45 -> 2388 with `RIGHT_HALF_PINNED`,
+  219 -> 522, 12/76 -> 204/8, 613 -> 145, check 16's 48/66 -> 12/20; 633's hold -> 89, beside
+  633's absence; the membership shape -> seed 1972), the rest the absence with its reason; the
+  table is in D-127, the rows in `scripts/nightly-shards.txt`. **Two findings for the owner, not
+  fixed**: the shard scenario's plain schedule fails the correct system on seeds 2147 (pre-vote:
+  the check reads a refused replica's lost term against an install's decision time) and 6773
+  (liveness on `k08`, a write truncated under D-131's one try), both passing on c5cd18d and on the
+  shaped schedule the sweep runs for them; D-127 gives the account.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

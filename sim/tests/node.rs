@@ -1203,7 +1203,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // split's apply does, so the host drops the range's messages in between (D-109
     // §1.6). Asserted at every tier as an absence; before that fix it was 11 answers on
     // 9 of the first thousand seeds (45, 221, 375, 401, 466, 579, 595, 604, 915), and
-    // seed 45's pin asserts it at the gate.
+    // the right half's pin (seed 2388 since PROPOSED D-127) asserts it at the gate.
     assert_eq!(
         placeholders.answered_for_a_replica, 0,
         "a placeholder answered for a replica its node had created, on one of {seeds} seeds \
@@ -2655,8 +2655,8 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
 /// Its right half's clause trips on the correct node itself — a voter
 /// installed past a split holds no right half until placeholders exist — so it is
-/// compared and printed and not asserted absent, and its seed 45
-/// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
+/// compared and printed and not asserted absent, and its pinned seed, 2388
+/// ([`RIGHT_HALF_PINNED`], seed 45 until PROPOSED D-127), is compared fold by fold whatever the tier, out of the tier's
 /// own comparison at the gate's twenty and inside it from CI's hundred, asserting the
 /// clause's words there: the comparison is held in violation, where a fold fed in
 /// chunks that lost its state between them reads `Ok` (#166's review, N7). Its overlap
@@ -2684,17 +2684,17 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
     );
     // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
     // tier.
-    // With the placeholders the correct node's seed 45 holds the clause: its voter gets
+    // With the placeholders the correct node's pinned seed holds the clause: its voter gets
     // its right half through its placeholder before its restart
-    // (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`).
-    // So the shape is planted on seed 45's own trace, the voter's creation and
-    // restatements of the right half taken out, and compared there at every tier
-    // (PROPOSED D-109).
+    // (`seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`;
+    // seed 45 until PROPOSED D-127). So the shape is planted on that seed's own trace, the
+    // voter's creation and restatements of the right half taken out, and compared there at
+    // every tier (PROPOSED D-109).
     let (seed, node, _, _, right) = RIGHT_HALF_PINNED;
     let planted = without_the_right_half(&node_records(seed, &[]), node, right);
     let words = compare_range_folds(
         seed,
-        "the correct node's seed 45 with its voter's right half taken out",
+        "the correct node's pinned seed with its voter's right half taken out",
         &planted,
     )
     .unwrap_or_else(|mismatch| panic!("{mismatch}"))
@@ -2883,15 +2883,18 @@ fn the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at
 
 /// The compared seeds on which `MetaOverwritesByArrival` trips check 16, among the first
 /// hundred, since check 16 reads one meta index against the next by index (PROPOSED
-/// D-109): 48 and 66, each a resend of a split parent's first generation applied at an
-/// index above the split's update.
-const META_REORDER_PINNED: [u64; 2] = [48, 66];
+/// D-109): 48 and 66 until PROPOSED D-127 moved the node's schedules, and 12 and 20 on its
+/// tree, each a resend of a split parent's first generation applied at an index above the
+/// split's update.
+// PROPOSED(D-127): 48 and 66 moved off the shape; 12, 20 and 30 trip among the hundred.
+const META_REORDER_PINNED: [u64; 2] = [12, 20];
 
 /// Check 16 against `MetaOverwritesByArrival` (SHARD.md §12, Stage C's exit): a resend
 /// of a split parent's old descriptor that the variant's meta range stores after the
 /// split's update. Measured, by trace order (D-106): 149 of seeds 0 to 999, 18 of the
 /// first hundred, 3 of the first twenty, asserted from CI's hundred compared seeds. By
-/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0. The comparison never sees more
+/// index (PROPOSED D-109): 19, 2 (seeds 48 and 66) and 0; on PROPOSED D-127's tree, 3 of
+/// the first hundred (seeds 12, 20 and 30) and 1 of the first twenty. The comparison never sees more
 /// than a hundred seeds, and two in a hundred is under D-061's 5 %, so the tier's catch
 /// is printed and not asserted; the comparison is held in violation on the two seeds
 /// pinned ([`META_REORDER_PINNED`]) at every tier, as check 18's grants clause is on its
@@ -3176,9 +3179,9 @@ fn by_the_range_id_clause(violation: &str) -> bool {
 /// every tier (D-061: 70 %), each trip a split's creation on a seed check 18's range-id
 /// clause trips on too, so that what the clause sees here is the reused id. It is the
 /// clause's tripping variant because no other variant reaches it at a rate a tier can
-/// assert: `SnapshotOverlapsReplica`, whose harm §5 names, creates a range twice on one
-/// seed of the node sweep's thousand (seed 219, pinned:
-/// `seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`)
+/// assert: `SnapshotOverlapsReplica`, whose harm §5 names, creates a range twice on few
+/// seeds of the node sweep's thousand (seed 219 until PROPOSED D-127 and seed 522 since,
+/// pinned: `seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second`)
 /// and on none of `sim/split.rs` (i)'s. The run's own verdict names check 18 or an
 /// earlier check on every one of the 630, since the clause is asked last.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
@@ -3356,9 +3359,13 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
 
 /// The correct node's seed on which check 8's right half's clause tripped before the
 /// placeholders, and on whose trace its shape is now planted (`without_the_right_half`;
-/// PROPOSED D-109): (seed, node, parent, the split's index, the right half).
+/// PROPOSED D-109): (seed, node, parent, the split's index, the right half). Seed 45 until
+/// PROPOSED D-127 moved its schedule off the install past the split; seed 2388 carries the
+/// shape on D-127's tree, the install past the split, the right half through its placeholder
+/// and a restatement after it, where none of seeds 0 to 1999 does.
 // PROPOSED(D-107)
-const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (45, 2, 4, 165, 14);
+// PROPOSED(D-127): moved from seed 45, whose schedule D-127 moved.
+const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (2388, 1, 5, 35, 30);
 
 /// Check 8's right half's clause's violation on [`RIGHT_HALF_PINNED`], word for word.
 // PROPOSED(D-107)
@@ -3411,12 +3418,18 @@ fn without_the_right_half(records: &[TraceRecord], node: u32, right: u64) -> Vec
 /// crashes; its restatement after the restart names 14, and the clause holds. What is
 /// asserted is that mechanism, step by step, and that the shape the pin had is absent,
 /// with the reason: the day a schedule moves the seed off it, this says so.
+///
+/// **PROPOSED D-127 moved seed 45 off the install past the split**, its answers to the chunks a
+/// node holds moving every node schedule, and the pin moved with [`RIGHT_HALF_PINNED`] to seed
+/// 2388: node 1's replica of range 5 lags the split at index 35 (right half 30) and is installed
+/// past it, makes a placeholder of 30 whose install creates node 1's replica of 30, crashes, and
+/// restates both.
 // PROPOSED(D-107): the right half's clause's STOP, pinned where the thousand found it.
 // PROPOSED(D-109): and closed by a placeholder, on the same seed.
+// PROPOSED(D-127): moved from seed 45, whose schedule D-127 moved.
 #[test]
-fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder() {
-    let seed = 45u64;
-    let (node, parent, index, right) = (2u32, 4u64, 165u64, 14u64);
+fn seed_2388_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder() {
+    let (seed, node, parent, index, right) = RIGHT_HALF_PINNED;
     let report = correct(seed);
     report
         .check()
@@ -3485,9 +3498,9 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         "seed {seed}: node {node} created the right half {right} before its placeholder did"
     );
     // The install's window (D-109 §1.6): before the descriptor was put in place at the
-    // creation's trace, node 2's placeholder answered two AppendEntries of 14 as a
-    // refused server, 0.2 ms and 18.8 ms after 14's creation, and 14's leader restarted
-    // the stream from offset 0 to a node that held the replica.
+    // creation's trace, seed 45's node 2's placeholder answered two AppendEntries of 14
+    // as a refused server, 0.2 ms and 18.8 ms after 14's creation, and 14's leader
+    // restarted the stream from offset 0 to a node that held the replica.
     let answered = raft::placeholders_of(&report.records).answered_for_a_replica;
     assert_eq!(
         answered, 0,
@@ -3544,10 +3557,23 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
 /// violation after that record. On the correct node: green, the refusal for overlap
 /// before the split's apply, and 62 created on node 3 once. The day a schedule moves
 /// the seed off either, this says which, and the pin is re-audited (CLAUDE.md).
+///
+/// **Pinned on seed 219 until PROPOSED D-127**, whose answers to the chunks a node holds moved
+/// every node schedule and that seed off the shape. Seed 522 carries it on D-127's tree, the
+/// lowest of seeds 0 to 1499 whose created-twice clause trips under the variant with the
+/// split's creation first: node 1 makes a placeholder of range 14, its replica of the parent
+/// applies the split at index 48 that makes 14, and the install the variant let past the overlap
+/// check creates 14 a second time. Seed 1278 trips the clause the other way round, the install's
+/// creation first. On seed 219 the raft checker tripped after the second creation and named
+/// the run; on seed 522 it never trips, and the created-twice clause is the only check that
+/// sees the run, its verdict, which is asserted in place of the raft checker's. And the
+/// correct node refuses the install for overlap after its split's apply made 14, the refusal
+/// of a range made here meanwhile, where on seed 219 it refused it before the apply.
 // PROPOSED(D-116)
+// PROPOSED(D-127): re-pinned from seed 219, whose schedule D-127 moved.
 #[test]
-fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second() {
-    let (seed, node, parent, index, right) = (219u64, 3u32, 5u64, 346u64, 62u64);
+fn seed_522_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_second() {
+    let (seed, node, index, right) = (522u64, 1u32, 48u64, 14u64);
     let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
     let variant = raft::run_on_the_node(
         seed,
@@ -3556,6 +3582,20 @@ fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_s
         RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]),
     );
     let records = &variant.records;
+    // The range whose split at `index` makes the right half.
+    // PROPOSED(D-127)
+    let parent = records
+        .iter()
+        .find_map(|record| match record.event {
+            TraceEvent::RangeSplit {
+                range,
+                right: made,
+                index: at,
+                ..
+            } if made == right && at == index => Some(range),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("seed {seed}: no split at {index} made range {right}"));
     let find = |what: &str, from: usize, matches: &dyn Fn(&TraceEvent) -> bool| {
         from + records[from..]
             .iter()
@@ -3644,24 +3684,25 @@ fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_s
          green here"
     );
     // Raft's state machine safety sees the harm later, at the re-apply.
+    // On seed 219 the raft checker tripped after the second creation, node 3 applying an
+    // index again, and that was the run's verdict. On this seed it never trips: the
+    // created-twice clause is the only check that sees the run, and the run's verdict.
+    // PROPOSED(D-127)
     let mut log = ananke_raft::invariants::Checker::new(raft::SERVERS as usize);
-    let raft_tripped = records
-        .iter()
-        .position(|record| {
-            log.extend(ananke_sim::traced(std::slice::from_ref(record)));
-            log.verdict().is_err()
-        })
-        .unwrap_or_else(|| panic!("seed {seed}: the raft checker never tripped"));
-    assert!(
-        by_install < raft_tripped,
-        "seed {seed}: the raft checker tripped at record {raft_tripped}, not after node \
-         {node}'s second creation of {right} at {by_install}"
+    let raft_tripped = records.iter().position(|record| {
+        log.extend(ananke_sim::traced(std::slice::from_ref(record)));
+        log.verdict().is_err()
+    });
+    assert_eq!(
+        raft_tripped, None,
+        "seed {seed}: the raft checker tripped, at record {raft_tripped:?}: re-read what sees \
+         node {node}'s second creation of {right} at {by_install}"
     );
     let why = variant
         .check()
-        .expect_err("seed 219 fails under SnapshotOverlapsReplica");
+        .expect_err("the seed fails under SnapshotOverlapsReplica");
     assert!(
-        why.contains("state machine safety"),
+        why.contains("a replica created twice on one node"),
         "seed {seed}: the run's verdict under SnapshotOverlapsReplica: {why}"
     );
     // The correct node: the install refused for overlap, and one creation.
@@ -3688,23 +3729,27 @@ fn seed_219_a_split_and_an_install_create_one_range_twice_and_check_8_sees_the_s
         matches!(&created[..], [one] if matches!(&report.records[*one].event,
             TraceEvent::RangeCreated { cause: ananke_env::RangeCause::Split, floor_index, .. }
                 if *floor_index == index)),
-        "seed {seed}: the correct node 3 did not create {right} once, by the split at {index}: \
+        "seed {seed}: the correct node {node} did not create {right} once, by the split at {index}: \
          {created:?}"
     );
+    // On seed 219 the correct node refused the install while its parent still covered the
+    // right half, before the split's apply; on this seed the stream completes after the
+    // apply made the range, and the refusal is the one of a range made here meanwhile
+    // (`a_placeholders_install_of_a_range_made_here_meanwhile_is_refused`, PROPOSED D-110).
+    // PROPOSED(D-127)
     assert!(
-        refused.is_some_and(|refused| refused < created[0]),
+        refused.is_some_and(|refused| refused > created[0]),
         "seed {seed}: the correct node {node} did not refuse {right}'s install for overlap \
-         before its split's apply created it ({refused:?})"
+         after its split's apply created it ({refused:?})"
     );
     println!(
         "seed {seed}: under SnapshotOverlapsReplica node {node} made a placeholder of {right} at \
          {:?}, created it by the split at {:?} and by the install at {:?}, which check 8's \
-         created-twice clause trips at; the raft checker trips at {:?}; the correct node refused \
-         the install for overlap at {:?} and created {right} once",
+         created-twice clause trips at and the run's verdict names; the correct node created \
+         {right} once and refused the install for overlap at {:?}",
         records[placeholder].at,
         records[by_split].at,
         records[by_install].at,
-        records[raft_tripped].at,
         refused.map(|at| report.records[at].at)
     );
 }
@@ -5543,62 +5588,49 @@ fn seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tai
 /// exemption kept the write as the wedge. The first condition excuses it: the run
 /// stopped inside its client's own wait.
 // PROPOSED(D-102): a split half's one write in flight at the end.
+///
+/// **PROPOSED D-127 moved the seed off the shape**, its answers to the chunks a node holds
+/// moving every node schedule: `k4` is written six times after the heal now, and no key of the
+/// run ends with one post-heal write in flight inside its client's wait, nor does any of the
+/// correct node's first two thousand seeds on D-127's tree with that key's every other
+/// condition here. The pin is the absence with its reason: the run passes and no such key is
+/// left, so the day one is, this says so.
+// PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 #[test]
 fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
     let report = correct(2809);
-    assert!(report.uniform(), "seed 2809 is a uniform schedule");
-    assert!(
-        report.records.iter().any(|r| matches!(
-            &r.event,
-            TraceEvent::RangeSplit { range: 4, key, .. }
-                if ananke_raft::apply::user_key_of(key) == Some(&b"k5"[..])
-        )),
-        "seed 2809's range 4 no longer splits at k5"
-    );
-    let k4 =
-        |op: &&ananke_sim::lin::Op| op.call >= report.last_heal && op.op.key().as_ref() == b"k4";
-    let writes: Vec<&ananke_sim::lin::Op> = report
-        .history
-        .ops
-        .iter()
-        .filter(|op| op.op.is_write())
-        .filter(k4)
-        .collect();
-    let reads_served = report
-        .history
-        .ops
-        .iter()
-        .filter(|op| !op.op.is_write() && op.ret.is_some())
-        .filter(k4)
-        .count();
-    println!(
-        "seed 2809: k4 written {} times after the heal, read {reads_served} times; the run \
-         stopped at {:?}",
-        writes.len(),
-        report.ended
-    );
-    let [write] = writes.as_slice() else {
-        panic!("seed 2809's k4 is not written exactly once after the heal: {writes:?}");
-    };
-    let waited = report.ended.duration_since(write.call);
-    assert!(
-        write.ret.is_none() && waited <= raft::WRITE_TIMEOUT,
-        "seed 2809's one post-heal write to k4 is not pending inside its client's wait at the \
-         end ({waited:?}, returned {:?})",
-        write.ret
-    );
-    assert_eq!(keys_with_only_a_tail(&report), vec!["k4".to_owned()]);
-    assert!(
-        reads_served > 0,
-        "seed 2809's left half served no read of k4 after the heal"
-    );
     report
         .check()
-        .expect("the correct node passes seed 2809: the write was in flight");
+        .unwrap_or_else(|violation| panic!("seed 2809 no longer passes: {violation}"));
+    // A key whose post-heal writes are all pending inside the bound of the end, written
+    // exactly once after the heal, that one write still inside its client's wait.
+    let in_flight: Vec<String> = keys_with_only_a_tail(&report)
+        .into_iter()
+        .filter(|key| {
+            let writes: Vec<&ananke_sim::lin::Op> = report
+                .history
+                .ops
+                .iter()
+                .filter(|op| {
+                    op.op.is_write()
+                        && op.call >= report.last_heal
+                        && op.op.key().as_ref() == key.as_bytes()
+                })
+                .collect();
+            matches!(writes.as_slice(), [write] if write.ret.is_none()
+                && report.ended.duration_since(write.call) <= raft::WRITE_TIMEOUT)
+        })
+        .collect();
+    assert!(
+        in_flight.is_empty(),
+        "seed 2809 ends with {in_flight:?} written once after the heal and that write in flight \
+         again: upgrade the pin back to its mechanism (PROPOSED D-102)"
+    );
 }
 
-/// Seeds 12 and 76 under `SharedSnapshotDir`: wedges that the run's true end **alone**
-/// would excuse, and that the exemption's evidence keeps (PROPOSED D-102).
+/// Seeds 204 and 8 under `SharedSnapshotDir` (seeds 12 and 76 until PROPOSED D-127):
+/// wedges that the run's true end **alone** would excuse, and that the exemption's evidence
+/// keeps (PROPOSED D-102).
 ///
 /// Read against where the run stopped, every post-heal write to the wedged key was
 /// called inside the bound of the end, so D-086's exemption at the true end, asking
@@ -5629,16 +5661,26 @@ fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
 /// completes no post-heal write, so the starting map has nothing to excuse the wedge
 /// with there; seed 76 is the lowest of the first thousand to carry the shape on this
 /// tree (76, 80, 277, 320, …), and the pin moved to it.
+///
+/// **PROPOSED D-127 moved seeds 12 and 76 off their shapes**, its answers to the chunks a node
+/// holds moving every node schedule: neither leaves a wedge the true end alone would excuse
+/// under the variant now, which is asserted. Seed 204 carries seed 12's shape on D-127's
+/// tree, range 2's `k0` and `k1` wedged and the read bound reported first and attributed to
+/// the wedge. And D-127 brought seed 8 back to the second shape, whose absence this pin had
+/// asserted since D-109 so that the day the schedule reached it again it would say so: range
+/// 3 split at `k3`, its left half wedged on `k2` while the right half completes post-heal
+/// writes to `k3`, the liveness clause first. The pin is upgraded back to seed 8.
 // PROPOSED(D-102): the exemption keeps the wedges the true end alone would excuse.
 // PROPOSED(D-109): the split range's shape moved from seed 8 to seed 76.
+// PROPOSED(D-127): re-pinned from seeds 12 and 76, whose schedules D-127 moved.
 #[test]
-fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
+fn seeds_204_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
     let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
-    let twelve = buggy(12, Variant::SharedSnapshotDir);
-    let seventy_six = buggy(76, Variant::SharedSnapshotDir);
+    let twelve = buggy(204, Variant::SharedSnapshotDir);
+    let seventy_six = buggy(8, Variant::SharedSnapshotDir);
     for (report, keys, range) in [
         (&twelve, &["k0", "k1"][..], 2u64),
-        (&seventy_six, &["k4"][..], 4),
+        (&seventy_six, &["k2"][..], 3),
     ] {
         let seed = report.seed;
         assert!(report.uniform(), "seed {seed} is a uniform schedule");
@@ -5672,57 +5714,60 @@ fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wo
         );
         assert!(wedged(report), "seed {seed}: the wedge is not attributed");
     }
-    // Seed 12: the read bound reports first, and the attribution reads the wedge.
-    let violation = twelve.check().expect_err("seed 12 fails under the variant");
+    // Seed 204: the read bound reports first, and the attribution reads the wedge.
+    let violation = twelve
+        .check()
+        .expect_err("seed 204 fails under the variant");
     assert!(
         read_bound_reports_a_wedge(&twelve, &violation),
-        "seed 12's read-bound trip is not attributed to the wedge: {violation}"
+        "seed 204's read-bound trip is not attributed to the wedge: {violation}"
     );
-    // Seed 76: the split, and the sibling the starting map would have counted.
+    // Seed 8: the split, and the sibling the starting map would have counted.
     assert!(
         seventy_six.records.iter().any(|r| matches!(
             &r.event,
-            TraceEvent::RangeSplit { range: 4, key, .. }
-                if ananke_raft::apply::user_key_of(key) == Some(&b"k5"[..])
+            TraceEvent::RangeSplit { range: 3, key, .. }
+                if ananke_raft::apply::user_key_of(key) == Some(&b"k3"[..])
         )),
-        "seed 76's range 4 no longer splits at k5"
+        "seed 8's range 3 no longer splits at k3"
     );
     assert!(
         seventy_six.history.ops.iter().any(|op| op.op.is_write()
             && op.call >= seventy_six.last_heal
             && op.ret.is_some()
-            && op.op.key().as_ref() == b"k5"),
-        "seed 76's right half completed no post-heal write to k5, so the starting map had \
+            && op.op.key().as_ref() == b"k3"),
+        "seed 8's right half completed no post-heal write to k3, so the starting map had \
          nothing to excuse the wedge with"
     );
     let violation = seventy_six
         .check()
-        .expect_err("seed 76 fails under the variant");
+        .expect_err("seed 8 fails under the variant");
     assert_eq!(
         mechanism(&violation),
         "liveness",
-        "seed 76 fails first on something else: {violation}"
+        "seed 8 fails first on something else: {violation}"
     );
-    // Seed 8, where the shape was pinned first: its right half completes no post-heal
-    // write to `k3` on this tree, so the shape is absent there, with the reason above.
-    // The day the schedule brings it back this says so.
-    let eight = buggy(8, Variant::SharedSnapshotDir);
-    assert!(
-        !eight.history.ops.iter().any(|op| op.op.is_write()
-            && op.call >= eight.last_heal
-            && op.ret.is_some()
-            && op.op.key().as_ref() == b"k3"),
-        "seed 8's right half completes a post-heal write to k3 again: its shape may be back"
-    );
+    // Seeds 12 and 76 carried the two shapes until PROPOSED D-127 moved their schedules: on
+    // neither does the variant leave a wedge the true end alone would excuse now.
+    // PROPOSED(D-127)
+    for seed in [12, 76] {
+        let report = buggy(seed, Variant::SharedSnapshotDir);
+        assert!(
+            keys_with_only_a_tail(&report).is_empty() || !wedged(&report),
+            "seed {seed} leaves a wedge the true end alone would excuse again under the \
+             variant: its shape may be back, so re-audit the pin"
+        );
+    }
 }
 
-/// Seed 613 under `ApplyWaitsForEveryRange`: **a stall the exemption's range evidence
-/// excused as it first merged**, because that evidence was older than the writes it
-/// excused (PROPOSED D-102, after #157's review).
+/// Seed 145 (seed 613 until PROPOSED D-127) under `ApplyWaitsForEveryRange`: **a stall the
+/// exemption's range evidence excused as it first merged**, because that evidence was
+/// older than the writes it excused (PROPOSED D-102, after #157's review).
 ///
 /// The variant's apply task waits for a job of every range before it runs any, so a
-/// node's applies stall behind its quietest range while the logs go on committing. The
-/// last heal is at 13.816 s and the run stops at 16.546 s. Range 2 (`k0`, `k1`, never
+/// node's applies stall behind its quietest range while the logs go on committing. On
+/// seed 613, where this was pinned, the last heal is at 13.816 s and the run stops at
+/// 16.546 s. Range 2 (`k0`, `k1`, never
 /// split on this run) last completed a post-heal client write 1.993 s before the end;
 /// `k1`'s two post-heal writes were called after it, the first 1.748 s before the end,
 /// and both are pending. The clause as first merged asked only that the range had
@@ -5736,25 +5781,32 @@ fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wo
 /// **The stall moved key with the placeholders** (PROPOSED D-109): as pinned it was range
 /// 4's, `k4`'s three writes pending from 1.359 s before the end; the placeholders moved
 /// this seed's schedule, and the same shape — every completion of the range before the
-/// pending writes' calls, none after in the 4 s more — is range 2's now, which is what
-/// this asserts.
+/// pending writes' calls, none after in the 4 s more — was range 2's after them.
+///
+/// **Pinned on seed 613 until PROPOSED D-127**, whose answers to the chunks a node holds
+/// moved its schedule off the stall. Seed 145 carries it on D-127's tree, and on the same
+/// key: `k1`'s three post-heal writes
+/// pending, range 2 never split and every one of its post-heal completions before their
+/// calls, none answered in the 4 s more, which is what this asserts.
+// PROPOSED(D-127): re-pinned from seed 613, whose schedule D-127 moved.
 // PROPOSED(D-102): the exemption asks for the range shown live after the call.
 // PROPOSED(D-109): re-pinned on the key the stall moved to.
 #[test]
-fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse() {
+fn seed_145_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse() {
+    const SEED: u64 = 145;
     let variant = NodeVariants::correct().with(NodeVariant::ApplyWaitsForEveryRange);
     let run = |schedule: raft::Schedule| {
         raft::run_on(
             Cluster::Node,
-            613,
+            SEED,
             schedule,
             Variants::default(),
             variant,
             RangeVariants::correct(),
         )
     };
-    let report = run(raft::Schedule::draw_on_the_node(613));
-    assert!(report.uniform(), "seed 613 is a uniform schedule");
+    let report = run(raft::Schedule::draw_on_the_node(SEED));
+    assert!(report.uniform(), "seed {SEED} is a uniform schedule");
     let k1 = bytes::Bytes::from_static(b"k1");
     assert_eq!((report.key_range)(&k1), 2, "k1 is range 2's");
     assert!(
@@ -5762,13 +5814,13 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
             .records
             .iter()
             .any(|r| matches!(&r.event, TraceEvent::RangeSplit { range: 2, .. })),
-        "seed 613 splits range 2 now, so the range serving k1 at the end is to be re-read"
+        "seed {SEED} splits range 2 now, so the range serving k1 at the end is to be re-read"
     );
     // k1's post-heal writes: all pending, every one called inside the bound of the end
     // and before its client's wait, so the range's evidence alone decides them.
     assert!(
         keys_with_only_a_tail(&report).contains(&"k1".to_owned()),
-        "seed 613's post-heal writes to k1 are not all pending inside the bound of the end"
+        "seed {SEED}'s post-heal writes to k1 are not all pending inside the bound of the end"
     );
     let writes: Vec<&ananke_sim::lin::Op> = report
         .history
@@ -5798,7 +5850,7 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
         .collect();
     let last = completed.iter().max().copied();
     println!(
-        "seed 613: last heal {:?}, stopped at {:?}; range 2's last completed post-heal write \
+        "seed {SEED}: last heal {:?}, stopped at {:?}; range 2's last completed post-heal write \
          at {last:?}; k1's {} writes called from {first_call:?}",
         report.last_heal,
         report.ended,
@@ -5815,18 +5867,18 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
             "liveness: no client write to k1 completed after the last heal at {:?}",
             report.last_heal
         )),
-        "seed 613's stall is not reported"
+        "seed {SEED}'s stall is not reported"
     );
     let violation = report
         .check()
-        .expect_err("seed 613 fails under the variant");
+        .expect_err("the seed fails under the variant");
     assert_eq!(
         mechanism(&violation),
         "liveness",
-        "seed 613 fails first on something else: {violation}"
+        "seed {SEED} fails first on something else: {violation}"
     );
     // The counterfactual: 4 s more, every draw unchanged.
-    let mut longer = raft::Schedule::draw_on_the_node(613);
+    let mut longer = raft::Schedule::draw_on_the_node(SEED);
     longer.settle += Duration::from_secs(4);
     let extended = run(longer);
     assert_eq!(
@@ -5846,7 +5898,7 @@ fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_ex
         .count();
     assert_eq!(
         answered, 0,
-        "a pending write to k1 was answered in the 4 s more: seed 613 is no longer a stall"
+        "a pending write to k1 was answered in the 4 s more: seed {SEED} is no longer a stall"
     );
 }
 
@@ -6325,6 +6377,12 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_n
 /// as a follower with no receipt), that term is `stream`, the term of the stream the
 /// install completed, every term record of the replica inside the window keeps it, and
 /// the check holds the isolation green.
+///
+/// No pin calls it since PROPOSED D-127 moved seeds 1817 and 248 off the straddle; it is
+/// kept, unchanged, for the pins' upgrade the day a schedule reaches the straddle again, as
+/// their absences ask.
+// PROPOSED(D-127): kept for the straddle pins' upgrade.
+#[allow(dead_code)]
 fn assert_an_installs_restatement_straddles(
     report: &raft::Report,
     server: u64,
@@ -6423,6 +6481,56 @@ fn assert_an_installs_restatement_straddles(
     );
 }
 
+/// Every (server, range) whose install, created and traced before an isolation of `server`
+/// began, is first restated inside it: the straddle PROPOSED D-112 reads by the
+/// restatement's term, as (server, range, the stream's term, the snapshot's floor term).
+// PROPOSED(D-127): the straddle's absence on seeds 1817 and 248.
+fn installs_straddling_an_isolation(report: &raft::Report) -> Vec<(u64, u64, u64, u64)> {
+    let mut found = Vec::new();
+    for &(server, from, until) in &report.isolations {
+        let on = |record: &TraceRecord| record.node.is_some_and(|n| u64::from(n.get()) == server);
+        for record in &report.records {
+            let TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Snapshot,
+                floor_term,
+                ..
+            } = &record.event
+            else {
+                continue;
+            };
+            if record.at >= from || !on(record) {
+                continue;
+            }
+            let installed = report.records.iter().any(|r| {
+                r.at < from
+                    && matches!(r.event, TraceEvent::RaftSnapshot { server: s, range: g, taken: false, .. }
+                        if (s, g) == (server, *range))
+            });
+            let first = report.records.iter().find_map(|r| match &r.event {
+                TraceEvent::RaftTerm {
+                    server: s,
+                    range: g,
+                    term,
+                    role,
+                    received,
+                } if (*s, *g) == (server, *range) => Some((r.at, *term, *role, received.is_none())),
+                _ => None,
+            });
+            if let Some((at, term, "follower", true)) = first
+                && installed
+                && from < at
+                && at < until
+            {
+                found.push((server, *range, term, *floor_term));
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 /// **Seed 1817 of the correct node: a placeholder's install straddles an isolation's
 /// start, and pre-vote's property holds** (PROPOSED D-112). The nightly on 0e07274 (run
 /// 40220930109) failed the correct node's sweep and `RefusedReadLeft`'s test on it with
@@ -6437,17 +6545,23 @@ fn assert_an_installs_restatement_straddles(
 /// restatement came after the window's start. It now reads the restatement's term,
 /// which is the term 2 of the stream the install completed.
 // PROPOSED(D-112)
+///
+/// **PROPOSED D-127 moved the seed off the shape**, its answers to the chunks a node holds
+/// moving every node schedule: node 3 is created no replica of range 70 by an install now, and
+/// no install's restatement on the run straddles an isolation's start, nor on any of the
+/// correct node's first two thousand seeds on D-127's tree. The pin is the absence with its
+/// reason, and the day the straddle is back this says so.
+// PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 #[test]
 fn seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term() {
     let report = correct(1817);
     checked(&report).expect("the correct node passes seed 1817");
-    assert_an_installs_restatement_straddles(
-        &report,
-        3,
-        70,
-        ananke_env::Instant::from_nanos(15_760_000_000),
-        ananke_env::Instant::from_nanos(16_628_000_000),
-        2,
+    let straddles = installs_straddling_an_isolation(&report);
+    assert!(
+        straddles.is_empty(),
+        "seed 1817: an install's restatement straddles an isolation's start again, {straddles:?} \
+         as (server, range, stream term, floor term): upgrade the pin back to its mechanism \
+         (PROPOSED D-112)"
     );
 }
 
@@ -6461,6 +6575,12 @@ fn seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term() 
 /// the creation's floor term cannot stand for the replica's term; the stream's does.
 /// The variant has nothing to do with it, and no check but check 9 may catch it here.
 // PROPOSED(D-112)
+///
+/// **PROPOSED D-127 moved the seed off the shape**, its answers to the chunks a node holds
+/// moving every node schedule: under the variant no install's restatement at a stream term
+/// above its floor straddles an isolation's start on this seed, nor on any of seeds 0 to 1499.
+/// The pin is the absence with its reason; the pre-vote check still flags nothing here.
+// PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 #[test]
 fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
     let report = raft::run_on_the_node(
@@ -6475,30 +6595,15 @@ fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
             "seed 248: the pre-vote check flags the run under ApplyIgnoresSpan: {violation}"
         );
     }
-    let floor = report
-        .records
-        .iter()
-        .find_map(|record| match &record.event {
-            TraceEvent::RangeCreated {
-                range: 38,
-                cause: ananke_env::RangeCause::Snapshot,
-                floor_term,
-                ..
-            } if record.node.is_some_and(|n| n.get() == 3) => Some(*floor_term),
-            _ => None,
-        });
-    assert_eq!(
-        floor,
-        Some(2),
-        "seed 248: the install's snapshot's last term"
-    );
-    assert_an_installs_restatement_straddles(
-        &report,
-        3,
-        38,
-        ananke_env::Instant::from_nanos(15_674_000_000),
-        ananke_env::Instant::from_nanos(16_602_000_000),
-        5,
+    let above: Vec<(u64, u64, u64, u64)> = installs_straddling_an_isolation(&report)
+        .into_iter()
+        .filter(|&(_, _, term, floor)| term > floor)
+        .collect();
+    assert!(
+        above.is_empty(),
+        "seed 248: an install's restatement at a stream term above its floor straddles an \
+         isolation's start again, {above:?}: upgrade the pin back to its mechanism (PROPOSED \
+         D-112)"
     );
 }
 
@@ -6531,184 +6636,51 @@ fn seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation() {
 /// pin asserts that too.
 /// `IgnoreIncarnation` alone passes, and no store is refused on any run. The day a
 /// schedule moves the seed off any step, this says which, and the pin is re-audited.
+///
+/// **PROPOSED D-127 moved the seed off the shape**: with the node answering the chunks it
+/// holds, every node schedule moved, and on seed 57 the stream half reaches no reset past a
+/// placeholder's answer that the pair then wedges on. The pin is the absence with its reason
+/// now: the stream half passes with no store refused, and it is not the case both that it
+/// resets a progress past a placeholder's answer and that the pair fails. Among seeds 0 to 399,
+/// and the seeds a search beyond them reached, eleven pass under `SharedSnapshotDir` alone,
+/// reset a progress and fail under the pair (6, 71, 173, 341, 366, 504, 508, 541, 640, 645 and
+/// 761). The seven whose pair fails on one key's liveness were run through the shape step by
+/// step and each fails a step, the stream half taking the right half again after its reset on
+/// most; the other four fail the pair on something else first. The day a seed's schedule
+/// reaches the shape again, this or the pair's sweep says so, and the pin is upgraded back.
 // PROPOSED(D-111): the pair on the node, past a placeholder's skipped reset.
+// PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 #[test]
 fn seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved() {
     let seed = 57u64;
-    let (left, right, cut, leader, follower) = (5u64, 14u64, 37u64, 3u64, 2u32);
     let pair = buggy(
         seed,
         Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
     );
     let stream = buggy(seed, Variant::SharedSnapshotDir);
-    let incarnation = buggy(seed, Variant::IgnoreIncarnation);
-    let honest = correct(seed);
-    for (name, report) in [
-        ("the correct node", &honest),
-        ("SharedSnapshotDir alone", &stream),
-        ("IgnoreIncarnation alone", &incarnation),
-    ] {
-        checked(report).unwrap_or_else(|violation| {
-            panic!(
-                "seed {seed}: {name} no longer passes, so the pin's shape has moved: {violation}"
-            )
-        });
-    }
-    for report in [&honest, &pair, &stream, &incarnation] {
+    checked(&stream).unwrap_or_else(|violation| {
+        panic!("seed {seed}: SharedSnapshotDir alone no longer passes: {violation}")
+    });
+    for report in [&pair, &stream] {
         assert!(
             report.refused.is_empty(),
             "seed {seed}: a store was refused, which is the incarnation half's other path"
         );
     }
-    let on = |node: u32| move |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
-    // A placeholder's answer for 14 from node 2: refused, store incarnation 0.
-    let placeholder_answers = |report: &raft::Report, upto: usize| {
-        report.records[..upto]
-            .iter()
-            .filter(|record| on(follower)(record))
-            .filter(|record| match &record.event {
-                TraceEvent::MessageSent { payload, .. } => {
-                    raft::messages_of(payload).iter().any(|(range, message)| {
-                        *range == right
-                            && matches!(
-                                message,
-                                ananke_raft::message::Message::AppendEntriesResponse {
-                                    incarnation: 0,
-                                    refused: true,
-                                    ..
-                                }
-                            )
-                    })
-                }
-                _ => false,
-            })
-            .count()
-    };
-    // 1. The split, node 2's placeholder of 14 before its own apply creates it, and the
-    //    placeholder's answers, on the stream half's run.
-    let made = stream.records.iter().position(|record| {
-        on(follower)(record)
-            && matches!(record.event, TraceEvent::RangeReplicaCreated { range } if range == right)
-    });
-    let created = stream.records.iter().position(|record| {
-        on(follower)(record)
-            && matches!(
-                &record.event,
-                TraceEvent::RangeCreated { range, cause: ananke_env::RangeCause::Split, parent: Some(p), floor_index, .. }
-                    if *range == right && *p == left && *floor_index == cut
-            )
-    });
-    assert!(
-        matches!((made, created), (Some(made), Some(created)) if made < created),
-        "seed {seed}: node {follower} did not make a placeholder of {right} before its apply \
-         of range {left}'s split at {cut} created it ({made:?}, {created:?})"
-    );
-    // 2. The stream half's one reset, the change it answers, and the pair the same run up
-    //    to it.
-    let resets = |report: &raft::Report| -> Vec<(u64, u64, u64)> {
-        report
-            .records
-            .iter()
-            .filter_map(|record| match record.event {
-                TraceEvent::RaftProgressReset {
-                    server,
-                    range,
-                    follower,
-                    ..
-                } => Some((server, range, follower)),
-                _ => None,
-            })
-            .collect()
-    };
-    assert_eq!(
-        resets(&stream),
-        vec![(leader, right, u64::from(follower))],
-        "seed {seed}: under SharedSnapshotDir alone the leader's resets are not the one past \
-         node {follower}'s placeholder of {right}"
-    );
-    assert_eq!(
-        resets_past_placeholders(&stream.records),
-        (1, 0),
-        "seed {seed}: the stream half's reset is not a placeholder's"
-    );
-    let reset = first_reset(&stream.records).expect("asserted above");
-    assert!(
-        placeholder_answers(&stream, reset) > 0,
-        "seed {seed}: node {follower} sent 14's leader no answer with store incarnation 0 \
-         before the reset, so the reset is not the placeholder's change"
+    let (past_placeholders, _) = resets_past_placeholders(&stream.records);
+    let pair_verdict = checked(&pair).err();
+    println!(
+        "seed {seed}: the stream half resets {past_placeholders} progresses past a \
+         placeholder's answer, and the pair {}",
+        pair_verdict
+            .as_deref()
+            .map_or("passes".to_owned(), |why| format!("fails: {why}"))
     );
     assert!(
-        the_pair_is_the_stream_half_up_to_its_first_reset(&pair.records, &stream.records),
-        "seed {seed}: the pair's run is not the stream half's record for record up to the \
-         stream half's reset"
-    );
-    // 3. Node 3 takes 14 again after the reset under the pair, and not under the stream
-    //    half.
-    let takes_of_right_after = |report: &raft::Report| {
-        report.records[reset..]
-            .iter()
-            .filter(|record| {
-                matches!(record.event, TraceEvent::RaftSnapshot { server, range, taken: true, .. }
-                    if server == leader && range == right)
-            })
-            .count()
-    };
-    let (taken_pair, taken_stream) = (takes_of_right_after(&pair), takes_of_right_after(&stream));
-    assert!(
-        taken_pair > 1 && taken_stream == 0,
-        "seed {seed}: after the reset node {leader} took {right} {taken_pair} times under the \
-         pair and {taken_stream} under SharedSnapshotDir alone, where it was the pair's \
-         stale designation of node {follower} that it took for"
-    );
-    // 4. Range 5's retake loop after the last heal under the pair: takes, no stream, no
-    //    write; and IgnoreIncarnation acting on no range but 14 is what step 2's record
-    //    equality and the single reset say.
-    let violation = checked(&pair).expect_err("the pair passes seed 57: re-audit the pin");
-    assert!(
-        mechanism(&violation) == "liveness"
-            && violation.contains("no client write to k6 completed after the last heal"),
-        "seed {seed}: the pair is caught other than by range {left}'s liveness on `k6`: \
-         {violation}"
-    );
-    let after_heal = |report: &raft::Report| {
-        let heal = report.last_heal;
-        report
-            .records
-            .iter()
-            .filter(move |record| record.at > heal)
-            .cloned()
-            .collect::<Vec<TraceRecord>>()
-    };
-    let late = after_heal(&pair);
-    let takes = late
-        .iter()
-        .filter(|record| matches!(record.event, TraceEvent::RaftSnapshot { range, taken: true, .. } if range == left))
-        .count();
-    let streams = late
-        .iter()
-        .filter(|record| matches!(record.event, TraceEvent::RaftSnapshotStreams { range, .. } if range == left))
-        .count();
-    let writes = late
-        .iter()
-        .filter(|record| matches!(&record.event, TraceEvent::RaftApply { range, key: Some(_), .. } if *range == left))
-        .count();
-    assert!(
-        takes > 1 && streams == 0 && writes == 0,
-        "seed {seed}: after the last heal range {left} under the pair took {takes} checkpoints, \
-         opened {streams} streams and applied {writes} writes, where its leader's retake loop \
-         takes again and again, streams nothing and writes nothing"
-    );
-    // The correct node: no reset, because node 2's placeholder of 14 answers no
-    // AppendEntries before 14 is created there.
-    assert!(
-        resets(&honest).is_empty(),
-        "seed {seed}: the correct node reset a follower's progress: re-audit the pin's reason"
-    );
-    assert_eq!(
-        placeholder_answers(&honest, honest.records.len()),
-        0,
-        "seed {seed}: on the correct node node {follower}'s placeholder of {right} answered an \
-         AppendEntries, so the pin's reason for the correct node's absent reset is wrong"
+        past_placeholders == 0 || pair_verdict.is_none(),
+        "seed {seed}: the stream half resets a progress past a placeholder's answer and the \
+         pair fails, the shape this pin was for: upgrade it back to asserting its mechanism \
+         step by step (PROPOSED D-111)"
     );
 }
 
@@ -7137,18 +7109,61 @@ fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
     );
 }
 
-/// **Seed 633 is the hold D-091's pin waits on, on this tree**: the split moved every
-/// node schedule (PROPOSED D-100) and off seed 493's hold, and the correct node's sweep
-/// at the thousand counted three holds the arm answers for and names the lowest
-/// (`live_install_holds_first`), 633 — its two premerges folded 979 and 633 first,
-/// which is why the counter names the lowest now and not the first folded. Pinned in the shape D-091's pin keeps: a replica held
+/// **Seed 633 was the hold D-091's pin waits on until PROPOSED D-127**: the split moved
+/// every node schedule (PROPOSED D-100) and off seed 493's hold, and the correct node's
+/// sweep at the thousand named 633. D-127's answers to the chunks a node holds moved every
+/// node schedule again and off 633's hold, so the pin is the absence with its reason now, as
+/// seeds 272, 516, 368 and 493 are: no stretch the arm answers for, nothing flagged without
+/// the arm either, and the guard, every live install on the run traced at one instant.
+/// Seeds 89, 323 and 370 hold for a live install on D-127's tree, the lowest of the first
+/// thousand (`live_install_holds_first`) is 89, and the mechanism's pin is
+/// [`seed_89_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it`].
+// PROPOSED(D-127): the schedule moved off 633's hold; the absence, with its reason.
+#[test]
+fn seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 633u64;
+    let report = correct(seed);
+    report
+        .check()
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let gaps = report.timer_gaps(raft::TimerResets::ALL);
+    assert!(
+        gaps.is_empty(),
+        "seed {seed}: the timer replay reports {gaps:?} under every arm"
+    );
+    let held = report.timer_gaps_held_by_a_live_install();
+    assert!(
+        held.is_empty(),
+        "seed {seed}: the check without the fourth arm finds {} stretches held by a \
+         live install: {held:?}. The schedule has reached the hold again on this seed, \
+         and this pin is upgraded to assert it in D-099's shape, not left as an absence",
+        held.len()
+    );
+    assert!(
+        report
+            .timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL)
+            .is_empty(),
+        "seed {seed}: the check without the fourth arm flags a stretch the arm does \
+         not answer for, and the replay under every arm did not"
+    );
+    let switches = live_installs_at_one_instant(seed, &report);
+    println!(
+        "seed {seed}: no stretch held by a live install (PROPOSED D-127 moved the schedule \
+         off its hold); {switches} live installs on the run, every one traced at one instant"
+    );
+}
+
+/// **Seed 89 is the hold D-091's pin waits on, on PROPOSED D-127's tree**: D-127 moved every
+/// node schedule and off seed 633's hold, and the correct node's sweep at the thousand counts
+/// three holds the arm answers for, on seeds 89, 323 and 370, and names the lowest
+/// (`live_install_holds_first`), 89. Pinned in the shape D-091's pin keeps: a replica held
 /// for a live install past its timer bound, which the check with the fourth arm passes
-/// and the check without it flags, exactly that stretch and nothing else. Server 2's
-/// replica of range 0, the root, its clock last reset at 12.508 s, was fed a snapshot of
-/// that range: the install was decided at 12.508 s, where the `raft` task handed the
-/// repair over and took the hold, and switched, with the restatement on it, at
-/// 13.018 s; the replay flags it at 12.905 s, 397 ms into the hold and 113 ms before
-/// the restatement.
+/// and the check without it flags, exactly that stretch and nothing else. Server 1's
+/// replica of range 3, its clock last reset at 16.007 s, was fed a snapshot of that range:
+/// the install was decided at 16.120 s and switched, with the restatement on it, at
+/// 16.432 s, and the replay flags it at 16.407 s, 25 ms before the restatement. On seed
+/// 633, where it was pinned before D-127, it was server 2's replica of range 0, the root,
+/// held from 12.508 s and switched at 13.018 s, flagged at 12.905 s.
 ///
 /// What is asserted is the mechanism, not the pass: the one stretch the arm answers
 /// for equals what the check without the arm flags; the install's decision and its
@@ -7156,12 +7171,13 @@ fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
 /// restatement land at one instant, which is what the arm reads a switch by; and a
 /// stream toward the replica was re-opened inside the window, the shape's leader
 /// streaming a follower it stopped appending to. The day the schedule moves off the
-/// hold, this pin becomes the absence with its reason, as seeds 272, 516, 368 and 493 are,
-/// and the sweep's counter names the next.
+/// hold, this pin becomes the absence with its reason, as seeds 272, 516, 368, 493 and 633
+/// are, and the sweep's counter names the next.
 // PROPOSED(D-100): the hold reached, on the seed the sweep's counter named.
+// PROPOSED(D-127): moved from seed 633, whose schedule D-127 moved off the hold.
 #[test]
-fn seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
-    let seed = 633u64;
+fn seed_89_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 89u64;
     let report = correct(seed);
     report
         .check()
@@ -7177,8 +7193,8 @@ fn seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         held.len(),
         1,
         "seed {seed}: the schedule has moved off the hold this pin asserts ({held:?}); \
-         assert the absence with its reason, as seeds 272, 516, 368 and 493 do, and move the \
-         pin to the seed the correct node's sweep names"
+         assert the absence with its reason, as seeds 272, 516, 368, 493 and 633 do, and move \
+         the pin to the seed the correct node's sweep names"
     );
     assert_eq!(
         held, without,

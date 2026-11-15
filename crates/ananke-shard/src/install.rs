@@ -58,6 +58,7 @@ use std::net::SocketAddr;
 use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ananke_env::{
@@ -239,9 +240,20 @@ impl SnapAnswer {
 /// How many times one chunk is resent before its stream is given up, as the
 /// one-group task counts them (RAFT.md §1).
 ///
-/// **The correct node trips this bound, and it is left alone on purpose.** It reads 4
-/// while RAFT.md:210 says eight and the one-group task counts to eight, so correcting
-/// it looked like part of D-090's sentence — until it was measured. `sim/install.rs`,
+/// **The correct node no longer trips it, and the number is still 4** (PROPOSED D-127).
+/// What D-090 found below was the receiver, not the bound: it held a chunk and said
+/// nothing — while the install a stream completed was pending, and for the whole of any
+/// install its `snapshot` task made — and the sender counted that silence as a lost
+/// chunk. On `c5cd18d`, `sim/install.rs`'s 32 seeds gave up 21 streams on 14 seeds with
+/// every receiver up; with the receiver answering what it holds (`Task::held`,
+/// [`Installing`]) and an answer counted once it has reached the node (`answered_in`),
+/// they give up none, and the longest run of resends of one chunk is 3.
+/// `NodeVariant::SilentWhileInstalling` keeps the silence beside the fix.
+///
+/// D-090's finding, as it stood: **the correct node trips this bound, and it is left
+/// alone on purpose.** It reads 4 while RAFT.md:210 says eight and the one-group task
+/// counts to eight, so correcting it looked like part of D-090's sentence — until it
+/// was measured. `sim/install.rs`,
 /// 32 seeds in release, correct node: **2 112 streams given up on this bound**, with
 /// runs of up to **nine** consecutive resends of one chunk, so raising 4 to 8 would not
 /// have stopped it either. The cause is not the number: the receiver answers *nothing*
@@ -252,7 +264,85 @@ impl SnapAnswer {
 /// slice, and it is reported rather than papered over: **issue #120**, and D-090's
 /// consequences.
 // PROPOSED(D-090): measured, tripped by the correct node, and deliberately not widened.
+// PROPOSED(D-127): the trip was the receiver's silence, and the number is unchanged.
 const CHUNK_RESENDS: u32 = 4;
+
+/// Whether the node's `snapshot` task is making an install, shared with the node's
+/// `net` task.
+///
+/// The `snapshot` task is the only part of the node that answers a chunk, and it makes
+/// an install inline — a placeholder's whole creation, a live install's switch — and
+/// answers nothing else until it is done. Measured on `sim/install.rs` before D-127,
+/// one install took 80 to 145 ms of the task's time there, and installs that land
+/// together run back to back, so a chunk that reached the node behind two of them sat
+/// unanswered for longer than the 250 ms a sender's `CHUNK_RESENDS` allows a receiver
+/// gone silent. The `net` task takes every chunk off the wire, and it answers one that
+/// arrives while this is set with [`queued`]: the chunk is held, behind an install,
+/// and nothing about its stream has changed.
+// PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+#[derive(Clone, Debug, Default)]
+pub struct Installing(Arc<AtomicBool>);
+
+impl Installing {
+    /// Whether an install is being made now.
+    #[must_use]
+    pub fn now(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Marks an install as being made until the mark is dropped, which it is however
+    /// the install ends.
+    fn mark(&self) -> Making {
+        self.0.store(true, Ordering::SeqCst);
+        Making(self.0.clone())
+    }
+}
+
+/// One install being made: see [`Installing::mark`].
+struct Making(Arc<AtomicBool>);
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// What the node's `net` task answers a chunk that reaches the node while an install is
+/// being made ([`Installing`]): `Waiting` at the chunk's own term and identity, framed
+/// for its range and sent as from `id`. `None` for anything but a chunk.
+///
+/// It is the answer the `snapshot` task gives a stream it holds and has not finished
+/// with (`Task::held`), and the sender takes it the same way: the resend count starts
+/// again, nothing is counted against either bound, and the chunk falls due on the
+/// ordinary resend timer (`booked`, `Step::Wait`). The `snapshot` task still takes
+/// the chunk itself once the install is made and answers it as it always did, so a
+/// sender hears this first and the chunk's own answer after. The incarnation is 0: a
+/// sender reads only an `Installed` answer's (D-042), and this one has no store to
+/// read it from.
+// PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+#[must_use]
+pub fn queued(id: ServerId, range: RangeId, message: &Message) -> Option<Bytes> {
+    let Message::InstallSnapshot {
+        term,
+        last_index,
+        last_term,
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let encoded = Frame {
+        from: id,
+        message: snapshot::waiting(*term, (*last_index, *last_term)),
+    }
+    .encode();
+    let mut builder = crate::frame::Builder::new(MAX_FRAME_LEN);
+    if !builder.fits(encoded.len()) {
+        return None;
+    }
+    builder.push(range, &encoded);
+    Some(builder.finish())
+}
 
 /// How many times a stream is restarted from its first byte before the sender counts
 /// the checkpoint unusable and asks for a fresh take: RAFT.md:210-212, "restarted from
@@ -276,7 +366,8 @@ const STREAM_RESTARTS: u32 = 2;
 struct Counted {
     /// Resends of the chunk outstanding on this stream, which [`CHUNK_RESENDS`]
     /// bounds. Any answer at all clears it: that bound is for a receiver gone silent,
-    /// and a receiver that answers is not silent.
+    /// and a receiver that answers is not silent. An answer counts from when it reaches
+    /// the node, not from when this task reads it (`answered_in`, PROPOSED D-127).
     resends: u32,
     /// How many times this stream has been restarted from its first byte at a
     /// receiver's ask, which [`STREAM_RESTARTS`] bounds. Cap-waits are not counted
@@ -432,6 +523,19 @@ fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
         SnapshotStatus::Overlaps => snapshot::overlaps(term, at),
         _ => snapshot::start_over(term, at),
     }
+}
+
+/// Whether an answer from `to` about `range`'s stream waits in the `snapshot` task's
+/// queue: a stream whose answer has reached the node, which RAFT.md:231-233's resend
+/// bound does not count as unanswered (`Task::due`).
+///
+/// A free function over the queue for the reason [`step_for`] is one: the bound's
+/// reading is a thing a check drives directly rather than a branch inside an async loop.
+// PROPOSED(D-127): an answer in the queue is an answer.
+fn answered_in(snaps: &Queue<SnapJob>, range: RangeId, to: ServerId) -> bool {
+    snaps.count(|job| {
+        matches!(job, SnapJob::Response { range: of, from, .. } if *of == range && *from == to)
+    }) > 0
 }
 
 /// Whether the stream a refusal for overlap ended is streamed again from a fresh take,
@@ -608,8 +712,10 @@ struct Inbound {
     /// The last file completed: where an acknowledgement points between files.
     last_done: Option<(Bytes, u64)>,
     /// The install this stream completed into, waiting on the `raft` task's repair.
-    /// While it is set the sender's further chunks are ignored: it retries once the
-    /// switch settles, as the one-group receiver makes it (node.rs:1956-1959).
+    /// While it is set the sender's further chunks are answered `Waiting` and nothing
+    /// else (`Task::held`): the install's own answer ends the stream once it is made.
+    /// Until PROPOSED D-127 they were ignored, as the one-group receiver ignores them
+    /// (node.rs:1956-1959), and the sender gave the stream up for the silence (#120).
     pending: Option<Box<Install>>,
 }
 
@@ -659,6 +765,9 @@ pub struct Task<E: Environment> {
     /// The range layer's variants: a placeholder's install is a creation, and draws its
     /// incarnation as `IncarnationPerRangeStream` says (PROPOSED D-108, D-109).
     range_variants: RangeVariants,
+    /// Set while this task makes an install, for the node's `net` task to read.
+    // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+    installing: Installing,
     /// What a directed test lands at the switch, after the last await of the task's own
     /// and before what the switch reads: where an apply job queued before the hold lands.
     /// Timing it by the simulator's disk would move with every read on the path.
@@ -694,6 +803,7 @@ impl<E: Environment> Task<E> {
         anchor: Arc<RaftStore<E>>,
         on_a_reseed: bool,
         range_variants: RangeVariants,
+        installing: Installing,
     ) -> Self {
         Self {
             env,
@@ -717,6 +827,7 @@ impl<E: Environment> Task<E> {
             anchor,
             on_a_reseed,
             range_variants,
+            installing,
             #[cfg(test)]
             at_the_switch: std::sync::Mutex::new(None),
         }
@@ -805,7 +916,22 @@ impl<E: Environment> Task<E> {
             .filter(|(_, out)| out.deadline <= now)
             .map(|(key, _)| *key)
             .collect();
+        let timeout = self.chunk_timeout();
         for (range, to) in due {
+            // A stream whose receiver's answer has reached the node and waits in this
+            // task's queue is not unanswered, whatever this task's clock says: the
+            // answer was late only in being read, because the task was busy. It is
+            // neither resent nor counted, and falls due again a chunk timeout on, by
+            // which time its answer has said where it stands. Before D-127 the bound
+            // counted from the last answer *read*, and it gave up streams whose answer
+            // was in hand (#120).
+            // PROPOSED(D-127): an answer in the queue is an answer.
+            if answered_in(&self.snaps, range, to) {
+                if let Some(out) = self.sending.get_mut(&(range, to)) {
+                    out.deadline = now + timeout;
+                }
+                continue;
+            }
             let give_up = {
                 let Some(out) = self.sending.get_mut(&(range, to)) else {
                     continue;
@@ -814,6 +940,12 @@ impl<E: Environment> Task<E> {
                 out.counted.resends > CHUNK_RESENDS
             };
             if give_up {
+                // PROPOSED(D-127): the resend bound's give-up is traced.
+                self.env.trace(TraceEvent::RaftSnapshotGaveUp {
+                    server: self.id.0,
+                    range: range.get(),
+                    to: to.0,
+                });
                 self.sending.remove(&(range, to));
                 self.plan.sent(range, to);
                 self.local
@@ -1055,8 +1187,21 @@ impl<E: Environment> Task<E> {
             .get(&(range, from))
             .is_some_and(|inbound| inbound.pending.is_some())
         {
-            // Mid-decision: the sender retries once the switch settles.
-            return;
+            // Mid-decision: the install this stream completed is being decided, and
+            // whatever it decides is answered once it is made. Until then the chunk
+            // is answered as what it is — held, nothing changed, ask again — and
+            // never left to silence, which the sender cannot tell from a lost chunk
+            // and counts against `CHUNK_RESENDS` (#120).
+            // PROPOSED(D-127): a stream whose install is pending is answered `Waiting`.
+            return self
+                .held(
+                    range,
+                    from,
+                    held_term(),
+                    (last_index, last_term),
+                    incarnation(),
+                )
+                .await;
         }
         let at = Identity {
             term,
@@ -1304,6 +1449,9 @@ impl<E: Environment> Task<E> {
     /// The `raft` task's repair for a stream that completed: D-066's live install, in
     /// one manifest switch, with the node's other ranges left running.
     async fn finish(&mut self, range: RangeId, from: ServerId, repair: Repair, held: Decision) {
+        // Until this returns, the task answers nothing, and the `net` task answers for it.
+        // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+        let _making = self.installing.mark();
         let Some(install) = self
             .receiving
             .get_mut(&(range, from))
@@ -1659,6 +1807,8 @@ impl<E: Environment> Task<E> {
     // PROPOSED(D-109): a placeholder's install creates the replica, quarantined on a
     // re-seeded node, and is refused where it would overlap.
     async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
+        // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+        let _making = self.installing.mark();
         let installing = self.env.decision();
         let prefix = KeyPrefix::group(range.get());
         let at = install.at;
@@ -2152,6 +2302,32 @@ impl<E: Environment> Task<E> {
             .cloned()
             .map_or(0, |store| store.incarnation());
         self.answer(range, from, refusal(status, term, at), incarnation)
+            .await;
+    }
+
+    /// Answers a chunk of a stream whose install is pending — staged whole, the `raft`
+    /// task holding the range or about to — with `Waiting`: held, nothing changed, ask
+    /// again. The sender's resend count starts again and nothing is counted against
+    /// either bound (`booked`, [`Step::Wait`]); what ends the stream is the answer the
+    /// install gives once it is made.
+    ///
+    /// Before D-127 these chunks were answered nothing, and the sender, which cannot
+    /// tell a receiver's silence from a lost chunk, gave the stream up on
+    /// [`CHUNK_RESENDS`] while its install was being made (#120).
+    /// [`NodeVariant::SilentWhileInstalling`] is that node.
+    // PROPOSED(D-127): a stream the node holds is answered while its install is made.
+    async fn held(
+        &self,
+        range: RangeId,
+        from: ServerId,
+        term: Term,
+        at: (Index, Term),
+        incarnation: u64,
+    ) {
+        if self.variants.contains(NodeVariant::SilentWhileInstalling) {
+            return;
+        }
+        self.answer(range, from, snapshot::waiting(term, at), incarnation)
             .await;
     }
 
@@ -3242,6 +3418,7 @@ mod tests {
             store.clone(),
             false,
             RangeVariants::correct(),
+            Installing::default(),
         );
         (task, store, local, follower)
     }
@@ -3330,6 +3507,194 @@ mod tests {
             .checkpoint_spans(&spans, dir)
             .await
             .expect("the checkpoint");
+    }
+
+    /// A resent chunk of `R2`'s stream from [`FOLLOWER`]'s side at (2, 30, 2): what a
+    /// sender puts on the wire while it waits on that stream's install.
+    // PROPOSED(D-127)
+    fn resent_last_chunk() -> Message {
+        Message::InstallSnapshot {
+            term: 2,
+            last_index: 30,
+            last_term: 2,
+            file: Bytes::from_static(b"CURRENT"),
+            offset: 0,
+            total: 16,
+            done: true,
+            data: Bytes::from(vec![0u8; 16]),
+        }
+    }
+
+    /// #120's first silence, through the task's chunk path: a chunk of a stream whose
+    /// install is pending — staged whole, its range held for the repair — is answered
+    /// `Waiting`, which clears its sender's resend count (`booked`). Before D-127 it was
+    /// answered nothing, and the sender, which cannot tell that from a lost chunk, gave
+    /// the stream up on `CHUNK_RESENDS` while the install it waited on was being made.
+    /// `SilentWhileInstalling` is that node: nothing reaches the follower under it.
+    // PROPOSED(D-127): a stream whose install is pending is answered `Waiting`.
+    #[test]
+    fn a_chunk_of_a_stream_whose_install_is_pending_is_answered_waiting() {
+        let heard = |variants: NodeVariants| {
+            on_a_node(move |env| async move {
+                let (mut task, _store, _local, follower) = task_on(&env, R2, &[]).await;
+                task.variants = variants;
+                let at = Identity {
+                    term: 2,
+                    last_index: 30,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                task.chunk(R2, FOLLOWER, resent_last_chunk()).await;
+                answered(&env, &follower).await
+            })
+            .0
+        };
+        assert_eq!(
+            heard(NodeVariants::correct()),
+            Some(SnapshotStatus::Waiting),
+            "a chunk of a stream whose install is pending is answered, `Waiting`"
+        );
+        assert_eq!(
+            heard(NodeVariants::of(&[NodeVariant::SilentWhileInstalling])),
+            None,
+            "under `SilentWhileInstalling` it is answered nothing, the node before D-127"
+        );
+    }
+
+    /// #120's second silence: the task answers nothing while it makes an install, so it
+    /// marks one as being made for the node's `net` task, from the top of `finish` until
+    /// it returns, and the `net` task answers a chunk that arrives meanwhile with
+    /// [`queued`] — `Waiting`, at the chunk's own identity, framed for its range. Planted
+    /// away, the mark in `finish` is false at the switch here, and the one in
+    /// `install_placeholder` is what `sim/install.rs`'s check of no stream given up
+    /// reads, since every install there is a placeholder's.
+    // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+    #[test]
+    fn an_install_is_marked_while_it_is_made_and_a_chunk_meanwhile_is_answered_waiting() {
+        let ((before, during, after), _) = on_a_node(|env| async move {
+            let parent = described(R2, "k0", "k2", 1);
+            let (mut task, _store, _local, _follower) =
+                task_on(&env, R2, std::slice::from_ref(&parent)).await;
+            let at = Identity {
+                term: 2,
+                last_index: 30,
+                last_term: 2,
+            };
+            let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true) else {
+                panic!("the stream completes");
+            };
+            checkpoint_of(&env, R2, 30, Some(&parent), &install.source).await;
+            task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+            let installing = task.installing.clone();
+            let before = installing.now();
+            let seen = Arc::new(AtomicBool::new(false));
+            *lock(&task.at_the_switch) = Some(Box::pin({
+                let installing = installing.clone();
+                let seen = seen.clone();
+                async move { seen.store(installing.now(), Ordering::SeqCst) }
+            }));
+            task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+            (before, seen.load(Ordering::SeqCst), installing.now())
+        });
+        assert!(!before, "nothing is marked before the install");
+        assert!(
+            during,
+            "an install is marked while it is made: the switch saw no mark"
+        );
+        assert!(!after, "and the mark goes with it");
+        let frame = queued(ServerId(1), R2, &resent_last_chunk()).expect("a chunk is answered");
+        let decoded = crate::frame::decode(&frame).expect("one frame");
+        let [tagged] = &decoded.messages[..] else {
+            panic!("one message in the frame");
+        };
+        assert_eq!((tagged.range, tagged.frame.from), (R2, ServerId(1)));
+        assert!(
+            matches!(
+                tagged.frame.message,
+                Message::InstallSnapshotResponse {
+                    status: SnapshotStatus::Waiting,
+                    last_index: 30,
+                    last_term: 2,
+                    ..
+                }
+            ),
+            "the `net` task's answer is `Waiting` at the chunk's identity, not {:?}",
+            tagged.frame.message
+        );
+        assert!(
+            queued(ServerId(1), R2, &snapshot::waiting(2, (30, 2))).is_none(),
+            "an answer is not a chunk, and is not answered"
+        );
+    }
+
+    /// The bound's reading (#120's third finding): a stream whose answer has reached the
+    /// node and waits in the task's queue is not unanswered. `due` neither resends nor
+    /// counts it and lets it fall due a chunk timeout on; the same stream with nothing
+    /// queued is resent and counted. Before D-127 the count ran from the last answer
+    /// *read*, and on `sim/install.rs` one of the 21 streams given up was given up with
+    /// its answer already queued behind the task's own work.
+    // PROPOSED(D-127): an answer in the queue is an answer.
+    #[test]
+    fn a_stream_whose_answer_is_queued_is_not_counted_as_unanswered() {
+        let ((queued_count, queued_deadline, bare_count), trace) = on_a_node(|env| async move {
+            let parent = described(R2, "k0", "k2", 1);
+            let (mut task, _store, _local, _follower) =
+                task_on(&env, R2, std::slice::from_ref(&parent)).await;
+            // A take's version, whole: its checkpoint and its own RAFT-FORMAT record,
+            // which `find_version` asks of every candidate (D-060, D-083).
+            let version = Path::new("/n1/snap-r2-30-1");
+            checkpoint_of(&env, R2, 30, Some(&parent), version).await;
+            ananke_raft::format::write_checkpoint_record(&env, version)
+                .await
+                .expect("the version's format record");
+            task.open(R2, FOLLOWER, 30, 2).await;
+            assert!(
+                task.sending.contains_key(&(R2, FOLLOWER)),
+                "the stream opens"
+            );
+            let now = env.clock().now();
+            task.sending
+                .get_mut(&(R2, FOLLOWER))
+                .expect("the stream")
+                .deadline = now;
+            task.snaps.push(SnapJob::Response {
+                range: R2,
+                from: FOLLOWER,
+                message: snapshot::ack(2, (30, 2), Bytes::new(), 0),
+            });
+            task.due().await;
+            let out = &task.sending[&(R2, FOLLOWER)];
+            let queued = (out.counted.resends, out.deadline > now);
+            let _ = task.snaps.remove_first(|_| true);
+            task.sending
+                .get_mut(&(R2, FOLLOWER))
+                .expect("the stream")
+                .deadline = now;
+            task.due().await;
+            (
+                queued.0,
+                queued.1,
+                task.sending[&(R2, FOLLOWER)].counted.resends,
+            )
+        });
+        assert_eq!(
+            queued_count, 0,
+            "a stream whose answer is queued is not counted"
+        );
+        assert!(queued_deadline, "and falls due again later, not at once");
+        assert_eq!(
+            bare_count, 1,
+            "the same stream with nothing queued is counted"
+        );
+        let resent = trace
+            .iter()
+            .filter(|record| matches!(record.event, TraceEvent::RaftSnapshotResumed { .. }))
+            .count();
+        assert_eq!(resent, 1, "and only that one is resent");
     }
 
     /// A core's ask for a stream to a follower whose overlap refusal's wait is still

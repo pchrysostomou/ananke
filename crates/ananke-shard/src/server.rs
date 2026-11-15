@@ -3362,6 +3362,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // The answers to the node's own `MetaUpdate`s, for its `meta` task (PROPOSED
     // D-098).
     let meta_answers: Queue<Response> = Queue::new();
+    // Set while the `snapshot` task makes an install, which it answers nothing during.
+    // PROPOSED(D-127)
+    let installing = install::Installing::default();
     env.spawn("net", {
         let env = env.clone();
         let sock = sock.clone();
@@ -3369,6 +3372,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let local = local.clone();
         let snaps = snaps.clone();
         let meta_answers = meta_answers.clone();
+        let installing = installing.clone();
         async move {
             loop {
                 let Ok((from, bytes)) = sock.recv().await else {
@@ -3416,6 +3420,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                     ) && !node_variants.contains(NodeVariant::ChunksToTheInbox);
                     if diverted {
                         let range = tagged.range;
+                        // A chunk that reaches the node while the `snapshot` task makes
+                        // an install waits behind it, and the task answers nothing until
+                        // it is made. It is answered here, `Waiting`, so its sender hears
+                        // that it is held rather than counting a silence the length of
+                        // the install against `CHUNK_RESENDS` (#120). The task still
+                        // takes it afterwards and answers it as it always did.
+                        // PROPOSED(D-127): the node answers a chunk while its `snapshot`
+                        // task is installing.
+                        if installing.now()
+                            && !node_variants.contains(NodeVariant::SilentWhileInstalling)
+                            && let Some(answer) = install::queued(id, range, &tagged.frame.message)
+                        {
+                            let _ = sock.send(from, answer).await;
+                        }
                         let from = tagged.frame.from;
                         snaps.push(match tagged.frame.message {
                             message @ Message::InstallSnapshot { .. } => SnapJob::Chunk {
@@ -3906,6 +3924,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             anchor,
             on_a_reseed,
             range_variants,
+            installing,
         );
         async move {
             task.run().await;

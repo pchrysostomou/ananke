@@ -25252,6 +25252,216 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
+## PROPOSED D-127 — The node's resend bound counted a silence the receiver chose: the node answers every chunk it holds, `Waiting` while a stream's install is pending and from the `net` task while the `snapshot` task makes an install; an answer counts once it reaches the sender's node; the give-up is traced and `sim/install.rs` asserts none; `CHUNK_RESENDS` stays 4 and `SilentWhileInstalling` keeps the silence beside the fix; every node pin it moved is re-audited (#120)
+
+**The number.** Off `main` at c5cd18d, whose highest entry is D-132 and whose footer reads D-133.
+D-124 to D-127 were left open by the batch order D-128's preamble records; this is D-127, placed
+between D-123 and D-128 in numerical order, and the footer stays D-133. Every code site carries
+`// PROPOSED(D-127)`.
+
+**The question.** #120 found that the node's `Task::due` gives a stream up once one chunk has
+been resent more than `CHUNK_RESENDS` times, and that the correct node does so on essentially
+every install. D-090 measured it, left the number at 4 because the trip was not the number's
+(D-030, D-039), and reported it. The question this entry answers is whether the bound measures
+the wrong interval or the system resends wrongly.
+
+**The answer, measured.** Mostly neither. The sender resends exactly as RAFT.md:231-233 asks, and
+the bound counts what that sentence calls unanswered. What was wrong was the receiver: it held
+chunks and said nothing, so "unanswered" took in time the receiver had the chunk. One part was
+the bound's own reading: it ran from the last answer the sender *read*, so an answer queued behind
+the sender's own work counted as silence. Three things, in the order they cost:
+
+1. **The `snapshot` task answers nothing while it makes an install.** It is the node's only
+   answerer of chunks, and it makes a placeholder's whole creation (`install_placeholder`) and a
+   live install's switch (`finish`) inline. On `sim/install.rs` one install took 80 to 145 ms of
+   the task, and installs that land together run back to back. A stream's last chunk waits out its
+   own install unanswered, and any chunk that reaches the node behind two installs waits longer
+   than the 250 ms the sender allows: five deadlines of half a minimum election timeout.
+2. **A chunk of a stream whose install is pending is answered nothing** (`Inbound::pending`, "the
+   sender retries once the switch settles"). This is the silence #120 named. Since D-109 every
+   install on `sim/install.rs` is a placeholder's, which has no pending window, so this is not
+   what trips there any more; it is reached where live installs are, the raft sweep on the node.
+3. **The count ran from the last answer read.** When the sender's own task was busy (opening a
+   stream, a pass of resends) and its deadline then won the race against its queue, a resend was
+   counted for a stream whose answer was already waiting to be read.
+
+**What it cost, on c5cd18d.** The give-up branch, the resend count and the receiver's chunk path
+instrumented with `eprintln!`, in release, correct node, 32 seeds each:
+
+| scenario | streams given up | what the receiver was doing |
+| --- | --- | --- |
+| `sim/install.rs` | **21, on 14 seeds** | all 21 held the chunk: its snapshot task was making an install, another range's and then its own, when the chunk reached it, and its answer left after the give-up, 15 of them within 20 ms of it by the two nodes' clocks. One of the 21 was given up with its answer already in the sender's queue. |
+| raft sweep on the node (`run_on_the_node`) | 635 | 539 live installs; 797 chunks met the pending window; 77 give-ups followed a chunk dropped there. Most of the rest are toward a receiver no chunk reached, the sweep's crashes and partitions. |
+| membership on the node | 194 | about half toward a receiver no chunk reached |
+| re-seed shape | 1 402 | 1 370 toward the refused node while it is down |
+
+`sim/install.rs` is the measure that can be read without judgement: no node crashes there, nothing
+is partitioned, and a message is lost one time in fifty, so the network alone reaches five lost
+exchanges of one chunk about once in ten million chunks. Every give-up there is a live receiver. The
+others mix in receivers that are really silent, which is what the bound is for, and the split
+above was read off timestamps of different nodes, whose clocks the simulator skews, and answers a
+partition drops: it is indicative and not asserted. The issue's 3 781 and 2 112 are the D-090
+tree's, before D-109 made every install on `sim/install.rs` a placeholder's; they are not
+re-taken here.
+
+**What is built** (`crates/ananke-shard/src/install.rs`, `server.rs`, `variant.rs`;
+`crates/ananke-env/src/trace.rs`, `moirae.rs`).
+
+1. **A chunk of a stream whose install is pending is answered `Waiting`** (`Task::held`): held,
+   nothing changed, ask again. The sender books it as D-090's cap-wait: the resend count starts
+   again, neither bound counts it, and the chunk falls due on the ordinary timer (`booked`,
+   `Step::Wait`). The install's own answer, `Installed` or a refusal, ends the stream as before.
+   `Waiting` is reused rather than a status added: its meaning on the wire is already "nothing
+   changed, ask again", which is this, and a new tag would move the codec and the studio's decoder
+   for no difference the sender acts on.
+2. **While the `snapshot` task makes an install, the `net` task answers a chunk that arrives**,
+   with the same `Waiting` at the chunk's own term and identity (`install::queued`). The task
+   marks an install from the top of `finish` and `install_placeholder` until either returns
+   (`Installing`, a flag the two tasks share; the mark clears on drop, however the install ends).
+   The `snapshot` task still takes the chunk afterwards and answers it as it always did, so a
+   sender hears `Waiting` first and the chunk's own answer after. The incarnation is 0: a sender
+   reads only an `Installed` answer's (D-042).
+3. **An answer counts once it reaches the node** (`answered_in`). `due` neither resends nor counts
+   a stream whose answer waits in the task's queue, and lets it fall due a chunk timeout on, by
+   which time the answer has re-armed or ended it. This is the one change to what the bound reads:
+   a chunk is unanswered while no answer to it has reached the sender's node, where it was while
+   none had been read.
+4. **The give-up is traced**, `RaftSnapshotGaveUp { server, range, to }`, exported to the studio
+   as `ananke.raft.snapshot-gave-up`. It is a state transition — the stream ends and the core is
+   told `Failed { retake: false }` — and it had no event, which is why #120 was invisible to every
+   check and wanted measuring rather than reading. The one-group server's give-up is not traced
+   here: its task is Phase 2's and its counts are not this entry's.
+5. **`CHUNK_RESENDS` stays 4.** RAFT.md:210's eight is still not the node's number; nothing here
+   needed it, and D-090's reason for not changing it on a measurement that trips stands.
+
+The answer at the completing chunk itself — `Waiting` as the last chunk is staged, before the
+install — was built first and taken out: item 1 answers the resends of the pending window and
+item 2 those of the install, so it changed when the first answer left by less than one resend
+period and was the one line no check could fail.
+
+**After, on this tree**, counting the new event and the resends the trace records
+(`RaftSnapshotResumed`), release, correct node, 32 seeds, every seed passing: `sim/install.rs`
+gives up **no stream**, and resends 821 chunks where c5cd18d resent 956, read off the same trace
+event there. The raft sweep on the node gives up 540 streams on all 32 seeds (635 before),
+membership on the node 159 on 29 (194), the re-seed shape 1 401 on 32 (1 402). What remains there
+is the bound doing its job, toward receivers that are crashed, partitioned or down; it is reported
+and not asserted, for the reason the table above gives. **The old reading's false trips**, measured
+on this tree's receiver with item 3 taken out, the reading as it stood: 20 resends in
+`sim/install.rs`'s 32 seeds were counted against an answer already in the sender's queue, one of
+them the fourth of its run, one short of a give-up; and on c5cd18d one of the 21 give-ups was of a
+stream whose answer was queued. That is what the reading cost a receiver that answers.
+
+### The checks, and the pair
+
+- **`sim/install.rs`'s `Report::check` asserts no stream is given up** (`Report::gave_up`), with
+  the reason in its message: no receiver there is ever down. The correct sweep,
+  `the_correct_node_installs_on_every_seed`, runs it on its fixed 32 seeds at every tier.
+- **`NodeVariant::SilentWhileInstalling`** is the node before D-127 on the receiver's side: no
+  answer in the pending window and none from the `net` task. It keeps item 3, the sender's new
+  reading, so it is the variant the new reading still catches: on the same 32 seeds on this tree
+  it gives up 21 streams on 16 seeds and fails those 16, every failure the resend bound's clause
+  (`a_receiver_silent_while_it_installs_has_its_streams_given_up`). Caught on half the seeds,
+  well above D-061's 5 %, so it is asserted at every tier; it runs the whole 32 rather than
+  `every_wiring_variant_is_caught`'s three, which would leave its catch to the draw. It sits in
+  `NodeVariant::BOUNDS` beside D-090's two, at bit 52.
+- **Each part can fail on its own.** Planted away one at a time: the `net` task's answer fails
+  the correct sweep on 16 of 32 seeds (seed 0 first); the pending window's answer fails
+  `a_chunk_of_a_stream_whose_install_is_pending_is_answered_waiting`, which also holds the
+  variant to silence; the mark in `finish` fails
+  `an_install_is_marked_while_it_is_made_and_a_chunk_meanwhile_is_answered_waiting`, which also
+  decodes the `net` task's answer; and `answered_in` fails
+  `a_stream_whose_answer_is_queued_is_not_counted_as_unanswered`. The mark in
+  `install_placeholder` is what the correct sweep reads, since every install there is a
+  placeholder's.
+
+### What it moved: every node pin re-audited
+
+The answers are messages and the resends they save are messages, so every node scenario's
+schedule moves (consequence 3). On the first build of this tree 26 pinned tests failed, every one a
+pin whose seed's schedule had moved off its shape and none a check failing the correct system:
+eleven in `sim/tests/node.rs`, fourteen in `sim/tests/shard.rs` and one in `sim/membership.rs`.
+Each was re-audited as CLAUDE.md asks, searching for the shape with the pin's own conditions —
+the plain schedules' and the shaped schedules' first ten thousand for `sim/tests/shard.rs`, the
+node's first two to five thousand per variant for `sim/tests/node.rs` — and either moved to a seed
+that carries it, asserting the mechanism, or turned into the absence on its own seed, with the
+reason:
+
+| pin | now |
+| --- | --- |
+| seed 463 (unconfirmable reads) | seed 1068, the lowest such |
+| seeds 128, 643, 986 (absence) | absence kept; none has a store refused now |
+| seed 3291 (a replica restated before its split is traced grants) | seed 9699; the fold without `RangesRestated` flags 1006 and 7319 too, where the split is traced first |
+| seeds 3870, 5303 (`SplitLeavesQuarantineBehind`'s named failures) | seed 9535, the one seed of the ten thousand; 3870 and 5303 asserted no longer caught on leader completeness |
+| seed 2097 (a restart restates a right half's quarantine) | seed 329, the lowest carrying the variant's half too |
+| seed 9 (a chain of quarantined right halves) | seed 68, the lowest with the chain's live install on the first link and none on the second; under the variant the first link's vote moves the run, so its half asserts that link and no quarantine on any right half after (seed 9 kept all three) |
+| seeds 2272, 7949 (the meta bound's exception) | 2272 keeps it, node 3's parent past the split at 123 and a child, 37, beside 36; 7949 asserted to pass without the exception |
+| seed 368 (a grant whose answer has not landed) | absence: no plain schedule of the ten thousand carries it |
+| seed 8934 (a placeholder's answer overtaken) | absence: the fold without resets passes every plain schedule of the ten thousand |
+| seed 707 (the log view after a re-seed) | absence |
+| seed 992 (an asker whose answer is lost) | seed 1314 |
+| seed 5620 (an install a split overtook) | absence; the variant's catch is `install.rs`'s unit tests' |
+| seed 16725 (a write that heard nothing) | seed 73, the lowest |
+| seed 18925 (an asker's tries spent on bounces) | absence: no restart arm on it now |
+| seed 45 and `RIGHT_HALF_PINNED` (a voter's right half through its placeholder; check 8's planted comparison) | seed 2388, none of seeds 0 to 1999 carrying it |
+| seed 219 (`SnapshotOverlapsReplica` creates a range twice) | seed 522; its raft checker never trips, so the created-twice clause is the run's verdict, and the correct node refuses the install after the split's apply made the range |
+| seeds 12, 76 (wedges the true end alone would excuse) | seed 204 for 12's shape; seed 8 for 76's, the shape D-109 had moved it off and whose absence the pin asserted, upgraded back; 12 and 76 asserted absent |
+| seed 613 (`ApplyWaitsForEveryRange`'s stall) | seed 145, on the same key, `k1` |
+| seed 633 (a live install's hold) | absence, as 272, 516, 368 and 493; the mechanism's pin is seed 89, the lowest of the thousand's three holds (89, 323, 370) |
+| seed 57 (the pair's wedge past a placeholder's skipped reset) | absence: none of the eleven candidates of seeds 0 to 399 and beyond carries it step by step |
+| seeds 2809, 1817, 248 | absence, none of the searched seeds carrying the shape |
+| check 16's pins 48, 66 | 12 and 20, of 12, 20 and 30 that trip among the first hundred |
+| `sim/membership.rs`'s seed-1969 shape | built on seed 1972, the first after 1969 with it |
+
+Every renamed pin keeps its nightly row's shard (below).
+
+### Found on the way, and not this entry's
+
+The search ran the shard scenario's plain schedule on its first ten thousand seeds, where the sweep
+runs that schedule on one seed in eight (`PLAIN_ONE_IN`), and the correct system failed two of them
+that the sweep never runs plain: 2147, `pre-vote: server 3 raised its term from 4 to 5 while
+isolated`, and 6773, `liveness: no client write to k08 completed after the last heal`. On c5cd18d
+both pass, and the shaped schedule the sweep runs for each passes on this tree. 2147 is the pre-vote
+check's, as far as it was read: node 3's replica of range 30 was lost at its refusal before the
+isolation and re-made by a placeholder's install of a stream at term 5, decided inside the window,
+behind the installs of ranges 19, 2 and 29 the `snapshot` task made first, and traced after the
+window ends. The check reads the term before the window from the replica the refusal destroyed (4)
+and the term at its end from the creation's decision time (5), while its skip and its creation
+clause read traced times, which fall outside the window. 6773's first post-heal write to `k08` was
+proposed at index 105 by node 3 at term 3 and truncated by node 1's election at term 4, and under
+D-131's one try its client never hears; its second, 0.77 s before the run ends, no leader proposed.
+The range commits other keys and serves reads of `k08` to the end. Neither is fixed here; both are
+reported to the owner with this account, the second unresolved.
+
+### Consequences
+
+1. **A decision that never settles is answered `Waiting` for ever**, and its sender never gives
+   up, as a cap-wait is (D-090's `Step::Wait`). Before, it was given up and asked again, and the
+   new stream met the same silence, since the window is keyed by (range, sender): neither
+   recovers, and this one says why in the trace. The raft task's hold yields a `Finish` for every
+   `Ready` it steps (D-066, D-098), and a wedged one is a finding in its own right.
+2. **A chunk the `snapshot` task would answer nothing** — a stale leader's, which it lets time out
+   — is answered `Waiting` by the `net` task if it arrives during an install, which delays that
+   stream's give-up by at most the install's length.
+3. **More answers on the wire**: one per chunk that arrives during a pending window or an install,
+   and a resend saved per stream whose answer was queued. Every node scenario's schedule moves.
+4. **The one-group server has the same pending silence** (`crates/ananke-raft/src/node.rs`,
+   "Mid-decision: the sender retries once the switch settles"), under eight resends and with one
+   group and no cap. It is not measured or changed here.
+5. RAFT.md §1 gains the node's rule beside D-075's (issue #120; D-127, proposed).
+
+**The nightly's rows (D-064).** One `install` row, the variant's sweep, weighed from the built
+release binary at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, which runs its fixed 32 seeds: 6.5 cpu
+s, the median of three runs beside other slices' runs (load averages 256 to 274). Into the
+lightest shard, shard 4, at 2231.2 -> 2237.7. The twelve pins moved to other seeds are renamed in
+place, each keeping its shard and re-weighed the same way on this tree (load averages 277 to 357),
+which moves shard 4 to 2238.0, shard 5 to 2256.4 and shard 6 to 2363.6; seed 89's hold, the one
+row added, weighs 1.0 and goes into the lightest, shard 3, at 2237.4 -> 2238.4. The pins turned into
+absences keep their rows. `scripts/nightly-shards.txt` gives every figure.
+
+**PROPOSED.** This closes #120.
+
+---
+
 ## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,

@@ -2211,7 +2211,9 @@ fn replica_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftSnapshotStreams { server, .. }
         // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
         | TraceEvent::RaftSnapshotOverlapped { server, .. }
-        | TraceEvent::RaftSnapshotRestream { server, .. } => Some(*server),
+        | TraceEvent::RaftSnapshotRestream { server, .. }
+        // PROPOSED(D-127): the resend bound's give-up is traced.
+        | TraceEvent::RaftSnapshotGaveUp { server, .. } => Some(*server),
         _ => None,
     }
 }
@@ -2967,6 +2969,8 @@ pub fn range_of(event: &TraceEvent) -> Option<u64> {
         // PROPOSED(D-110): the leader's half of the overlap rule (#180's review, N8).
         | TraceEvent::RaftSnapshotOverlapped { range, .. }
         | TraceEvent::RaftSnapshotRestream { range, .. }
+        // PROPOSED(D-127): the resend bound's give-up is traced.
+        | TraceEvent::RaftSnapshotGaveUp { range, .. }
         | TraceEvent::RaftMatchStarted { range, .. }
         | TraceEvent::RaftLearnerRound { range, .. }
         | TraceEvent::RaftChangeAccepted { range, .. } => Some(*range),

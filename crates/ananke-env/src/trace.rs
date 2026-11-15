@@ -901,6 +901,20 @@ pub enum TraceEvent {
         /// The offset within the current file the stream resumed from.
         offset: u64,
     },
+    /// A leader gave a snapshot stream up on RAFT.md's resend bound: the chunk outstanding
+    /// on it fell due once more than the bound allows with no answer from the follower
+    /// since it was last answered, and the stream ends without asking for a fresh take.
+    /// It is the bound reached, and on a receiver that answers what it holds it means the
+    /// follower went silent or the network lost every exchange in that time.
+    // PROPOSED(D-127): the resend bound's give-up is traced.
+    RaftSnapshotGaveUp {
+        /// The leader.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The follower.
+        to: u64,
+    },
     /// A Raft server adopted a completed snapshot install at its start (RAFT.md
     /// §1): the staged store was copied into the server's store directory and
     /// its `CURRENT` switched to it, and the incarnation that follows runs on the

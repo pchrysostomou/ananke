@@ -253,7 +253,13 @@ an admitted assembly holds is given up when that range's own Raft supersedes its
 sender — a chunk of that range from a leader at a higher term takes it — and on a
 leader change the node observes for a range, the node ends the assembly the old leader
 held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
-proposed). On the node a chunk and its response are taken off the wire by the `net`
+proposed). On the node a chunk the receiver holds is never left unanswered, since its
+sender cannot tell silence from loss and counts it against the resend bound: a chunk of
+a stream whose install is pending is answered `Waiting`, and a chunk that arrives while
+the `snapshot` task makes an install, which it answers nothing during, is answered
+`Waiting` by the `net` task; and an answer counts from when it reaches the sender's node,
+so a chunk whose answer waits behind the sender's own work is not resent or counted
+(issue #120; D-127, proposed). On the node a chunk and its response are taken off the wire by the `net`
 task and handed to the `snapshot` task before the node's inbox sees them, so they are
 charged to that task's receive cap and not to the inbox's byte bound, and so they
 arrive at all: the core's arm for them is empty because the server is expected to route
