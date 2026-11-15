@@ -1392,12 +1392,17 @@ fn seed_2147_an_install_decided_inside_an_isolation_begins_it_at_the_term_it_wro
 /// and its call stays open; the run ends 2.113 s after that call, past the 2 s bound, which takes
 /// away the exemption for a pending write on a range shown live. The range was live: under node
 /// 1 it completed writes to `k09` and `k10` after that call and served `k08`'s reads to the end.
-/// The client's next write to `k08`, at 5.581 s, was proposed by no leader and so left no
+/// The client's next write to `k08`, at 5.581 s, was sent to node 4, which holds no replica of
+/// range 30, and went unanswered under one try, so no leader proposed it and it left no
 /// operation.
 ///
 /// Whether a write the trace shows truncated before any apply is evidence for its key is a
 /// design question the documents do not settle, asked of the owner in D-127 (Q1, #250); this
 /// pin holds the shape and the verdict until then, so the day either moves it says so.
+///
+/// `Report::check` stops at its first violation, so while this pin stands the checks after the
+/// write bound are asked of the run here directly (D-127's second review, F3): the timer check
+/// on every live range, the shape, the meta convergence bound, D-092's retries and #45's kinds.
 // PROPOSED(D-127): an open question for the owner, the shape held until the ruling.
 #[test]
 fn seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_wedge() {
@@ -1465,6 +1470,28 @@ fn seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_w
         why.contains("liveness: no client write to k08 completed after the last heal"),
         "the verdict this seed is pinned for: {why}"
     );
+    // The checks `check` makes after the write bound, which its first violation hides.
+    let live = checked.ranges_with_a_majority_up();
+    let gaps: Vec<_> = checked
+        .timer_gaps(raft::TimerResets::ALL)
+        .into_iter()
+        .filter(|gap| live.contains(&gap.range))
+        .map(|gap| gap.violation())
+        .collect();
+    assert_eq!(
+        gaps,
+        Vec::<String>::new(),
+        "the timer check on every live range"
+    );
+    assert_eq!(report.shape(), Ok(()), "the shape");
+    assert_eq!(checked.stopped, None, "the run reached its schedule's end");
+    assert_eq!(
+        report.meta_converges(),
+        Ok(()),
+        "the meta convergence bound"
+    );
+    assert_eq!(report.retries_take_effect(), Ok(()), "D-092's retries");
+    assert_eq!(report.losses_are_named(), Ok(()), "#45's kinds");
 }
 
 /// Seed 8934, the sweep's first failure of the match-starts fold on the correct system, at the

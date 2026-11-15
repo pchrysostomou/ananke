@@ -25485,7 +25485,8 @@ for the owner, below, and not fixed here.**
    pending write on a range shown live after its call does not apply.
 5. The range was live. Under node 1 it completed writes to `k09` and `k10` after the call, and it
    served `k08`'s reads to the end.
-6. The client's next write to `k08`, at 5.581 s, was proposed by no leader, so it left no operation.
+6. The client's next write to `k08`, at 5.581 s, was sent to node 4, which holds no replica of
+   range 30, and went unanswered under one try, so no leader proposed it and it left no operation.
 
 The system did what Raft does: an entry a deposed leader proposed is lost at the new leader's
 first append, and only a retry could complete the write, which the harness forbids. The reading
@@ -25496,17 +25497,76 @@ the shape and today's verdict until the ruling, so either moving says so. Issue 
 **Question for the owner (D-127, Q1).** Under the per-key liveness reading, is a client write
 evidence for its key when the trace shows it proposed and then truncated before any apply?
 
-- **Recommended: no.** Read it the way a write no leader proposed is read already, as no evidence
-  (`lin.rs`). That means a post-heal write whose proposal its proposer truncated (`RaftProposed`,
+- **Recommended: no evidence where the range has completed a later write, and evidence
+  otherwise.** Take a post-heal write whose every proposal its proposer truncated (`RaftProposed`,
   then `RaftTruncate` from at or below its index) and whose entry no node applies at that index
-  and term leaves `post_heal_writes`. Two plants would show it changes nothing else: a wedged
-  range still fails the per-range reading (`recovery_from_the_heal`), and every liveness variant's
-  catch is unchanged.
+  and term. It is no evidence where the range serving its key at the run's end completed a client
+  write called after this write's call. For this kind of write alone that condition holds at any
+  distance from the call, past D-102's 2 s bound, since one try leaves such a write open for
+  ever. Every other pending write keeps D-102's exemption as it is. This is D-102's evidence, read
+  from the range serving the key, with one thing stricter: the completed write must have been
+  *called* after this one, not only returned after it. So a write already in flight before the
+  churn cannot speak for a range that has since stopped committing. On 6773 it excuses the put:
+  range 30 completed `k10`'s compare-and-set, called at 4.458 s and back at 4.500 s. Where the
+  range completes nothing called after the write, the write stays evidence in every reading. So a
+  range wedged by election churn, where every post-heal write is proposed and truncated and nothing
+  commits, still fails.
+- **Not the narrower form**, which drops such writes from the per-key reading only and keeps
+  them in `writes_after_heal_by_range` and `recoveries_by_final_range`. The per-range readings
+  stop at a range's first completion (#197, #158). So a range that completes one write after
+  the heal and then wedges by churn would pass every reading: its later writes would leave the
+  per-key reading, and the per-range readings would already have their completion. And on the
+  shard scenario `recovery_from_the_heal` reads every key as `FIRST_RANGE`'s
+  (`first_range_of_key`), so `Report::liveness` would pass the churn wedge itself, which only
+  `liveness_by_final_range`'s per-range arm would still see. The recommendation keeps the per-key
+  reading's catch in both cases.
+- **Not built.** No reading changes here, and seed 6773's pin holds today's verdict. If the
+  recommendation is built, these plants go with it:
+  - **the churn-wedge plant.** Take seed 6773's correct run and make range 30, `[k08, k11)`, a
+    wedge after the heal. Its 11 post-heal writes to `k08`, `k09` and `k10` are left pending, each
+    proposed and then truncated, none applied, and the run's own proposals of them are detached.
+    `liveness` and `liveness_by_final_range` must both still fail on `k08`. The second review's
+    `rr_q1_hides_a_range_whose_every_post_heal_write_was_proposed_and_truncated` builds it.
+  - **the same range recovering, then wedged.** Keep the first write to range 30 that completed
+    after the put's call (`k10`'s, at 4.458 s) and wedge every write called after it, as above.
+    Both readings must still fail, on `k09`.
+  - **the existing wedge pins**, which must not move:
+    `seeds_204_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse`,
+    `seed_145_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse` and
+    `seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tail`
+    (`sim/tests/node.rs`). Every liveness variant's sweep catch must not move either.
+  - **seed 6773's pin**, which flips. It is rewritten to assert that the run passes.
+
+  Measured with throwaway probes on this tree. Under the recommendation, both plants fail as they
+  must and seed 6773 passes `check`. Under the narrower form, the second plant passes both
+  readings and the first passes `liveness`. Under the wording first proposed here, both plants
+  pass both readings. The three node pins hold under all three, so they cannot tell the forms
+  apart, and the plants are needed.
 - **Alternative: the node answers the client of a truncated proposal**, which is known lost at the
   truncation, so the client can move it on as it moves a `NotLeader`. On 6773 the truncation came
   under 3 ms after the proposal, inside the 60 ms try. But it adds an answer to the wire and moves
   every schedule.
 - Under either, the bound and the one try stay.
+
+**Second review (before merge).** A second adversarial review of the fix above found Q1's
+recommendation wrong as first worded (F1, must-fix). It dropped every such write from
+`post_heal_writes`, which feeds both per-range readings as well. So a range in churn that
+completed nothing would have left all three readings, and the run would have passed while other
+ranges completed writes: the opposite of what the recommendation said. It is now bounded by the
+range's later completion, and its plants are named. The other confirmed findings:
+
+- Step 6 now says why the 5.581 s write left no operation (F2). Under one try, routing and
+  injected loss thin this seed's write evidence too: two more of that client's writes, to `k07`
+  at 5.170 s and to `k09` at 5.235 s, were dropped on the way to node 1.
+- `Report::check` stops at its first violation, so seed 6773's pin hid every check after the
+  write bound (F3). The pin now asks the run for them directly: the timer check on every live
+  range, the shape, the meta convergence bound, D-092's retries and #45's kinds. Each, planted to
+  fail, fails the pin at its own assertion.
+- Issue #250 named a function that does not exist; it now names `Report::created_term_by` (F5).
+
+F4 was refuted. It said that a re-seeded core's carried-over term breaks "What it gives up". But
+such a core traces `RaftReseeded` at its creation's instant, so `reseeding_during` skips it
+before `created_term_by` is read.
 
 ### Consequences
 

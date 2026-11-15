@@ -125,7 +125,10 @@ _Update this section at the end of every session._
   Fixed (`Report::created_term_by`, a unit test that the reading before fails, seed 2147's pin). 6773
   is the per-key liveness reading counting a write truncated by an election, which one try leaves
   open for ever, on a live range: **D-127 Q1 asks the owner** whether such a write is evidence
-  (recommended: no); seed 6773's pin holds the shape and today's verdict until the ruling (#250).
+  (recommended: not where the range serving its key completed a write called after it, so a range
+  in churn that completes nothing still fails; not built, its plants named; second review F1);
+  seed 6773's pin holds the shape and today's verdict until the ruling, and asserts the checks
+  after the write bound directly (#250).
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),
