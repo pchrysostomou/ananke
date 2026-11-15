@@ -26398,4 +26398,159 @@ Seeds 0 to 19 999 of the sharded sweep, in release, ran on this tree beside its 
 
 ---
 
-_Next entry: D-135. Add one before implementing anything not covered above._
+## PROPOSED D-141 — Check 8's right half's clause under the owner's reading R of D-107, asserted beside the node sweep's and the sharded sweep's verdicts, with `RestartDropsRightHalves` its instrument; the installed voter's bound measured, failed by the correct system on #220's wedge, and put to the owner
+
+**The number.** Off 8760c49 (#236), whose footer reads D-135. This entry is D-141, the number given to S8 (c)'s clause half: D-135 to D-140 are not in this tree, and D-139 and D-140 are reserved by PRs in flight. The footer names D-142. Every code site carries a `// PROPOSED(D-141)` marker line, or names PROPOSED D-141 in the comment it sits under.
+
+**The owner's ruling (2026-11-14, D-107): reading R.** This is D-107's recommendation as written. R is owed from an apply of `s`, meaning `RangeSplit` or the `RaftApply` of `s` with effect `took`. It is kept across restarts until R's `RangeRemoved` or a refusal. A restatement past `s` owes R only where the node's replica of P was not installed at or past `s` since its last refusal. The voter installed past `s` is held to R by a check of its own: R created on it within a bound measured on the correct system (#170). Both are asserted from the placeholders' slice, and D-109 is merged. This entry builds the first half and asserts it. It builds and measures the second half and does **not** assert it, because the correct system fails it (§2) and no document grants that bound an exception. The bound is the owner's call (§6).
+
+### 1. What is built
+
+- **The clause under reading R** (`OneOwnerPerKey`, `crates/ananke-shard/src/invariants.rs`).
+  - *What counts as an install.* Either a switch's read-back, `RaftSnapshot { taken: false }` outside a restatement, at its `last_index` and dated at its switch's `SpanInstalled`; or a switch a crash cut before that read-back, at the applied index the node's next restatement states P at.
+  - *What the fold keeps.* Per node and range, the highest index an install put the replica at since the node's last refusal; and beside each restatement of a range, that index as it stood when the restatement stated the range.
+  - *How a restatement is read.* A restatement of P at or past `s` is read as an apply of `s` only where no such install had reached `s` when the restatement stated P. An install read after the restatement excuses nothing in it, even where the split becomes known only after that install. Where one had, the restatement owes nothing. It is recorded as excused (`OneOwnerPerKey::excused`) where the voter had not applied `s`, with whether R was held when the restatement closed: those are the restatements where reading R and §8's reading differ. A voter that applied `s` owes R from its apply under either reading, so its restatements are not recorded.
+  - *An apply still owes R.* An apply of `s` (`RangeSplit`, or a `RaftApply` with effect `took`) owes R from then on, across restarts, as before.
+  - *An installed voter owes R once it holds it.* From its creation of R, which ends its wait, or from the install itself where R is already among its spans, the installed voter owes R as an applier does: across its restarts, until R's `RangeRemoved` or a refusal. The clause's words then name the install rather than an apply. Without this, a voter given R and then restarted without it passed every check: its restatement was excused, and no wait was open to measure the loss.
+- **The installed voter** (`OneOwnerPerKey::installed_voters`, `InstalledVoter`, `WaitEnded`). It is a voter of P at a known split `s` whose P an install put at or past `s` since its last refusal, which has not applied `s` and holds no R. Its wait opens at the install's switch. It ends when its node creates R, whatever the cause, or at a refusal. A crash does not end it. From the creation that ends it, the node owes R (above). `Checker::owners` exposes the fold, and `OneOwnerPerKey::crash_cut_installs` counts the installs read off a restatement because a crash cut their switch before its read-back.
+- **Where the clause is asserted.** It stays out of `Checker::verdict` (`Fold::VERDICT`). Every node scenario and variant test reads that verdict, and no other scenario has been measured under reading R. Instead `raft::Report::right_half_held` asks the clause. The node sweep (`every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`) and the sharded sweep (`every_seed_passes_on_the_correct_sharded_sweep`) each put it into every seed's verdict beside their own checks. The correct node's fold-by-fold test (`the_range_layers_folds_agree_one_by_one_on_the_correct_node`) asserts it absent on every seed it compares.
+- **Seed 45's plant, in that fold-by-fold test.** The plant took out node 2's creation of right half 14 and its restatements of 14. Under reading R that voter is installed past the split, so it would be excused, and the plant would no longer trip anything. The plant now also takes out node 2's switches and read-backs of range 4's installs. Its restatement past the split then reads as an apply of the split: the crash between a split's durable batch and its trace, which is the shape the restated form is there for. The comparison is held in violation there as before, in the pinned words.
+- **Seed 45's pin** (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`) now also asserts two things. Node 2 is an installed voter of range 4's split at 165, and its wait ended when 14 was created. Its restatement past the split was excused, and it held 14 there. The pin prints the wait, 694 ms, and asserts no bound on it.
+- **The instrument, `RangeVariant::RestartDropsRightHalves`** (bit 11), outside §10's count. Node 1's restart skips `discover_ranges`, so it reopens none of the replicas that no configuration names. Every right half node 1's splits made is gone at its next start, and so is every replica an install made there. Its keys stay in the engine, and no `RangeRemoved` is traced. §10's variant for the clause, `SplitNotAtomicWithDescriptor`, is Stage D's. D-107 measured the same shape on all three nodes as a planting, caught on 98 of 100. Its test is in §4.
+- **The measurement, which is not asserted.** Both sweeps print four things at every tier:
+  - the clause's trips;
+  - what reading R excused, and of that what held no R;
+  - the installs read off a restatement, a crash having cut their switch;
+  - the installed voters' waits: how many were given R, refused first, or still waiting at the end, and on how many seeds one is late against the candidate bound `raft::RIGHT_HALF_ARRIVAL` of 5.63 s. The first late voter's words are printed too (`raft::right_half_late`).
+
+  The constant and the function are documented as measurement, not asserted until the owner rules.
+- **Coverage.** The sharded sweep asserts two counters, each where its rate supports it (D-061). Without them, the clause would be asserted only where reading R and §8's reading say the same thing.
+  - *A restatement read past.* A voter that had not applied `s` restated P past `s` after an install, and reading R did not read it as an apply. Measured on 4 of the first 20 sharded seeds, 13 of the first 100, 111 of the first 1 000 and 1 248 of 10 000, which is 12.5 %. At that rate twenty seeds would see none about one time in 14, and a hundred about once in 600 000. So it is asserted from CI's hundred.
+  - *A verdict changed.* Such a restatement held no R: §8's reading fails it, and reading R passes it. Measured on 2 of the first 100, 16 of the first 1 000 and 202 of 10 000, which is 2.0 %. That is under 5 %, so it is asserted from the thousand, where at the first thousand's 1.6 % it misses about once in 10^7.
+
+  The node sweep prints both counters and asserts neither. On the correct node the first appears on 3 of the first 1 000 seeds (45, 401 and 878), so a thousand seeds would miss it about one time in 20.
+- **Unit tests over hand-written records.**
+  - `a_voter_installed_past_a_split_is_an_installed_voter_and_owes_no_right_half_at_its_restart` covers: an install read back; one cut by a crash; a refusal, which ends the wait and forgets the install; an install below the split; a restatement's own `RaftSnapshot`; a voter that applied the split, whose restatements after an install are not recorded as excused and which, restarted without R, is caught in the apply's words; and a non-voter.
+  - `an_installed_voter_given_its_right_half_owes_it_across_its_restarts` covers: a voter given R by its placeholder's install and restarted without it, caught in the install's words; the same caught at a later restart after one that kept R; a voter that already held R when the install was read, owing R from there; and a `RangeRemoved` of R and a refusal, each of which ends the obligation.
+  - `an_install_after_a_restatement_does_not_excuse_it_when_the_split_becomes_known` covers the restatement past `s` without R before any replica traced the split, followed by an install past `s`, and only then the split's trace: caught in the apply's words. With the install read before the restatement, the restatement is excused and the voter is an installed voter.
+  - The existing right-half test's restated-form case is split in two. A restatement with no install owes R. A restatement after an install past `s` is excused, and the voter is an installed voter.
+  - `an_installed_voter_is_late_only_past_the_bound`, in `sim/raft.rs`, covers `raft::right_half_late`.
+- **Built, measured and removed: `PlaceholderAnswersNothing`.** It was a placeholder that answers nothing, meant as the bound's instrument. On 100 node seeds it never reached the bound: one installed voter in the hundred, given R in 1.04 s. With the bound not asserted, nothing catches it, and the pair rule forbids a variant nothing catches. It comes back with the owner's ruling on the bound.
+
+### 2. The measurement, on the correct system, under reading R
+
+These were taken on 8760c49 with this work, in release, by a scratch probe, before the review's fixes (§7). It folded each seed's trace as the tests here do, and it is in no tree. Its "excused" counts every restatement past `s` after an install, a voter that applied `s` included; the final tree counts only the voters that had not applied it (§1). The final tree's figures follow the probe's.
+
+**The sharded sweep, seeds 0 to 9 999.**
+
+- **The sweep's own checks** (`report.check()`): 0 seeds fail.
+- **The clause under reading R: 0 seeds fail.**
+  - §8's reading would have failed **202**. It finds 244 restatements past a split without R, and an install since the voter's last refusal excuses every one of them.
+  - Reading R excused 5 387 restatements in all.
+- **Installed voters:** 9 200 on 4 982 seeds.
+  - 8 577 were given R. The worst wait was 2.815 s from the install's switch: seed 3378, node 3, right half 36, with a crash inside the wait. The worst on a uniform seed was 2.181 s.
+  - 63 were refused first.
+  - 560 were still waiting when the run ended.
+- **The bound, at twice the worst: 5.63 s.** That is D-076's rule, as for `READS_OUTSTANDING`. **At 5.63 s, 189 installed voters are late, on 117 seeds.** 81 of the 189 are on uniform seeds, and 53 seeds still fail with the non-uniform ones left out. 188 of the 189 were still waiting at the end, and 1 was refused after the bound ran out.
+- **What the late voters are.** Each was read against #220's reading (`shard::RightHalf`):
+  - On none of the 189 did R elect a leader after the install, and on none did a leader stand at the end.
+  - R had one voter able to vote on 165 of them, and none on 24.
+  - **131 meet all three of #220's conditions.**
+  - **The other 58 fail condition 3 only.** The third voter holds a replica of R that cannot vote because it is quarantined after a refusal (D-130). Seed 36 shows it: node 2 is refused at 1.35 s and its replica of right half 11 is quarantined; node 3 alone can vote; node 1 had range 2 installed at 138, past the split at 128, and waits 6.1 s, to the run's end. Seeds 36 and 828 were read by hand. #220's narrow exception does not cover this form, even for the meta convergence bound.
+- **The 117 seeds:** 36, 68, 328, 336, 547, 602, 654, 828, 835, 1107, 1310, 1429, 1453, 1551, 1571, 1598, 1617, 1679, 1718, 1720, 1806, 1911, 2135, 2191, 2316, 2438, 2483, 2514, 2613, 2710, 2797, 2811, 2861, 2887, 2902, 2918, 2988, 3286, 3288, 3292, 3363, 3375, 3400, 3411, 3489, 3649, 3829, 3868, 3899, 3947, 4023, 4262, 4298, 4347, 4355, 4458, 4502, 4696, 4987, 5285, 5545, 5697, 5766, 5832, 5896, 5913, 5951, 5966, 6203, 6232, 6245, 6306, 6357, 6526, 6575, 6586, 6605, 6699, 6701, 6742, 6939, 6979, 7206, 7333, 7566, 7637, 7840, 7945, 8020, 8135, 8183, 8207, 8230, 8292, 8349, 8385, 8413, 8441, 8518, 8579, 8738, 8763, 8892, 8984, 8992, 9144, 9440, 9459, 9523, 9640, 9724, 9805, 9806, 9820, 9830, 9890, 9904.
+- **The bound measured from the last heal does not help.** The worst wait measured from the heal is 1.774 s, so twice the worst would be 3.55 s. The run settles for only 2.2 s after its last heal, so a wait still open at the end could never be late, and the bound could never trip.
+
+**The node sweep, seeds 0 to 999.**
+
+- **Every seed passes its checks, and the clause under reading R holds on every seed.**
+  - §8's reading would have failed one seed, 878. It is D-107's own seed: node 1's replica of range 5 is installed past its split at 71 and restarts without right half 46. 46 arrived 1.846 s after the install.
+  - Reading R excused 322 restatements on 239 seeds, 1 of them without R (seed 878's).
+- **Installed voters:** 15 on 15 seeds. Every one was given R, the worst in 1.846 s, and none is late.
+
+**The final tree, after the review's fixes, in release: the tests themselves.**
+
+- **The sharded sweep at 10 000 seeds** (`ANANKE_SEEDS=10000`) passes every seed, with the clause and both coverage assertions. It took 2 452.9 user + 76.6 sys cpu s.
+  - The clause trips on 0 of 10 000. So owing R from an installed voter's holding it, and reading an install as it stood at the restatement, trip the correct system nowhere: no install-made replica is lost at a restart on any of the ten thousand.
+  - Reading R read past 1 926 restatements by a voter that had not applied the split, on 1 248 seeds: 4 of the first 20, 13 of the first 100, 111 of the first 1 000. 244 of them held no R, on 202 seeds: 0, 2 and 16 of the first 20, 100 and 1 000. Those 202 are the seeds §8's reading fails, the probe's 202.
+  - The fold read 162 installs off a restatement, a crash having cut the switch, on 160 seeds (20 on 20 of the first 1 000).
+  - Installed voters: 9 200 on 4 982 seeds. 8 577 were given R: median 232 ms, p99 1.449 s, worst 2.816 s. 63 were refused first. 560 were still waiting at the end, the longest for 14.108 s.
+  - Against 5.63 s, a voter is late on 117 seeds, the probe's list exactly; on 9 of the first 1 000 (36, 68, 328, 336, 547, 602, 654, 828 and 835).
+- **The node sweep at 1 000 seeds** passes, with the clause. It took 531.4 user + 14.4 sys cpu s. The clause trips on 0 of 1 000. Reading R read past 3 restatements by a voter that had not applied the split, on seeds 45, 401 and 878, and 1 of them held no R, seed 878's. The fold read 28 installs off a restatement, on 28 seeds. Installed voters: 15 on 15 seeds, every one given R, median 355 ms, worst 1.846 s, none late.
+- **The correct node's fold-by-fold test at 100 compared seeds** passes. The clause is absent on all 100, and seed 45's plant is compared in violation in its pinned words.
+- **Seed 45's pin** passes. Node 2 waited 694 ms for 14.
+- **The unit tests pass:** `ananke-shard`'s 194 and `sim/raft.rs`'s `an_installed_voter_is_late_only_past_the_bound`.
+
+### 3. D-113 §11's nine seeds, as they stand
+
+D-113 §11 found the clause, as §8 words it, tripping on nine of the sharded sweep's first thousand seeds: 281, 328, 444, 458, 508, 519, 525, 784 and 825. Their schedules have moved since, because D-128 to D-134 and S11's shapes all landed after §11. On 8760c49 under reading R, **none of the nine trips the clause.**
+
+- **444, 525, 784 and 825** would still trip under §8's reading. Each is D-107's shape: a voter installed past the split restarts and restates P without R. All four voters crashed inside their wait and were given R afterwards: 587 ms, 1.605 s, 800 ms and 531 ms after their installs.
+- **281, 458 and 519**: every restatement past a split that reading R excused held R.
+- **281**, where §11 found R never arriving: every installed voter now gets R within 490 ms, and the run no longer reaches the deadlock of two refused nodes.
+- **508**: no restatement was excused. Two installed voters are still waiting at the run's end, within the candidate bound (4.853 s and 3.658 s), and one was refused first.
+- **328** is one of the 117. Nodes 3 and 1 are still waiting for right half 29 of range 27 when the run ends, 7.116 s and 6.374 s after their installs. That right half has one voter able to vote, and both others are placeholders whose parent is past the split: #220's three conditions.
+- **The crash-cut install no longer occurs on 281, 458 or 784**, §11's crash-cut seeds: on each, every switch is read back before any crash. So the fold's crash-cut reading (`switched_unread`) is shown working by its unit test alone on those seeds. The two sweeps now print how many installs the fold read off a restatement: on the sharded sweep 162 on 160 of 10 000 seeds, and on the node sweep 28 on 28 of its first 1 000. One misreading is known and harmless. A split's non-voter step traces a `SpanInstalled` naming P's Raft keys. Where a crash falls between it and its `RangeSplit`, the step is read as an install of P at the split. The node is no voter of P at that split, so the install excuses nothing and opens no wait there, and its index is below every later split of P.
+
+### 4. The pair
+
+**`RestartDropsRightHalves`**, `the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves`. It is compared fold by fold on the node sweep's `range_folds_compared()` seeds, which D-106 asks of each of the range layer's folds against the variant that trips it. Measured on the final tree, in release, it is caught on 10 of the gate's 20 seeds and 52 of 100. Every catch is node 1's, at its restatement, so the catch is asserted at every tier (D-061: far above 5 %), and so are its words. Before the review's fixes, a scratch probe ran seeds 0 to 999: 539 of the 1 000 were caught, every one in those words. No fold that stops a run (`Fold::VERDICT`) tripped on any of the thousand. `report.check()` failed 204 of them, by other checks, which this test does not read. The variant also drops install-made replicas, so owing R from an installed voter's holding it can only add catches.
+
+**The pair's correct half** is `the_range_layers_folds_agree_one_by_one_on_the_correct_node`, on the same `range_folds_compared()` seeds: it asserts the clause absent on every one, before anything else it asks of the clause. The instrument's test no longer re-runs the correct node itself; the sibling instruments' tests leave that half to the same correct-node test.
+
+**No other variant trips the clause.** The probe ran every variant of both sets on 100 node seeds, 65 with this work's two. Only `RestartDropsRightHalves` tripped the clause, on 52 of the 100.
+
+### 5. Each new assertion seen to fail
+
+Each plant was applied to the tree, run in release, and reverted, and the sources were then compared byte for byte with copies saved before. A, F1 to F3, COV1 and COV2 ran on the final tree, as one build whose plants an environment variable switched on one at a time. B, D and E ran on the tree the review read; the review's fixes do not touch what they plant out. B applies two plants at once; the test that fails tells them apart.
+
+| Plant | What failed |
+|---|---|
+| A: node 1 drops its right halves at every restart, as if the instrument were always on (`server.rs`) | The correct node's fold-by-fold test, at its absence assertion, at 20 seeds: the clause in violation on 10 of 20, first "node 1 is a voter of range 4's configuration at its split at index 36, its replica of range 4 has applied it, and at its restatement it holds no replica of the right half 14". The sweeps fail first on other checks under this plant (the node sweep on a placeholder answering for a replica, the sharded sweep on state machine safety), so plant D is what isolates the clause there |
+| B: the clause out (`right_half_verdict` always `Ok`), and no installed voter ever opened | The instrument's test, caught on none of 20. Seed 45's pin: node 2 is not an installed voter. `a_voter_installed_past_a_split_is_an_installed_voter_and_owes_no_right_half_at_its_restart`, and every right-half unit test |
+| D: the clause reports node 1 missing every right half it owes, with the server untouched | The node sweep's verdict, in the clause's words, on all 20 seeds. The sharded sweep's verdict, the same, on 19 of 20 |
+| E: seed 45's plant without its installs taken out, the plant as it stood before this entry | The fold-by-fold test's planted shape: nothing is compared in violation, since reading R excuses the voter |
+| F1: an installed voter never owes R, neither at its creation of R nor where it held R at the install | `an_installed_voter_given_its_right_half_owes_it_across_its_restarts`, at its first case: `Ok` where the voter given R restarts without it. Every other `ananke-shard` test passes |
+| F2: a voter that applied the split is recorded as excused | `a_voter_installed_past_a_split_is_an_installed_voter_and_owes_no_right_half_at_its_restart`: `[Excused { node: 2, …, held: true }]` where `[]` is asserted |
+| F3: the restated form asks the install as it stands at the split's registration, not at the restatement | `an_install_after_a_restatement_does_not_excuse_it_when_the_split_becomes_known`, at its first case: `Ok` |
+| COV1: nothing recorded as excused | The sharded sweep at 100 seeds, at its first coverage assertion: nothing read past on any of 100. Seed 45's pin: node 2's restatement was not excused holding 14 |
+| COV2: every excuse recorded as holding R | The sharded sweep at 1 000 seeds, at its second coverage assertion: nothing excused without R on any of 1 000, with the first assertion passing (111 seeds) |
+
+### 6. Why the bound is not asserted
+
+An installed voter gets R in one of two ways: it applies the split, which an install past `s` rules out, or R's leader installs R through its placeholder. When R can elect no leader, neither can happen, so the voter waits for the rest of the run. That is #220's wedge, seen from the voter's side. The bound read off the correct system fails it on 117 of 10 000 seeds. A bound is never widened (D-030, D-039, D-063, D-091). #220's ruling of 2026-11-09 excuses its narrow form from the meta convergence bound alone, and no ruling excuses anything from this bound. So the bound stops here, measured and printed, and goes to the owner.
+
+### 7. The review, before merge
+
+The review of the staged tree found two must-fix defects and six nits. Each is fixed in this entry and its tree.
+
+- **F1 (must-fix): an installed voter given R and then left without it passed every check.** Its wait ended at R's creation and nothing was owed, so its next restatement without R was excused and opened no wait, however many restarts followed. A regression in `discover_ranges` reopening no install-made replica (D-109) would have passed check 8. *Fixed*: the installed voter owes R from the moment it holds it (§1, choice 6). The sharded sweep's 10 000 seeds and the node sweep's 1 000 were re-measured: the correct system trips it on none.
+- **F2 (must-fix): the coverage assertion counted restatements where both readings agree.** It counted voters that had applied `s` and voters that held R, and at the gate's 20 seeds every excuse it saw was of that kind. *Fixed*: `Excused` records only voters that had not applied `s`, and its doc says so. The counter is measured at 3 of the node sweep's first 1 000 seeds, too few to assert at any tier, and at 12.5 % on the sharded sweep. So the sharded sweep asserts it from the hundred, and asserts the unheld case, where the verdicts differ, from the thousand (§1). The node sweep prints both.
+- **F3 (nit): an install excused an earlier restatement retroactively.** Where a split became known after both, the restated form asked the install as it stood then. *Fixed*: each restatement keeps the install's index as it stood when it stated the range, and the split's registration reads that.
+- **F4 (nit): the node sweep at 10 000 seeds was unmeasured, and the entry was silent.** *Stated* in the tiers paragraph: ten thousand node seeds are about 5 800 cpu s, which the pre-merge nightly spends.
+- **F5 (nit): the crash-cut install's path is not reached on §11's seeds.** *Stated* in §3, and both sweeps now print the crash-cut installs' rate.
+- **F6 (nit): the instrument's test re-ran the correct node**, which the correct node's fold-by-fold test already asserts on the same seeds. *Fixed*: dropped, and that test is cited as the pair. Its absence assertion now comes before its seed-45 planting, so plant A fails it there, in the clause's words. The row is re-weighed.
+- **F7 (nit): markers.** The new helpers, accessors and the server site carry `// PROPOSED(D-141)` lines.
+- **F8 (nit): `docs/BOOTSTRAP_PROMPT.md`'s current status** carries this branch.
+
+### For the owner (PROPOSED)
+
+**The question: the installed voter's bound.** It fails the correct system on 117 of 10 000 sharded seeds. On every one, R elects no leader after the install.
+
+- **(a) Wait for #220's fix, then measure the bound on the tree that has it and assert it at twice the worst** (D-076). **Recommended.** It widens no bound and grants no new exception. Until the fix lands, the clause is asserted and the waits are printed every night, so the 117 stay visible, and their disappearance will show the fix working.
+- **(b) Extend #220's narrow exception to this bound.** The extension must include the form where the third voter holds a quarantined replica (58 of the 189), which even the meta convergence bound does not excuse. This asserts the bound now, at the cost of a second exception that is wider than the first.
+- **(c) Measure the bound from the last heal instead of from the install.** This is shown useless (§2). Twice the worst wait from the heal is 3.55 s, longer than the 2.2 s the run settles after its last heal, so the bound could never trip.
+
+**This entry's own choices, also PROPOSED:**
+
+1. **The clause sits in the two sweeps' verdicts, not in `Checker::verdict`.** The other scenarios that run the node (membership, quorum, re-seed, split, install) have not been measured under reading R. Recommended: measure each, then move the clause into the checker's verdict in a change of its own.
+2. **`RestartDropsRightHalves` is the clause's instrument in Stage C,** outside §10's count, until Stage D builds `SplitNotAtomicWithDescriptor`.
+3. **`RIGHT_HALF_ARRIVAL` and `right_half_late` stay as printed measurement** rather than being removed. The nightly then shows the 117, and will show them gone once #220's fix lands.
+4. **SHARD.md §8's text for check 8 is not amended here.** It still reads the restated form as §8 words it. Recommended: amend it to reading R in one edit, with the owner's ruling on the bound.
+5. **D-107's seed 878 is not pinned.** It is the one seed of the node sweep's first thousand where §8's reading and reading R differ. A pin would assert that reading R excuses it and that 46 arrives.
+6. **The installed voter owes R from the moment it holds it**, kept across its restarts as an applier's R is (§1). The ruling holds the installed voter to R's arrival within a bound. This entry also holds it to keeping R once it arrives. That follows D-107's own reason for the installed voter's check, that a voter left without R stays visible whether or not it restarts. Without it, a regression in `discover_ranges` that stopped reopening install-made replicas (D-109) would pass check 8 on every seed where the voter got R before its restart.
+
+**Tiers (D-061, D-064).** The instrument's test is new. It compares `range_folds_compared()` seeds: the gate's 20, and 100 from CI's tier up. Its nightly row is in `scripts/nightly-shards.txt`, and `scripts/check-nightly-shards.sh` passes. The two sweeps keep their rows. The unit tests are in the crates' libs, which the `rest` job runs. The row: shard 4, `node`, 33.5 cpu s at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, the median of three runs under load averages of 209 to 214. It was 65.3 while the test re-ran the correct node. Shard 4 goes from 2231.2 to 2264.7. The sharded sweep's two coverage assertions fire from CI's hundred and from the premerge's thousand, at the rates in §1. **The node sweep has not been run at 10 000 seeds under reading R.** Its first 1 000 are measured here, and the pre-merge nightly is the first measurement of its ten thousand. D-107 had §8's reading trip 13 of 10 000 node seeds before the placeholders.
+
+---
+
+_Next entry: D-142. Add one before implementing anything not covered above._

@@ -3564,7 +3564,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // on a node that joined, every replica an install made on it (PROPOSED
             // D-109); the anchor holds no descriptor and is no range.
             // PROPOSED(D-100)
-            let discovered = discover_ranges(anchor.engine(), &hosted).await?;
+            // The instrument that drops node 1's right halves at its restart reopens
+            // none of them, nor any replica an install made there (PROPOSED D-141).
+            // PROPOSED(D-141)
+            let discovered =
+                if server == 1 && range_variants.contains(RangeVariant::RestartDropsRightHalves) {
+                    Vec::new()
+                } else {
+                    discover_ranges(anchor.engine(), &hosted).await?
+                };
             for range in hosted.iter().skip(1).cloned().chain(discovered) {
                 let (store, recovered) = anchor
                     .open_sibling(KeyPrefix::group(range.id.get()))

@@ -16,7 +16,8 @@
 //!   makes: the four log invariants keyed by range, linearizability of the
 //!   clients' history, pre-vote's property per (range, server), the timer check,
 //!   the liveness bound and the write bound per key of a range whose unimpaired
-//!   replicas form a majority;
+//!   replicas form a majority; and, beside them, check 8's right half's clause under
+//!   the owner's reading R of D-107 (PROPOSED D-141);
 //! - Phase 2's variants on these arms are caught on the node too, each at the tier
 //!   its **measured** rate supports and no stronger than its Phase 2 test asserts
 //!   (§10, D-061). Every rate is printed;
@@ -408,10 +409,33 @@ struct Coverage {
     /// holds to its map.
     restatements: usize,
     descriptors_stated: usize,
-    /// Check 8's right-half clause over the correct node, **folded and not asserted**
-    /// (PROPOSED D-107): the seeds on which a voter of a parent at its split restated
-    /// the parent at or past the split without the right half, with the violation.
+    /// Check 8's right-half clause over the correct node under the owner's reading R,
+    /// asserted beside the checker's verdict (PROPOSED D-141): the seeds on which it
+    /// tripped, with the violation, which the sweep's verdict fails.
     right_half_not_restated: Vec<(u64, String)>,
+    /// The restatements past a split the clause excused, by a voter that had not applied
+    /// it and whose P an install had put there since its last refusal (`Excused`), and the
+    /// seeds on which one was; then those of them that held no right half at the
+    /// restatement — the shape D-107 found the clause tripping on, where reading R passes
+    /// what §8's reading fails — and their seeds (PROPOSED D-141, review F2).
+    right_half_excused: usize,
+    right_half_excused_seeds: Vec<u64>,
+    right_half_excused_unheld: usize,
+    right_half_excused_unheld_seeds: Vec<u64>,
+    /// The installs check 8's fold read off a restatement, a crash having cut the switch
+    /// before its read-back, and on how many seeds (PROPOSED D-141, review F5).
+    crash_cut_installs: usize,
+    crash_cut_install_seeds: usize,
+    /// The installed voters' waits (PROPOSED D-141), measured and not asserted: ended by
+    /// their node's creation of the right half, how long each took; ended by a refusal;
+    /// still open at the run's end, how long each had waited; on how many seeds one
+    /// opened; and the seeds on which one was late against the candidate bound
+    /// `raft::RIGHT_HALF_ARRIVAL`, with the first late voter's words.
+    installed_waits: Vec<Duration>,
+    installed_refused: usize,
+    installed_open: Vec<Duration>,
+    installed_seeds: usize,
+    installed_late: Vec<(u64, String)>,
     /// What the placeholders did over the tier (SHARD.md §5, Q22), summed, and on how
     /// many seeds a placeholder was made, was installed into, and had an install refused
     /// for overlapping a replica (PROPOSED D-109).
@@ -513,6 +537,21 @@ impl std::fmt::Debug for Coverage {
             .field("restatements", &self.restatements)
             .field("descriptors_stated", &self.descriptors_stated)
             .field("right_half_not_restated", &self.right_half_not_restated)
+            .field("right_half_excused", &self.right_half_excused)
+            .field("right_half_excused_seeds", &self.right_half_excused_seeds)
+            .field("right_half_excused_unheld", &self.right_half_excused_unheld)
+            .field(
+                "right_half_excused_unheld_seeds",
+                &self.right_half_excused_unheld_seeds,
+            )
+            .field("crash_cut_installs", &self.crash_cut_installs)
+            .field("crash_cut_install_seeds", &self.crash_cut_install_seeds)
+            .field("installed_waits", &self.installed_waits.len())
+            .field("installed_wait_max", &self.installed_waits.iter().max())
+            .field("installed_refused", &self.installed_refused)
+            .field("installed_open", &self.installed_open)
+            .field("installed_seeds", &self.installed_seeds)
+            .field("installed_late", &self.installed_late.len())
             .field("placeholders_made", &self.placeholders.made)
             .field("placeholders_by_split", &self.placeholders.by_split)
             .field("placeholders_installed", &self.placeholders.installed)
@@ -546,11 +585,47 @@ impl Coverage {
         let checker = invariants::folded(&report.records);
         self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
         self.descriptors_stated += checker.descriptors().statements();
-        // PROPOSED(D-107): check 8's right-half clause, folded over the correct node
-        // and printed, not asserted.
+        // PROPOSED(D-107): check 8's right-half clause, folded over the correct node.
+        // PROPOSED(D-141): under reading R, asserted by the sweep's verdict
+        // (`raft::Report::right_half_held`); printed here with what it excused, and the
+        // installed voters' waits, measured against the candidate bound and not asserted.
         if let Err(violation) = checker.verdict_of(Fold::RightHalf) {
             self.right_half_not_restated.push((report.seed, violation));
             self.right_half_not_restated.sort();
+        }
+        let owners = checker.owners();
+        let unheld = owners.excused().iter().filter(|e| !e.held).count();
+        self.right_half_excused += owners.excused().len();
+        self.right_half_excused_unheld += unheld;
+        if !owners.excused().is_empty() {
+            self.right_half_excused_seeds.push(report.seed);
+            self.right_half_excused_seeds.sort_unstable();
+        }
+        if unheld > 0 {
+            self.right_half_excused_unheld_seeds.push(report.seed);
+            self.right_half_excused_unheld_seeds.sort_unstable();
+        }
+        self.crash_cut_installs += owners.crash_cut_installs();
+        self.crash_cut_install_seeds += usize::from(owners.crash_cut_installs() > 0);
+        self.installed_seeds += usize::from(!owners.installed_voters().is_empty());
+        if let Some(late) = raft::right_half_late(
+            owners.installed_voters(),
+            report.ended,
+            raft::RIGHT_HALF_ARRIVAL,
+        ) {
+            self.installed_late.push((report.seed, late));
+            self.installed_late.sort();
+        }
+        for voter in owners.installed_voters() {
+            match voter.ended {
+                Some((at, invariants::WaitEnded::Created)) => {
+                    self.installed_waits.push(at.duration_since(voter.since));
+                }
+                Some((_, invariants::WaitEnded::Refused)) => self.installed_refused += 1,
+                None => self
+                    .installed_open
+                    .push(report.ended.duration_since(voter.since)),
+            }
         }
         // PROPOSED(D-109): the placeholders.
         let placeholders = raft::placeholders_of(&report.records);
@@ -1062,7 +1137,9 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     let coverage = std::sync::Mutex::new(Coverage::default());
     let verdicts = sweep(seeds, |seed| {
         let report = correct(seed);
-        let outcome = checked(&report);
+        // PROPOSED(D-141): check 8's right half's clause under reading R, asked of the
+        // correct node beside the checker's verdict.
+        let outcome = checked(&report).and_then(|()| report.right_half_held());
         coverage.lock().expect("the coverage").add(&report);
         if outcome.is_err() {
             write_trace(&format!("node-{seed}"), &report.jsonl());
@@ -1149,19 +1226,59 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         coverage.descriptors_stated,
         coverage.restatements
     );
-    // Check 8's right-half clause, folded over every seed and **not asserted** until the
-    // owner rules on how it reads a voter installed past the split (PROPOSED D-107).
-    // Before the placeholders such a voter held no R and got none back, and the
-    // restatement after its next restart read as an apply of the split without R; now
-    // its placeholder takes R's snapshot (below), and the clause as §8 words it held on
-    // every one of the correct node's first thousand seeds (PROPOSED D-109). Printed at
-    // every tier, with every seed's violation.
+    // Check 8's right-half clause under the owner's reading R of D-107 (2026-11-14) is
+    // asserted by the sweep's verdict above (`raft::Report::right_half_held`; PROPOSED
+    // D-141): R owed from a voter's apply of the split and kept across its restarts, from
+    // a restatement past the split only where no install had put the voter's P there since
+    // its last refusal, and from an installed voter's holding R. Printed at every tier:
+    // the clause's trips (which the verdict fails), what reading R excused — restatements
+    // by a voter that had not applied the split, where the two readings differ, and of
+    // them those without R, where §8's reading fails and reading R passes — and the
+    // installs read off a restatement. Reading R's excuse is not asserted reached here:
+    // measured on 3 of the correct node's first 1 000 seeds (45, 401, 878), a thousand
+    // seeds would see none about one time in 20 (0.997^1000), so the sharded sweep, where
+    // it is far commoner, asserts it (D-061; review F2). The installed voters' waits are
+    // printed against the candidate bound `raft::RIGHT_HALF_ARRIVAL` and **not asserted**:
+    // the correct system fails that bound on the sharded sweep, and it waits on the owner
+    // (D-141's question).
+    let mut waits = coverage.installed_waits.clone();
+    waits.sort_unstable();
     println!(
-        "node: check 8's right-half clause, folded and not asserted (PROPOSED D-107), finds \
-         a voter of a parent at its split restating the parent at or past it without the \
-         right half on {}/{seeds} seeds: {:?}",
+        "node: check 8's right-half clause under reading R (PROPOSED D-141), asserted, tripped \
+         on {}/{seeds} seeds: {:?}; it excused {} restatements past a split by a voter that \
+         had not applied it, on {}/{seeds} seeds {:?}, {} of them without the right half, on \
+         {}/{seeds} seeds {:?}; installs read off a restatement, their switch cut by a crash: \
+         {} on {}/{seeds} seeds",
         coverage.right_half_not_restated.len(),
-        coverage.right_half_not_restated
+        coverage.right_half_not_restated,
+        coverage.right_half_excused,
+        coverage.right_half_excused_seeds.len(),
+        coverage.right_half_excused_seeds,
+        coverage.right_half_excused_unheld,
+        coverage.right_half_excused_unheld_seeds.len(),
+        coverage.right_half_excused_unheld_seeds,
+        coverage.crash_cut_installs,
+        coverage.crash_cut_install_seeds,
+    );
+    println!(
+        "node: installed voters (PROPOSED D-141), measured and not asserted: {} on {}/{seeds} \
+         seeds, {} given their right half, median {:?}, worst {:?}; {} refused first; {} still \
+         waiting at the run's end, the longest {:?}; late against the candidate bound of {:?} \
+         on {}/{seeds} seeds, first: {}",
+        waits.len() + coverage.installed_refused + coverage.installed_open.len(),
+        coverage.installed_seeds,
+        waits.len(),
+        waits.get(waits.len() / 2),
+        waits.last(),
+        coverage.installed_refused,
+        coverage.installed_open.len(),
+        coverage.installed_open.iter().max(),
+        raft::RIGHT_HALF_ARRIVAL,
+        coverage.installed_late.len(),
+        coverage
+            .installed_late
+            .first()
+            .map_or("none", |(_, late)| late.as_str()),
     );
     // The placeholders (SHARD.md §5, Q22). A split's right half pre-votes at once from
     // the node whose parent led (Q21) and reaches the other replicas of the parent
@@ -2653,13 +2770,17 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// here with the others ([`Fold::VERDICT`]), and its comparison in violation comes with
 /// `IdBlockResumed`
 /// (`the_range_layers_folds_agree_one_by_one_and_checks_18_and_8_trip_under_id_block_resumed`).
-/// Its right half's clause trips on the correct node itself — a voter
-/// installed past a split holds no right half until placeholders exist — so it is
-/// compared and printed and not asserted absent, and its seed 45
-/// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
-/// own comparison at the gate's twenty and inside it from CI's hundred, asserting the
-/// clause's words there: the comparison is held in violation, where a fold fed in
-/// chunks that lost its state between them reads `Ok` (#166's review, N7). Its overlap
+/// Its right half's clause, under the owner's reading R, stops no run and is asserted
+/// absent here beside the stopping folds, as the correct node's sweep asserts it
+/// (PROPOSED D-141); its seed 45 ([`RIGHT_HALF_PINNED`]), planted, is compared fold by
+/// fold whatever the tier, out of the tier's own comparison at the gate's twenty and
+/// inside it from CI's hundred, asserting the clause's words there: the comparison is
+/// held in violation, where a fold fed in chunks that lost its state between them reads
+/// `Ok` (#166's review, N7). Its comparison in violation under a variant comes with its
+/// instrument, `RestartDropsRightHalves`
+/// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves`,
+/// PROPOSED D-141), on these same seeds: the absence asserted here is that pair's correct
+/// half. Its overlap
 /// clause trips on no run of this tree, so its comparison in violation comes with its
 /// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12), on `sim/split.rs` (i)
 /// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`,
@@ -2682,6 +2803,28 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
         "no split took effect on the correct node's compared seeds, so check 18's split \
          clause and every fold reading a split's descriptors compared nothing of one"
     );
+    // PROPOSED(D-141): under reading R the clause is asserted absent on the correct node:
+    // the correct half of `RestartDropsRightHalves`'s pair, on these same seeds. Asked
+    // before seed 45's planting below, so a node that trips the clause fails here, in the
+    // clause's words.
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::RightHalf))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: the correct node: check 8's right half's clause under reading R \
+         (PROPOSED D-141), asserted absent, in violation on seeds {on:?} of the {compared} \
+         compared"
+    );
+    assert!(
+        on.is_empty(),
+        "the correct node tripped check 8's right half's clause under reading R on seeds \
+         {on:?}, first: {:?} (PROPOSED D-141)",
+        on.first()
+            .and_then(|seed| found[*seed].tripped.get(&Fold::RightHalf))
+    );
     // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
     // tier.
     // With the placeholders the correct node's seed 45 holds the clause: its voter gets
@@ -2689,9 +2832,11 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
     // (`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`).
     // So the shape is planted on seed 45's own trace, the voter's creation and
     // restatements of the right half taken out, and compared there at every tier
-    // (PROPOSED D-109).
-    let (seed, node, _, _, right) = RIGHT_HALF_PINNED;
-    let planted = without_the_right_half(&node_records(seed, &[]), node, right);
+    // (PROPOSED D-109). Under reading R that voter, installed past the split, owes no R at
+    // its restatement, so the planting also takes out its installs of the parent: its
+    // restatement past the split then reads as an apply of it (PROPOSED D-141).
+    let (seed, node, parent, _, right) = RIGHT_HALF_PINNED;
+    let planted = without_the_right_half(&node_records(seed, &[]), node, parent, right);
     let words = compare_range_folds(
         seed,
         "the correct node's seed 45 with its voter's right half taken out",
@@ -2708,22 +2853,15 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
          clause was not compared in violation in its pin's shape, so the planting no longer \
          makes the shape it was written for"
     );
-    let on: Vec<usize> = found
-        .iter()
-        .enumerate()
-        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::RightHalf))
-        .map(|(seed, _)| seed)
-        .collect();
     println!(
-        "range folds: the correct node: check 8's right half's clause, compared and not \
-         asserted absent (PROPOSED D-107), in violation on seeds {on:?} of the {compared} \
-         compared, and compared in violation on the pinned seed {seed} planted at every tier"
+        "range folds: the correct node: check 8's right half's clause compared in violation on \
+         the pinned seed {seed} planted, at every tier"
     );
 }
 
 /// The folds of `outcome` in violation that stop a run ([`Fold::VERDICT`]): every one
-/// but check 8's right half's clause, which a correct system trips until placeholders
-/// exist (PROPOSED D-107).
+/// but check 8's right half's clause, which is not in the checker's verdict and is asserted
+/// apart where a scenario asks it (PROPOSED D-107, D-141).
 // PROPOSED(D-107)
 fn stopping_folds(outcome: &FoldsFound) -> BTreeMap<Fold, &str> {
     outcome
@@ -3099,6 +3237,48 @@ fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_install_repla
     }
 }
 
+/// Check 8's right half's clause against `RestartDropsRightHalves` (PROPOSED D-141), its
+/// instrument: node 1's restart reopens none of the replicas no configuration names, so
+/// every right half a split's apply made there is gone at its next start, and so is every
+/// replica an install made there. Under the owner's reading R of D-107 the clause owes R
+/// from node 1's apply of the split, or from its holding R as an installed voter, and
+/// keeps it across the restart, so the restatement after the drop is its catch. Compared
+/// fold by fold on the node sweep's seeds (D-106: each of the range layer's folds runs
+/// under the equivalence test against the variant that trips it). Measured on this tree,
+/// release: caught on 10 of the gate's 20 and 52 of the 100, so asserted at
+/// every tier (D-061: far above 5 %), every catch node 1's at its restatement. The pair's
+/// other half is the correct node's fold-by-fold test on the same `range_folds_compared()`
+/// seeds (`the_range_layers_folds_agree_one_by_one_on_the_correct_node`), which asserts the
+/// clause absent on every one of them, as the sibling instruments' tests leave it
+/// (CLAUDE.md's pair rule; review F6).
+// PROPOSED(D-141)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("RestartDropsRightHalves", compared, |seed| {
+        node_records(seed, &[RangeVariant::RestartDropsRightHalves])
+    });
+    let caught = tripped_on(&found, Fold::RightHalf);
+    for (seed, outcome) in found.iter().enumerate() {
+        if let Some(words) = outcome.tripped.get(&Fold::RightHalf) {
+            assert!(
+                words.contains("node 1 is a voter") && words.contains("at its restatement"),
+                "seed {seed}: check 8's right half's clause caught RestartDropsRightHalves in \
+                 other words: {words}"
+            );
+        }
+    }
+    println!(
+        "node: RestartDropsRightHalves caught by check 8's right half's clause under reading R \
+         on {caught}/{compared} seeds"
+    );
+    assert!(
+        caught > 0,
+        "check 8's right half's clause did not trip on any of {compared} seeds of \
+         RestartDropsRightHalves (PROPOSED D-141)"
+    );
+}
+
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
 /// the range and generation a mismatch has already corrected. Measured: 1 000 of seeds
 /// 0 to 999 — asserted on every compared seed.
@@ -3375,17 +3555,35 @@ fn right_half_pinned_words() -> String {
 /// creation, the restatements of its descriptor, and its name in every `RangesRestated`
 /// of `node` — the trace of a voter that never gets its right half, which is what check
 /// 8's right half's clause exists to see and what the placeholders keep the correct node
-/// from tracing (PROPOSED D-109).
-fn without_the_right_half(records: &[TraceRecord], node: u32, right: u64) -> Vec<TraceRecord> {
+/// from tracing (PROPOSED D-109) — and, since the owner's reading R of D-107, the
+/// switches and read-backs of `node`'s installs of `parent`, so that its restatement past
+/// the split reads as an apply of it with no install that excuses it: the crash between
+/// a split's durable batch and its trace, which the restated form is there for
+/// (PROPOSED D-141).
+fn without_the_right_half(
+    records: &[TraceRecord],
+    node: u32,
+    parent: u64,
+    right: u64,
+) -> Vec<TraceRecord> {
+    let parents_raft_keys = ananke_raft::store::KeyPrefix::group(parent).span().start;
     records
         .iter()
         .filter(|record| {
             !(record.node.is_some_and(|n| n.get() == node)
-                && matches!(
-                    &record.event,
+                && match &record.event {
                     TraceEvent::RangeCreated { range, .. }
-                        | TraceEvent::RangeDescriptor { range, .. } if *range == right
-                ))
+                    | TraceEvent::RangeDescriptor { range, .. } => *range == right,
+                    TraceEvent::RaftSnapshot {
+                        range,
+                        taken: false,
+                        ..
+                    } => *range == parent,
+                    TraceEvent::SpanInstalled { spans, .. } => {
+                        spans.iter().any(|(start, _)| *start == parents_raft_keys)
+                    }
+                    _ => false,
+                })
         })
         .cloned()
         .map(|mut record| {
@@ -3410,9 +3608,13 @@ fn without_the_right_half(records: &[TraceRecord], node: u32, right: u64) -> Vec
 /// creates node 2's replica of 14 (`RangeCreated { cause: snapshot }`) before node 2
 /// crashes; its restatement after the restart names 14, and the clause holds. What is
 /// asserted is that mechanism, step by step, and that the shape the pin had is absent,
-/// with the reason: the day a schedule moves the seed off it, this says so.
+/// with the reason: the day a schedule moves the seed off it, this says so. Under the
+/// owner's reading R of D-107 (PROPOSED D-141) node 2 is an installed voter from its
+/// install's switch to 14's creation, and its restatement past the split is read as
+/// installed and not as an apply of it: both asserted, the wait printed.
 // PROPOSED(D-107): the right half's clause's STOP, pinned where the thousand found it.
 // PROPOSED(D-109): and closed by a placeholder, on the same seed.
+// PROPOSED(D-141): and read under reading R.
 #[test]
 fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder() {
     let seed = 45u64;
@@ -3433,6 +3635,48 @@ fn seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeh
         checker.verdict_of(Fold::RightHalf),
         Ok(()),
         "seed {seed}: check 8's right-half clause"
+    );
+    // PROPOSED(D-141): under reading R node 2, installed past the split, is an installed
+    // voter from its install's switch until its placeholder's install creates 14, and its
+    // restatement after its crash is read past the split as installed, not as an apply of
+    // it, holding 14. The wait is printed: its bound is not asserted until the owner rules.
+    let voter = checker
+        .owners()
+        .installed_voters()
+        .iter()
+        .find(|voter| {
+            (voter.node, voter.parent, voter.index, voter.right)
+                == (u64::from(node), parent, index, right)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: node {node} is not an installed voter of range {parent}'s split at \
+                 {index}: {:?}",
+                checker.owners().installed_voters()
+            )
+        });
+    let Some((given, invariants::WaitEnded::Created)) = voter.ended else {
+        panic!(
+            "seed {seed}: node {node}'s wait for {right} did not end in its creation: {voter:?}"
+        );
+    };
+    println!(
+        "seed {seed}: node {node} waited {:?} for {right}, from its install's switch at {:?} \
+         (PROPOSED D-141, measured and not asserted)",
+        given.duration_since(voter.since),
+        voter.since
+    );
+    assert!(
+        checker.owners().excused().contains(&invariants::Excused {
+            node: u64::from(node),
+            parent,
+            index,
+            right,
+            held: true,
+        }),
+        "seed {seed}: node {node}'s restatement past range {parent}'s split at {index} was not \
+         excused as installed holding {right}: {:?}",
+        checker.owners().excused()
     );
     let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
     let find = |what: &str, from: usize, matches: &dyn Fn(&TraceEvent) -> bool| {

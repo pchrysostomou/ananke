@@ -7,10 +7,12 @@
 //! check `sim/shard.rs`'s `Report::check` makes — checks 1 to 4 keyed by range, the range
 //! layer's folds (7, 8, 9, 10, 16, 17, 18, 20), linearizability of every key across every
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
-//! and per range the run ended with and the meta convergence bound — that nodes 4 and 5
-//! hold nothing, and that each of the workload's shapes reached its window (PROPOSED D-131).
-//! It prints the driver's work, the refusals by the loss that made them (#45), the empty blocks
-//! a split finds (D-092), the shapes' rates and the bounds' margins.
+//! and per range the run ended with and the meta convergence bound — and, beside them, check
+//! 8's right half's clause under the owner's reading R of D-107 (PROPOSED D-141); that nodes 4
+//! and 5 hold nothing, and that each of the workload's shapes reached its window (PROPOSED
+//! D-131). It prints the driver's work, the refusals by the loss that made them (#45), the empty
+//! blocks a split finds (D-092), the shapes' rates, the bounds' margins and the installed voters'
+//! waits against a candidate bound that is not asserted (PROPOSED D-141).
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,7 +57,23 @@ struct Seen {
     keyspace_from_heal: Option<Duration>,
     /// How long each asker D-092's assertion asks of took (PROPOSED D-113 §8).
     retries_asked: Vec<Duration>,
+    /// Check 8's right-half clause under reading R tripped (PROPOSED D-141).
     right_half: bool,
+    /// The restatements past a split the clause excused, by a voter that had not applied it
+    /// and whose P an install had put there (`Excused`), and of those how many held no
+    /// right half, where §8's reading fails and reading R passes (PROPOSED D-141).
+    right_half_excused: (usize, usize),
+    /// The installs check 8's fold read off a restatement, a crash having cut the switch
+    /// before its read-back (PROPOSED D-141, review F5).
+    crash_cut_installs: usize,
+    /// The installed voters, measured and not asserted (PROPOSED D-141): how long each given
+    /// its right half waited, how many were refused first, how long each still open at the
+    /// run's end had waited, and the first late against the candidate bound
+    /// `raft::RIGHT_HALF_ARRIVAL`, in words.
+    installed_waits: Vec<Duration>,
+    installed_refused: usize,
+    installed_open: Vec<Duration>,
+    installed_late: Option<String>,
     partitions: usize,
     blocks: usize,
     crashes: usize,
@@ -97,7 +115,11 @@ fn every_key_still_asked(report: &shard::Report) -> Result<(), String> {
 
 fn seen_of(seed: u64) -> Seen {
     let report = shard::run(seed);
-    let verdict = report.check();
+    // PROPOSED(D-141): check 8's right half's clause under reading R, asked of the correct
+    // system beside the sweep's own checks.
+    let verdict = report
+        .check()
+        .and_then(|()| report.checked.right_half_held());
     if verdict.is_err() {
         write_trace(&format!("shard-{seed}"), &report.jsonl());
     }
@@ -133,6 +155,26 @@ fn seen_of(seed: u64) -> Seen {
         .flatten();
     let count =
         |want: fn(&TraceEvent) -> bool| report.records().iter().filter(|r| want(&r.event)).count();
+    // PROPOSED(D-141)
+    let folded = invariants::folded(report.records());
+    let owners = folded.owners();
+    let mut installed_waits = Vec::new();
+    let mut installed_refused = 0;
+    let mut installed_open = Vec::new();
+    for voter in owners.installed_voters() {
+        match voter.ended {
+            Some((at, invariants::WaitEnded::Created)) => {
+                installed_waits.push(at.duration_since(voter.since));
+            }
+            Some((_, invariants::WaitEnded::Refused)) => installed_refused += 1,
+            None => installed_open.push(report.checked.ended.duration_since(voter.since)),
+        }
+    }
+    let installed_late = raft::right_half_late(
+        owners.installed_voters(),
+        report.checked.ended,
+        raft::RIGHT_HALF_ARRIVAL,
+    );
     Seen {
         uniform: checked.uniform(),
         drift_exceeded: report.schedule.drift_exceeded(),
@@ -165,9 +207,16 @@ fn seen_of(seed: u64) -> Seen {
             .iter()
             .map(|retried| retried.took(report.last_fault_healed))
             .collect(),
-        right_half: invariants::folded(report.records())
-            .verdict_of(Fold::RightHalf)
-            .is_err(),
+        right_half: folded.verdict_of(Fold::RightHalf).is_err(),
+        right_half_excused: (
+            owners.excused().len(),
+            owners.excused().iter().filter(|e| !e.held).count(),
+        ),
+        crash_cut_installs: owners.crash_cut_installs(),
+        installed_waits,
+        installed_refused,
+        installed_open,
+        installed_late,
         partitions: count(|e| matches!(e, TraceEvent::PartitionStarted { .. })),
         blocks: count(|e| matches!(e, TraceEvent::LinkBlocked { .. })),
         crashes: count(|e| matches!(e, TraceEvent::NodeCrashed { .. })),
@@ -340,10 +389,80 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         retries.len(),
         retries.iter().max(),
     );
+    // PROPOSED(D-141): check 8's right-half clause under the owner's reading R of D-107,
+    // asserted by every seed's verdict above; printed with what reading R excused —
+    // restatements by a voter that had not applied the split, where the two readings
+    // differ, and of them those without R, where §8's reading fails and reading R passes —
+    // each with how many of its seeds fall in the gate's twenty, CI's hundred and the
+    // premerge's thousand, and with the installs read off a restatement. The installed
+    // voters' waits are printed against the candidate bound `raft::RIGHT_HALF_ARRIVAL` and
+    // **not asserted**: the correct system fails it on right halves that elect no leader
+    // after the install (#220), and it waits on the owner.
+    let excused_seeds: Vec<u64> = (0u64..)
+        .zip(&seen)
+        .filter(|(_, s)| s.right_half_excused.0 > 0)
+        .map(|(seed, _)| seed)
+        .collect();
+    let unheld_seeds: Vec<u64> = (0u64..)
+        .zip(&seen)
+        .filter(|(_, s)| s.right_half_excused.1 > 0)
+        .map(|(seed, _)| seed)
+        .collect();
+    let below = |of: &[u64]| [20, 100, 1000].map(|tier| of.iter().filter(|s| **s < tier).count());
+    let mut waits: Vec<Duration> = seen
+        .iter()
+        .flat_map(|s| s.installed_waits.iter().copied())
+        .collect();
+    waits.sort_unstable();
+    let open: Vec<Duration> = seen
+        .iter()
+        .flat_map(|s| s.installed_open.iter().copied())
+        .collect();
+    let late: Vec<(u64, &str)> = seen
+        .iter()
+        .zip(0u64..)
+        .filter_map(|(s, seed)| s.installed_late.as_deref().map(|late| (seed, late)))
+        .collect();
     println!(
-        "shard: check 8's right-half clause, folded and not asserted (PROPOSED D-107), trips on \
-         {}/{count} seeds",
-        seen.iter().filter(|s| s.right_half).count()
+        "shard: check 8's right-half clause under reading R (PROPOSED D-141), asserted, trips on \
+         {}/{count} seeds; it excused {} restatements past a split by a voter that had not \
+         applied it, on {}/{count} seeds (below seeds 20, 100, 1000: {:?}), {} of them without \
+         the right half, on {}/{count} seeds (below 20, 100, 1000: {:?}); installs read off a \
+         restatement, their switch cut by a crash: {} on {}/{count} seeds",
+        seen.iter().filter(|s| s.right_half).count(),
+        seen.iter().map(|s| s.right_half_excused.0).sum::<usize>(),
+        excused_seeds.len(),
+        below(&excused_seeds),
+        seen.iter().map(|s| s.right_half_excused.1).sum::<usize>(),
+        unheld_seeds.len(),
+        below(&unheld_seeds),
+        seen.iter().map(|s| s.crash_cut_installs).sum::<usize>(),
+        seen.iter().filter(|s| s.crash_cut_installs > 0).count(),
+    );
+    println!(
+        "shard: installed voters (PROPOSED D-141), measured and not asserted: {} on {} seeds, {} \
+         given their right half, median {:?}, p99 {:?}, worst {:?}; {} refused first; {} still \
+         waiting at the run's end, the longest {:?}; late against the candidate bound of {:?} on \
+         {}/{count} seeds {:?}, first: {}",
+        waits.len() + open.len() + seen.iter().map(|s| s.installed_refused).sum::<usize>(),
+        seen.iter()
+            .filter(|s| {
+                !s.installed_waits.is_empty()
+                    || !s.installed_open.is_empty()
+                    || s.installed_refused > 0
+            })
+            .count(),
+        waits.len(),
+        waits.get(waits.len() / 2),
+        waits.get(waits.len() * 99 / 100),
+        waits.last(),
+        seen.iter().map(|s| s.installed_refused).sum::<usize>(),
+        open.len(),
+        open.iter().max(),
+        raft::RIGHT_HALF_ARRIVAL,
+        late.len(),
+        late.iter().map(|(seed, _)| *seed).collect::<Vec<_>>(),
+        late.first().map_or("none", |(_, words)| words),
     );
 
     // PROPOSED(D-131): each shape, seeds that drew it and seeds that reached its window, each
@@ -392,6 +511,34 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         assert!(
             empty_seeds > 0,
             "no split found an empty block over the thousand (PROPOSED D-092; D-061)"
+        );
+    }
+    // PROPOSED(D-141), review F2: reading R reached where it differs from §8's reading.
+    // First, a voter installed past a split restarts before applying it, and its restatement
+    // past the split is read as no apply of it: measured on the correct system on 4 of the
+    // first 20 seeds, 13 of the first 100, 111 of the first 1 000 and 1 248 of the first
+    // 10 000 (12.5 %), so asserted from CI's hundred (D-061: well above 5 %, but at that
+    // rate twenty seeds see none about one time in 14, a hundred about once in 600 000).
+    // Second, such a restatement without R, which §8's reading fails and reading R passes:
+    // measured on 2 of the first 100, 16 of the first 1 000 and 202 of the first 10 000
+    // (2.0 %), under 5 %, so asserted from the thousand (D-061; at 1.6 % a thousand see none
+    // about once in 10^7, at 2.0 % about once in 7 * 10^8). Without them the clause would be
+    // asserted where reading R and §8's reading are one. The node sweep sees the first on 3
+    // of its first 1 000 seeds, too few to assert at any tier.
+    if seeds() >= 100 {
+        assert!(
+            !excused_seeds.is_empty(),
+            "no restatement past a split by a voter that had not applied it was read past as \
+             installed on any of {count} seeds: check 8's right half's clause was asserted where \
+             reading R and §8's reading read every restatement alike (PROPOSED D-141)"
+        );
+    }
+    if seeds() >= 1000 {
+        assert!(
+            !unheld_seeds.is_empty(),
+            "no restatement past a split without its right half was excused as installed on any \
+             of {count} seeds: check 8's right half's clause was asserted where reading R and \
+             §8's reading give one verdict (PROPOSED D-141)"
         );
     }
     // PROPOSED(D-131): the shapes, each asserted reached at every tier, each well above D-061's

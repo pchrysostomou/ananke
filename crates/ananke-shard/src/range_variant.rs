@@ -29,7 +29,7 @@
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
-//!   §8 has something that trips it where no protocol mistake of §10 does. Three are
+//!   §8 has something that trips it where no protocol mistake of §10 does. Four are
 //!   built. Two were moved here from the node's set by PROPOSED D-108 because each
 //!   breaks a rule of the range layer's and not of the node's:
 //!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
@@ -39,7 +39,9 @@
 //!   of the node's generator, at Q15's re-seed, at a split's right half and at a
 //!   placeholder's install (D-077, PROPOSED D-100, D-109).
 //!   [`RangeVariant::RefillNotResent`] breaks D-092's refill and is the instrument of
-//!   its per-seed assertion on the sharded sweep (PROPOSED D-113). Two more are
+//!   its per-seed assertion on the sharded sweep (PROPOSED D-113).
+//!   [`RangeVariant::RestartDropsRightHalves`] is check 8's right half's clause's,
+//!   under the owner's reading R of D-107 (PROPOSED D-141). Two more are
 //!   proposed and not built: D-093's `SplitLeavesGap` for check 19's fold, and Stage D's
 //!   variant for the re-add window assertion (§12, Stage D's question 1), which needs a
 //!   stream derived anew at each creation and so is not `IncarnationPerRangeStream` read
@@ -58,6 +60,7 @@
 //! schedule or a trace: D-105 and D-108 measure it.
 // PROPOSED(D-105): the range layer's own variant set (Q37).
 // PROPOSED(D-108): the two range-layer instruments the node's set held.
+// PROPOSED(D-141): check 8's right half's clause's instrument.
 
 use std::fmt;
 
@@ -180,6 +183,16 @@ pub enum RangeVariant {
     /// D-092's rule, and the check needs one (CLAUDE.md's pair rule).
     // PROPOSED(D-113)
     RefillNotResent,
+    /// Node 1's restart reopens none of the replicas no configuration names: every right
+    /// half a split's apply made there is dropped at its next start, its keys left in the
+    /// engine and no `RangeRemoved` traced, where SHARD.md §5 has a crash after the split's
+    /// batch restart "both replicas from their keys". Check 8's right half's clause sees it
+    /// at the restatement after the drop: R is owed from node 1's apply of the split and
+    /// kept across its restarts, the owner's reading R of D-107. A test instrument outside
+    /// §10's count: §10's variant for the clause, `SplitNotAtomicWithDescriptor`, is
+    /// Stage D's, and the clause is asserted from Stage C (PROPOSED D-141).
+    // PROPOSED(D-141)
+    RestartDropsRightHalves,
 }
 
 impl RangeVariant {
@@ -196,6 +209,7 @@ impl RangeVariant {
         RangeVariant::UninitialisedReplicaVotes,
         RangeVariant::SnapshotOverlapsReplica,
         RangeVariant::RefillNotResent,
+        RangeVariant::RestartDropsRightHalves,
     ];
 
     /// The bit this variant takes in a [`RangeVariants`]. The match is exhaustive on
@@ -223,6 +237,8 @@ impl RangeVariant {
             RangeVariant::RefillNotResent => 1 << 9,
             // PROPOSED(D-131): a read checked at its receipt and not at its serving.
             RangeVariant::ReadCheckAtReceiptOnly => 1 << 10,
+            // PROPOSED(D-141): the right half's clause's instrument.
+            RangeVariant::RestartDropsRightHalves => 1 << 11,
         }
     }
 
@@ -242,7 +258,8 @@ impl RangeVariant {
             | RangeVariant::SnapshotOverlapsReplica => true,
             RangeVariant::AnyFreshNodeBootstraps
             | RangeVariant::IncarnationPerRangeStream
-            | RangeVariant::RefillNotResent => false,
+            | RangeVariant::RefillNotResent
+            | RangeVariant::RestartDropsRightHalves => false,
         }
     }
 
@@ -261,6 +278,7 @@ impl RangeVariant {
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
             RangeVariant::SnapshotOverlapsReplica => "SnapshotOverlapsReplica",
             RangeVariant::RefillNotResent => "RefillNotResent",
+            RangeVariant::RestartDropsRightHalves => "RestartDropsRightHalves",
         }
     }
 }
@@ -378,9 +396,10 @@ mod tests {
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
         // the range-id blocks, D-109's one for placeholders, D-110's one for the
         // overlap rule and D-131's one for the read check, all of them §10's; and
-        // the two instruments PROPOSED D-108 moved here from the node's set and PROPOSED
-        // D-113's one for D-092's refill, none of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 11);
+        // the two instruments PROPOSED D-108 moved here from the node's set, PROPOSED
+        // D-113's one for D-092's refill and PROPOSED D-141's one for check 8's right
+        // half, none of them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 12);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -396,7 +415,8 @@ mod tests {
         assert_eq!(counted, 8, "§10's eight built so far");
         // The instruments outside the count, by name: the two the node's set held
         // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
-        // a replica's incarnation at its creation), and D-113's (D-092's refill).
+        // a replica's incarnation at its creation), D-113's (D-092's refill) and D-141's
+        // (the right halves a restart drops).
         let instruments: Vec<&str> = RangeVariant::BUGS
             .iter()
             .filter(|variant| !variant.in_section_10())
@@ -407,7 +427,8 @@ mod tests {
             [
                 "AnyFreshNodeBootstraps",
                 "IncarnationPerRangeStream",
-                "RefillNotResent"
+                "RefillNotResent",
+                "RestartDropsRightHalves"
             ],
             "the range layer's instruments outside §10's count"
         );

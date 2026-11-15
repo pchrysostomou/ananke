@@ -19,12 +19,15 @@
 //!
 //! **Check 8**, [`OneOwnerPerKey`], Stage C's four clauses: no two of a node's spans
 //! overlap, and a voter of P at a split that applied it holds R at every restatement
-//! after (PROPOSED D-107); no install replaces another replica's span (PROPOSED D-128);
+//! after (PROPOSED D-107), under the owner's reading R of 2026-11-14 (PROPOSED D-141);
+//! no install replaces another replica's span (PROPOSED D-128);
 //! and no node creates a replica it already holds initialised
 //! (PROPOSED D-116), SHARD.md §5's "R already initialised here" asked of the trace. The
 //! second clause is folded, compared under the equivalence test, and not in the
-//! [`Checker`]'s verdict ([`Fold::RightHalf`]): the correct node trips it until
-//! placeholders exist.
+//! [`Checker`]'s verdict ([`Fold::RightHalf`]): the node sweep and the sharded sweep
+//! assert it of the correct system beside that verdict (PROPOSED D-141). The installed
+//! voters it reads past ([`OneOwnerPerKey::installed_voters`]) are measured and printed,
+//! and no bound on their wait is asserted until the owner rules on it (PROPOSED D-141).
 //!
 //! **Check 9**: a `RaftApply` whose effect is `applied` and whose key lies outside the
 //! span of its range's descriptor in force before its index, or whose descriptor is
@@ -79,7 +82,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{ApplyEffect, ClientOp, RangeCause, RangeState, TraceEvent};
+use ananke_env::{ApplyEffect, ClientOp, Instant, RangeCause, RangeState, TraceEvent};
 use ananke_raft::apply::user_key;
 use ananke_raft::store::RAFT_TENANT;
 use bytes::Bytes;
@@ -419,6 +422,82 @@ impl std::fmt::Display for Since {
     }
 }
 
+/// How an installed voter's wait for its right half ended (PROPOSED D-141).
+// PROPOSED(D-141)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitEnded {
+    /// The node created the right half: by its placeholder's install, or by any creation.
+    Created,
+    /// The node's store was refused, which ends every obligation the clause puts on it.
+    Refused,
+}
+
+/// Why a node owes a right half R (PROPOSED D-141), which the right half's clause's words
+/// name.
+// PROPOSED(D-141)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owes {
+    /// Its replica of the parent applied the split: `RangeSplit`, a `RaftApply` of the
+    /// split with effect `took`, or a restatement past the split that no install excused.
+    Applied,
+    /// It is an installed voter of the split and held R: from its creation of R, which
+    /// ends its wait, or from the install itself where it already held R.
+    Installed,
+}
+
+/// A voter of P's configuration at a split `s` whose replica of P was installed at or past
+/// `s` since its node's last refusal, holding no right half R and having applied no `s`:
+/// what the owner's reading R of D-107 gives a check of its own, R created on it within a
+/// bound measured on the correct system. That bound fails the correct system on right
+/// halves with no possible majority (#220), so the wait is measured and printed and no
+/// bound on it is asserted until the owner rules (PROPOSED D-141). The wait opens at the
+/// install's switch and ends at the node's creation of R or its refusal; a crash does not
+/// end it. From the creation that ends it the node owes R as a voter that applied `s`
+/// does, kept across its restarts, so a voter given R and then left without it is the
+/// right half's clause's at its next restatement.
+// PROPOSED(D-141)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledVoter {
+    /// The node.
+    pub node: u64,
+    /// The split's parent, P.
+    pub parent: u64,
+    /// The split's index, `s`.
+    pub index: u64,
+    /// The right half, R.
+    pub right: u64,
+    /// The index the install put the node's P at, at or past `s`.
+    pub installed_at: u64,
+    /// The install's switch.
+    pub since: Instant,
+    /// Where and how the wait ended, `None` while it is open.
+    pub ended: Option<(Instant, WaitEnded)>,
+}
+
+/// A restatement of P at or past a split `s` by a voter of P at `s` that had not applied
+/// `s` since its last refusal, which the right half's clause did not read as an apply of
+/// `s` because an install had put the node's P at or past `s` since that refusal when the
+/// restatement stated it (PROPOSED D-141): where reading R and §8's reading differ. It
+/// carries whether the node held R when its restatement closed. Where it held none, the
+/// shape D-107 found the clause tripping on, §8's reading fails the restatement and
+/// reading R does not; where it held R, the two give the same verdict, since the
+/// installed voter owes R from the moment it holds it. A voter that applied `s` is never
+/// recorded: it owes R from its apply under either reading.
+// PROPOSED(D-141)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Excused {
+    /// The node.
+    pub node: u64,
+    /// The split's parent, P.
+    pub parent: u64,
+    /// The split's index, `s`.
+    pub index: u64,
+    /// The right half, R.
+    pub right: u64,
+    /// Whether the node held R when the restatement closed.
+    pub held: bool,
+}
+
 /// Check 8, one owner per key on a node (SHARD.md §8), Stage C's four clauses, an
 /// interval map per node folded from `RangeCreated`, `RangeDescriptor`,
 /// `RangeRemoved`, `RangesRestated`, `NodeCrashed` and the node's `RaftRefused`.
@@ -429,13 +508,25 @@ impl std::fmt::Display for Since {
 /// orders, no two of a node's spans overlap. A crash forgets the node's spans and its
 /// restatement states them again; a `RaftRefused` forgets them for good.
 ///
-/// **The right half's clause**: a node that is a voter of P's configuration at `s`
-/// whose replica of P has applied `s`, traced as `RangeSplit`, as a `RaftApply` of `s`
-/// with effect `took`, or restated at an applied index at or past `s`, holds R
-/// initialised from then until a `RangeRemoved` of R or a `RaftRefused` on that node:
-/// at the `RaftApply` of `s` (R's creation precedes it, §8's fixed order) and at every
-/// `RangesRestated` after it, R is among the node's spans. A split is known from the
-/// first replica to trace it — its `RangeSplit` and, after it in the fixed order, its
+/// **The right half's clause**, under the owner's reading R of 2026-11-14 (PROPOSED
+/// D-141): a node that is a voter of P's configuration at `s` whose replica of P has
+/// applied `s`, traced as `RangeSplit` or as a `RaftApply` of `s` with effect `took`,
+/// holds R initialised from then until a `RangeRemoved` of R or a `RaftRefused` on that
+/// node, kept across its restarts: at the `RaftApply` of `s` (R's creation precedes it,
+/// §8's fixed order) and at every `RangesRestated` after it, R is among the node's
+/// spans. A restatement of P at an applied index at or past `s` is read as an apply of
+/// `s` only where the node's replica of P had not been installed at or past `s` since the
+/// node's last refusal when the restatement stated it: the crash between a split's
+/// durable batch and its trace, which the restated form is there for. An install is the
+/// switch's `RaftSnapshot { taken: false }` outside a restatement, at its last index, or
+/// a switch a crash cut before that read-back (`SpanInstalled` naming P's Raft keys), at
+/// the applied index the next restatement states P at. The voter installed past `s`
+/// owes no R at its restatement while it has never held R; it is an installed voter
+/// instead ([`OneOwnerPerKey::installed_voters`]), whose wait for its right half the
+/// simulator measures and does not yet bound. From the moment it holds R — its creation
+/// of R, which ends its wait, or the install itself where R is already among its spans —
+/// it owes R as a voter that applied `s` does, kept across its restarts. A split is known
+/// from the first replica to trace it — its `RangeSplit` and, after it in the fixed order, its
 /// descriptor of P at `s`, which names P's voters, or R's first
 /// `RangeCreated { cause: split }`, which names the voters of P's plain configuration
 /// at `s`, whichever comes first (check 18 holds the two equal) — so the first voter to
@@ -474,6 +565,7 @@ impl std::fmt::Display for Since {
 // PROPOSED(D-107): check 8's two Stage C clauses.
 // PROPOSED(D-128): and what a switch replaced.
 // PROPOSED(D-116): and the created-twice clause.
+// PROPOSED(D-141): the right half's clause under reading R, and the installed voters.
 #[derive(Clone, Debug, Default)]
 pub struct OneOwnerPerKey {
     /// Per node, the span of every initialised replica it holds.
@@ -498,12 +590,50 @@ pub struct OneOwnerPerKey {
     applied_splits: BTreeMap<u64, BTreeSet<(u64, u64)>>,
     /// Per (node, range), the applied index the node's last restatement stated the
     /// range at, since its last refusal: the restated form, read again when a split
-    /// of the range becomes known after it.
-    restated_at: BTreeMap<(u64, u64), u64>,
+    /// of the range becomes known after it. Beside it, the highest index an install had
+    /// put the replica at since the node's last refusal when the restatement stated it,
+    /// which is what decides whether a split known later reads it as an apply.
+    // PROPOSED(D-141): and the install as it stood at the restatement.
+    restated_at: BTreeMap<(u64, u64), (u64, Option<u64>)>,
     /// Per node, the ranges it held at its last `RangesRestated`.
     restated_with: BTreeMap<u64, BTreeSet<u64>>,
-    /// Per node, the right halves it must hold: right to (parent, index).
-    owed: BTreeMap<u64, BTreeMap<u64, (u64, u64)>>,
+    /// Per node, the right halves it must hold: right to (parent, index, why).
+    // PROPOSED(D-141): and why it owes it.
+    owed: BTreeMap<u64, BTreeMap<u64, (u64, u64, Owes)>>,
+    /// Installs read off a restatement, a crash having cut their switch before its
+    /// read-back, counted over the fold (PROPOSED D-141).
+    // PROPOSED(D-141)
+    crash_cut_installs: usize,
+    /// Per (node, range), the highest index an install put the node's replica of the
+    /// range at since the node's last refusal, and the instant of that install's switch.
+    // PROPOSED(D-141)
+    installed: BTreeMap<(u64, u64), (u64, Instant)>,
+    /// Per (node, range), an install whose switch the node traced (`SpanInstalled`) and
+    /// whose read-back (`RaftSnapshot { taken: false }`) it has not traced yet: the
+    /// switch's instant.
+    // PROPOSED(D-141)
+    switching: BTreeMap<(u64, u64), Instant>,
+    /// Per (node, range), a switch a crash cut before its read-back: its index is the
+    /// applied index the node's next restatement states the range at.
+    // PROPOSED(D-141)
+    switched_unread: BTreeMap<(u64, u64), Instant>,
+    /// Installs read off a restatement — (node, range, applied, the switch's instant) —
+    /// whose installed voters are opened when the restatement closes, the node's spans
+    /// then complete.
+    // PROPOSED(D-141)
+    restated_installs: Vec<(u64, u64, u64, Instant)>,
+    /// Every installed voter, in the order its wait opened.
+    // PROPOSED(D-141)
+    installed_voters: Vec<InstalledVoter>,
+    /// Per node, the splits whose restated form an install since the node's last refusal
+    /// excused in its open restatement: (parent, index, right).
+    // PROPOSED(D-141)
+    excusing: BTreeMap<u64, Vec<(u64, u64, u64)>>,
+    /// Every restatement of a voter's P past a split it had not applied, which the
+    /// restated form did not read as an apply, P having been installed at or past the
+    /// split since the node's last refusal ([`Excused`]).
+    // PROPOSED(D-141)
+    excused: Vec<Excused>,
     overlap: Option<String>,
     right_half: Option<String>,
     // PROPOSED(D-128)
@@ -547,15 +677,27 @@ impl OneOwnerPerKey {
             self.owed
                 .entry(node)
                 .or_default()
-                .insert(*right, (parent, index));
+                .insert(*right, (parent, index, Owes::Applied));
         }
+    }
+
+    /// `node`, an installed voter of the split of `parent` at `index`, holds `right` from
+    /// here: it owes it from now on, across its restarts, as a voter that applied the split
+    /// does, unless it already owes it from an apply (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn owe_installed(&mut self, node: u64, parent: u64, index: u64, right: u64) {
+        self.owed
+            .entry(node)
+            .or_default()
+            .entry(right)
+            .or_insert((parent, index, Owes::Installed));
     }
 
     /// The split of `parent` at `index` into `right` is known from here, with the
     /// voters of the parent's configuration at it: every node whose replica of the
-    /// parent applied it, or restated the parent at or past it since its last refusal,
-    /// owes the right half, and one whose restatement has already closed without it
-    /// is a violation now.
+    /// parent applied it, or restated the parent at or past it since its last refusal
+    /// with no install at or past it then, owes the right half, and one whose
+    /// restatement has already closed without it is a violation now.
     fn register(&mut self, parent: u64, index: u64, right: u64, voters: &[u64]) {
         if self.splits.contains_key(&(parent, index)) {
             return;
@@ -571,13 +713,33 @@ impl OneOwnerPerKey {
         for node in applied {
             self.owe(node, parent, index);
         }
-        let restated: Vec<u64> = self
+        // PROPOSED(D-141): the restated form is read as an apply only where no install had
+        // put the node's P at or past the split when the restatement stated it; an install
+        // after the restatement excuses nothing in it.
+        let restated: Vec<(u64, bool)> = self
             .restated_at
             .iter()
-            .filter(|((_, range), applied)| *range == parent && **applied >= index)
-            .map(|((node, _), _)| *node)
+            .filter(|((_, range), (applied, _))| *range == parent && *applied >= index)
+            .map(|((node, _), (_, installed))| {
+                (*node, installed.is_some_and(|installed| installed >= index))
+            })
             .collect();
-        for node in restated {
+        for (node, installed_then) in restated {
+            if installed_then {
+                let held = self
+                    .restated_with
+                    .get(&node)
+                    .is_some_and(|held| held.contains(&right));
+                if self.restated.contains(&node) {
+                    self.excuse(node, parent, index, right, held);
+                } else {
+                    self.excusing
+                        .entry(node)
+                        .or_default()
+                        .push((parent, index, right));
+                }
+                continue;
+            }
             self.applied_split(node, parent, index);
             let owed = self
                 .owed
@@ -593,18 +755,150 @@ impl OneOwnerPerKey {
                     parent,
                     index,
                     right,
+                    Owes::Applied,
                     "at its restatement",
                 ));
             }
         }
+        // PROPOSED(D-141): a node whose P an install put at or past the split, and which
+        // has not applied it (above, its restated form included), is an installed voter
+        // from that install, or owes R from it where it already holds R.
+        let installed: Vec<(u64, u64, Instant)> = self
+            .installed
+            .iter()
+            .filter(|((_, range), (at, _))| *range == parent && *at >= index)
+            .map(|((node, _), (at, since))| (*node, *at, *since))
+            .collect();
+        for (node, at, since) in installed {
+            self.open_installed_voters(node, parent, at, since);
+        }
     }
 
-    /// The right half's clause's words for `node` lacking `right`.
-    fn missing(node: u64, parent: u64, index: u64, right: u64, at: &str) -> String {
+    /// Whether an install put `node`'s replica of `parent` at or past `index` since the
+    /// node's last refusal (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn installed_past(&self, node: u64, parent: u64, index: u64) -> bool {
+        self.installed
+            .get(&(node, parent))
+            .is_some_and(|(at, _)| *at >= index)
+    }
+
+    /// Records the restated form excused for `node`'s split of `parent` at `index`, with
+    /// whether it held `right` when its restatement closed, where the node is a voter there
+    /// and has not applied the split since its last refusal ([`Excused`]).
+    // PROPOSED(D-141)
+    fn excuse(&mut self, node: u64, parent: u64, index: u64, right: u64, held: bool) {
+        let server = self.server_of(node);
+        let applied = self
+            .applied_splits
+            .get(&node)
+            .is_some_and(|applied| applied.contains(&(parent, index)));
+        if !applied
+            && self
+                .splits
+                .get(&(parent, index))
+                .is_some_and(|(_, voters)| voters.contains(&server))
+        {
+            self.excused.push(Excused {
+                node,
+                parent,
+                index,
+                right,
+                held,
+            });
+        }
+    }
+
+    /// An install put `node`'s replica of `range` at `index`, its switch at `since`: the
+    /// highest index since the node's last refusal is kept (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn record_install(&mut self, node: u64, range: u64, index: u64, since: Instant) {
+        let entry = self
+            .installed
+            .entry((node, range))
+            .or_insert((index, since));
+        if index > entry.0 {
+            *entry = (index, since);
+        }
+    }
+
+    /// For every split of `range` at or below `at` that is known, of whose parent's
+    /// configuration `node` is a voter there, and that the node has not applied: where the
+    /// node holds the right half, it owes it from here (`owe_installed`); where it does
+    /// not, a wait opens, unless one is already open for it (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn open_installed_voters(&mut self, node: u64, range: u64, at: u64, since: Instant) {
+        let server = self.server_of(node);
+        let held = self.spans.get(&node);
+        let applied = self.applied_splits.get(&node);
+        let mut holding = Vec::new();
+        let mut opened = Vec::new();
+        for ((_, index), (right, voters)) in self.splits.range((range, 0)..=(range, at)) {
+            if !voters.contains(&server)
+                || applied.is_some_and(|applied| applied.contains(&(range, *index)))
+            {
+                continue;
+            }
+            if held.is_some_and(|held| held.contains_key(right)) {
+                holding.push((*index, *right));
+            } else if !self
+                .installed_voters
+                .iter()
+                .any(|wait| wait.node == node && wait.right == *right && wait.ended.is_none())
+            {
+                opened.push(InstalledVoter {
+                    node,
+                    parent: range,
+                    index: *index,
+                    right: *right,
+                    installed_at: at,
+                    since,
+                    ended: None,
+                });
+            }
+        }
+        self.installed_voters.extend(opened);
+        for (index, right) in holding {
+            self.owe_installed(node, range, index, right);
+        }
+    }
+
+    /// Ends `node`'s open waits for `right`, or for every right half where `right` is
+    /// `None`, at `at`. A wait the node's creation of its right half ends leaves the node
+    /// owing that right half from here (`owe_installed`) (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn end_installed_voters(&mut self, node: u64, right: Option<u64>, at: Instant, how: WaitEnded) {
+        let mut given = Vec::new();
+        for wait in &mut self.installed_voters {
+            if wait.node == node
+                && wait.ended.is_none()
+                && right.is_none_or(|right| wait.right == right)
+            {
+                wait.ended = Some((at, how));
+                if how == WaitEnded::Created {
+                    given.push((wait.parent, wait.index, wait.right));
+                }
+            }
+        }
+        for (parent, index, right) in given {
+            self.owe_installed(node, parent, index, right);
+        }
+    }
+
+    /// The right half's clause's words for `node` lacking `right`, owed for `why`.
+    fn missing(node: u64, parent: u64, index: u64, right: u64, why: Owes, at: &str) -> String {
+        let owes = match why {
+            Owes::Applied => format!("its replica of range {parent} has applied it"),
+            // PROPOSED(D-141)
+            Owes::Installed => format!(
+                "an install put its replica of range {parent} at or past it, after which the \
+                 node held the right half"
+            ),
+        };
         format!(
             "one owner per key: node {node} is a voter of range {parent}'s configuration at \
-             its split at index {index}, its replica of range {parent} has applied it, and \
-             {at} it holds no replica of the right half {right} (SHARD.md §8, check 8)"
+             its split at index {index}, {owes}, and {at} it holds no replica of the right \
+             half {right} (SHARD.md §8, check 8)"
         )
     }
 
@@ -673,9 +967,9 @@ impl OneOwnerPerKey {
         self.owed
             .get(&node)?
             .iter()
-            .find_map(|(right, (parent, index))| {
+            .find_map(|(right, (parent, index, why))| {
                 (!held.is_some_and(|held| held.contains_key(right)))
-                    .then(|| Self::missing(node, *parent, *index, *right, at))
+                    .then(|| Self::missing(node, *parent, *index, *right, *why, at))
             })
     }
 
@@ -719,6 +1013,9 @@ impl OneOwnerPerKey {
                     end,
                     Since::Created(*cause, *floor_index),
                 );
+                // PROPOSED(D-141): an installed voter's wait ends at its node's creation
+                // of the right half, whatever makes it.
+                self.end_installed_voters(node, Some(*range), record.at, WaitEnded::Created);
                 if *cause == RangeCause::Split
                     && let Some(parent) = parent
                 {
@@ -747,14 +1044,32 @@ impl OneOwnerPerKey {
                 // A restatement of P at an applied index at or past a split of P: the
                 // splits known now, and any that becomes known later (`register`).
                 if !self.restated.contains(&node) {
-                    self.restated_at.insert((node, *range), *applied);
-                    let splits: Vec<u64> = self
+                    // PROPOSED(D-141): a switch a crash cut before its read-back put P
+                    // where this restatement states it.
+                    if let Some(since) = self.switched_unread.remove(&(node, *range)) {
+                        self.record_install(node, *range, *applied, since);
+                        self.restated_installs.push((node, *range, *applied, since));
+                        self.crash_cut_installs += 1;
+                    }
+                    let installed = self.installed.get(&(node, *range)).map(|(at, _)| *at);
+                    self.restated_at
+                        .insert((node, *range), (*applied, installed));
+                    let splits: Vec<(u64, u64)> = self
                         .splits
                         .range((*range, 0)..=(*range, *applied))
-                        .map(|((_, index), _)| *index)
+                        .map(|((_, index), (right, _))| (*index, *right))
                         .collect();
-                    for index in splits {
-                        self.applied_split(node, *range, index);
+                    for (index, right) in splits {
+                        // PROPOSED(D-141): reading R. P installed at or past the split
+                        // since the node's last refusal is no apply of it.
+                        if self.installed_past(node, *range, index) {
+                            self.excusing
+                                .entry(node)
+                                .or_default()
+                                .push((*range, index, right));
+                        } else {
+                            self.applied_split(node, *range, index);
+                        }
                     }
                 }
             }
@@ -766,6 +1081,21 @@ impl OneOwnerPerKey {
             } => {
                 self.applied_split(node, *range, *index);
                 self.splitting.insert(node, (*range, *index, *right));
+                // PROPOSED(D-141): a non-voter's step switches P's keys with the right
+                // span's, and is no install.
+                self.switching.remove(&(node, *range));
+            }
+            // PROPOSED(D-141): an install's read-back, outside a restatement, which
+            // states the store's snapshot with the same event.
+            TraceEvent::RaftSnapshot {
+                range,
+                last_index,
+                taken: false,
+                ..
+            } if self.restated.contains(&node) => {
+                let since = self.switching.remove(&(node, *range)).unwrap_or(record.at);
+                self.record_install(node, *range, *last_index, since);
+                self.open_installed_voters(node, *range, *last_index, since);
             }
             TraceEvent::RaftApply {
                 range,
@@ -780,7 +1110,16 @@ impl OneOwnerPerKey {
                 }
             }
             // PROPOSED(D-128)
-            TraceEvent::SpanInstalled { spans, .. } => self.replaced(node, spans),
+            TraceEvent::SpanInstalled { spans, .. } => {
+                self.replaced(node, spans);
+                // PROPOSED(D-141): the switch of an install of each range whose Raft
+                // keys it names, read back at its `RaftSnapshot` unless a crash cuts it.
+                if self.restated.contains(&node) {
+                    for range in spans.iter().filter_map(|(start, _)| raft_group_of(start)) {
+                        self.switching.entry((node, range)).or_insert(record.at);
+                    }
+                }
+            }
             TraceEvent::RangeRemoved { range, .. } => {
                 if let Some(held) = self.spans.get_mut(&node) {
                     held.remove(range);
@@ -795,6 +1134,25 @@ impl OneOwnerPerKey {
                 self.held_since.retain(|(of, _), _| *of != node);
                 self.restated.remove(&node);
                 self.splitting.remove(&node);
+                // PROPOSED(D-141): a switch with no read-back yet is read off the next
+                // restatement, and so is one a restatement the crash cut had read.
+                let cut: Vec<((u64, u64), Instant)> = self
+                    .switching
+                    .iter()
+                    .filter(|((of, _), _)| *of == node)
+                    .map(|(key, at)| (*key, *at))
+                    .collect();
+                for (key, at) in cut {
+                    self.switching.remove(&key);
+                    self.switched_unread.entry(key).or_insert(at);
+                }
+                for (of, range, _, at) in &self.restated_installs {
+                    if *of == node {
+                        self.switched_unread.entry((node, *range)).or_insert(*at);
+                    }
+                }
+                self.restated_installs.retain(|(of, ..)| *of != node);
+                self.excusing.remove(&node);
             }
             TraceEvent::RaftRefused { .. } => {
                 self.spans.remove(&node);
@@ -804,6 +1162,14 @@ impl OneOwnerPerKey {
                 self.splitting.remove(&node);
                 self.restated_at.retain(|(of, _), _| *of != node);
                 self.restated_with.remove(&node);
+                // PROPOSED(D-141): installs count since the last refusal, and a refusal
+                // ends every wait.
+                self.installed.retain(|(of, _), _| *of != node);
+                self.switching.retain(|(of, _), _| *of != node);
+                self.switched_unread.retain(|(of, _), _| *of != node);
+                self.restated_installs.retain(|(of, ..)| *of != node);
+                self.excusing.remove(&node);
+                self.end_installed_voters(node, None, record.at, WaitEnded::Refused);
             }
             TraceEvent::RangesRestated { .. } => {
                 self.restated.insert(node);
@@ -816,9 +1182,59 @@ impl OneOwnerPerKey {
                 if self.right_half.is_none() {
                     self.right_half = self.owed_and_missing(node, "at its restatement");
                 }
+                // PROPOSED(D-141): what reading R excused in this restatement, and the
+                // installed voters a crash-cut switch makes, now the spans are complete.
+                for (parent, index, right) in self.excusing.remove(&node).unwrap_or_default() {
+                    let held = self
+                        .spans
+                        .get(&node)
+                        .is_some_and(|held| held.contains_key(&right));
+                    self.excuse(node, parent, index, right, held);
+                }
+                let installs: Vec<(u64, u64, u64, Instant)> = self
+                    .restated_installs
+                    .iter()
+                    .filter(|(of, ..)| *of == node)
+                    .copied()
+                    .collect();
+                self.restated_installs.retain(|(of, ..)| *of != node);
+                for (_, range, applied, since) in installs {
+                    self.open_installed_voters(node, range, applied, since);
+                }
+                self.switched_unread.retain(|(of, _), _| *of != node);
             }
             _ => {}
         }
+    }
+
+    /// Every installed voter the fold has seen, in the order its wait opened (PROPOSED
+    /// D-141): what the simulator measures of the right half's arrival, which no test
+    /// asserts a bound on until the owner rules.
+    // PROPOSED(D-141)
+    #[must_use]
+    pub fn installed_voters(&self) -> &[InstalledVoter] {
+        &self.installed_voters
+    }
+
+    /// Every restatement past a split by a voter that had not applied it, which the right
+    /// half's clause excused because an install had put the voter's P at or past it since
+    /// its last refusal ([`Excused`], PROPOSED D-141).
+    // PROPOSED(D-141)
+    #[must_use]
+    pub fn excused(&self) -> &[Excused] {
+        &self.excused
+    }
+
+    /// How many installs the fold read off a restatement, a crash having cut the switch
+    /// before its read-back (PROPOSED D-141). A split's non-voter step, whose
+    /// `SpanInstalled` names P's Raft keys, is read so too where a crash falls between it
+    /// and its `RangeSplit`: as an install of P at that split, of which the node is no
+    /// voter, so it excuses nothing there and opens no wait for it, and it is below every
+    /// later split of P.
+    // PROPOSED(D-141)
+    #[must_use]
+    pub fn crash_cut_installs(&self) -> usize {
+        self.crash_cut_installs
     }
 
     /// The overlap clause's first violation.
@@ -1860,8 +2276,9 @@ pub enum Fold {
     // PROPOSED(D-107)
     Overlap,
     /// Check 8's right half's clause ([`OneOwnerPerKey::right_half_verdict`]): folded
-    /// and compared, and **not** asked by [`Checker::verdict`], since the correct node
-    /// trips it until placeholders exist.
+    /// and compared, and **not** asked by [`Checker::verdict`], whose verdict every node
+    /// scenario and variant test reads; the node sweep and the sharded sweep assert it of
+    /// the correct system under the owner's reading R (PROPOSED D-141).
     // PROPOSED(D-107)
     RightHalf,
     /// Check 8's install clause ([`OneOwnerPerKey::install_verdict`]): asked after the
@@ -2035,6 +2452,14 @@ impl Checker {
         &self.descriptors
     }
 
+    /// Check 8's fold as it stands: what its installed voters and its excused restatements
+    /// are read from (PROPOSED D-141).
+    // PROPOSED(D-141)
+    #[must_use]
+    pub fn owners(&self) -> &OneOwnerPerKey {
+        &self.owners
+    }
+
     /// `fold`'s own verdict: its first violation, whatever the other folds found. A fold
     /// latches its message and stops judging at its violation; one whose state another
     /// fold reads goes on folding that state — check 7's map, which every fold here
@@ -2075,10 +2500,11 @@ impl Checker {
     /// then check 8's overlap clause, its install clause and its created-twice clause,
     /// last so that no violation a fold before them reports moves to them. This is what stops a run, and it names one fold where several may
     /// be in violation: read [`Checker::verdict_of`] for what each fold found. Check 8's
-    /// right half's clause is folded and **not** in it: the correct node trips it on a
-    /// voter installed past a split, which holds no placeholder for the right half
-    /// (Q22), so it is read apart ([`Fold::RightHalf`]) and left to the owner
-    /// (PROPOSED D-107).
+    /// right half's clause is folded and **not** in it (PROPOSED D-107): it is read apart
+    /// ([`Fold::RightHalf`]), and asserted under the owner's reading R by the node sweep
+    /// and the sharded sweep beside this verdict, which every node scenario and variant
+    /// test reads and which other scenarios have not been measured against (PROPOSED
+    /// D-141).
     ///
     /// # Errors
     ///
@@ -3247,9 +3673,11 @@ mod tests {
             refused.push(&record);
         }
         assert!(refused.verdict().is_ok(), "{:?}", refused.verdict());
-        // And a node that restates P past the split, a voter there, owes R whether or
-        // not it applied the split by an apply: an install past it, then a restart.
-        let mut installed = refused.clone();
+        // A node that restates P past the split, a voter there, with no install of P at
+        // or past it since its refusal owes R: P reached the split by an apply whose
+        // trace is not there, the crash between a split's durable batch and its trace.
+        // Under reading R that is the only restatement that owes it (PROPOSED D-141).
+        let mut untraced = refused.clone();
         for record in [
             recovered(2, 2, 20),
             stated(2, 2, 20, b"a", b"m", 2),
@@ -3258,10 +3686,38 @@ mod tests {
             stated(2, 2, 20, b"a", b"m", 2),
             restated(2, &[2]),
         ] {
+            untraced.push(&record);
+        }
+        let why = untraced.right_half_verdict().unwrap_err();
+        assert!(why.contains("right half 6"), "{why}");
+        // The same node installed P at 20 after its refusal, its switch read back outside
+        // a restatement, owes no R at the restatement after its restart: it is an
+        // installed voter instead, still waiting (PROPOSED D-141).
+        let mut installed = refused.clone();
+        for record in [
+            switched(2, vec![raft_span(2), keys(b"a", b"m")]),
+            snapshot_installed(2, 2, 20),
+            stated(2, 2, 20, b"a", b"m", 2),
+            crashed(2),
+            recovered(2, 2, 20),
+            stated(2, 2, 20, b"a", b"m", 2),
+            restated(2, &[2]),
+        ] {
             installed.push(&record);
         }
-        let why = installed.right_half_verdict().unwrap_err();
-        assert!(why.contains("right half 6"), "{why}");
+        assert_eq!(installed.right_half_verdict(), Ok(()));
+        assert_eq!(
+            installed.excused(),
+            [Excused {
+                node: 2,
+                parent: 2,
+                index: 9,
+                right: 6,
+                held: false
+            }]
+        );
+        assert_eq!(installed.installed_voters().len(), 1, "{installed:?}");
+        assert_eq!(installed.installed_voters()[0].ended, None);
         // A node that is not a voter of P at the split owes no right half.
         let mut learner = OneOwnerPerKey::default();
         for record in &a_split_applied() {
@@ -3275,6 +3731,400 @@ mod tests {
             learner.push(&record);
         }
         assert!(learner.verdict().is_ok(), "{:?}", learner.verdict());
+    }
+
+    /// An install's read-back on `node`: its replica of `range` at `last_index`, outside a
+    /// restatement (PROPOSED D-141).
+    // PROPOSED(D-141)
+    fn snapshot_installed(node: u64, range: u64, last_index: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RaftSnapshot {
+                server: node,
+                range,
+                last_index,
+                last_term: 1,
+                taken: false,
+            },
+        )
+    }
+
+    /// `record` moved to `ms` milliseconds.
+    // PROPOSED(D-141)
+    fn at_ms(ms: u64, mut record: TraceRecord) -> TraceRecord {
+        record.at = Instant::from_nanos(ms * 1_000_000);
+        record.decided = record.at;
+        record
+    }
+
+    /// Node 3, a voter of range 2 at its split at 9 that never applies it, beside the
+    /// split as nodes 1 and 2 apply it: restated at its start, so what follows is outside
+    /// a restatement.
+    // PROPOSED(D-141)
+    fn a_split_node_3_lags() -> Vec<TraceRecord> {
+        let mut records = a_split_applied();
+        records.push(recovered(3, 2, 0));
+        records.push(stated(3, 2, 0, b"a", b"z", 1));
+        records.push(restated(3, &[2]));
+        records
+    }
+
+    /// The owner's reading R of D-107 (PROPOSED D-141): a voter whose P an install put past
+    /// the split owes no R at its restatement, whether its switch was read back before its
+    /// crash or the crash cut it, and is an installed voter from the switch until it
+    /// creates R; an install below the split leaves a restatement past it owing R; a
+    /// refusal ends the wait and forgets the install.
+    // PROPOSED(D-141)
+    #[test]
+    fn a_voter_installed_past_a_split_is_an_installed_voter_and_owes_no_right_half_at_its_restart()
+    {
+        let fold = |records: &[TraceRecord]| {
+            let mut owners = OneOwnerPerKey::default();
+            for record in records {
+                owners.push(record);
+            }
+            owners
+        };
+        let install = [
+            at_ms(100, switched(3, vec![raft_span(2), keys(b"a", b"m")])),
+            at_ms(101, snapshot_installed(3, 2, 12)),
+            at_ms(101, stated(3, 2, 12, b"a", b"m", 2)),
+        ];
+        let restart = [
+            at_ms(200, crashed(3)),
+            at_ms(300, recovered(3, 2, 12)),
+            at_ms(300, stated(3, 2, 12, b"a", b"m", 2)),
+            at_ms(300, restated(3, &[2])),
+        ];
+        // Read back, then a restart without R: no violation, one installed voter waiting
+        // from the switch, and the restatement excused without R.
+        let mut records = a_split_node_3_lags();
+        records.extend(install.clone());
+        records.extend(restart.clone());
+        let owners = fold(&records);
+        assert_eq!(owners.right_half_verdict(), Ok(()));
+        let waiting = InstalledVoter {
+            node: 3,
+            parent: 2,
+            index: 9,
+            right: 6,
+            installed_at: 12,
+            since: Instant::from_nanos(100_000_000),
+            ended: None,
+        };
+        assert_eq!(owners.installed_voters(), std::slice::from_ref(&waiting));
+        assert_eq!(
+            owners.excused(),
+            [Excused {
+                node: 3,
+                parent: 2,
+                index: 9,
+                right: 6,
+                held: false
+            }]
+        );
+        // Its placeholder's install creates R: the wait ends there.
+        records.push(at_ms(450, installed_as_created(3, 6, 12, b"m", b"z", 2)));
+        let owners = fold(&records);
+        assert_eq!(
+            owners.installed_voters()[0].ended,
+            Some((Instant::from_nanos(450_000_000), WaitEnded::Created))
+        );
+        // The crash cuts the switch before its read-back: the restatement states P at the
+        // switch's index, the restatement owes nothing, and the wait opens at the switch.
+        let mut cut = a_split_node_3_lags();
+        cut.push(install[0].clone());
+        cut.extend(restart.clone());
+        let owners = fold(&cut);
+        assert_eq!(owners.right_half_verdict(), Ok(()));
+        assert_eq!(owners.installed_voters(), std::slice::from_ref(&waiting));
+        // A refusal ends the wait and forgets the install: the restatement after it, past
+        // the split with no install since, owes R.
+        let mut refused = a_split_node_3_lags();
+        refused.extend(install.clone());
+        refused.extend([
+            at_ms(150, crashed(3)),
+            at_ms(
+                160,
+                record(
+                    3,
+                    TraceEvent::RaftRefused {
+                        server: 3,
+                        reason: "lost".into(),
+                    },
+                ),
+            ),
+            at_ms(170, restated(3, &[])),
+        ]);
+        let owners = fold(&refused);
+        assert_eq!(
+            owners.installed_voters()[0].ended,
+            Some((Instant::from_nanos(160_000_000), WaitEnded::Refused))
+        );
+        refused.extend(restart.clone());
+        let why = fold(&refused).right_half_verdict().unwrap_err();
+        assert!(
+            why.contains("node 3 is a voter") && why.contains("at its restatement"),
+            "{why}"
+        );
+        // An install below the split, then a restatement past it: the apply of the split
+        // is not traced and the restated form owes R — `SplitNotAtomicWithDescriptor`'s
+        // shape (SHARD.md §10).
+        let mut below = a_split_node_3_lags();
+        below.extend([
+            at_ms(100, switched(3, vec![raft_span(2), keys(b"a", b"z")])),
+            at_ms(101, snapshot_installed(3, 2, 8)),
+        ]);
+        below.extend(restart.clone());
+        let owners = fold(&below);
+        let why = owners.right_half_verdict().unwrap_err();
+        assert!(
+            why.contains("node 3 is a voter") && why.contains("at its restatement"),
+            "{why}"
+        );
+        assert_eq!(owners.installed_voters(), []);
+        // A restatement's own `RaftSnapshot` states the store's snapshot and is no install.
+        let mut stated_only = a_split_node_3_lags();
+        stated_only.extend([
+            at_ms(200, crashed(3)),
+            at_ms(300, recovered(3, 2, 12)),
+            at_ms(300, snapshot_installed(3, 2, 12)),
+            at_ms(300, stated(3, 2, 12, b"a", b"m", 2)),
+            at_ms(300, restated(3, &[2])),
+        ]);
+        assert!(fold(&stated_only).right_half_verdict().is_err());
+        // A voter that applied the split is owed R from its apply, and is no installed
+        // voter whatever is installed after. Its restatement past the split after such an
+        // install is not recorded as excused, R or no R: both readings owe R from its apply,
+        // and without R it is caught in the apply's words.
+        let mut applied = a_split_applied();
+        applied.extend([
+            at_ms(100, switched(2, vec![raft_span(2), keys(b"a", b"m")])),
+            at_ms(101, snapshot_installed(2, 2, 12)),
+        ]);
+        assert_eq!(fold(&applied).installed_voters(), []);
+        let mut kept = applied.clone();
+        kept.extend([
+            at_ms(200, crashed(2)),
+            at_ms(300, recovered(2, 2, 12)),
+            at_ms(300, stated(2, 2, 12, b"a", b"m", 2)),
+            at_ms(300, recovered(2, 6, 12)),
+            at_ms(300, stated(2, 6, 12, b"m", b"z", 2)),
+            at_ms(300, restated(2, &[2, 6])),
+        ]);
+        let owners = fold(&kept);
+        assert_eq!(owners.right_half_verdict(), Ok(()));
+        assert_eq!(owners.excused(), []);
+        let mut dropped = applied;
+        dropped.extend([
+            at_ms(200, crashed(2)),
+            at_ms(300, recovered(2, 2, 12)),
+            at_ms(300, stated(2, 2, 12, b"a", b"m", 2)),
+            at_ms(300, restated(2, &[2])),
+        ]);
+        let owners = fold(&dropped);
+        let why = owners.right_half_verdict().unwrap_err();
+        assert!(
+            why.contains("node 2 is a voter")
+                && why.contains("its replica of range 2 has applied it"),
+            "{why}"
+        );
+        assert_eq!(owners.excused(), []);
+        // A node that is not a voter of P at the split waits for nothing.
+        let mut learner = a_split_applied();
+        learner.extend([
+            recovered(4, 2, 0),
+            stated(4, 2, 0, b"a", b"z", 1),
+            restated(4, &[2]),
+            at_ms(101, snapshot_installed(4, 2, 12)),
+        ]);
+        assert_eq!(fold(&learner).installed_voters(), []);
+    }
+
+    /// An installed voter owes its right half from the moment it holds it, kept across its
+    /// restarts as an applier's is (PROPOSED D-141, review F1): given R by its placeholder's
+    /// install and then restarted without it, it is caught at that restatement and at the
+    /// first one after any number of restarts, in the install's words; restarted with R it
+    /// passes. One that already held R at the install, its switch cut by a crash and R
+    /// restated beside P, owes R from the restatement that read the install. A refusal
+    /// ends the obligation, and a `RangeRemoved` of R does.
+    // PROPOSED(D-141)
+    #[test]
+    fn an_installed_voter_given_its_right_half_owes_it_across_its_restarts() {
+        let fold = |records: &[TraceRecord]| {
+            let mut owners = OneOwnerPerKey::default();
+            for record in records {
+                owners.push(record);
+            }
+            owners
+        };
+        let mut given = a_split_node_3_lags();
+        given.extend([
+            at_ms(100, switched(3, vec![raft_span(2), keys(b"a", b"m")])),
+            at_ms(101, snapshot_installed(3, 2, 12)),
+            at_ms(101, stated(3, 2, 12, b"a", b"m", 2)),
+            at_ms(450, installed_as_created(3, 6, 12, b"m", b"z", 2)),
+        ]);
+        let restart_without = |at: u64| {
+            [
+                at_ms(at, crashed(3)),
+                at_ms(at + 100, recovered(3, 2, 12)),
+                at_ms(at + 100, stated(3, 2, 12, b"a", b"m", 2)),
+                at_ms(at + 100, restated(3, &[2])),
+            ]
+        };
+        let restart_with = |at: u64| {
+            [
+                at_ms(at, crashed(3)),
+                at_ms(at + 100, recovered(3, 2, 12)),
+                at_ms(at + 100, stated(3, 2, 12, b"a", b"m", 2)),
+                at_ms(at + 100, recovered(3, 6, 12)),
+                at_ms(at + 100, stated(3, 6, 12, b"m", b"z", 2)),
+                at_ms(at + 100, restated(3, &[2, 6])),
+            ]
+        };
+        let words = "node 3 is a voter of range 2's configuration at its split at index 9, an \
+                     install put its replica of range 2 at or past it, after which the node held \
+                     the right half, and at its restatement it holds no replica of the right half 6";
+        // Given R, then restarted without it: caught, and the wait ended where R came.
+        let mut lost = given.clone();
+        lost.extend(restart_without(500));
+        let owners = fold(&lost);
+        let why = owners.right_half_verdict().unwrap_err();
+        assert!(why.contains(words), "{why}");
+        assert_eq!(
+            owners.installed_voters()[0].ended,
+            Some((Instant::from_nanos(450_000_000), WaitEnded::Created))
+        );
+        // Restarted with R, then without it: the obligation outlived the first restart.
+        let mut later = given.clone();
+        later.extend(restart_with(500));
+        assert_eq!(fold(&later).right_half_verdict(), Ok(()));
+        later.extend(restart_without(700));
+        let why = fold(&later).right_half_verdict().unwrap_err();
+        assert!(why.contains(words), "{why}");
+        // R held already when the install is read: the switch cut by a crash, and the
+        // restatement states P at the install's index with R beside it. No wait opens, the
+        // restatement is excused holding R, and R is owed from there.
+        let mut held = a_split_node_3_lags();
+        held.push(at_ms(
+            100,
+            switched(3, vec![raft_span(2), keys(b"a", b"m")]),
+        ));
+        held.extend(restart_with(200));
+        let owners = fold(&held);
+        assert_eq!(owners.right_half_verdict(), Ok(()));
+        assert_eq!(owners.installed_voters(), []);
+        assert_eq!(
+            owners.excused(),
+            [Excused {
+                node: 3,
+                parent: 2,
+                index: 9,
+                right: 6,
+                held: true
+            }]
+        );
+        held.extend(restart_without(400));
+        let why = fold(&held).right_half_verdict().unwrap_err();
+        assert!(why.contains(words), "{why}");
+        // A `RangeRemoved` of R ends the obligation, and so does a refusal.
+        let removed = record(
+            3,
+            TraceEvent::RangeRemoved {
+                range: 6,
+                generation: 2,
+                incarnation: 7,
+                cause: ananke_env::RangeRemovedCause::Collected,
+            },
+        );
+        let mut let_go = given.clone();
+        let_go.push(at_ms(480, removed));
+        let_go.extend(restart_without(500));
+        assert_eq!(fold(&let_go).right_half_verdict(), Ok(()));
+        let mut refused = given;
+        refused.extend([
+            at_ms(480, crashed(3)),
+            at_ms(
+                490,
+                record(
+                    3,
+                    TraceEvent::RaftRefused {
+                        server: 3,
+                        reason: "lost".into(),
+                    },
+                ),
+            ),
+            at_ms(495, restated(3, &[])),
+        ]);
+        assert_eq!(fold(&refused).right_half_verdict(), Ok(()));
+    }
+
+    /// An install read after a restatement excuses nothing in it (PROPOSED D-141, review
+    /// F3): node 1 restates P past the split, holding no R, before any replica has traced
+    /// the split, the crash-cut apply the restated form is there for; its P is installed
+    /// past the split after that restatement, and only then is the split traced. The
+    /// restatement owed R when it closed, and is caught; the same install read before the
+    /// restatement excuses it, and node 1 is an installed voter.
+    // PROPOSED(D-141)
+    #[test]
+    fn an_install_after_a_restatement_does_not_excuse_it_when_the_split_becomes_known() {
+        let mut records = three_voters();
+        records.extend([
+            crashed(1),
+            recovered(1, 2, 9),
+            stated(1, 2, 9, b"a", b"m", 2),
+            restated(1, &[2]),
+            at_ms(100, switched(1, vec![raft_span(2), keys(b"a", b"m")])),
+            at_ms(101, snapshot_installed(1, 2, 12)),
+            at_ms(101, stated(1, 2, 12, b"a", b"m", 2)),
+        ]);
+        records.extend(a_split_on(2, true));
+        records.extend(a_split_on(3, true));
+        let mut owners = OneOwnerPerKey::default();
+        for record in &records {
+            owners.push(record);
+        }
+        let why = owners.right_half_verdict().unwrap_err();
+        assert!(
+            why.starts_with("one owner per key: node 1 is a voter of range 2's configuration")
+                && why.contains("its replica of range 2 has applied it")
+                && why.contains("at its restatement it holds no replica of the right half 6"),
+            "{why}"
+        );
+        assert_eq!(owners.excused(), []);
+        assert_eq!(owners.installed_voters(), []);
+        // The install read before the restatement: the crash comes after it.
+        let mut before = three_voters();
+        before.extend([
+            recovered(1, 2, 0),
+            restated(1, &[2]),
+            at_ms(100, switched(1, vec![raft_span(2), keys(b"a", b"m")])),
+            at_ms(101, snapshot_installed(1, 2, 12)),
+            at_ms(101, stated(1, 2, 12, b"a", b"m", 2)),
+            at_ms(200, crashed(1)),
+            at_ms(300, recovered(1, 2, 12)),
+            at_ms(300, stated(1, 2, 12, b"a", b"m", 2)),
+            at_ms(300, restated(1, &[2])),
+        ]);
+        before.extend(a_split_on(2, true));
+        before.extend(a_split_on(3, true));
+        let mut owners = OneOwnerPerKey::default();
+        for record in &before {
+            owners.push(record);
+        }
+        assert_eq!(owners.right_half_verdict(), Ok(()));
+        assert_eq!(
+            owners.excused(),
+            [Excused {
+                node: 1,
+                parent: 2,
+                index: 9,
+                right: 6,
+                held: false
+            }]
+        );
+        assert_eq!(owners.installed_voters().len(), 1, "{owners:?}");
     }
 
     #[test]
@@ -3877,7 +4727,7 @@ mod tests {
     /// verdict's third fold from last, after every fold but the install and created-twice
     /// clauses (PROPOSED D-128, D-116), so a violation an earlier fold reports on the same
     /// records is the one the verdict names; the right half's clause is its own verdict
-    /// and not the checker's, which a correct node trips until placeholders exist.
+    /// and not the checker's (PROPOSED D-141: asserted apart by the two sweeps).
     // PROPOSED(D-107)
     #[test]
     fn check_8s_overlap_clause_is_third_from_last_and_its_right_half_clause_is_not_in_it() {

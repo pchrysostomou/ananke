@@ -101,6 +101,19 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-right-half-clause` (2026-11-15), off 8760c49 (#236), **PROPOSED D-141,
+  #162's S8 (c), the clause half.** Check 8's right half's clause under the owner's reading R of
+  D-107 (2026-11-14): R owed from a voter's apply of the split and kept across its restarts, from a
+  restatement past the split only where no install had put the voter's P there when it was restated,
+  and from an installed voter's holding R. Asserted beside the node sweep's and the sharded sweep's
+  verdicts, not in `Checker::verdict`; the correct system trips it on none of the sharded sweep's
+  10 000 seeds or the node sweep's first 1 000. Instrument `RestartDropsRightHalves` (bit 11,
+  outside §10's count), caught on 10 of 20 and 52 of 100 compared node seeds; the correct node's
+  fold-by-fold test is its pair. The sharded sweep asserts that reading R was reached where it
+  differs from §8's reading. The installed voter's bound is built, measured and printed and **not
+  asserted**: the correct system fails a 5.63 s bound on 117 of 10 000 sharded seeds, all #220's
+  wedge, so it is the owner's question (D-141, option (a) recommended). `PlaceholderAnswersNothing`
+  was built and removed. Review F1 to F8 fixed in place.
 - Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
   **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
   ended in a switch, so a hold the node let go with no switch was measured as a running core (seed
