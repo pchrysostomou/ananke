@@ -25556,6 +25556,8 @@ nothing else.
   replayed keys and is then streamed keeps those beyond the snapshot's span until a right half's
   install replaces them, where configuration's span used to take them: no replica serves them, and
   no run here shows it. Both belong with #199.
+  **Corrected after #200 merged:** #199 closes with D-138, which leaves both as they were, so both
+  belong with #248 (D-138 §5).
 
 ### 10. The nightly's rows (D-064)
 
@@ -26467,20 +26469,28 @@ first and recommends it.
 
 ### 5. What is not here
 
-- **A right half installed beside such a replica before it replays to the split.** The overlap
-  rule admits R's install beside a replica with no descriptor, which is not initialised (D-128).
-  If R's leader streams R to the node before the replica's log reaches the split, the split's
-  apply then makes R a second time on a node that holds it initialised, and writes R's Raft state
-  over at the floor. Check 8 names it: a `RangeCreated` of a range its node holds initialised.
-  Before this entry the same schedule failed state machine safety at the split, so nothing
-  regresses. It is not reached. On `main` every replay of a split on a replica with no descriptor
-  failed state machine safety, and S11's sweep passed its 10 000 seeds there (D-131), so no seed
-  of 0 to 9 999 replays one; this entry moves no schedule that does not, and this tree's sweep at
-  10 000 says the same (section 6). D-128 §9's last bullet, a replica with no descriptor replaying
-  keyed entries below a split with R beside it, is the same window and is unchanged. Recommended,
-  for its own issue in #178's family: the split's apply that finds R initialised in the host's
-  table takes P's half and leaves R as its install made it, since R's install carries R's state
-  from at or past the split, as D-107 leaves to P's own install an entry it moved past.
+- **A right half installed beside such a replica before it replays to the split (#248).** The
+  overlap rule admits R's install beside a replica with no descriptor, which is not initialised
+  (D-128). If R's leader streams R to the node before the replica's log reaches the split, the
+  split's apply then makes R a second time on a node that holds it initialised, and writes R's
+  Raft state over at the floor. Check 8 names it: a `RangeCreated` of a range its node holds
+  initialised. Before this entry the same schedule failed state machine safety at the split, so
+  nothing regresses. It is not reached. On `main` every replay of a split on a replica with no
+  descriptor failed state machine safety, and S11's sweep passed its 10 000 seeds there (D-131),
+  so no seed of 0 to 9 999 replays one; this entry moves no schedule that does not, and this
+  tree's sweep at 10 000 says the same (section 6). Recommended, in #178's family: the split's
+  apply that finds R initialised in the host's table takes P's half and leaves R as its install
+  made it, since R's install carries R's state from at or past the split, as D-107 leaves to P's
+  own install an entry it moved past.
+- **D-128 §9's last bullet, both halves (#248).** D-128 made #199 their home, and #199 closes with
+  this entry, so #248 holds them with the window above. First, a replica with no descriptor that
+  replays keyed entries below a split with R beside it writes R's keys, since its apply check
+  reads no span (D-097). It needs the order above, and this entry leaves it as it was: the
+  fallback is read at a split's apply and nowhere else, and the recommendation above would not
+  reach it, since those writes come before the split. Second, a replica that replays keyed
+  entries and is then streamed keeps those outside the snapshot's span until a right half's
+  install replaces them, and no replica serves them. That replica installs where it would have
+  applied the split, so nothing here touches it.
 
 ### 6. What the sweeps say
 
@@ -26517,7 +26527,7 @@ The outcome is settled by the documents, as above, so what is the owner's is the
 1. Section 3's question: the descriptor taken from configuration at the split's apply, rather than
    written at the re-seed or at the replica's first apply. Recommended and built.
 2. Bit 52, and the variant restoring the refusal.
-3. The window in section 5, left open and named, with the recommendation there.
+3. The windows in section 5, left open in #248, with the recommendation there for the first.
 4. The directed run's tiers: the correct node on the binary's capped tier and the variant on
    `HIGH_RATE_SHARE`, as `TasksOnTheRefusedDir` is run (D-115's cap, still the owner's).
 
