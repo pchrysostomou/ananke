@@ -10,7 +10,8 @@
 //! and per range the run ended with and the meta convergence bound — that nodes 4 and 5
 //! hold nothing, and that each of the workload's shapes reached its window (PROPOSED D-131).
 //! It prints the driver's work, the refusals by the loss that made them (#45), the empty blocks
-//! a split finds (D-092), the shapes' rates and the bounds' margins.
+//! a split finds (D-092), the shapes' rates, the bounds' margins and how often an install lets a
+//! hold go with no replica restored (PROPOSED D-134).
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +66,81 @@ struct Seen {
     shapes: shard::Shapes,
     /// Which shapes this seed drew: a write burst, a read burst, the stale cache, the restart.
     drawn: [bool; 4],
+    /// The holds an install let go with no replica restored (PROPOSED D-134).
+    released: Released,
+}
+
+/// What PROPOSED D-134's record did on one run: the holds an install let go with no replica
+/// restored (`RaftSnapshotReleased`), how many of those a switch that rebuilt no replica let go,
+/// the rest being abandoned installs, and whether the timer check finds a different number of
+/// gaps with D-134's arm (`TimerResets::ALL`) and without it (`WITHOUT_RELEASED_HOLD`). Printed,
+/// not asserted: a count of a correct system's events is no property, and neither is the gap
+/// count, since a gap inside a hold let go is rightly excused.
+// PROPOSED(D-134): the record's rate, printed by the sweep that cites it.
+struct Released {
+    holds: usize,
+    at_a_switch: usize,
+    gaps_moved: bool,
+}
+
+/// A release is counted as a switch's where a `RaftSnapshot { taken: false }` of the same server
+/// and range is decided at its decision, as seed 16725's pin tells them apart. Only a run with a release
+/// replays the timer check twice: the arm acts on that record alone, so with none the two
+/// replays are one.
+// PROPOSED(D-134)
+fn released_of(report: &shard::Report) -> Released {
+    let records = report.records();
+    let releases: Vec<(u64, u64, &TraceRecord)> = records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEvent::RaftSnapshotReleased { server, range } => Some((server, range, record)),
+            _ => None,
+        })
+        .collect();
+    let at_a_switch = releases
+        .iter()
+        .filter(|&&(server, range, release)| {
+            records.iter().any(|record| {
+                matches!(record.event,
+                    TraceEvent::RaftSnapshot { server: s, range: r, taken: false, .. }
+                        if (s, r) == (server, range) && record.decided == release.decided)
+            })
+        })
+        .count();
+    let gaps_moved = !releases.is_empty()
+        && report.checked.timer_gaps(raft::TimerResets::ALL).len()
+            != report
+                .checked
+                .timer_gaps(raft::TimerResets::WITHOUT_RELEASED_HOLD)
+                .len();
+    Released {
+        holds: releases.len(),
+        at_a_switch,
+        gaps_moved,
+    }
+}
+
+/// Prints [`Released`] over a sweep, its runs in seed order.
+// PROPOSED(D-134)
+fn print_released<'a>(name: &str, runs: impl Iterator<Item = &'a Released>) {
+    let (mut count, mut holds, mut at_a_switch, mut seeds) = (0_usize, 0, 0, 0);
+    let mut moved = Vec::new();
+    for (seed, run) in runs.enumerate() {
+        count += 1;
+        holds += run.holds;
+        at_a_switch += run.at_a_switch;
+        seeds += usize::from(run.holds > 0);
+        if run.gaps_moved {
+            moved.push(seed);
+        }
+    }
+    println!(
+        "shard: {name}: {holds} holds an install let go with no replica restored, on \
+         {seeds}/{count} seeds (PROPOSED D-134), {} of them abandoned and {at_a_switch} at a \
+         switch that rebuilt no replica; the timer check's gaps differ in number with D-134's arm \
+         and without it on seeds {moved:?}",
+        holds - at_a_switch,
+    );
 }
 
 /// SHARD.md §8's write bound, as `raft::Report::liveness_by_final_range` asks it, keeps the
@@ -173,6 +249,7 @@ fn seen_of(seed: u64) -> Seen {
         crashes: count(|e| matches!(e, TraceEvent::NodeCrashed { .. })),
         lease_reads: count(|e| matches!(e, TraceEvent::RaftRead { lease: true, .. })),
         placeholders: count(|e| matches!(e, TraceEvent::RangeReplicaCreated { .. })),
+        released: released_of(&report),
         shapes: report.shapes(),
         drawn: [
             report
@@ -345,6 +422,8 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
          {}/{count} seeds",
         seen.iter().filter(|s| s.right_half).count()
     );
+    // PROPOSED(D-134): how often an install lets a hold go with no replica restored.
+    print_released("the correct node", seen.iter().map(|s| &s.released));
 
     // PROPOSED(D-131): each shape, seeds that drew it and seeds that reached its window, each
     // reached well above D-061's 5 % over the seeds that draw it.
@@ -435,6 +514,8 @@ struct Under {
     splits: usize,
     /// The splits that took an id from a block of an earlier run of its holder.
     from_an_earlier_run: usize,
+    /// The holds an install let go with no replica restored (PROPOSED D-134).
+    released: Released,
 }
 
 /// `high_rate_share` of `sim/tests/node.rs`: a tenth of the tier, at least the gate's twenty.
@@ -469,6 +550,7 @@ fn under(
                 .collect(),
             splits: report.splits(),
             from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
+            released: released_of(&report),
         }
     });
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
@@ -851,9 +933,12 @@ fn a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep() 
 }
 
 /// Phase 2's timer variant: 30 of 100 seeds by the timer check, and 5 more by the write bound.
+/// It prints the seeds where PROPOSED D-134's arm changes the number of gaps the check finds.
+// PROPOSED(D-134): the arm's effect on the variant, printed.
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep() {
     let found = core_variant("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
+    print_released("ResetTimerOnAnyRpc", found.iter().map(|u| &u.released));
     assert!(
         said(&found, "timers:") > 0,
         "no timer stayed reset by a stale sender"
