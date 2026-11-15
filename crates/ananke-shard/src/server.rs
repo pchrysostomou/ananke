@@ -2682,6 +2682,12 @@ impl<E: Environment> Applier for ServerApplier<E> {
             for entry in entries {
                 // The store's own applied index wins when it is ahead: a live install
                 // moved it inside a manifest switch, without an apply (D-083).
+                //
+                // Not closed here: an entry of a job the replaced core queued before the
+                // hold that passes this head before the `snapshot` task restates the
+                // store to the snapshot, and reaches `RaftStore::apply` after it past an
+                // await below, is refused ("applying N after N") and fails the range.
+                // That is PROPOSED D-126 section 7's window, #225's.
                 let applied = lock(&self.applied)
                     .get(&range)
                     .map_or(0, |state| state.index)
@@ -4359,7 +4365,11 @@ fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Ind
 ///
 /// The `snapshot` task's own restatement, right after the switch, reads it too: a job
 /// that applied past the snapshot while `install_spans` was in flight wrote above the
-/// switch, and is kept there as here (#113's review, F1).
+/// switch, and is kept there as here (#113's review, F1). That such an index was applied
+/// above the switch rests there on D-132's second re-check, which leaves only a store
+/// below the snapshot to be numbered; `finish` reads the store at that re-check and asks
+/// this only where it stood below, so `InstallReplacesCopiedSpan`, which skips the
+/// re-check, keeps nothing there past a store that did not (#113's second review, N1).
 // PROPOSED(D-126)
 pub(crate) fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
     held > snapshot && !variants.contains(NodeVariant::SwitchForgetsLateApplies)
@@ -5032,9 +5042,11 @@ mod tests {
     ///
     /// The pair is [`NodeVariant::SwitchForgetsLateApplies`], which takes it back. This
     /// holds the rule, as `install_creates`' test above holds its reading; its two call
-    /// sites in `installed`, which no sweep reaches (PROPOSED D-126 measures the late job),
-    /// are held by the test below, and the watermark's half of the same variant is paired
-    /// in `round`.
+    /// sites in `installed`, which no sweep reaches at its tiers (PROPOSED D-126 measures
+    /// the late job; seed 13283 of the sharded sweep, past the nightly's range, reaches it
+    /// and fails on #225's window on the correct node too, D-126 sections 6 and 7), are
+    /// held by the test below, and the watermark's half of the same variant is paired in
+    /// `round`.
     // PROPOSED(D-126)
     #[test]
     fn the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot() {

@@ -25370,7 +25370,14 @@ chunk and the hold. Neither is shown impossible, so the path is fixed, not close
    up to the snapshot, as D-083 and D-086 have them, and an index already past the snapshot is
    kept: it was applied after the switch's numbering, on top of the state it installed, and the
    store's applied-index key says so too, since the late job's batches were numbered above the
-   switch's. The first was added after this entry's review (F1); the placeholder's install
+   switch's. At the `snapshot` task's site that rests on D-132's second re-check: a store at or
+   past the snapshot there is answered installed, and nothing awaits between the re-check and
+   the numbering, so a store that reaches the switch stood below the snapshot and every apply
+   past it was numbered above the switch. `finish` reads the store at that re-check and keeps
+   only where it stood below the snapshot, which on the correct node is every store that
+   switches; under `InstallReplacesCopiedSpan`, which skips the re-check, it keeps nothing past
+   a store that stood at or past the snapshot there, as before D-132 (the second review's N1,
+   section 6). The first was added after this entry's review (F1); the placeholder's install
    (D-109) restates too, and is not a site, since it replaces no core and so no job of one can
    be queued.
 3. **`NodeVariant::SwitchForgetsLateApplies`**, the tree before this entry, every half at once:
@@ -25407,10 +25414,20 @@ nightly's range, seed 13283 is a run the `snapshot` task's rule changes (section
   it by the simulator's disk would move with every read on the path. Its applied-index key
   reads 32 on both nodes; the correct node leaves the store's cached index and the task at 32,
   and the variant takes both to 30, below the key.
+  `a_switch_numbered_over_a_store_past_the_snapshot_keeps_nothing_past_it` holds what that keep
+  rests on (the second review's N1, section 3.2), and its other half is
+  `InstallReplacesCopiedSpan`, not this entry's variant. The store and the task stand at 5, the
+  snapshot is at 6, and a job lands through D-132's `at_the_switch`, before the numbering, and
+  applies 6 to 9, entry 8 writing `k0y`. The correct node answers it installed: no switch, the
+  store, the task and the key at 9, `k0y` there. Under `InstallReplacesCopiedSpan` the switch
+  overwrites the job's batches, the key reading 6 and `k0y` gone, and the restatement takes the
+  store and the task back to 6, so the new replica's first `Apply` hands 7 to 9 out again; kept
+  at 9, over a key at 6, entry 8's write would be lost for good.
 
 All are unit pairs, as `RestartAppliesFromZero`'s was (D-081), and for the reason in section 2:
-the late job is an interleaving no sweep in the tree reaches at its tiers. The variant is caught
-on every run of each, so at every tier.
+the late job is an interleaving no sweep in the tree reaches at its tiers; seed 13283 of the
+sharded sweep, past the nightly's range, reaches it (section 6), and is not pinned. The variant
+is caught on every run of each, so at every tier.
 
 The reading that says no sweep reaches it is tested too, since the pin in section 5 asserts its
 absence through it: `a_late_job_is_read_from_the_hold_to_the_first_commit` (`sim/reseed.rs`).
@@ -25483,6 +25500,32 @@ rule, `true ||` before the store's test in `finish` and `false &&` in its task f
 `(Some(32), 32)`; the rule's own test passes, as the review found it did. Unplanted, the crate's
 lib passes, 195 tests.
 
+**The second review, of bc758d7.** Nothing blocking, and three nits its verifier confirmed.
+**N1:** the keep in `finish` rested on D-132's second re-check, which `InstallReplacesCopiedSpan`
+skips, so under that variant applies numbered below the switch and overwritten by it were kept,
+with the store and the task above the applied-index key the switch wrote and those writes lost
+for good (the review's probe: store at 5, snapshot at 6, applies 6 to 9 at `at_the_switch`,
+ending at 9 over a key at 6). Fixed in the code, not only named: `finish` reads the store at that
+re-check and keeps only where it stood below the snapshot there (section 3.2), which on the
+correct node is every store that switches, so no correct run moves; under the variant it takes
+back as before D-132. Held by
+`a_switch_numbered_over_a_store_past_the_snapshot_keeps_nothing_past_it` (section 4). Plants,
+each alone in release and reverted: both keeps on `kept_past_the_switch` alone, bc758d7's, fail
+it with `(9, Some(9))` for `(6, Some(6))`; the store's keep alone with `(9, Some(6))`; the task's
+alone with `(6, Some(9))`; F1's test passes under each. The variant's own pair, at the tiers D-132
+section 4 asserts it, which are every tier, run again in release with the restatement
+instrumented and then reverted: its directed tests and seed 5620's pin pass, and the crate's lib
+passes, 196 tests. The new reading decides only where the variant's store stood at or past the
+snapshot at the numbering. That is the split test's case past the split, 9 over a snapshot at 6,
+which now restates to 6 where it kept 9 and is caught by check 8's install clause as before; its
+case at the split, 9 over 9; and seed 5620, 113 over 113 and still 113 at the restatement, which
+restates what it did before, so that run does not move. **N2:** section 7 left out that the
+window fails the range as well as leaving older values; added there and to section 8's
+question, from the review's and the verifier's probes, with no code change. **N3:** the code docs
+of `SwitchForgetsLateApplies` and of its pairs in `install`, `server` and `round` said flatly that
+no sweep reaches the late job, against seed 13283 above; each now says at its tiers, and names
+that seed.
+
 ### 7. What is not here
 
 - **A late job's entries at or below the snapshot, landing while the switch is in flight.** The
@@ -25496,24 +25539,39 @@ lib passes, 195 tests.
   snapshot, and a `Cas` applied again reads a later value than it first did. A throwaway directed
   test on this tree, the seam above with entry 29 writing `k0x` over a snapshot at 30 that holds
   it, ends with `k0x` at entry 29's value, the store's cached index at 30 and its applied-index key
-  at 29. It is the window D-132 section 5 names for a split's apply, which #225 tracks, met by
-  any apply: D-132 counted the applied index moving there on 2 of 60 226 switches past the
-  nightly's range, and none within it. An index rule cannot close it. What closes it is the
-  `apply` task's job and the range's install excluding each other, #225's recommendation widened
-  from a split's apply to every apply of the range, which is a change to the `apply` task and the
-  owner's to shape (section 8). This entry does not close it, and it is not #113's failure.
+  at 29. The same window can fail the range as well. An entry at or below the snapshot that
+  passes the `apply` task's head before the restatement and reaches `RaftStore::apply` after it,
+  past an await of its own such as a keyed command's descriptor read, finds the store restated
+  to the snapshot and is refused, "applying 30 after 30"; `ServerApplier` traces
+  `RaftServerFailed` and drops the rest of its job. A directed probe in the second review's
+  scratch copy (section 6), holding that await across the restatement on the seam above, ends
+  that way on the correct node and under `SwitchForgetsLateApplies` alike, since
+  `kept_past_the_switch(29, 30)` is false on both: this entry neither causes it nor makes it
+  worse. It needs the await to straddle `install_spans`' return, which a switch of tens of
+  milliseconds makes plausible; the probe forces it, and no run has found it by timing. It is
+  the window D-132 section 5 names for a split's apply, which #225 tracks, met by any apply:
+  D-132 counted the applied index moving there on 2 of 60 226 switches past the nightly's range,
+  seed 13283's among them (section 6), and none within it. An index rule cannot close it. What
+  closes it is the `apply` task's job and the range's install excluding each other, #225's
+  recommendation widened from a split's apply to every apply of the range, which is a change to
+  the `apply` task and the owner's to shape (section 8). This entry does not close it, and it is
+  not #113's failure.
 
 ### 8. For the owner (PROPOSED)
 
 1. The two rules' shape: the watermark raised only by a compaction the step took (section 3.1),
-   and both restatements moving only up (section 3.2).
+   and both restatements moving only up, the `snapshot` task's keeping only over a store that
+   stood below the snapshot at the numbering (section 3.2).
 2. Bit 52, and the variant restoring every half of the old tree at once.
 3. **A question: section 7's window.** Recommended: the exclusion #225 recommends for a split's
    apply, widened to every apply of the range. The `apply` task waits out an install of the range
    that is numbered and not yet restated, and the install waits for a job of the range in flight
    before it is numbered. That closes section 7's window, and F1's route at its root, leaving this
-   entry's rules as guards. Whether it goes under #225 or an issue of its own is the owner's too.
-   Once it lands, seed 13283 (section 6) can be pinned on both: the correct run clean, and
+   entry's rules as guards. The window fails the range too, and does not only leave keys at
+   older values: an entry in flight across the restatement is refused, "applying 30 after 30",
+   and the rest of its job is dropped (section 7), which weighs for widening the exclusion
+   sooner. Whether it goes under #225 or an issue of its own is the owner's too. Once it lands,
+   seed 13283 (section 6) can be pinned on both: the correct run clean, and
    `SwitchForgetsLateApplies` applying 168 twice.
 
 **Closes #113.** The issue's failure is not reproduced by search, on this tree or on its own;

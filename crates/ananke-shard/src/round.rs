@@ -956,8 +956,10 @@ mod tests {
     /// [`NodeVariant::SwitchForgetsLateApplies`] it names 384, which the core no longer
     /// holds — the issue's own numbers, "an apply through 389 names index 384", and
     /// the node stops on it (`a_gap_in_the_applied_stream_fails_the_node_and_an_empty
-    /// _job_is_not_a_job`). No sweep has reached the late job (PROPOSED D-126 measures
-    /// it), so this is the variant's pair, beside the restatement's in `server`.
+    /// _job_is_not_a_job`). No sweep reaches the late job at its tiers (PROPOSED D-126
+    /// measures it; seed 13283 of the sharded sweep, past the nightly's range, reaches it
+    /// and fails on #225's window on the correct node too, D-126 sections 6 and 7), so this
+    /// is the variant's pair, beside the restatement's in `server`.
     // PROPOSED(D-126)
     #[test]
     fn a_record_the_replaced_core_asked_for_raises_the_watermark_with_its_compaction() {

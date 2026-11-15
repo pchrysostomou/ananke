@@ -1442,7 +1442,11 @@ impl<E: Environment> Task<E> {
         let copied = self
             .variants
             .contains(NodeVariant::InstallReplacesCopiedSpan);
-        if !copied && store.applied() >= install.at.last_index {
+        // The store at the numbering, which the restatement after the switch reads again:
+        // an index past the snapshot there was applied after the numbering only if the
+        // store stood below the snapshot here (PROPOSED D-126).
+        let at_the_numbering = store.applied();
+        if !copied && at_the_numbering >= install.at.last_index {
             drop(source);
             return self
                 .caught_up(range, from, &install, repair.term, &store)
@@ -1529,23 +1533,48 @@ impl<E: Environment> Task<E> {
         // task stand at the snapshot, the restatement at `Switched` then finds nothing
         // past it to keep, and the new replica's first `Apply` hands those entries out a
         // second time (#113's review, F1). `SwitchForgetsLateApplies` takes it back.
+        //
+        // That an index past the snapshot was applied after the numbering rests on the
+        // re-check before the switch: it sends a store at or past the snapshot to
+        // `caught_up`, and nothing awaits between it and the numbering, so the correct
+        // node's store stood below the snapshot there and every apply past it was
+        // numbered above the switch. `InstallReplacesCopiedSpan` skips that re-check, so
+        // its store can stand at or past the snapshot at the numbering, with what it
+        // applied there numbered below the switch and overwritten by it. Kept, the store
+        // and the task would stand above the applied-index key the switch wrote and no
+        // `Apply` would hand those entries out again, so their writes would be gone for
+        // good. So only a store below the snapshot at the numbering keeps, which on the
+        // correct node is every store that reaches here, and under that variant this
+        // restatement takes back as it did before D-132 (#113's second review, N1).
+        //
+        // What no index rule here closes: a late job's entries at or below the snapshot that
+        // land between the numbering and this restatement apply again over the installed
+        // state, and one that passed the `apply` task's head before it and reaches the store
+        // after it is refused ("applying N after N") and fails the range. That is D-126
+        // section 7's window, D-132's for any apply, which #225 tracks. Seed 13283 of the
+        // sharded sweep, past the nightly's range, reaches the late job on this route
+        // (D-126 section 6).
         // PROPOSED(D-126): the snapshot task's restatement takes nothing back either.
-        if !crate::server::kept_past_the_switch(
-            store.applied(),
-            install.at.last_index,
-            self.variants,
-        ) {
+        let below_at_the_numbering = at_the_numbering < install.at.last_index;
+        let keeps_the_store = below_at_the_numbering
+            && crate::server::kept_past_the_switch(
+                store.applied(),
+                install.at.last_index,
+                self.variants,
+            );
+        if !keeps_the_store {
             store.installed_at(install.at.last_index);
         }
         if let Ok(mut applied) = self.applied.lock() {
             let kept = applied
                 .get(&range)
                 .filter(|held| {
-                    crate::server::kept_past_the_switch(
-                        held.index,
-                        install.at.last_index,
-                        self.variants,
-                    )
+                    below_at_the_numbering
+                        && crate::server::kept_past_the_switch(
+                            held.index,
+                            install.at.last_index,
+                            self.variants,
+                        )
                 })
                 .cloned();
             applied.insert(
@@ -4251,7 +4280,9 @@ mod tests {
     /// value. Under `SwitchForgetsLateApplies`, the tree before this, both go back to 30,
     /// below the key: the restatement at `Switched` then reads 30 and keeps nothing, and the
     /// new replica's first `Apply` hands 31 and 32 out a second time. No sweep reaches the
-    /// late job (PROPOSED D-126), so this is the pair of the half that lives here.
+    /// late job at its tiers; seed 13283 of the sharded sweep, past the nightly's range, does,
+    /// and fails on #225's window on the correct node too, so it is not pinned (PROPOSED
+    /// D-126 sections 6 and 7). So this is the pair of the half that lives here.
     // PROPOSED(D-126)
     #[test]
     fn a_late_job_that_applies_past_the_snapshot_while_the_switch_is_in_flight_is_kept() {
@@ -4334,6 +4365,117 @@ mod tests {
                     (cached, task_at),
                     (32, Some(32)),
                     "the correct node keeps what the late job applied past the snapshot"
+                );
+            }
+        }
+    }
+
+    /// The test above keeps an index past the snapshot because it was applied after the
+    /// switch's numbering, and that rests on D-132's second re-check: a store at or past the
+    /// snapshot there is answered installed, so a store that reaches the switch stood below
+    /// it (#113's second review, N1). R2's store and its `apply` task stand at 5 and the
+    /// stream's snapshot is at 6. A job lands at the switch (`at_the_switch`), after the
+    /// stream's last await and before the numbering, and applies 6 to 9 as the `apply` task
+    /// does, entry 8 writing `k0y`.
+    ///
+    /// The correct node finds the store at 9 at the re-check and switches nothing: the
+    /// store, the task and the applied-index key stand at 9, and `k0y` is there.
+    /// `InstallReplacesCopiedSpan` skips the re-check and switches over the job's batches,
+    /// which were numbered below the switch, so the applied-index key reads 6 and `k0y` is
+    /// gone. Its restatement takes the store and the task back to 6, as the tree before
+    /// D-132 did, so the new replica's first `Apply` hands 7 to 9 out again and entry 8
+    /// writes `k0y` back. Kept at 9 over a key at 6, the store would take 10 next and entry
+    /// 8's write would be lost for good: a second bug beside the variant's own, which the
+    /// tree before D-132 did not have.
+    // PROPOSED(D-126)
+    #[test]
+    fn a_switch_numbered_over_a_store_past_the_snapshot_keeps_nothing_past_it() {
+        for buggy in [false, true] {
+            let variants = if buggy {
+                NodeVariants::of(&[NodeVariant::InstallReplacesCopiedSpan])
+            } else {
+                NodeVariants::correct()
+            };
+            let ((cached, task_at, on_disk, k0y), trace) = on_a_node(move |env| async move {
+                let parent = described(R2, "k0", "k9", 1);
+                let (mut task, store, _local, _follower) =
+                    task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                task.variants = variants;
+                let mut first = ananke_storage::WriteBatch::new();
+                first.put(KeyPrefix::group(R2.get()).descriptor_key(), parent.encode());
+                store.apply(1, first).await.expect("an apply");
+                for index in 2..=5 {
+                    store
+                        .apply(index, ananke_storage::WriteBatch::new())
+                        .await
+                        .expect("an apply");
+                }
+                let held = |index| crate::server::Applied {
+                    index,
+                    term: 2,
+                    config: Configuration::of(&[ServerId(1), ServerId(2), FOLLOWER]),
+                };
+                lock(&task.applied).insert(R2, held(5));
+                let at = Identity {
+                    term: 2,
+                    last_index: 6,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                checkpoint_with(&env, R2, 6, Some(&parent), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                let job = {
+                    let (store, applied) = (store.clone(), task.applied.clone());
+                    async move {
+                        for index in 6..=9 {
+                            let mut batch = ananke_storage::WriteBatch::new();
+                            if index == 8 {
+                                batch.put(key("k0y"), Bytes::from_static(b"entry 8"));
+                            }
+                            store.apply(index, batch).await.expect("the job's apply");
+                            lock(&applied).insert(R2, held(index));
+                        }
+                    }
+                };
+                *lock(&task.at_the_switch) = Some(Box::pin(job));
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let task_at = lock(&task.applied).get(&R2).map(|state| state.index);
+                let on_disk = store
+                    .applied_at(&store.engine().snapshot())
+                    .await
+                    .expect("a read");
+                let k0y = store.engine().get(&key("k0y")).await.expect("a read");
+                (store.applied(), task_at, on_disk, k0y.is_some())
+            });
+            if buggy {
+                assert_eq!(
+                    switches(&trace),
+                    vec![r2_replaced("k9")],
+                    "the variant switches over a store past the snapshot"
+                );
+                assert_eq!(
+                    (on_disk, k0y),
+                    (6, false),
+                    "the switch overwrote what the job applied below its numbering"
+                );
+                assert_eq!(
+                    (cached, task_at),
+                    (6, Some(6)),
+                    "the variant's restatement takes the store and the task back to the \
+                     snapshot, to the key the switch wrote, so the entries are handed out again"
+                );
+            } else {
+                assert!(
+                    switches(&trace).is_empty(),
+                    "the correct node answers a store past the snapshot installed"
+                );
+                assert_eq!(
+                    (cached, task_at, on_disk, k0y),
+                    (9, Some(9), 9, true),
+                    "the correct node keeps what the job applied"
                 );
             }
         }

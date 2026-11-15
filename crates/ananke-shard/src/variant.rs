@@ -456,7 +456,16 @@ pub enum NodeVariant {
     /// right half the node holds, with every descriptor right. Check 8's install clause sees
     /// the switch's spans (PROPOSED D-132). A replica with no descriptor is D-128's and
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
+    ///
+    /// Its store can then stand at or past the snapshot when the switch is numbered, with
+    /// what it applied there overwritten by the switch. The `snapshot` task's restatement
+    /// keeps an index past the snapshot only where the store stood below it at the
+    /// numbering, which on the correct node the skipped re-check guarantees; under this
+    /// variant it takes the store and the `apply` task back to the snapshot, as the tree
+    /// before D-132 did, so those entries are handed out again rather than lost (PROPOSED
+    /// D-126, #113's second review, N1).
     // PROPOSED(D-132)
+    // PROPOSED(D-126)
     InstallReplacesCopiedSpan,
     /// The tree before D-126: what a job the replaced core queued before a live
     /// install's hold applies after the switch is forgotten twice over. The restatements,
@@ -466,8 +475,10 @@ pub enum NodeVariant {
     /// the applied watermark stays at the snapshot below a compaction
     /// that job's record makes, so the next `Apply` names an index the replica the switch
     /// built has compacted away and the node stops (issue #113). The node holds a range's
-    /// core across its install, not its `apply` task, so such a job can land; a sweep has
-    /// not reached it, and the pair is a unit pair (PROPOSED D-126).
+    /// core across its install, not its `apply` task, so such a job can land. No sweep
+    /// reaches it at its tiers; seed 13283 of the sharded sweep, past the nightly's range,
+    /// does, and fails on #225's window on the correct node too, so it is not pinned and
+    /// the pair is a unit pair (PROPOSED D-126 sections 6 and 7).
     // PROPOSED(D-126)
     SwitchForgetsLateApplies,
 }
