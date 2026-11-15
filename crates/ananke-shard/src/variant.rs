@@ -458,6 +458,17 @@ pub enum NodeVariant {
     /// unchanged: [`InstallReplacesHostedSpan`](Self::InstallReplacesHostedSpan) is that one.
     // PROPOSED(D-132)
     InstallReplacesCopiedSpan,
+    /// The tree before D-126: what a job the replaced core queued before a live
+    /// install's hold applies after the switch is forgotten twice over. The restatement
+    /// at `Switched` takes the `apply` task's applied state and the store's applied index
+    /// back to the snapshot below the entries that job applied, so the next `Apply` hands
+    /// them out again, and the applied watermark stays at the snapshot below a compaction
+    /// that job's record makes, so the next `Apply` names an index the replica the switch
+    /// built has compacted away and the node stops (issue #113). The node holds a range's
+    /// core across its install, not its `apply` task, so such a job can land; a sweep has
+    /// not reached it, and the pair is a unit pair (PROPOSED D-126).
+    // PROPOSED(D-126)
+    SwitchForgetsLateApplies,
 }
 
 impl NodeVariant {
@@ -515,6 +526,7 @@ impl NodeVariant {
         NodeVariant::InstallReplacesHostedSpan,
         NodeVariant::SplitLeavesQuarantineBehind,
         NodeVariant::InstallReplacesCopiedSpan,
+        NodeVariant::SwitchForgetsLateApplies,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -610,11 +622,17 @@ impl NodeVariant {
     /// mark, and what the *other three* replicas restate afterwards is the evidence.
     /// With one range there is one mark, the crash is on the only replica there is,
     /// and a node that lost it has nothing left to compare it against.
+    ///
+    /// [`SwitchForgetsLateApplies`](Self::SwitchForgetsLateApplies) is the fourth: the
+    /// family the shape's second restart was filed with as issue #113, a job the
+    /// replaced core queued before a live install's hold landing after the switch.
     // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    // PROPOSED(D-126): the shape's fourth.
     pub const SHAPE: &'static [NodeVariant] = &[
         NodeVariant::ReseedMarkNotSynced,
         NodeVariant::RestartAppliesFromZero,
         NodeVariant::RecordNeverQueued,
+        NodeVariant::SwitchForgetsLateApplies,
     ];
 
     /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
@@ -724,6 +742,9 @@ impl NodeVariant {
             // PROPOSED(D-132): an initialised replica's install replacing the plan's copy
             // of its spans. Bits 52 and 53 are free, and twelve bits are left.
             NodeVariant::InstallReplacesCopiedSpan => 1 << 51,
+            // PROPOSED(D-126): a late job's applies forgotten at a switch. Bit 53 is
+            // free, and eleven bits are left.
+            NodeVariant::SwitchForgetsLateApplies => 1 << 52,
         }
     }
 
@@ -783,6 +804,7 @@ impl NodeVariant {
             NodeVariant::InstallReplacesHostedSpan => "InstallReplacesHostedSpan",
             NodeVariant::SplitLeavesQuarantineBehind => "SplitLeavesQuarantineBehind",
             NodeVariant::InstallReplacesCopiedSpan => "InstallReplacesCopiedSpan",
+            NodeVariant::SwitchForgetsLateApplies => "SwitchForgetsLateApplies",
         }
     }
 }
@@ -882,13 +904,15 @@ mod tests {
         // D-117's one, the start's tasks on the refused directory, is Q15's sixth. D-130's
         // one is a right half made on a quarantined parent with no quarantine. D-132's one
         // is an initialised replica's install replacing the plan's copy of its spans.
+        // D-126's one is the shape's fourth, a late job's applies a switch forgot.
         // PROPOSED(D-108)
         // PROPOSED(D-110)
         // PROPOSED(D-117)
         // PROPOSED(D-128)
         // PROPOSED(D-130)
         // PROPOSED(D-132)
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        // PROPOSED(D-126)
+        assert_eq!(NodeVariant::BUGS.len(), 53);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -904,7 +928,7 @@ mod tests {
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
-        assert_eq!(NodeVariant::SHAPE.len(), 3);
+        assert_eq!(NodeVariant::SHAPE.len(), 4);
         assert_eq!(NodeVariant::BOUNDS.len(), 2);
         // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise
         // disjoint: a

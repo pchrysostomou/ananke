@@ -161,6 +161,11 @@ const DOWN: Duration = Duration::from_millis(300);
 /// How long the run goes on after the arm's restart: long enough for four streams
 /// through two slots, and the installs they complete.
 const AFTER: Duration = Duration::from_secs(7);
+/// How long the run goes on after [`run_restarted_again`]'s second restart: issue #113's
+/// two seconds, long enough for every restarted replica to be appended to, commit and
+/// apply, which is where a watermark below the replica's prefix shows.
+// PROPOSED(D-126)
+const AGAIN_SETTLE: Duration = Duration::from_secs(2);
 /// The longest the arm waits for the refusal, and then for the mark it crashes on.
 /// A wait that runs out is an arm that did not fire, which [`Report::check`] fails on
 /// rather than passing quietly.
@@ -263,6 +268,50 @@ impl Report {
     #[must_use]
     pub fn log_ranges() -> BTreeSet<u64> {
         BTreeSet::from([crate::ranges::ROOT_RANGE, crate::ranges::META_RANGE])
+    }
+
+    /// Every apply of an index above a snapshot a replica switched to, made after the
+    /// install's hold and before the replica commits anything on top of the snapshot:
+    /// `(server, range, index)`. [`late_applies`](fn@late_applies) says how it reads the
+    /// trace.
+    // PROPOSED(D-126)
+    #[must_use]
+    pub fn late_applies(&self) -> Vec<(u64, u64, u64)> {
+        late_applies(&self.records)
+    }
+
+    /// The ranges whose replica on the node restated a compacted prefix at the node's last
+    /// start: a `RaftSnapshot { taken: false }` above index 0 after its last
+    /// `NodeRestarted`. In [`run_restarted_again`] that is the second restart, and a
+    /// streamed range here is a restart over a replica its install filled, the situation
+    /// issue #113 is about (PROPOSED D-126).
+    // PROPOSED(D-126)
+    #[must_use]
+    pub fn compacted_at_the_last_start(&self) -> BTreeSet<u64> {
+        let victim = self
+            .node_of
+            .iter()
+            .find(|(_, server)| **server == VICTIM)
+            .map(|(node, _)| *node);
+        let last_start = self.records.iter().rposition(|record| {
+            matches!(record.event, TraceEvent::NodeRestarted { node } if Some(node) == victim)
+        });
+        let Some(last_start) = last_start else {
+            return BTreeSet::new();
+        };
+        self.records[last_start..]
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshot {
+                    server,
+                    range,
+                    last_index,
+                    taken: false,
+                    ..
+                } if *server == VICTIM && *last_index > 0 => Some(*range),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The trace read for the refusal, the marks, the installs and the answers.
@@ -976,10 +1025,108 @@ async fn writer<E: Environment>(env: E, client: u64, range: u64, committed: Arc<
     }
 }
 
+/// Every apply of an index above a snapshot a replica switched to, made after the
+/// install's hold and before the replica commits anything on top of the snapshot:
+/// `(server, range, index)`, in the trace's order.
+///
+/// In that window the replica's core hands its `apply` task nothing: the hold stops the
+/// core until the `raft` task steps `Switched`, and the replica the switch builds commits
+/// before it applies. And nothing applied above the snapshot before the switch, or the
+/// switch's re-check would have answered installed without switching (D-083, D-132). So
+/// an index applied above the snapshot there comes from a job the *replaced* core queued
+/// before the hold, landing after the switch (issue #113): the late job whose record
+/// moves the new replica's prefix past the applied watermark.
+///
+/// The window opens at the hold, the snapshot record's decision (D-047), and not at the
+/// record: the record is traced once the switch is durable and its state read back, and
+/// a late job lands as readily while that read-back is in flight as after it. It closes
+/// at the replica's first `RaftCommit`, or at its next snapshot. A start's restatement
+/// is a `RaftSnapshot { taken: false }` too, decided as it is traced, and a start's
+/// `apply` task holds no job of an earlier life, so it adds nothing. The correct node
+/// keeps what such a job applies; this says whether a run had one (PROPOSED D-126).
+// PROPOSED(D-126)
+#[must_use]
+pub fn late_applies(records: &[TraceRecord]) -> Vec<(u64, u64, u64)> {
+    let mut late = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let TraceEvent::RaftSnapshot {
+            server,
+            range,
+            last_index,
+            taken: false,
+            ..
+        } = record.event
+        else {
+            continue;
+        };
+        let above = |event: &TraceEvent| match *event {
+            TraceEvent::RaftApply {
+                server: s,
+                range: r,
+                index,
+                ..
+            } if (s, r) == (server, range) && index > last_index => Some(index),
+            _ => None,
+        };
+        // Back to the hold: the records are in the order they were traced, and so in
+        // the order of `at`, which is never before a record's decision.
+        let mut found: Vec<u64> = records[..at]
+            .iter()
+            .rev()
+            .take_while(|earlier| earlier.at >= record.decided)
+            .filter_map(|earlier| above(&earlier.event))
+            .collect();
+        found.reverse();
+        found.extend(
+            records[at + 1..]
+                .iter()
+                .take_while(|later| {
+                    !matches!(later.event,
+                        TraceEvent::RaftCommit { server: s, range: r, .. }
+                        | TraceEvent::RaftSnapshot { server: s, range: r, taken: false, .. }
+                        if (s, r) == (server, range))
+                })
+                .filter_map(|later| above(&later.event)),
+        );
+        late.extend(found.into_iter().map(|index| (server, range, index)));
+    }
+    late
+}
+
 /// Runs the shape for `seed`.
 #[must_use]
 pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants) -> Report {
-    let variants = variants.into();
+    shape(seed, variants.into(), node_variants, false)
+}
+
+/// The shape with a second restart after its `AFTER` window: issue #113's recipe, a node
+/// restarted over the replicas its installs filled.
+///
+/// By the end of `AFTER` every streamed range's replica has been filled by its install, so
+/// the restart is a start over four compacted replicas whose logs begin above index 1 and
+/// whose applied index stands at or above the snapshot under each. The node is crashed,
+/// kept down for the arm's own `DOWN`, started again and run for `AGAIN_SETTLE`.
+/// Everything before the crash is [`run`]'s run of the same seed, draw for draw: the
+/// configuration, `run_length_hint` included, is [`config`]'s, so the extra restart moves
+/// no schedule ahead of it.
+///
+/// It was filed with the issue rather than shipped in the shape, because on the tree it
+/// was found on it failed the correct system on one seed in a hundred (D-081). On this
+/// tree the correct system holds on it but for the harness's runaway cap, which a long
+/// seed's trace passes; the late job behind the issue's failure is reached on no seed
+/// measured; and the hole that job opens is closed and paired as a unit. PROPOSED D-126
+/// has the figures.
+// PROPOSED(D-126): issue #113's recipe, as a run of its own.
+#[must_use]
+pub fn run_restarted_again(
+    seed: u64,
+    variants: impl Into<Variants>,
+    node_variants: NodeVariants,
+) -> Report {
+    shape(seed, variants.into(), node_variants, true)
+}
+
+fn shape(seed: u64, variants: Variants, node_variants: NodeVariants, again: bool) -> Report {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..SERVERS as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
@@ -1096,6 +1243,13 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
 
     // The four streams, through two slots, and the installs they complete.
     sim.run_for(AFTER);
+    if again {
+        sim.crash(at);
+        sim.run_for(DOWN);
+        sim.restart(at);
+        spawn(&sim, at, VICTIM, variants, node_variants, false);
+        sim.run_for(AGAIN_SETTLE);
+    }
 
     let refused_at_end = audit(&mut sim, at, Path::new(DIR));
     let still_lost = marked_lost(&mut sim, at, Path::new(DIR));
@@ -3211,4 +3365,83 @@ fn bring_back(
 #[must_use]
 pub fn fresh_dir() -> PathBuf {
     ananke_shard::reseed::generation_dir(Path::new(DIR), ananke_shard::reseed::FIRST_GENERATION + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(millis: u64, decided: u64, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: Instant::from_nanos(millis * 1_000_000),
+            decided: Instant::from_nanos(decided * 1_000_000),
+            node: None,
+            event,
+        }
+    }
+
+    fn apply(millis: u64, range: u64, index: u64) -> TraceRecord {
+        record(
+            millis,
+            millis,
+            TraceEvent::RaftApply {
+                server: VICTIM,
+                range,
+                index,
+                entry_term: 2,
+                hash: 0,
+                key: None,
+                effect: ApplyEffect::Applied,
+            },
+        )
+    }
+
+    /// `late_applies` reads a late job from the install's hold to the replica's first
+    /// commit after the switch, on its own range only, and so it can say a run had one.
+    /// The hold is at 20 ms and the switch to 383 is traced at 30 ms, decided at the
+    /// hold. 384 applied at 25 ms, while the switch's read-back was in flight, and 385
+    /// after the record are the late job's; 384 at 15 ms is before the hold and outside
+    /// the window; 390 on range 3 is another replica's; 387 after the commit is the
+    /// replica's own (PROPOSED D-126).
+    // PROPOSED(D-126)
+    #[test]
+    fn a_late_job_is_read_from_the_hold_to_the_first_commit() {
+        let records = vec![
+            apply(10, 2, 380),
+            apply(15, 2, 384),
+            apply(25, 2, 384),
+            apply(25, 3, 390),
+            record(
+                30,
+                20,
+                TraceEvent::RaftSnapshot {
+                    server: VICTIM,
+                    range: 2,
+                    last_index: 383,
+                    last_term: 2,
+                    taken: false,
+                },
+            ),
+            apply(31, 2, 385),
+            record(
+                32,
+                32,
+                TraceEvent::RaftCommit {
+                    server: VICTIM,
+                    range: 2,
+                    term: 2,
+                    index: 389,
+                },
+            ),
+            apply(33, 2, 387),
+        ];
+        assert_eq!(
+            late_applies(&records),
+            vec![(VICTIM, 2, 384), (VICTIM, 2, 385)]
+        );
+        assert!(
+            late_applies(&records[..4]).is_empty(),
+            "no switch, no late job"
+        );
+    }
 }

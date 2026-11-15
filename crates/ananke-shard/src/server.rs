@@ -1043,24 +1043,51 @@ impl<E: Environment> ServerHost<E> {
         // a record whose term or configuration is off is one D-029's revert floor reads
         // wrong.
         // PROPOSED(D-086): a live install moves the `apply` task's applied state.
-        lock(&self.applied).insert(
-            range,
-            Applied {
-                index: at.last_index,
-                term: at.last_term,
-                config: config.clone(),
-            },
-        );
+        //
+        // It moves it *up* to the snapshot and never back. The `snapshot` task set it
+        // to the snapshot at the switch, and this runs later, when the `raft` task
+        // steps `Switched`; between the two the `apply` task may have run a job the
+        // replaced core queued before the hold and applied entries past the snapshot
+        // (issue #113). Taken back to the snapshot, the task applies them a second time
+        // when the new replica's first `Apply` names them; and where a record that
+        // job's core asked for has moved the new replica's compacted prefix past them,
+        // and the watermark with it (`Cores::step`), that `Apply` starts above where the
+        // task was taken back to and the task fails the range on the gap. What stands
+        // past the snapshot here was applied after the switch, on top of it, so it is
+        // kept (`kept_past_the_switch`).
+        // PROPOSED(D-126): the restatement at `Switched` takes nothing back.
+        {
+            let mut applied = lock(&self.applied);
+            let kept = applied
+                .get(&range)
+                .filter(|held| kept_past_the_switch(held.index, at.last_index, self.node))
+                .cloned();
+            applied.insert(
+                range,
+                kept.unwrap_or_else(|| Applied {
+                    index: at.last_index,
+                    term: at.last_term,
+                    config: config.clone(),
+                }),
+            );
+        }
         // And the store's own caches, for the same reason one layer down: the switch
         // wrote this range's hard state, log bounds and applied index without passing
-        // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
+        // through `persist` or `apply`, which are what keep them (PROPOSED D-086). The
+        // applied index, too, only up: an apply after the switch wrote its own key on
+        // top of the repair's (PROPOSED D-126).
         if let Some(store) = lock(&self.stores).get(&range).cloned() {
+            let applied = if kept_past_the_switch(store.applied(), at.last_index, self.node) {
+                store.applied()
+            } else {
+                at.last_index
+            };
             store.restate_after_install(
                 restored.term(),
                 restored.vote(),
                 at.last_index + 1,
                 restored.last_index(),
-                at.last_index,
+                applied,
             );
         }
         if created {
@@ -4322,6 +4349,18 @@ fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Ind
     !held && applied == 0 && last_index == 0 && snapshot == (0, 0)
 }
 
+/// Whether an applied index `held` past a live install's `snapshot` is kept by the
+/// restatement at `Switched`: what the `apply` task, or the store, stands at above the
+/// snapshot when the `raft` task steps the switch was applied after it, on top of the
+/// state it installed, by a job the replaced core queued before the hold (issue #113).
+/// Taking it back hands those entries to the task a second time. A held index at or
+/// below the snapshot is the replaced replica's and moves up to the snapshot, which is
+/// D-086's restatement. [`NodeVariant::SwitchForgetsLateApplies`] keeps nothing.
+// PROPOSED(D-126)
+fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
+    held > snapshot && !variants.contains(NodeVariant::SwitchForgetsLateApplies)
+}
+
 /// The generation and the voters an install's creation names (`RangeCreated { cause:
 /// snapshot }`, SHARD.md §8): the descriptor the switch put in place, read back from the
 /// store, and for a snapshot that carries none, which no take of this tree makes, the
@@ -4976,6 +5015,43 @@ mod tests {
             !install_creates(false, 0, 0, (5, 2)),
             "a replica with a snapshot"
         );
+    }
+
+    /// The restatement at `Switched` moves the `apply` task's applied index, and the
+    /// store's, up to the snapshot and never back (issue #113). A switch to 383 stepped
+    /// after a job the replaced core queued before the hold applied 384 to 386 keeps
+    /// 386: taken back to 383, the task applies 384 to 386 again when the new replica's
+    /// first `Apply` names them, and where that job's record compacted the replica past
+    /// them the `Apply` starts at 387 and the task fails the range, "apply of 387 after
+    /// 383". A replaced replica's index at or below the snapshot moves up to it, which is
+    /// D-086's restatement unchanged.
+    ///
+    /// The pair is [`NodeVariant::SwitchForgetsLateApplies`], which takes it back. This
+    /// holds the rule and not its two call sites in `installed`, which no sweep reaches
+    /// (PROPOSED D-126 measures the late job), as `install_creates`' test above holds its
+    /// reading; the watermark's half of the same variant is paired in `round`.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot() {
+        let correct = NodeVariants::correct();
+        assert!(
+            kept_past_the_switch(386, 383, correct),
+            "entries applied after the switch are kept"
+        );
+        assert!(
+            !kept_past_the_switch(383, 383, correct),
+            "the snapshot itself"
+        );
+        assert!(
+            !kept_past_the_switch(380, 383, correct),
+            "the replaced replica's index moves up to the snapshot"
+        );
+        let buggy = NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies]);
+        assert!(
+            !kept_past_the_switch(386, 383, buggy),
+            "the variant takes the late job's applies back to the snapshot"
+        );
+        assert!(!kept_past_the_switch(380, 383, buggy));
     }
 
     fn client_addr() -> SocketAddr {

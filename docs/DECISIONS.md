@@ -25252,6 +25252,182 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
+## PROPOSED D-126 — What a job of the replaced core applies after a live install's switch is kept: the restatement at `Switched` takes nothing back, a compaction carries the applied watermark with it, and `SwitchForgetsLateApplies` keeps both beside the fix; issue #113's second restart is pinned on its seed 26 (closes #113)
+
+**The number.** Off `main` at c5cd18d, whose footer reads D-133. #162's S13 order gives D-125
+to #105 and D-126 to #113, so this entry is D-126, placed in numerical order among the entries;
+the footer stays D-133. Every code site carries `// PROPOSED(D-126)`.
+
+**The issue.** D-081's second finding filed it: the directed re-seed shape with a second restart
+after its `AFTER` window failed the correct system on seed 26 of 100 with "range RangeId(2): an
+apply through 389 names index 384, which the core does not hold", and the second restart was
+left out of the shape because a criterion that fails the correct system is a model error to fix,
+not a bound to widen (D-030, D-039).
+
+### 1. Searched for: not reached, on this tree or on the issue's own
+
+- **This tree.** `reseed::run_restarted_again` is the recipe as the issue gives it: the shape's
+  run of the seed, draw for draw, then a crash, the arm's `DOWN`, a restart and two seconds. Over
+  seeds 0 to 999 in release: no gap, no `RaftServerFailed` of any reason on any seed, no
+  `RaftCompacted` above the highest index its replica had committed or restated, and no late apply
+  (section 2; `reseed::late_applies`, read from each install's hold to the replica's first commit
+  after it) at any of the 8 892 `RaftSnapshot { taken: false }` records of the thousand runs,
+  switches and starts' restatements, every one of them the re-seeded node's. On all thousand the
+  second start is over the four streamed replicas, each restating a compacted prefix. One seed
+  fails, 344, and on the harness's runaway cap, 415 319 trace records against 400 000: the run is
+  the shape's and 2.3 s more (section 5).
+- **The issue's tree.** The issue names "the merged base of #86 and #107 (wiring tip 4a94b01)",
+  which is 64ace84, the merge of the shape's branch onto the wiring at 4a94b01. With the recipe
+  as the earlier attempt applied it there (the archived probe tree `ananke-x113-old`), built
+  apart and run in release over seeds 0 to 299: seed 26 passes and no seed has the gap. One seed
+  fails, 113, on (b)'s cap clause, which 3bda450 made a rate the next commit. #113 was opened at
+  19:51 UTC and 64ace84 committed at 20:00, so the failure came from a working tree that was not
+  the one committed, and is not recoverable.
+
+So no later change can be named as the one that closed it, and none did: the arithmetic of the
+failure points at a path that is still open on this tree (section 2). What changed is that no
+schedule reaches it.
+
+### 2. Reproduced, directed: the late job
+
+The failure's numbers say which moment it is. The watermark (`Cores::applied_sent`) stood at 383
+and the core's log began above 384. A start and a switch set the watermark to the replica's own
+applied index, which is at or above its prefix (`Cores::insert`, D-081 and D-086;
+`Cores::installed`, D-083), and every `Apply` moves it to its `through`. So the core compacted
+past the watermark between its switch or start and its first `Apply`: it stepped a
+`SnapshotTaken` above 383, a record the `apply` task writes at its own applied index (D-065), while
+nothing the core had handed that task went above 383.
+
+One thing does that. **The node holds a range's core across its live install, not its `apply`
+task** (`install.rs`'s `finish` says so: "a job queued before the hold can still land"). A job
+the replaced core queued before the hold can run after the switch. Its entries at or below the
+snapshot are skipped and its entries above it apply, on top of the installed state, since the
+`snapshot` task set the task's applied state to the snapshot at the switch. A record that core
+asked for and queued behind the job is then written at the higher index, and its answer, held
+with the range's other local inputs while the range was held, is stepped into the replica the
+switch built (`Node::restore`, then its replay of the held locals). That core compacts past the
+watermark the switch set to the snapshot, and its next `Apply` names the first index it
+compacted away. The entries are not lost, since the task applied them; only the watermark
+forgot them.
+
+The same late job meets a second hole on this tree. D-086's restatement at `Switched`
+(`ServerHost::installed`) sets the `apply` task's applied state and the store's applied index to
+the snapshot. The `snapshot` task had already set both at the switch, and the `raft` task steps
+`Switched` later, after the read-back; a late job that ran in between had moved both past the
+snapshot. Taken back, the task applies those entries a second time when the new replica's first
+`Apply` names them. If the watermark alone were raised, that `Apply` would start above where the
+task was taken back to, and the task would fail the range, "apply of 387 after 383".
+
+`a_record_the_replaced_core_asked_for_raises_the_watermark_with_its_compaction`
+(`ananke_shard::round`) drives the node's own steps in its order through `Cores`: the hold, the
+switch to a snapshot at 383 keeping the tail to 395, the late job's `Applied(386)` and its record's
+`SnapshotTaken` at 386, and the leader's heartbeat committing 389. The node as it stood hands out
+"an apply through 389" naming 384, the issue's own numbers, and `Node::act` stops the node on that
+(`a_gap_in_the_applied_stream_fails_the_node_and_an_empty_job_is_not_a_job`).
+
+**What a late job needs, and why the shape does not reach it.** The replaced core must have
+committed past the snapshot it is about to install, with the `apply` task far enough behind that
+the switch's re-check (D-083, D-132) finds the store below the snapshot. A leader streams only to
+a follower it cannot append to: one silent for two minimum election timeouts and more than
+`snapshot_threshold` behind (D-037), or one whose probe walked below its prefix. While it
+streams it sends heartbeats at its own last index, which a follower without that entry refuses,
+so that follower's commit cannot pass the log it holds. A deposed leader's stream is refused
+once the follower's store holds the newer term. What is left is narrow: a follower that holds the
+leader's whole log yet was designated (its acknowledgements lost for two election timeouts on an
+idle range), or a newer leader's appends stepped in the few steps between a stale leader's last
+chunk and the hold. Neither is shown impossible, so the path is fixed, not closed as unreachable.
+
+### 3. What is built
+
+1. **A compaction carries the watermark with it** (`Cores::step`). A step that moved the
+   core's prefix raises the watermark to it: the indices a compaction drops were applied, since
+   a take or a record is written at the `apply` task's own index, the rule `RaftStore::open`
+   reads as `applied.max(snap_index)`. Only a compaction the step took: raised on every step,
+   the watermark would also cover a core put on the node already compacted, and
+   `RestartAppliesFromZero`'s gap would hide behind this rule. Measured with that condition
+   alone changed on this tree, raising on every step: seed 26's correct run still passes at its
+   352 477 records, and the variant is caught on 0 of 200 seeds of the second-restart run, so the
+   pin in section 5 fails on its `RestartAppliesFromZero` clause. Narrowed, the variant is caught
+   on all 200 (section 5). The pin is what holds the narrowing: D-081's unit pair inserts a core
+   and steps none, so it cannot see the difference.
+2. **The restatement at `Switched` takes nothing back** (`ServerHost::installed`,
+   `kept_past_the_switch`). The `apply` task's applied state and the store's applied index move
+   up to the snapshot, as D-086 has them, and an index already past the snapshot is kept: it was
+   applied after the switch, on top of the state it installed, and the store's applied-index key
+   says so too, since the late job's batches were written after the switch's.
+3. **`NodeVariant::SwitchForgetsLateApplies`**, the tree before this entry, both halves at once:
+   the restatement takes the task and the store back to the snapshot and the watermark stays
+   where the switch put it. It is the node's, at **bit 52**, the next free on this tree; bit 53
+   is free and eleven bits are left. It is in `BUGS` and is the fourth of `SHAPE`, the shape's
+   own holes, since the shape's second restart was filed with it.
+
+On every path the sweeps reach, the two rules change nothing: the watermark is already at or
+above the prefix, and nothing has applied past the snapshot when `Switched` is stepped (no late
+job, section 1). No step, draw or trace record changes, so no pinned trace hash and no pinned
+seed moves.
+
+### 4. The pairs
+
+- `ananke_shard::round`, the watermark: section 2's test, correct and under the variant. The
+  correct node hands the task 387 to 389 and its watermark ends at 389; the variant names 384 and
+  its watermark stays at 383.
+- `ananke_shard::server`, the restatement:
+  `the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot`. 386 past a snapshot at
+  383 is kept; 383 and 380 move to the snapshot, which is D-086's restatement unchanged; the
+  variant keeps nothing. It holds the rule, as `install_creates`' test holds that reading, and not
+  its two call sites in `installed`, which no sweep reaches.
+
+Both are unit pairs, as `RestartAppliesFromZero`'s was (D-081), and for the reason in section 2:
+the late job is an interleaving no sweep in the tree reaches. The variant is caught on every run
+of each, so at every tier.
+
+The reading that says no sweep reaches it is tested too, since the pin in section 5 asserts its
+absence through it: `a_late_job_is_read_from_the_hold_to_the_first_commit` (`sim/reseed.rs`).
+A late job's apply traced while the switch's read-back is still in flight, before the switch's
+`RaftSnapshot` record, is counted, and so is one after the record; one before the hold, one on
+another range and the replica's own after its first commit are not. The window opens at the
+hold, the record's decision (D-047), and not at the record, because the record is traced only
+once the switch is durable and its state read back, and a job queued before the hold lands as
+readily during that read-back as after it.
+
+### 5. The recipe, pinned on seed 26
+
+The issue asks for the second restart back as the regression test. It goes beside the shape and
+not into it, so the shape's clauses, figures and pins keep their run, and it goes in as a pin of
+the issue's own seed and not as a sweep of the tier. Over seeds 0 to 199, the tier's under
+D-115's cap, the longest trace of the run is seed 163's, 397 564 records against the runaway
+cap's 400 000, and seed 344 of the thousand passes the cap: a sweep would fail the correct system
+on the harness's cap the first time a change lengthened the run, and the cap is not to be raised
+to make room.
+`seed_26_a_node_restarted_over_the_replicas_its_installs_filled_holds_the_shape`
+(`sim/tests/reseed.rs`) pins:
+
+- **the situation**: at the second start every streamed range's replica restates a compacted
+  prefix (`Report::compacted_at_the_last_start`), a restart over replicas installs filled;
+- **the correct system** meets (a) to (e), the node still running at the end;
+- **`RestartAppliesFromZero`** is caught by its gap ("which the core does not hold"), since the
+  first `Apply` after the restart names index 1. D-081 paired it as a unit because the shape
+  reaches a restart over a compacted replica only when an install lands before the arm's crash;
+  this is a run beside that pair, which stays. Over seeds 0 to 199 of the run it is caught on
+  200, every one by its gap;
+- **the late job's absence**, asserted with its reason (`reseed::late_applies`): reached on no
+  seed measured, so the day this seed reaches it the test says so, and the pin is upgraded to
+  assert that the correct node keeps what the job applied, with `SwitchForgetsLateApplies` run on
+  it. Its record count is printed against the cap: 352 477 of the 400 000.
+
+**The nightly's row (D-064).** One `reseed` row, a pin of one seed run twice and so the same at
+any tier, weighed on its tree from the built release binary (`reseed-<hash> <test> --exact`) at
+ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three runs, the median, on an Apple M2 of 8
+cores beside other slices' builds and sweeps (load averages 164 to 172, so the figure is if
+anything high): 1.4 cpu s (1.29 + 0.18, 1.26 + 0.13, 1.27 + 0.15). Into the lightest shard,
+shard 4, at 2231.2 -> 2232.6.
+
+**Closes #113.** The issue's failure is not reproduced by search, on this tree or on its own;
+the path its numbers require is reproduced directed, closed and paired; and the recipe is pinned.
+**PROPOSED.**
+
+---
+
 ## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,

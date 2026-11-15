@@ -101,6 +101,19 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-restart-over-installed` (2026-11-14), off c5cd18d (`main`), **PROPOSED
+  D-126** (footer D-133), Closes #113. The issue's failure, the re-seed shape with a second restart
+  failing "an apply through 389 names index 384", is not reproduced by search: on this tree no gap
+  and no server failure over seeds 0 to 999 of the recipe (`reseed::run_restarted_again`), and on the
+  issue's own tree, 64ace84, none over 0 to 299, seed 26 included. Its numbers point at a path still
+  open: a job the replaced core queued before a live install's hold, landing after the switch. Its
+  record compacts the new replica past the applied watermark, and D-086's restatement at `Switched`
+  takes the `apply` task and the store back below what it applied. Fixed: a compaction carries the
+  watermark with it (`Cores::step`), and the restatement takes nothing back (`kept_past_the_switch`).
+  New node variant `SwitchForgetsLateApplies` (bit 52, the shape's fourth), paired as units in
+  `round` and `server`, since no sweep reaches the late job (0 of 8 892 snapshots, each read from
+  its install's hold, `reseed::late_applies`). The recipe is pinned on seed 26, not swept: over the
+  tier its longest trace is 397 564 of the runaway cap's 400 000, and seed 344 passes it.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

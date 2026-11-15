@@ -32,7 +32,10 @@
 //!   the right half's lands first (PROPOSED D-128);
 //! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
 //!   on committing, and the leader as it was is caught by the read bound
-//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
+//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129);
+//! - issue #113's recipe, the shape with a second restart over the replicas its installs
+//!   filled, holds on the issue's seed 26 with no late job, and `RestartAppliesFromZero` is
+//!   caught there by its gap (`reseed::run_restarted_again`, PROPOSED D-126).
 
 use ananke_env::{RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
@@ -858,4 +861,73 @@ fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_no
         Ok(())
     });
     verdict(&verdicts).expect("a right half made after a re-seed is quarantined on every seed");
+}
+
+/// Seed 26, issue #113's: the shape with a second restart after its `AFTER` window, a node
+/// restarted over the replicas its installs filled (`reseed::run_restarted_again`; PROPOSED
+/// D-126). On the tree the recipe was filed from, this seed failed the correct system with
+/// "an apply through 389 names index 384, which the core does not hold" (D-081).
+///
+/// What it pins:
+///
+/// - **the situation**: at the second start every streamed range's replica restates a
+///   compacted prefix, so the restart is over replicas an install filled, the issue's
+///   title;
+/// - **the correct system** meets (a) to (e), the node still running at the end;
+/// - **`RestartAppliesFromZero`** is caught there by its gap: the first `Apply` after the
+///   restart names index 1, which a compacted replica does not hold. D-081 paired it as a
+///   unit because the shape reaches a restart over a compacted replica only when an install
+///   lands before the arm's crash; this is the run beside that pair, which stays;
+/// - **the late job is absent**, and asserted absent: an index applied above a snapshot
+///   after the install's hold and before the replica commits on top of it
+///   (`reseed::late_applies`), #113's precondition. No seed measured on this tree reaches
+///   it (PROPOSED D-126), so `SwitchForgetsLateApplies` is paired as a unit in
+///   `ananke_shard::round` and `ananke_shard::server` and not run here. The correct node
+///   keeps what such a job applies, so the day a schedule reaches it here this assertion
+///   says so, and the pin is upgraded to assert that, and the variant run on it.
+///
+/// One seed and not the tier: over the tier's seeds this run's traces come within a few
+/// thousand records of the runaway cap, and a seed past the tier passes it (PROPOSED
+/// D-126 measures both), so a sweep of it would fail the correct system on the harness's
+/// cap the first time a change lengthened the run. The record count is printed here
+/// against the cap.
+// PROPOSED(D-126)
+#[test]
+fn seed_26_a_node_restarted_over_the_replicas_its_installs_filled_holds_the_shape() {
+    let seed = 26;
+    let report = reseed::run_restarted_again(seed, Variants::default(), NodeVariants::correct());
+    println!(
+        "seed {seed}, second restart: {} trace records, of the runaway cap's {}; late applies {:?}",
+        report.records.len(),
+        ananke_sim::ranges::TRACE_CAP,
+        report.late_applies()
+    );
+    assert_eq!(
+        report.compacted_at_the_last_start(),
+        Report::streamed_ranges(),
+        "seed {seed}: the second start is not over replicas the installs filled, so this pins \
+         nothing of issue #113"
+    );
+    report
+        .check()
+        .expect("the correct system meets (a) to (e) after a second restart");
+    assert!(
+        report.late_applies().is_empty(),
+        "seed {seed} now reaches issue #113's late job: {:?}. The correct node keeps what it \
+         applied, so upgrade this pin to assert that and run SwitchForgetsLateApplies on it",
+        report.late_applies()
+    );
+
+    let variant = NodeVariant::RestartAppliesFromZero;
+    let why = reseed::run_restarted_again(
+        seed,
+        Variants::default(),
+        NodeVariants::correct().with(variant),
+    )
+    .check()
+    .expect_err("RestartAppliesFromZero is caught on a restart over compacted replicas");
+    assert!(
+        why.contains("which the core does not hold"),
+        "seed {seed}: {variant} caught by something other than its gap: {why}"
+    );
 }
