@@ -118,11 +118,14 @@ _Update this section at the end of every session._
   2097 -> 329, 9 -> 68, 992 -> 1314, 16725 -> 73, 45 -> 2388 with `RIGHT_HALF_PINNED`,
   219 -> 522, 12/76 -> 204/8, 613 -> 145, check 16's 48/66 -> 12/20; 633's hold -> 89, beside
   633's absence; the membership shape -> seed 1972), the rest the absence with its reason; the
-  table is in D-127, the rows in `scripts/nightly-shards.txt`. **Two findings for the owner, not
-  fixed**: the shard scenario's plain schedule fails the correct system on seeds 2147 (pre-vote:
-  the check reads a refused replica's lost term against an install's decision time) and 6773
-  (liveness on `k08`, a write truncated under D-131's one try), both passing on c5cd18d and on the
-  shaped schedule the sweep runs for them; D-127 gives the account.
+  table is in D-127, the rows in `scripts/nightly-shards.txt`. **The shard scenario's plain
+  schedule failed the correct system on seeds 2147 and 6773** (both passing on c5cd18d and on the
+  shaped schedule the sweep runs for them; review F1). 2147 was the pre-vote check's: it read a
+  refused replica's lost term against an install decided inside the isolation and traced after it.
+  Fixed (`Report::created_term_by`, a unit test that the reading before fails, seed 2147's pin). 6773
+  is the per-key liveness reading counting a write truncated by an election, which one try leaves
+  open for ever, on a live range: **D-127 Q1 asks the owner** whether such a write is evidence
+  (recommended: no); seed 6773's pin holds the shape and today's verdict until the ruling (#250).
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

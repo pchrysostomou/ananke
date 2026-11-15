@@ -4844,9 +4844,15 @@ impl Report {
         if Self::reseeding_during(records, range, server, from, until) {
             return Ok(());
         }
-        let before = match Self::term_by(records, streams, range, server, time, from) {
-            0 => Self::created_term_in(records, range, server, from, until).unwrap_or(0),
-            term => term,
+        // PROPOSED(D-127): a replica created inside the window by the reading's own clock
+        // begins it at the term its creation wrote, where the trace states that term.
+        let before = match Self::created_term_by(records, streams, time, range, server, from, until)
+        {
+            Some(created) => created,
+            None => match Self::term_by(records, streams, range, server, time, from) {
+                0 => Self::created_term_in(records, range, server, from, until).unwrap_or(0),
+                term => term,
+            },
         };
         let after = Self::term_by(records, streams, range, server, time, until);
         if after != before {
@@ -4880,6 +4886,56 @@ impl Report {
                     | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
                     if *s == server)
         })
+    }
+
+    /// The term `server`'s replica of `range` was created with, where its last creation
+    /// falls inside `(from, until]` read by `time`, as the term records are, and the trace
+    /// states that term: a split's floor term, or an install's where D-112 ties it to its
+    /// stream ([`Report::installed_term`]). `None` where no creation falls there, or the
+    /// last one's term cannot be read, which leaves the window read as before. From
+    /// `records`, the [`Report::pre_vote_records`].
+    ///
+    /// The window then begins at that term: the replica the window ends with is the one
+    /// that creation made, and the term it was made with is no election of the isolated
+    /// server's. An install's term is its stream's, whose done chunk reached the node by
+    /// the switch's decision, and nothing reaches a node once it is cut off; a split's is
+    /// its floor's. A raise after the creation is still a raise, from that term.
+    ///
+    /// Without it the decided reading compared two replicas. Shard seed 2147 on the plain
+    /// schedule: node 3's refusal at 5.487 s left its range 30 a placeholder with no core;
+    /// the install of a term-5 stream, delivered before the isolation from 6.088 s to
+    /// 6.441 s, was decided at 6.389 s inside it and traced at 6.449 s after it; and the
+    /// check read the start from the term-4 replica the refusal had taken away and the end
+    /// from the install, "raised its term from 4 to 5". The skip and
+    /// [`Report::created_term_in`] read the creation's trace time, past the window.
+    // PROPOSED(D-127): a creation inside the window, by the reading's clock, starts it.
+    fn created_term_by(
+        records: &[&TraceRecord],
+        streams: &StreamTerms,
+        time: RecordTime,
+        range: u64,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Option<u64> {
+        let (index, created) = records.iter().enumerate().rev().find(|(_, record)| {
+            matches!(&record.event, TraceEvent::RangeCreated { range: g, .. } if *g == range)
+                && record.node.map(|node| u64::from(node.get())) == Some(server)
+                && from < time.of(record)
+                && time.of(record) <= until
+        })?;
+        match &created.event {
+            TraceEvent::RangeCreated {
+                cause: ananke_env::RangeCause::Split,
+                floor_term,
+                ..
+            } => Some(*floor_term),
+            TraceEvent::RangeCreated {
+                cause: ananke_env::RangeCause::Snapshot,
+                ..
+            } => Self::installed_term(records, streams, index, range, server),
+            _ => None,
+        }
     }
 
     /// The floor term of `server`'s replica of `range` where its `RangeCreated` was
@@ -10571,6 +10627,190 @@ mod tests {
             restatement(),
         ]);
         assert_eq!(again.isolation_keeps_the_term_by_cause(), words(0, 5));
+    }
+
+    /// A replica created inside an isolation by the decided reading's clock begins the
+    /// window at the term its creation wrote (PROPOSED D-127): shard seed 2147 on the
+    /// plain schedule. Server 1's replica led at term 4, its node was refused at 50 ms,
+    /// and an install of a term-5 stream, its done chunk delivered at 85 ms, before the
+    /// isolation from 100 ms to 500 ms, was decided at 300 ms and traced at 520 ms,
+    /// restated at 540 ms. Four cases:
+    ///
+    /// - that shape: no violation, where the reading before read the start from the
+    ///   term-4 replica the refusal took away and the end from the install, "from 4 to
+    ///   5"; by trace time the creation falls past the window and the reading is 4 at both
+    ///   ends;
+    /// - a creation decided and restated inside the window and a candidacy at 6 after it:
+    ///   the raise is caught, from the creation's term, "from 5 to 6";
+    /// - no creation and a candidacy at 5 inside the window: "from 4 to 5", which the
+    ///   creation alone excuses;
+    /// - a creation inside the window restated at 6, above its stream's 5: not tied to
+    ///   the stream, so its term is not read and the window is read as before, 4 at both
+    ///   ends (`a_range_created_under_an_isolation_starts_at_its_creations_term` holds
+    ///   the same fallback where the reading before is the creation clause's floor term).
+    // PROPOSED(D-127): a creation inside the window, by the reading's clock, starts it.
+    #[test]
+    fn an_install_decided_inside_an_isolation_begins_the_window_at_the_term_it_wrote() {
+        let isolation = (1, ms(100), ms(500));
+        let range = SINGLE_GROUP;
+        let addr = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let payload = Frame {
+            from: ServerId(2),
+            message: Message::InstallSnapshot {
+                term: 5,
+                last_index: 72,
+                last_term: 2,
+                file: bytes::Bytes::from_static(b"snapshot"),
+                offset: 0,
+                total: 1,
+                done: true,
+                data: bytes::Bytes::from_static(b"x"),
+            },
+        }
+        .encode();
+        let id = ananke_env::MessageId::new(7);
+        let led = record(ms(10), ms(10), Some(1), term(1, 4, "leader", None));
+        let refused = record(
+            ms(50),
+            ms(50),
+            Some(1),
+            TraceEvent::RaftRefused {
+                server: 1,
+                reason: "the log's head is missing".to_owned(),
+            },
+        );
+        let sent = record(
+            ms(80),
+            ms(80),
+            Some(2),
+            TraceEvent::MessageSent {
+                id,
+                from: addr(2),
+                to: addr(1),
+                payload,
+            },
+        );
+        let delivered = record(
+            ms(85),
+            ms(85),
+            Some(1),
+            TraceEvent::MessageDelivered {
+                id,
+                from: addr(2),
+                to: addr(1),
+                len: 1,
+                dup: false,
+            },
+        );
+        let created = |at: u64, decided: u64| {
+            record(
+                ms(at),
+                ms(decided),
+                Some(1),
+                TraceEvent::RangeCreated {
+                    range,
+                    cause: ananke_env::RangeCause::Snapshot,
+                    parent: None,
+                    start: bytes::Bytes::from_static(b"a"),
+                    end: bytes::Bytes::from_static(b"z"),
+                    generation: 2,
+                    voters: vec![1, 2, 3],
+                    floor_index: 72,
+                    floor_term: 2,
+                    incarnation: 9,
+                },
+            )
+        };
+        let restated = |at: u64, term_of: u64| {
+            vec![
+                record(
+                    ms(at),
+                    ms(at),
+                    Some(1),
+                    TraceEvent::RaftRecovered {
+                        server: 1,
+                        range,
+                        term: term_of,
+                        applied: 72,
+                        last_index: 72,
+                        incarnation: 9,
+                        state: ananke_env::RecoveredAs::Neither,
+                    },
+                ),
+                record(ms(at), ms(at), Some(1), term(1, term_of, "follower", None)),
+            ]
+        };
+        let run = |tail: Vec<TraceRecord>| {
+            let mut records = vec![
+                led.clone(),
+                refused.clone(),
+                sent.clone(),
+                delivered.clone(),
+            ];
+            records.extend(tail);
+            report(records, vec![isolation])
+        };
+        let words = |before: u64, after: u64| {
+            Err(format!(
+                "pre-vote: server 1 raised its term from {before} to {after} while isolated from \
+                 Instant(100ms) to Instant(500ms)"
+            ))
+        };
+
+        let mut tail = vec![
+            created(520, 300),
+            record(
+                ms(530),
+                ms(300),
+                Some(1),
+                TraceEvent::RaftSnapshot {
+                    server: 1,
+                    range,
+                    last_index: 72,
+                    last_term: 2,
+                    taken: false,
+                },
+            ),
+        ];
+        tail.extend(restated(540, 5));
+        let straddled = run(tail);
+        assert_eq!(
+            straddled.install_stream_terms().len(),
+            1,
+            "the stream's term is found"
+        );
+        assert_eq!(
+            straddled.isolation_keeps_the_term_by(RecordTime::Decided),
+            Ok(())
+        );
+        assert_eq!(straddled.isolation_keeps_the_term_by_cause(), Ok(()));
+        assert_eq!(
+            straddled.isolation_keeps_the_term_by(RecordTime::Durable),
+            Ok(()),
+            "by trace time the creation is past the window"
+        );
+
+        let mut tail = vec![created(210, 200)];
+        tail.extend(restated(220, 5));
+        tail.push(record(
+            ms(300),
+            ms(300),
+            Some(1),
+            term(1, 6, "candidate", None),
+        ));
+        assert_eq!(run(tail).isolation_keeps_the_term_by_cause(), words(5, 6));
+
+        let campaigned = run(vec![record(
+            ms(300),
+            ms(300),
+            Some(1),
+            term(1, 5, "candidate", None),
+        )]);
+        assert_eq!(campaigned.isolation_keeps_the_term_by_cause(), words(4, 5));
+
+        let mut tail = vec![created(520, 300)];
+        tail.extend(restated(540, 6));
+        assert_eq!(run(tail).isolation_keeps_the_term_by_cause(), Ok(()));
     }
 
     /// D-050's excuse needs every change of the window's term to be taken from a

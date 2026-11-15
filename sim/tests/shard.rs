@@ -1292,6 +1292,181 @@ fn seed_9699_a_replica_restated_before_any_node_traced_its_split_may_grant() {
     );
 }
 
+/// Seed 2147 on the plain schedule, which PROPOSED D-127's re-audit found failing the correct
+/// system on its tree and passing on c5cd18d: "pre-vote: server 3 raised its term from 4 to 5
+/// while isolated from Instant(6.088s) to Instant(6.441s)". A defect of the check. Node 3 led
+/// range 30 at term 4, crashed at 5.336 s over a rotted log block and was refused at 5.487 s,
+/// which left range 30 a placeholder with no core. Its `snapshot` task made the installs of
+/// ranges 1, 28, 19, 2 and 29 first, and range 30's, of a term-5 stream whose chunks reached the
+/// node before it was cut off at 6.088 s, was decided at 6.389 s, inside the isolation, and
+/// traced at 6.449 s, after it. The decided reading took the window's start from the term-4
+/// replica the refusal had taken away and its end from the install, while the skip and the
+/// creation clause read the creation's trace time, past the window. A replica created inside
+/// the window now begins it at the term its creation wrote (`created_term_by` in `sim/raft.rs`; its
+/// unit test plants the reading before). This pin asserts the shape and that the run passes.
+// PROPOSED(D-127): a creation inside the window, by the reading's clock, starts it.
+#[test]
+fn seed_2147_an_install_decided_inside_an_isolation_begins_it_at_the_term_it_wrote() {
+    let (seed, node, range) = (2147, 3, 30);
+    let report = pinned(seed);
+    report.check().unwrap();
+    let checked = &report.checked;
+    let records = report.records();
+    let on_node = |record: &TraceRecord| node_of(record) == Some(node);
+    let (from, until, created) = checked
+        .isolations
+        .iter()
+        .filter(|(server, ..)| *server == node)
+        .find_map(|&(_, from, until)| {
+            records
+                .iter()
+                .find(|record| {
+                    on_node(record)
+                        && matches!(record.event, TraceEvent::RangeCreated {
+                            range: made, cause: RangeCause::Snapshot, ..
+                        } if made == range)
+                        && from < record.decided
+                        && record.decided <= until
+                        && record.at > until
+                })
+                .map(|created| (from, until, created))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {seed} no longer decides an install of range {range} on node {node} inside \
+                 an isolation and traces it after: read its trace"
+            )
+        });
+    let term_of = |record: &TraceRecord| match record.event {
+        TraceEvent::RaftTerm {
+            server,
+            range: of,
+            term,
+            ..
+        } if server == node && of == range => Some(term),
+        _ => None,
+    };
+    let led = records
+        .iter()
+        .filter(|record| record.decided <= from)
+        .filter_map(|record| term_of(record).map(|term| (record.at, term)))
+        .last();
+    let refused = records.iter().find(|record| {
+        matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == node)
+            && record.at <= from
+            && led.is_some_and(|(at, _)| at < record.at)
+    });
+    let restated = records
+        .iter()
+        .filter(|record| record.at > created.at)
+        .find_map(term_of);
+    let stream = checked
+        .install_stream_terms()
+        .get(&(node, range, created.at))
+        .copied();
+    assert_eq!(
+        (
+            led.map(|(_, term)| term),
+            refused.is_some(),
+            stream,
+            restated
+        ),
+        (Some(4), true, Some(5), Some(5)),
+        "the shape: node {node}'s replica of range {range} at term 4 before the window, its \
+         refusal after that and before the window, and the install's stream and restatement at \
+         term 5"
+    );
+    assert_eq!(
+        checked.isolation_keeps_its_term_by(raft::RecordTime::Decided, node, from, until),
+        Ok(())
+    );
+}
+
+/// Seed 6773 on the plain schedule, the other seed PROPOSED D-127's re-audit found failing the
+/// correct system on its tree and passing on c5cd18d: "liveness: no client write to k08 completed
+/// after the last heal at Instant(4.152s)". The per-key reading counts as a wedge a write no
+/// system can complete. The only post-heal write to `k08` in the history, a put called at
+/// 4.239 s, reached node 3, which still led range 30, `[k08, k11)`, at term 3 and proposed it at
+/// index 105 at 4.245 s; node 1 had won term 4 at 4.243 s, and node 3 truncated 105 at 4.247 s.
+/// A write gets one try (`WRITE_TIMEOUT`, D-131's `ask_once`), so its client gave up at 4.299 s
+/// and its call stays open; the run ends 2.113 s after that call, past the 2 s bound, which takes
+/// away the exemption for a pending write on a range shown live. The range was live: under node
+/// 1 it completed writes to `k09` and `k10` after that call and served `k08`'s reads to the end.
+/// The client's next write to `k08`, at 5.581 s, was proposed by no leader and so left no
+/// operation.
+///
+/// Whether a write the trace shows truncated before any apply is evidence for its key is a
+/// design question the documents do not settle, asked of the owner in D-127 (Q1, #250); this
+/// pin holds the shape and the verdict until then, so the day either moves it says so.
+// PROPOSED(D-127): an open question for the owner, the shape held until the ruling.
+#[test]
+fn seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_wedge() {
+    let (seed, leader, range, index, term) = (6773, 3, 30, 105, 3);
+    let report = pinned(seed);
+    let checked = &report.checked;
+    let k08 = shard::key(8);
+    let after_heal: Vec<_> = checked
+        .history
+        .ops
+        .iter()
+        .filter(|op| op.op.is_write() && op.call >= checked.last_heal)
+        .collect();
+    let to_k08: Vec<_> = after_heal.iter().filter(|op| *op.op.key() == k08).collect();
+    let [write] = to_k08.as_slice() else {
+        panic!("seed {seed} no longer has one post-heal write to k08: {to_k08:?}");
+    };
+    assert_eq!(write.ret, None, "the write never completed");
+    let records = report.records();
+    let proposed = records
+        .iter()
+        .position(|record| {
+            record.event
+                == TraceEvent::RaftProposed {
+                    server: leader,
+                    range,
+                    client: write.process,
+                    seq: write.seq,
+                    index,
+                    term,
+                }
+        })
+        .unwrap_or_else(|| panic!("seed {seed} no longer proposes the write at {index}"));
+    assert!(
+        records[proposed..]
+            .iter()
+            .any(|record| matches!(record.event,
+            TraceEvent::RaftTruncate { server, range: of, from_index }
+                if server == leader && of == range && from_index <= index)),
+        "node {leader} truncates the write's entry"
+    );
+    assert!(
+        !records.iter().any(|record| matches!(record.event,
+            TraceEvent::RaftApply { range: of, index: at, entry_term, .. }
+                if of == range && at == index && entry_term == term)),
+        "no node applies the write's entry"
+    );
+    let served = after_heal.iter().any(|op| {
+        [shard::key(9), shard::key(10)].contains(op.op.key())
+            && op.call > write.call
+            && op.ret.is_some()
+    });
+    assert!(
+        served,
+        "range {range} completes other writes after the call"
+    );
+    assert!(
+        checked.ended.duration_since(write.call) > raft::election_max() * raft::LIVENESS_TIMEOUTS,
+        "the run ends past the bound of the call"
+    );
+    let why = report
+        .check()
+        .expect_err("the per-key reading reads it as a wedge");
+    assert!(
+        why.contains("liveness: no client write to k08 completed after the last heal"),
+        "the verdict this seed is pinned for: {why}"
+    );
+}
+
 /// Seed 8934, the sweep's first failure of the match-starts fold on the correct system, at the
 /// nightly's ten thousand. Node 2's placeholder of range 43 answers leader 1 with incarnation 0,
 /// node 2 applies the split that makes the replica, and the new store's first answer overtakes

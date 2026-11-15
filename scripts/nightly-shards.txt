@@ -713,6 +713,11 @@
 # 0.57, 0.64) and seed 9 -> 68 (0.2 -> 0.5; 0.46, 0.54, 0.50). One row was added, seed 89's hold, the pin seed 633's
 # moved to while 633's became its absence: 1.0 (0.91, 0.94, 0.97), into the lightest shard, shard 3 at 2237.4 ->
 # 2238.4. The pins turned into absences in place keep their rows and weights. Every header is recomputed.
+# D-127's review (F1) added two `shard` rows, the plain schedule's seeds 2147 (the pre-vote check's defect, fixed) and 6773
+# (the liveness question put to the owner), each one seed and not swept. Weighed on its tree from the built release binary
+# (`shard-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, user + sys, three runs, the median rounded up
+# to a tenth, beside other slices' builds (load average 213 to 215): seed 2147's 0.2 (0.15, 0.20, 0.15) and seed 6773's 0.2
+# (0.13, 0.12, 0.12). Each into the lightest shard, shard 4 both times, at 2238.0 -> 2238.2 -> 2238.4.
 # shard 1: 2689.1 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -793,7 +798,7 @@
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
 3	node	1.0	seed_89_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
-# shard 4: 2238.0 cpu s
+# shard 4: 2238.4 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -839,6 +844,8 @@
 4	shard	0.3	seed_73_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
 4	shard	0.2	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
 4	install	6.5	a_receiver_silent_while_it_installs_has_its_streams_given_up
+4	shard	0.2	seed_2147_an_install_decided_inside_an_isolation_begins_it_at_the_term_it_wrote
+4	shard	0.2	seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_wedge
 # shard 5: 2256.4 cpu s
 5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.6	seed_2272_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound

@@ -25252,7 +25252,7 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
-## PROPOSED D-127 — The node's resend bound counted a silence the receiver chose: the node answers every chunk it holds, `Waiting` while a stream's install is pending and from the `net` task while the `snapshot` task makes an install; an answer counts once it reaches the sender's node; the give-up is traced and `sim/install.rs` asserts none; `CHUNK_RESENDS` stays 4 and `SilentWhileInstalling` keeps the silence beside the fix; every node pin it moved is re-audited (#120)
+## PROPOSED D-127 — The node's resend bound counted a silence the receiver chose: the node answers every chunk it holds, `Waiting` while a stream's install is pending and from the `net` task while the `snapshot` task makes an install; an answer counts once it reaches the sender's node; the give-up is traced and `sim/install.rs` asserts none; `CHUNK_RESENDS` stays 4 and `SilentWhileInstalling` keeps the silence beside the fix; every node pin it moved is re-audited; the pre-vote check reads a replica created inside an isolation by the reading's own clock (#120)
 
 **The number.** Off `main` at c5cd18d, whose highest entry is D-132 and whose footer reads D-133.
 D-124 to D-127 were left open by the batch order D-128's preamble records; this is D-127, placed
@@ -25414,23 +25414,99 @@ reason:
 
 Every renamed pin keeps its nightly row's shard (below).
 
-### Found on the way, and not this entry's
+### Found on the way: two plain-schedule seeds
 
-The search ran the shard scenario's plain schedule on its first ten thousand seeds, where the sweep
-runs that schedule on one seed in eight (`PLAIN_ONE_IN`), and the correct system failed two of them
-that the sweep never runs plain: 2147, `pre-vote: server 3 raised its term from 4 to 5 while
-isolated`, and 6773, `liveness: no client write to k08 completed after the last heal`. On c5cd18d
-both pass, and the shaped schedule the sweep runs for each passes on this tree. 2147 is the pre-vote
-check's, as far as it was read: node 3's replica of range 30 was lost at its refusal before the
-isolation and re-made by a placeholder's install of a stream at term 5, decided inside the window,
-behind the installs of ranges 19, 2 and 29 the `snapshot` task made first, and traced after the
-window ends. The check reads the term before the window from the replica the refusal destroyed (4)
-and the term at its end from the creation's decision time (5), while its skip and its creation
-clause read traced times, which fall outside the window. 6773's first post-heal write to `k08` was
-proposed at index 105 by node 3 at term 3 and truncated by node 1's election at term 4, and under
-D-131's one try its client never hears; its second, 0.77 s before the run ends, no leader proposed.
-The range commits other keys and serves reads of `k08` to the end. Neither is fixed here; both are
-reported to the owner with this account, the second unresolved.
+The search ran the shard scenario's plain schedule on its first ten thousand seeds. The sweep runs
+that schedule on one seed in eight (`PLAIN_ONE_IN`) and every shard pin runs it (`pinned_of`), and
+the correct system failed two seeds the sweep happens to run shaped: 2147, `pre-vote: server 3
+raised its term from 4 to 5 while isolated from Instant(6.088s) to Instant(6.441s)`, and 6773,
+`liveness: no client write to k08 completed after the last heal at Instant(4.152s)`. Both pass on
+c5cd18d, whose schedules differ, and the shaped schedule the sweep draws for each passes on this
+tree. (Corrected before merge, from this entry's review, F1: as first pushed the entry left both
+open, the second unexplained, with no issue and no test. A correct-system failure not shown to be
+a check's or the harness's is not pushed, so each is now read from the trace to the end.)
+
+**2147 is a defect of the pre-vote check, fixed here.** On node 3, range 30:
+
+1. Node 3 leads range 30 at term 4 from 4.730 s.
+2. It crashes at 5.336 s over a rotted log block, restarts at 5.446 s and is refused at 5.487 s
+   ("the log's head is missing"). Range 30 is left a placeholder with no core
+   (`RangeReplicaCreated` at 5.533 s). No term record of it follows.
+3. The `snapshot` task makes the placeholders' installs one after another: ranges 1, 28, 19, 2
+   and 29 first.
+4. Node 3 is cut off at 6.088 s. No server's message reaches it until the heal at 6.441 s, so
+   range 30's stream, at term 5, had reached it before.
+5. Range 30's install is decided at 6.389 s, inside the window. Its `RangeCreated { cause:
+   snapshot }` is traced at 6.449 s and its `RaftSnapshot { taken: false }` at 6.480 s, both
+   after the window. The restatement, `RaftRecovered` and `RaftTerm` at term 5 with no receipt,
+   follows at 6.507 s.
+
+The decided reading took the window's start from the term-4 replica the refusal had taken away,
+and its end from the install's creation at its decision, which D-112 reads at the stream's term.
+It compared two replicas. The skip and the creation clause (`created_term_in`) read the creation's
+trace time, past the window, so neither applied. The replica that ends the window is the one the
+install made, and its term is its stream's, which reached the node before it was cut off: no
+election of the isolated server's.
+
+So a replica created inside the window by the reading's own clock now begins the window at the
+term its creation wrote, where the trace states that term (`Report::created_term_by`,
+`sim/raft.rs`): a split's floor term, or an install's restatement where D-112 ties it to its
+stream. A creation whose term cannot be read leaves the window read as before, as
+`a_range_created_under_an_isolation_starts_at_its_creations_term` holds (the first build of this
+fix read such a creation as the source before it and failed that test, "from 0 to 4"). The check
+moves no schedule.
+
+- **What it still catches.** A raise after the creation is a raise from the creation's term. A
+  raise with no creation in the window is read as before.
+- **What it gives up.** A raise by the replica the creation replaced, inside the same window. Its
+  state is gone at the creation, so a raise that ends with it is no raise at the heal.
+- **The pair.** The unit test
+  `an_install_decided_inside_an_isolation_begins_the_window_at_the_term_it_wrote` holds four
+  cases. Planted away (no creation found), the new reading fails it at its first case,
+  the 2147 shape, with "from 4 to 5" again, and seed 2147's pin fails with the seed's own words.
+  Its second case, the raise after a creation, would read "from 4 to 6" there, where it reads
+  "from 5 to 6".
+- **The pin.** `seed_2147_an_install_decided_inside_an_isolation_begins_it_at_the_term_it_wrote`
+  asserts the shape: the install decided inside node 3's isolation and traced after it, term 4
+  before the window, the refusal between, the stream and the restatement at 5. It also asserts
+  that the run passes.
+
+**6773 is the per-key liveness reading counting a write no system can complete. It is a question
+for the owner, below, and not fixed here.**
+
+1. The only post-heal write to `k08` in the history is a put called at 4.239 s.
+2. Node 1 won range 30's term 4 at 4.243 s. Node 3, still leading term 3 on `[k08, k11)`, proposed
+   the put at index 105 at 4.245 s and truncated it at 4.247 s on hearing term 4. No node applies
+   (105, term 3).
+3. A write gets one try (`WRITE_TIMEOUT`, 60 ms; D-131's `ask_once`), so its client gave up at
+   4.299 s and its call stays open, as `lin.rs` must leave a write whose fate the client never
+   heard.
+4. The run ends 2.113 s after that call. That is past the 2 s bound, so D-102's exemption for a
+   pending write on a range shown live after its call does not apply.
+5. The range was live. Under node 1 it completed writes to `k09` and `k10` after the call, and it
+   served `k08`'s reads to the end.
+6. The client's next write to `k08`, at 5.581 s, was proposed by no leader, so it left no operation.
+
+The system did what Raft does: an entry a deposed leader proposed is lost at the new leader's
+first append, and only a retry could complete the write, which the harness forbids. The reading
+calls that a wedge. Changing what counts as evidence is a choice the documents do not make, so it
+is asked. `seed_6773_a_keys_only_post_heal_write_truncated_by_an_election_is_read_as_a_wedge` holds
+the shape and today's verdict until the ruling, so either moving says so. Issue #250 tracks it.
+
+**Question for the owner (D-127, Q1).** Under the per-key liveness reading, is a client write
+evidence for its key when the trace shows it proposed and then truncated before any apply?
+
+- **Recommended: no.** Read it the way a write no leader proposed is read already, as no evidence
+  (`lin.rs`). That means a post-heal write whose proposal its proposer truncated (`RaftProposed`,
+  then `RaftTruncate` from at or below its index) and whose entry no node applies at that index
+  and term leaves `post_heal_writes`. Two plants would show it changes nothing else: a wedged
+  range still fails the per-range reading (`recovery_from_the_heal`), and every liveness variant's
+  catch is unchanged.
+- **Alternative: the node answers the client of a truncated proposal**, which is known lost at the
+  truncation, so the client can move it on as it moves a `NotLeader`. On 6773 the truncation came
+  under 3 ms after the proposal, inside the 60 ms try. But it adds an answer to the wire and moves
+  every schedule.
+- Under either, the bound and the one try stay.
 
 ### Consequences
 
@@ -25456,9 +25532,12 @@ lightest shard, shard 4, at 2231.2 -> 2237.7. The twelve pins moved to other see
 place, each keeping its shard and re-weighed the same way on this tree (load averages 277 to 357),
 which moves shard 4 to 2238.0, shard 5 to 2256.4 and shard 6 to 2363.6; seed 89's hold, the one
 row added, weighs 1.0 and goes into the lightest, shard 3, at 2237.4 -> 2238.4. The pins turned into
-absences keep their rows. `scripts/nightly-shards.txt` gives every figure.
+absences keep their rows. The review's two pins, seeds 2147 and 6773, weigh 0.2 each and both go
+into the lightest, shard 4, at 2238.0 -> 2238.2 -> 2238.4. `scripts/nightly-shards.txt` gives every
+figure.
 
-**PROPOSED.** This closes #120.
+**PROPOSED.** This closes #120. One question for the owner, Q1 above: whether a write truncated
+before any apply is evidence for its key under the per-key liveness reading (#250).
 
 ---
 
