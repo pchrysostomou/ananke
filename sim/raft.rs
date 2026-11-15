@@ -2105,7 +2105,9 @@ pub struct Report {
     /// Stage B), which the write bound and the liveness check read. One group's
     /// scenario maps every key to it; the node's maps its keys over four ranges, and
     /// that is what lets the liveness half of the majority carve-out be told from
-    /// the cluster-wide reading at all (D-071, item 6).
+    /// the cluster-wide reading at all (D-071, item 6). It is the map the run
+    /// **started** with: a split does not change it, and what follows the splits is
+    /// `Report::serving_at` (PROPOSED D-102, D-121).
     // PROPOSED(D-076): the scenario's key-to-range map is the run's, not a constant.
     pub key_range: fn(&Bytes) -> u64,
     /// Which system the run was driven against.
@@ -3780,10 +3782,12 @@ impl Report {
     }
 
     /// How long after the last heal the first client write completed, if one did:
-    /// the quickest range's recovery ([`Report::writes_after_heal_by_range`]).
+    /// the quickest range's recovery ([`Report::writes_after_heal_by_starting_range`]).
+    /// The minimum over every range does not depend on how writes are keyed to ranges,
+    /// so this is the same figure whichever map reads them.
     #[must_use]
     pub fn time_to_write_after_heal(&self) -> Option<Duration> {
-        self.writes_after_heal_by_range()
+        self.writes_after_heal_by_starting_range()
             .into_values()
             .flatten()
             .min()
@@ -3832,6 +3836,17 @@ impl Report {
                     }
                 },
             )
+    }
+
+    /// The range a post-heal write is the evidence of in the per-range readings: the one
+    /// serving its key when it completed ([`Report::serving_at`] at its return), the log
+    /// that committed it, as [`Report::last_completion_after_heal`] reads a completion;
+    /// and for a write still pending, the one serving its key where the run stopped
+    /// ([`Report::ended`]), the log it is waiting on, as [`Report::post_heal_writes`]
+    /// reads it. D-102's two readings of a write's range, shared.
+    // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+    fn serving_write(&self, splits: &[(u64, u64, Bytes, Instant)], op: &crate::lin::Op) -> u64 {
+        self.serving_at(splits, op.op.key(), op.ret.unwrap_or(self.ended))
     }
 
     /// When each range last **completed** a client write called at or after the last
@@ -4003,7 +4018,7 @@ impl Report {
     /// see. What it stops carrying is the recovery time proper — how long after the
     /// heal the range became writable at all — which is read per range instead,
     /// where no client's choice of key can lengthen it
-    /// ([`Report::writes_after_heal_by_range`]). Neither reading is widened: the
+    /// ([`Report::writes_after_heal_by_starting_range`]). Neither reading is widened: the
     /// bound is the same bound, asked of two things the old one conflated.
     ///
     /// An operation the trace closed by its entry's apply counts as completed, as
@@ -4033,10 +4048,11 @@ impl Report {
         by_key
     }
 
-    /// Per range some client wrote to a key of after the last heal, how long after
-    /// **the heal** the first of those writes completed, and `None` for a range
-    /// whose post-heal writes all stayed pending: the recovery time proper, which
-    /// the per-key reading above no longer carries.
+    /// Per range of the map the run **started** with ([`Report::key_range`]) some client
+    /// wrote to a key of after the last heal, how long after **the heal** the first of
+    /// those writes completed, and `None` for a range whose post-heal writes all stayed
+    /// pending: the recovery time proper, which the per-key reading above no longer
+    /// carries.
     ///
     /// It is keyed by range and not by the cluster for D-071's reason — one minimum
     /// over every write is passed by a wedged range beside a live one, since the
@@ -4044,9 +4060,20 @@ impl Report {
     /// next is the client's business and not the cluster's. Every range of a
     /// scenario this is asked of is written to within milliseconds of any moment its
     /// clients are running, so this minimum waits on no draw the way one key's does.
+    ///
+    /// **A split does not change this map**, so after one a parent and its right half,
+    /// two logs, are one range here, and one minimum over the two is passed by a wedged
+    /// half beside a live sibling as one over the cluster is by a wedged range beside a
+    /// live one (#148). The halves are read by [`Report::recoveries_by_final_range`],
+    /// each from its own first write; this reading stays beside that one, asked of the
+    /// span the run started with from the heal, because a span two keys wide waits on no
+    /// one key's draw and its recovery is still the cluster's to answer (PROPOSED D-121).
+    /// It was `writes_after_heal_by_range` until then, a name that read as the ranges the
+    /// run has.
     // PROPOSED(D-076): the recovery time proper is asked per range.
+    // PROPOSED(D-121): named for the map it reads; the halves are read beside it.
     #[must_use]
-    pub fn writes_after_heal_by_range(&self) -> BTreeMap<u64, Option<Duration>> {
+    pub fn writes_after_heal_by_starting_range(&self) -> BTreeMap<u64, Option<Duration>> {
         let mut by_range: BTreeMap<u64, Option<Duration>> = BTreeMap::new();
         for op in self.post_heal_writes() {
             let took = op.ret.map(|ret| ret.duration_since(self.last_heal));
@@ -4208,14 +4235,34 @@ impl Report {
     /// wrote to in the window is no evidence of anything, and the two clients draw
     /// their keys at random. A key whose post-heal writes all stayed pending is the
     /// wedge this check is here to see. With no range left with a majority nothing
-    /// is asked, as nothing was when the check was the cluster's.
+    /// is asked, as nothing was when the check was the cluster's. A key is asked where
+    /// the range serving it at the run's end has a majority up: that range's majority is
+    /// the one that can answer it, and after a split it is not the range the run started
+    /// with (PROPOSED D-121, #148).
     ///
     /// The same bound is asked, per live range, of the recovery time proper: how
     /// long after the heal the first write to any key of that range completed
-    /// ([`Report::writes_after_heal_by_range`]). The per-key reading measures each
-    /// write from its own call and so cannot carry that; the per-range one waits on
+    /// ([`Report::writes_after_heal_by_starting_range`]). The per-key reading measures
+    /// each write from its own call and so cannot carry that; the per-range one waits on
     /// no client's choice of key and so is not the client's idleness read as the
     /// cluster's (D-076).
+    ///
+    /// **And of each range a split cut, from its own first write** (PROPOSED D-121,
+    /// #148). The reading from the heal is of the ranges the run started with, and a
+    /// split makes two logs of one of them, so a wedged half beside a live sibling passes
+    /// it on the sibling's completion. Each range a split cut, on either side, is asked
+    /// what [`Report::liveness_by_final_range`] asks of every final range: its first
+    /// completion within the bound of its first post-heal write in the history
+    /// ([`Report::recoveries_by_final_range`]), and a half whose writes all stayed pending
+    /// is the wedge. From that write and not from the heal, because a split leaves each
+    /// half of a two-key range serving one key, and a half's first write is then one key's
+    /// draw, the client's idleness again (D-076). A range no split cut is the same range
+    /// in both maps and is read from the heal alone, as before. So a run with no split
+    /// reads exactly as it did, and the reading from the heal is asked as it was, before
+    /// the halves, so a run it failed still fails. What can still move a verdict, either
+    /// way, is which keys the per-key reading asks: a key is asked on the majority of the
+    /// range serving it, which differs from the starting map's only where a half has a
+    /// majority up and the range the run started with does not, or the reverse.
     ///
     /// Public since PROPOSED D-086's merge with `main`: `sim/tests/node.rs` reads it
     /// directly to attribute a wedge under a variant, because [`Report::check`]
@@ -4227,15 +4274,46 @@ impl Report {
     ///
     /// The violation, naming the key or the range and the bound.
     // PROPOSED(D-086): the fold is readable on its own, so a wedge is attributed.
+    // PROPOSED(D-121): the keys and the halves are read through the range serving them.
     pub fn liveness(&self) -> Result<(), String> {
         let live = self.ranges_with_a_majority_up();
         if live.is_empty() {
             return Ok(());
         }
+        let splits = self.splits_taken();
+        let asked = self.every_key_written_after_the_heal(&live, &splits)?;
+        self.recovery_from_the_heal(&live)?;
+        let cut: BTreeSet<u64> = splits
+            .iter()
+            .flat_map(|(parent, right, _, _)| [*parent, *right])
+            .collect();
+        self.recovery_from_the_first_call(&live, &splits, |range| cut.contains(&range))?;
+        if asked == 0 {
+            return Err(format!(
+                "liveness: no client write completed after the last heal at {:?}",
+                self.last_heal
+            ));
+        }
+        Ok(())
+    }
+
+    /// The per-key reading of the write bound: every key some client wrote after the heal
+    /// whose range serving it at the run's end ([`Report::serving_at`]) is in `live`, its
+    /// slowest post-heal write from its own call within the bound, and a key whose
+    /// post-heal writes all stayed pending the wedge ([`Report::writes_after_heal_by_key`]).
+    /// The number of keys asked, or the first violation.
+    // PROPOSED(D-071): the write bound is asked per key.
+    // PROPOSED(D-113): asked where the range serving the key at the end has a majority.
+    // PROPOSED(D-121): on every run, and not only the sharded sweep's.
+    fn every_key_written_after_the_heal(
+        &self,
+        live: &BTreeSet<u64>,
+        splits: &[(u64, u64, Bytes, Instant)],
+    ) -> Result<usize, String> {
         let bound = election_max() * LIVENESS_TIMEOUTS;
         let mut asked = 0usize;
         for (key, took) in self.writes_after_heal_by_key() {
-            if !live.contains(&(self.key_range)(&key)) {
+            if !live.contains(&self.serving_at(splits, &key, self.ended)) {
                 continue;
             }
             asked += 1;
@@ -4255,24 +4333,17 @@ impl Report {
                 }
             }
         }
-        self.recovery_from_the_heal(&live)?;
-        if asked == 0 {
-            return Err(format!(
-                "liveness: no client write completed after the last heal at {:?}",
-                self.last_heal
-            ));
-        }
-        Ok(())
+        Ok(asked)
     }
 
     /// The recovery time proper (D-076): per range of [`Report::key_range`] with a majority
     /// up, of those in `live`, the first write completed within the bound of **the heal**
-    /// ([`Report::writes_after_heal_by_range`]).
+    /// ([`Report::writes_after_heal_by_starting_range`]).
     // PROPOSED(D-076): the recovery time proper is asked per range.
     // PROPOSED(D-113): read beside the per-range arm from the first call.
     fn recovery_from_the_heal(&self, live: &BTreeSet<u64>) -> Result<(), String> {
         let bound = election_max() * LIVENESS_TIMEOUTS;
-        for (range, took) in self.writes_after_heal_by_range() {
+        for (range, took) in self.writes_after_heal_by_starting_range() {
             if !live.contains(&range) {
                 continue;
             }
@@ -4297,6 +4368,45 @@ impl Report {
         Ok(())
     }
 
+    /// The per-range arm read from each range's first post-heal write in the history
+    /// ([`Report::recoveries_by_final_range`]): of each range in `live` that `asked` picks,
+    /// the first completion within the bound of that write's call, and a range whose
+    /// post-heal writes all stayed pending the wedge. Not always the per-key reading's
+    /// wedge: a key that completed a write on a parent before a split passes that
+    /// reading, and the right half's own writes are what stayed pending.
+    // PROPOSED(D-113): the write bound per range the run ended with.
+    // PROPOSED(D-121): shared by both liveness readings.
+    fn recovery_from_the_first_call(
+        &self,
+        live: &BTreeSet<u64>,
+        splits: &[(u64, u64, Bytes, Instant)],
+        asked: impl Fn(u64) -> bool,
+    ) -> Result<(), String> {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        for (range, recovery) in self.recoveries_by(splits) {
+            if !live.contains(&range) || !asked(range) {
+                continue;
+            }
+            match recovery.first_completed {
+                Some(completed) => {
+                    let took = completed.duration_since(recovery.first_call.max(self.last_heal));
+                    if took > bound {
+                        return Err(format!(
+                            "liveness: range {range} took {took:?} from its first client write after the last heal to complete one, over {bound:?}"
+                        ));
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to range {range} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then every
     /// split the trace took, read where the run stopped ([`Report::ended`]).
     // PROPOSED(D-113): the write bound per range the run ended with.
@@ -4308,13 +4418,29 @@ impl Report {
     /// Per range the run ended with that some client wrote to after the last heal, when
     /// the first of those writes was called and when the first of them completed.
     /// The writes are the ones the per-key reading reads ([`Report::writes_after_heal_by_key`]).
+    ///
+    /// Each write is the range's that served its key **when it completed**, the log that
+    /// committed it, and a write still pending is the range's serving its key where the
+    /// run stopped, the log it waits on (`Report::serving_write`, D-102's two readings).
+    /// Read where the run stopped instead, as this was until PROPOSED D-121, a write a
+    /// parent committed before a split after the heal is its right half's, whose log did
+    /// not exist yet, so a right half whose own writes all stay pending is passed on its
+    /// parent's completion: one half's wedge behind the other's log, #148's shape by the
+    /// map the run ended with. Every range a write is keyed to is one the run ended with,
+    /// since a parent goes on as its left half.
     // PROPOSED(D-113): the write bound per range the run ended with.
+    // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
     #[must_use]
     pub fn recoveries_by_final_range(&self) -> BTreeMap<u64, Recovery> {
-        let splits = self.splits_taken();
+        self.recoveries_by(&self.splits_taken())
+    }
+
+    /// [`Report::recoveries_by_final_range`], over `splits` ([`Report::splits_taken`]).
+    // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
+    fn recoveries_by(&self, splits: &[(u64, u64, Bytes, Instant)]) -> BTreeMap<u64, Recovery> {
         let mut by_range: BTreeMap<u64, Recovery> = BTreeMap::new();
         for op in self.post_heal_writes() {
-            let range = self.serving_at(&splits, op.op.key(), self.ended);
+            let range = self.serving_write(splits, op);
             let recovery = by_range.entry(range).or_insert(Recovery {
                 first_call: op.call,
                 first_completed: None,
@@ -4335,7 +4461,8 @@ impl Report {
     /// - **Per key**, the same fold and the same bound: every key some client wrote after
     ///   the heal, its slowest write from its own call, asked where the range serving the
     ///   key at the run's end has a majority up ([`Report::ranges_with_a_majority_up`]).
-    /// - **Per range**, what [`Report::recoveries_by_final_range`] reads: a range whose
+    /// - **Per range**, what [`Report::recoveries_by_final_range`] reads, each write the
+    ///   range's that served its key when it completed (PROPOSED D-121): a range whose
     ///   post-heal writes in the history all stayed pending is the wedge, and otherwise the
     ///   first completion comes within the bound of the first call in the history. That
     ///   call and not the heal, because a range here is as few as two of sixteen keys, and
@@ -4376,63 +4503,21 @@ impl Report {
     ///
     /// The violation, naming the key or the range and the bound.
     // PROPOSED(D-113): the write bound per range the run ended with.
+    // PROPOSED(D-121): its arms shared with `liveness`, which asks them of a split's halves.
     pub fn liveness_by_final_range(&self) -> Result<(), String> {
         let live = self.ranges_with_a_majority_up();
         if live.is_empty() {
             return Ok(());
         }
-        let bound = election_max() * LIVENESS_TIMEOUTS;
         let splits = self.splits_taken();
-        let final_range = |key: &Bytes| self.serving_at(&splits, key, self.ended);
-        let mut asked = 0usize;
-        for (key, took) in self.writes_after_heal_by_key() {
-            if !live.contains(&final_range(&key)) {
-                continue;
-            }
-            asked += 1;
-            let key = String::from_utf8_lossy(&key).into_owned();
-            match took {
-                Some(took) if took <= bound => {}
-                Some(took) => {
-                    return Err(format!(
-                        "liveness: the slowest client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "liveness: no client write to {key} completed after the last heal at {:?}",
-                        self.last_heal
-                    ));
-                }
-            }
-        }
-        for (range, recovery) in self.recoveries_by_final_range() {
-            if !live.contains(&range) {
-                continue;
-            }
-            match recovery.first_completed {
-                Some(completed) => {
-                    let took = completed.duration_since(recovery.first_call.max(self.last_heal));
-                    if took > bound {
-                        return Err(format!(
-                            "liveness: range {range} took {took:?} from its first client write after the last heal to complete one, over {bound:?}"
-                        ));
-                    }
-                }
-                None => {
-                    return Err(format!(
-                        "liveness: no client write to range {range} completed after the last heal at {:?}",
-                        self.last_heal
-                    ));
-                }
-            }
-        }
+        let asked = self.every_key_written_after_the_heal(&live, &splits)?;
+        self.recovery_from_the_first_call(&live, &splits, |_| true)?;
         self.recovery_from_the_heal(&live)?;
         let touched: BTreeSet<u64> = self
             .history
             .ops
             .iter()
-            .map(|op| final_range(op.op.key()))
+            .map(|op| self.serving_at(&splits, op.op.key(), self.ended))
             .collect();
         if asked == 0 && touched.iter().all(|range| live.contains(range)) {
             return Err(format!(
@@ -12302,7 +12387,7 @@ mod tests {
         // And the range's own reading passes it: the range completed a write 30 ms
         // after the heal, so this one is the per-key check's to catch or nobody's.
         assert_eq!(
-            hidden.writes_after_heal_by_range()[&SINGLE_GROUP],
+            hidden.writes_after_heal_by_starting_range()[&SINGLE_GROUP],
             Some(Duration::from_millis(30))
         );
     }
@@ -13213,6 +13298,11 @@ mod tests {
             Some(1),
             term_of(1, SINGLE_GROUP, 1, "follower"),
         );
+        // The right half has a replica, as a real split's `RangeCreated` says: since
+        // PROPOSED D-121 a key is asked of on the majority of the range serving it, and a
+        // right half no record names is in no live set.
+        // PROPOSED(D-121): a key is asked of on the range serving it.
+        let right_term = record(ms(0), ms(0), Some(1), term_of(1, right, 1, "follower"));
         let split_at = |at| {
             record(
                 ms(at),
@@ -13232,7 +13322,10 @@ mod tests {
                 ..History::default()
             },
             ended: ms(2500),
-            ..report(vec![term.clone(), split_at(split)], Vec::new())
+            ..report(
+                vec![term.clone(), right_term.clone(), split_at(split)],
+                Vec::new(),
+            )
         };
         let wedge = |key: &str| {
             Err(format!(
@@ -13245,6 +13338,368 @@ mod tests {
         // Split before it: the completion is the right half's.
         assert_eq!(with(500, "k0").liveness(), wedge("k0"));
         with(500, "k2").liveness().unwrap();
+    }
+
+    /// The right half of [`split_run`]'s split.
+    const SPLIT_RIGHT: u64 = SINGLE_GROUP + 40;
+
+    /// A run of one range holding `k0`, `k1` and above, split at `k1` at `split` ms, or
+    /// not split at all, with the last heal at 0 and the run's end the hand-built 3.9 s.
+    /// Both halves have a replica, as a real split's `RangeCreated` says. `ops` is the
+    /// history, and each op's `ClientInvoke` is traced as a real run's is; `lost` is the
+    /// writes clients asked for and no leader proposed, (key, when): traced, and not in
+    /// the history (`lin::History::from_trace`).
+    // PROPOSED(D-121): the per-range readings of a split's halves, on records written by hand.
+    fn split_run(split: Option<u64>, lost: &[(&str, u64)], ops: Vec<lin::Op>) -> Report {
+        let put = |key: &[u8]| ClientOp::Put {
+            key: Bytes::copy_from_slice(key),
+            value: Bytes::from_static(b"v"),
+        };
+        let asked = |at: u64, seq: u64, op: ClientOp| {
+            record(
+                ms(at),
+                ms(at),
+                None,
+                TraceEvent::ClientInvoke { client: 1, seq, op },
+            )
+        };
+        let mut records = vec![
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, SINGLE_GROUP, 1, "follower"),
+            ),
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, SPLIT_RIGHT, 1, "follower"),
+            ),
+        ];
+        if let Some(at) = split {
+            records.push(record(
+                ms(at),
+                ms(at),
+                Some(1),
+                TraceEvent::RangeSplit {
+                    range: SINGLE_GROUP,
+                    right: SPLIT_RIGHT,
+                    key: user_key(b"k1"),
+                    index: 5,
+                },
+            ));
+        }
+        for op in &ops {
+            let at = u64::try_from(op.call.duration_since(ms(0)).as_millis()).expect("small");
+            records.push(asked(at, op.seq, op.op.clone()));
+        }
+        for (key, at) in lost {
+            records.push(asked(*at, 1_000_000 + *at, put(key.as_bytes())));
+        }
+        records.sort_by_key(|record| record.at);
+        Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ..report(records, Vec::new())
+        }
+    }
+
+    /// A [`Recovery`] at `first_call` ms, first completed at `first_completed` ms.
+    // PROPOSED(D-121)
+    fn recovery(first_call: u64, first_completed: Option<u64>) -> Recovery {
+        Recovery {
+            first_call: ms(first_call),
+            first_completed: first_completed.map(ms),
+        }
+    }
+
+    /// **The defect (#148): a wedged half beside a live sibling.** Every post-heal write
+    /// to `k0`, the left half's key, is pending; the right half serves `k1` in 50 ms. The
+    /// map the run started with reads the two logs as one range, whose first completion
+    /// is the sibling's; the range serving the key reads the left half as what it is. The
+    /// per-key reading reports this run first, so the readings are what is compared.
+    // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+    #[test]
+    fn a_wedged_half_beside_a_live_sibling_is_read_as_wedged_and_the_starting_map_reads_it_live() {
+        let ops = vec![put_at("k0", 500, None), put_at("k1", 600, Some(650))];
+        let split = split_run(Some(0), &[], ops.clone());
+        assert_eq!(
+            split.writes_after_heal_by_starting_range(),
+            BTreeMap::from([(SINGLE_GROUP, Some(Duration::from_millis(650)))]),
+            "the starting map's reading: the sibling's completion stands for the wedged half"
+        );
+        assert_eq!(
+            split.recoveries_by_final_range(),
+            BTreeMap::from([
+                (SINGLE_GROUP, recovery(500, None)),
+                (SPLIT_RIGHT, recovery(600, Some(650))),
+            ]),
+            "the serving reading: two logs, one of them wedged"
+        );
+        let wedge = Err(
+            "liveness: no client write to k0 completed after the last heal at Instant(0ns)"
+                .to_owned(),
+        );
+        assert_eq!(split.liveness(), wedge);
+        assert_eq!(split.liveness_by_final_range(), wedge);
+        // The pair: no split, one log, and that log's completion does stand for it.
+        let unsplit = split_run(None, &[], ops);
+        assert_eq!(
+            unsplit.recoveries_by_final_range(),
+            BTreeMap::from([(SINGLE_GROUP, recovery(500, Some(650)))])
+        );
+    }
+
+    /// **The catch only the halves' reading has (#148).** `k0`'s half proposes a write at
+    /// 100 ms that never commits, and completes nothing until a second write, called at
+    /// 2.49 s, returns at 2.51 s. The per-key reading folds `k0` into that write's 20 ms
+    /// (#158). The starting map's minimum is the sibling's 250 ms. Read from the half's
+    /// first post-heal write it is 2.41 s against the bound of 2 s, and it fails; before
+    /// PROPOSED D-121 `liveness` passed it.
+    ///
+    /// The pair is the same history without the write that never committed: nobody wrote
+    /// to that half until 2.49 s, it answered in 20 ms, and it passes. That is the
+    /// client's idleness, which read from the heal would fail a live half (D-076).
+    // PROPOSED(D-121): a half's recovery is read from its first post-heal write.
+    #[test]
+    fn a_half_slow_to_answer_its_first_write_fails_and_a_half_written_late_does_not() {
+        let answered = || vec![put_at("k1", 200, Some(250)), put_at("k0", 2490, Some(2510))];
+        let mut ops = answered();
+        ops.insert(0, put_at("k0", 100, None));
+        let slow = split_run(Some(0), &[], ops.clone());
+        assert_eq!(
+            slow.writes_after_heal_by_key()[&Bytes::from_static(b"k0")],
+            Some(Duration::from_millis(20)),
+            "the per-key reading sees a quick write"
+        );
+        assert_eq!(
+            slow.writes_after_heal_by_starting_range(),
+            BTreeMap::from([(SINGLE_GROUP, Some(Duration::from_millis(250)))]),
+            "the starting map's reading sees the sibling"
+        );
+        assert_eq!(
+            slow.time_to_write_after_heal(),
+            Some(Duration::from_millis(250)),
+            "the first write after the heal is still measured from the heal"
+        );
+        let over = Err(format!(
+            "liveness: range {SINGLE_GROUP} took 2.41s from its first client write after the \
+             last heal to complete one, over 2s"
+        ));
+        assert_eq!(slow.liveness(), over);
+        assert_eq!(slow.liveness_by_final_range(), over);
+
+        let late = split_run(Some(0), &[], answered());
+        assert_eq!(
+            late.recoveries_by_final_range()[&SINGLE_GROUP],
+            recovery(2490, Some(2510)),
+            "the half answered 20 ms after it was first written to"
+        );
+        late.liveness().unwrap();
+
+        // With no split there is one log and no draw to wait on, and the history that
+        // fails split is that one range's, read from the heal, as ever.
+        split_run(None, &[], ops).liveness().unwrap();
+    }
+
+    /// **A write no leader proposed starts no clock (PROPOSED D-121).** A half asked for
+    /// writes at 100 ms and 1.5 s, proposed neither time, and answering in 20 ms when next
+    /// written to at 2.49 s, passes. Read from the invocations it would read 2.41 s and
+    /// fail a range nothing showed slow: a write no leader proposed leaves no operation
+    /// (`lin.rs`), and on this reading it says nothing of the range.
+    // PROPOSED(D-121): a half's recovery is read from its first post-heal write.
+    #[test]
+    fn a_write_no_leader_proposed_starts_no_halfs_clock() {
+        let run = split_run(
+            Some(0),
+            &[("k0", 100), ("k0", 1500)],
+            vec![put_at("k1", 200, Some(250)), put_at("k0", 2490, Some(2510))],
+        );
+        let invoked = run
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                TraceEvent::ClientInvoke { op, .. } => Some(op.key()),
+                _ => None,
+            })
+            .filter(|key| key.as_ref() == b"k0")
+            .count();
+        assert_eq!(invoked, 3, "the two lost writes are traced");
+        assert_eq!(
+            run.recoveries_by_final_range()[&SINGLE_GROUP],
+            recovery(2490, Some(2510))
+        );
+        run.liveness().unwrap();
+    }
+
+    /// **What the halves' reading must not lose (PROPOSED D-121).** Both halves are slow:
+    /// neither completes a write until past the bound of the heal, and each is first
+    /// written to late enough to answer inside the bound of that write. Read per half
+    /// that passes, and the starting map's reading from the heal, D-076's, is still what
+    /// fails it, with the words it failed it with before: no verdict it failed moves to a
+    /// pass.
+    // PROPOSED(D-121): the span's recovery is still read from the heal.
+    #[test]
+    fn a_span_slow_from_the_heal_still_fails_though_each_half_answers_inside_the_bound_of_its_first_write()
+     {
+        let run = split_run(
+            Some(0),
+            &[],
+            vec![put_at("k0", 400, Some(2200)), put_at("k1", 500, Some(2300))],
+        );
+        assert_eq!(
+            run.recoveries_by_final_range(),
+            BTreeMap::from([
+                (SINGLE_GROUP, recovery(400, Some(2200))),
+                (SPLIT_RIGHT, recovery(500, Some(2300))),
+            ])
+        );
+        assert_eq!(
+            run.liveness(),
+            Err(format!(
+                "liveness: range {SINGLE_GROUP} took 2.2s after the last heal to complete a \
+                 client write, over 2s"
+            ))
+        );
+    }
+
+    /// A split after the heal, whose right half did not exist until the split (PROPOSED
+    /// D-121). The split is traced at 2.2 s. A write to `k1` called at 2.19 s and answered
+    /// at 2.21 s is the right half's evidence (D-102), and its own clock: 20 ms, where read
+    /// from the heal it would be 2.21 s against the bound of 2 s, for a log 10 ms old. A
+    /// write to `k1` that returned before the split is the parent's, which the left half
+    /// keeps, though its key is the right half's where the run stopped.
+    // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
+    #[test]
+    fn a_right_half_born_after_the_heal_is_not_charged_the_time_before_it() {
+        let across = split_run(
+            Some(2200),
+            &[],
+            vec![put_at("k0", 50, Some(60)), put_at("k1", 2190, Some(2210))],
+        );
+        assert_eq!(
+            across.recoveries_by_final_range()[&SPLIT_RIGHT],
+            recovery(2190, Some(2210))
+        );
+        across.liveness().unwrap();
+        across.liveness_by_final_range().unwrap();
+
+        let before = split_run(
+            Some(2200),
+            &[],
+            vec![put_at("k1", 50, Some(60)), put_at("k1", 2300, Some(2320))],
+        );
+        assert_eq!(
+            before.recoveries_by_final_range(),
+            BTreeMap::from([
+                (SINGLE_GROUP, recovery(50, Some(60))),
+                (SPLIT_RIGHT, recovery(2300, Some(2320))),
+            ])
+        );
+    }
+
+    /// **A right half passed on its parent's completion, by the map the run ended with
+    /// (PROPOSED D-121).** A split after the heal, at 1 s. `k1`'s write completes on the
+    /// parent at 60 ms, so the key has a completed post-heal write, the per-key reading
+    /// folds it into that, and the parent's span reads as recovered. Its next write,
+    /// called on the right half at 2.5 s, is still pending 1.4 s later where the run stops:
+    /// past its client's wait, inside the bound, on a half that has completed nothing.
+    /// Read where the run stopped, as `recoveries_by_final_range` read it until this
+    /// entry, the parent's completion was the right half's and both readings passed; read
+    /// by the range serving the key when the write completed, the right half has
+    /// completed nothing, and both fail. The pair is the same run with that write answered
+    /// in 20 ms.
+    // PROPOSED(D-121): each write keyed by the range serving its key when it completed.
+    #[test]
+    fn a_right_half_that_completes_nothing_fails_though_its_key_completed_on_the_parent() {
+        let wedged = split_run(
+            Some(1000),
+            &[],
+            vec![put_at("k1", 50, Some(60)), put_at("k1", 2500, None)],
+        );
+        assert_eq!(
+            wedged.writes_after_heal_by_key()[&Bytes::from_static(b"k1")],
+            Some(Duration::from_millis(10)),
+            "the per-key reading sees the write the parent completed"
+        );
+        assert_eq!(
+            wedged.writes_after_heal_by_starting_range(),
+            BTreeMap::from([(SINGLE_GROUP, Some(Duration::from_millis(60)))]),
+            "the starting map's reading sees the same write"
+        );
+        assert_eq!(
+            wedged.recoveries_by_final_range(),
+            BTreeMap::from([
+                (SINGLE_GROUP, recovery(50, Some(60))),
+                (SPLIT_RIGHT, recovery(2500, None)),
+            ])
+        );
+        let wedge = Err(format!(
+            "liveness: no client write to range {SPLIT_RIGHT} completed after the last heal at \
+             Instant(0ns)"
+        ));
+        assert_eq!(wedged.liveness(), wedge);
+        assert_eq!(wedged.liveness_by_final_range(), wedge);
+
+        let answered = split_run(
+            Some(1000),
+            &[],
+            vec![put_at("k1", 50, Some(60)), put_at("k1", 2500, Some(2520))],
+        );
+        assert_eq!(
+            answered.recoveries_by_final_range()[&SPLIT_RIGHT],
+            recovery(2500, Some(2520))
+        );
+        answered.liveness().unwrap();
+        answered.liveness_by_final_range().unwrap();
+    }
+
+    /// The majority is asked of the range serving the key (#148; SHARD.md §8 withholds
+    /// liveness from a range without one). `k1`'s write is pending and its half, the
+    /// right, is two replicas short: not asked, though the range the run started with is
+    /// whole. Quarantine the left half's replicas instead and the same pending write is on
+    /// a whole range, and is the wedge, though the starting map's range is short.
+    // PROPOSED(D-121): a key is asked of on the range serving it.
+    #[test]
+    fn a_keys_majority_is_the_one_of_the_range_serving_it_after_a_split() {
+        let with_quarantined = |range: u64| {
+            let mut run = split_run(
+                Some(0),
+                &[],
+                vec![put_at("k0", 100, Some(150)), put_at("k1", 200, None)],
+            );
+            for server in 1..=2 {
+                run.records.push(record(
+                    ms(300),
+                    ms(300),
+                    Some(server),
+                    TraceEvent::RaftReseeded { server, range },
+                ));
+            }
+            run
+        };
+        let right_short = with_quarantined(SPLIT_RIGHT);
+        assert_eq!(
+            right_short.ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP])
+        );
+        right_short.liveness().unwrap();
+
+        let left_short = with_quarantined(SINGLE_GROUP);
+        assert_eq!(
+            left_short.ranges_with_a_majority_up(),
+            BTreeSet::from([SPLIT_RIGHT])
+        );
+        assert_eq!(
+            left_short.liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
     }
 
     /// A write its client is still waiting for when the run stops — called less than

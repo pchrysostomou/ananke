@@ -101,6 +101,26 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-liveness-split-halves` (2026-11-14), off `main` at c5cd18d, PROPOSED
+  **D-121** (footer stays D-133), **#148's remainder after #216**: `Report::liveness`, which
+  `check()` asks of the node sweep and every run but `sim/shard.rs`'s, now follows the splits as
+  D-113 §5's reading does there. A key is asked on the majority of the range serving it at the
+  run's end; each range a split cut is read from its first post-heal write in the history, a half
+  whose writes all stayed pending the wedge; and D-076's reading from the heal over the starting
+  map stays, asked first and unchanged (renamed `writes_after_heal_by_starting_range`), so no run
+  it failed passes. Both readings now key a write by the range serving its key when it completed,
+  as D-102 keyed the exemption: read at the end, a right half born after the heal was passed on
+  its parent's completion. Measured in release, each run once under both readings: no verdict
+  moved on the correct node (seeds 0 to 499, 777 live halves, worst 721 ms from its first write),
+  `SharedSnapshotDir` (0 to 299, 73 of 150 uniform failing either way) or `sim/shard.rs` (0 to 499),
+  nor on the 32 other variants the node sweep runs (seeds 0 to 39 each, a spot check); no `check()`,
+  no off-schedule attribution and no key's asking moved; `SharedSnapshotDir` leaves a half the
+  starting map read live on 12 of 300, each also a per-key catch, now counted in its sweep and
+  asserted from the ten thousand. Read from the heal the correct node would fail seeds 105, 225 and
+  300, and from the invocations seed 300.
+  Pinned: seed 76 under `SharedSnapshotDir` (the wedged half beside a live sibling) and seeds 105 and
+  300 of the correct node (the clock); seven hand-built cases; ten plants each caught. Two nightly
+  rows, shard 4. Refs #148, not closed: a half that proposes nothing is in no reading (#197).
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

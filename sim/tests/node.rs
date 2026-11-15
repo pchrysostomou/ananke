@@ -3871,6 +3871,51 @@ fn wedged(report: &raft::Report) -> bool {
     report.uniform() && report.liveness().is_err()
 }
 
+/// Whether the per-range reading of a split's halves fails a range a split cut where
+/// the reading of the range the run started with, the span it came from, passes it or
+/// does not ask it: a half wedged or slow beside a sibling whose completion D-076's
+/// reading took for its own (#148). Read off the two readings themselves, whatever the
+/// per-key reading says of the run: each half is asked as `liveness` asks it, from its
+/// first post-heal write in the history (`raft::Report::recoveries_by_final_range`).
+// PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+fn a_half_the_starting_map_reads_live(report: &raft::Report) -> bool {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let live = report.ranges_with_a_majority_up();
+    let parents: BTreeMap<u64, u64> = report
+        .records
+        .iter()
+        .filter_map(|r| match &r.event {
+            TraceEvent::RangeSplit { range, right, .. } => Some((*right, *range)),
+            _ => None,
+        })
+        .collect();
+    let cut: BTreeSet<u64> = parents
+        .iter()
+        .flat_map(|(right, parent)| [*right, *parent])
+        .collect();
+    let span_of = |mut range: u64| {
+        while let Some(parent) = parents.get(&range) {
+            range = *parent;
+        }
+        range
+    };
+    let answered = |took: Option<Duration>| took.is_some_and(|took| took <= bound);
+    let starting = report.writes_after_heal_by_starting_range();
+    report
+        .recoveries_by_final_range()
+        .into_iter()
+        .any(|(range, recovery)| {
+            let took = recovery.first_completed.map(|completed| {
+                completed.duration_since(recovery.first_call.max(report.last_heal))
+            });
+            let span = span_of(range);
+            cut.contains(&range)
+                && live.contains(&range)
+                && !answered(took)
+                && (!live.contains(&span) || starting.get(&span).is_some_and(|t| answered(*t)))
+        })
+}
+
 /// Whether a violation is the read bound's (`READS_OUTSTANDING`, D-076 point 12).
 fn by_the_read_bound(violation: &str) -> bool {
     mechanism(violation) == "the node failed" && violation.contains("registered reads")
@@ -5229,6 +5274,10 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
         /// The read bound fired with no wedge, where the correct node passes the seed:
         /// the variant's load on a bound that counts retries (issue #125).
         load: bool,
+        /// A half the per-range reading of the halves fails and the starting map's reads
+        /// live (#148).
+        // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+        half: bool,
     }
     let outcomes: Vec<Shared> = sweep(share, |seed| {
         let report = buggy(seed, Variant::SharedSnapshotDir);
@@ -5266,6 +5315,7 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
             wedged: wedged(&report),
             read_bound_on_wedge,
             load,
+            half: report.uniform() && a_half_the_starting_map_reads_live(&report),
         }
     });
     let caught: Vec<&String> = outcomes
@@ -5385,6 +5435,27 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
         "node: SharedSnapshotDir's liveness catch is {liveness}/{share} over a tier of \
          {tier}, asserted from ten thousand as Phase 2 asserts it and no stronger"
     );
+    // **A half the starting map reads live, from the same ten thousand** (#148). The
+    // correct node's half of the pair is its own sweep, whose `check()` asks the halves'
+    // reading of every uniform seed. **12 of 300** on this tree (seeds 0 to 299, release),
+    // every one uniform, so 4.0 % over the seeds the assertion sees and under D-061's 5 %: the
+    // thousand's share of a hundred misses it about one run in sixty, which is a flake, and the
+    // ten thousand's share of a thousand all but never does. Each of the 12 also fails the
+    // per-key reading, so this counts the per-range reading's own answer and moves no verdict
+    // of the sweep (PROPOSED D-121).
+    // PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+    let halves = outcomes.iter().filter(|o| o.half).count();
+    println!(
+        "node: SharedSnapshotDir left a half the per-range reading of the halves fails and \
+         the starting map reads live on {halves}/{share} seeds"
+    );
+    if tier >= 10_000 {
+        assert!(
+            halves > 0,
+            "SharedSnapshotDir never wedged a half beside a sibling the starting map read as \
+             its own over {share} seeds, so the halves' reading was not asked of one"
+        );
+    }
 }
 
 /// Whether some server took a snapshot **of one range** at an index it had already
@@ -5714,6 +5785,212 @@ fn seeds_12_and_76_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wo
             && op.op.key().as_ref() == b"k3"),
         "seed 8's right half completes a post-heal write to k3 again: its shape may be back"
     );
+}
+
+/// Seed 76 under `SharedSnapshotDir`: **the wedged half beside a live sibling, which the
+/// per-range reading read as live until PROPOSED D-121 (#148).** Range 4 split at `k5`.
+/// Its left half, serving `k4`, completes no post-heal write, and its right half does.
+/// The map the run started with reads the two as one range and takes the right half's
+/// completion for the range's, within the bound of the heal. Keyed by the range serving
+/// each write, the left half reads no completion, the right half one within the bound of
+/// its first write, and `a_half_the_starting_map_reads_live` holds. The per-key reading
+/// still reports the run first (`k4`), as `seeds_12_and_76_...` pins; this pins the
+/// per-range reading's own answer, which before this entry was blind to the half. The pair
+/// is the correct node on the same seed, which reads no such half and passes.
+// PROPOSED(D-121): the per-range readings key a write by the range serving its key.
+#[test]
+fn seed_76_under_a_shared_snapshot_dir_reads_the_wedged_half_as_wedged_beside_its_live_sibling() {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let report = buggy(76, Variant::SharedSnapshotDir);
+    assert!(report.uniform(), "seed 76 is a uniform schedule");
+    let right = report
+        .records
+        .iter()
+        .find_map(|r| match &r.event {
+            TraceEvent::RangeSplit {
+                range: 4,
+                right,
+                key,
+                ..
+            } if ananke_raft::apply::user_key_of(key) == Some(&b"k5"[..]) => Some(*right),
+            _ => None,
+        })
+        .expect("seed 76's range 4 splits at k5");
+    let live = report.ranges_with_a_majority_up();
+    assert!(
+        live.contains(&4) && live.contains(&right),
+        "seed 76: both halves are asked of: {live:?}"
+    );
+    let starting = report.writes_after_heal_by_starting_range();
+    let halves = report.recoveries_by_final_range();
+    println!(
+        "seed 76: range 4 and its right half {right}: from the starting map {:?}; by the \
+         range serving each write {:?} and {:?}",
+        starting.get(&4),
+        halves.get(&4),
+        halves.get(&right)
+    );
+    assert!(
+        starting
+            .get(&4)
+            .copied()
+            .flatten()
+            .is_some_and(|took| took <= bound),
+        "seed 76: the starting map no longer reads range 4 live, so it hides nothing: {:?}",
+        starting.get(&4)
+    );
+    assert_eq!(
+        halves.get(&4).map(|recovery| recovery.first_completed),
+        Some(None),
+        "seed 76: the left half is not read wedged"
+    );
+    let answered = halves.get(&right).and_then(|recovery| {
+        recovery
+            .first_completed
+            .map(|completed| completed.duration_since(recovery.first_call.max(report.last_heal)))
+    });
+    assert!(
+        answered.is_some_and(|took| took <= bound),
+        "seed 76: the right half is not read live: {answered:?}"
+    );
+    assert!(a_half_the_starting_map_reads_live(&report));
+
+    // The pair: the correct node on the seed, whose every half answers.
+    let correct_run = correct(76);
+    assert!(!a_half_the_starting_map_reads_live(&correct_run));
+    correct_run
+        .check()
+        .unwrap_or_else(|violation| panic!("the correct node fails seed 76: {violation}"));
+}
+
+/// Seeds 105 and 300 of the correct node: **a half is read neither from the heal nor from a
+/// write no leader proposed** (PROPOSED D-121, #148). Each is a range a split cut whose first
+/// completed post-heal write returns more than the bound after the heal, on a run `check()`
+/// passes, because the half was not slow:
+///
+/// - **Seed 105, the client's idleness (D-076).** Range 6 is asked for no write until 2.19 s
+///   after the heal, and answers in 27 ms. Read from the heal it reads 2.214 s.
+/// - **Seed 300, a lost write and then the idleness.** Range 30 is asked for a put 49 ms after
+///   the heal that no leader proposes, so it leaves the history (`lin.rs`). Its leader serves
+///   its key to reads meanwhile, and the next put is drawn 2.42 s after the heal and answers in
+///   37 ms. Read from the invocation it reads 2.405 s, which is why the clock is the history's
+///   and not the invocations D-103's "asked" reads.
+///
+/// Measured over the correct node's 250 uniform runs of seeds 0 to 499, these three are the
+/// halves past the bound from the heal (seed 225's range 5 is the third, 2.123 s, 31 ms from its
+/// first write), and seed 300's is the one past it from the first invocation.
+// PROPOSED(D-121): a half's recovery is read from its first post-heal write.
+#[test]
+fn seeds_105_and_300_are_halves_past_the_bound_of_the_heal_and_live() {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    for (seed, range, lost) in [(105, 6, 0usize), (300, 30, 1)] {
+        let report = correct(seed);
+        assert!(report.uniform(), "seed {seed} is a uniform schedule");
+        report
+            .check()
+            .unwrap_or_else(|violation| panic!("the correct node fails: {violation}"));
+        // The range is one a split cut, and it serves one key the clients wrote after the heal.
+        assert!(
+            report.records.iter().any(|r| matches!(
+                &r.event,
+                TraceEvent::RangeSplit { range: parent, right, .. }
+                    if *parent == range || *right == range
+            )),
+            "seed {seed}: no split cut range {range}"
+        );
+        let writes: Vec<&ananke_sim::lin::Op> = report
+            .history
+            .ops
+            .iter()
+            .filter(|op| {
+                op.op.is_write()
+                    && op.call >= report.last_heal
+                    && report.final_range_of(op.op.key()) == range
+            })
+            .collect();
+        let keys: BTreeSet<&[u8]> = writes.iter().map(|op| op.op.key().as_ref()).collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "seed {seed}: range {range} does not serve one key written after the heal"
+        );
+        // Its first completed write is past the bound of the heal: from the heal it fails.
+        let first_return = writes
+            .iter()
+            .filter_map(|op| op.ret)
+            .min()
+            .expect("the half completes a post-heal write");
+        let from_heal = first_return.duration_since(report.last_heal);
+        assert!(
+            from_heal > bound,
+            "seed {seed}: range {range}'s first write returned {from_heal:?} after the heal, \
+             inside the bound: not the shape this pin is for"
+        );
+        // Each write asked of it that no leader proposed is an invocation and not in the
+        // history. Read from those, seed 300 fails the bound.
+        let asked: Vec<(u64, u64, ananke_env::Instant)> = report
+            .records
+            .iter()
+            .filter(|r| r.at >= report.last_heal && r.at < first_return)
+            .filter_map(|r| match &r.event {
+                TraceEvent::ClientInvoke { client, seq, op }
+                    if op.is_write() && report.final_range_of(op.key()) == range =>
+                {
+                    Some((*client, *seq, r.at))
+                }
+                _ => None,
+            })
+            .collect();
+        let unproposed = asked
+            .iter()
+            .filter(|(client, seq, _)| {
+                !report
+                    .history
+                    .ops
+                    .iter()
+                    .any(|op| op.process == *client && op.seq == *seq)
+            })
+            .count();
+        assert_eq!(
+            unproposed, lost,
+            "seed {seed}: the writes no leader proposed before the first return moved: {asked:?}"
+        );
+        let first_asked = asked.iter().map(|(_, _, at)| *at).min().expect("asked");
+        let from_asked = first_return.duration_since(first_asked);
+        // What the reading says: the half answered within the bound of its first write in
+        // the history.
+        let recovery = report.recoveries_by_final_range()[&range];
+        let took = recovery
+            .first_completed
+            .expect("the half completed a write")
+            .duration_since(recovery.first_call.max(report.last_heal));
+        println!(
+            "seed {seed}: range {range}: {from_heal:?} from the heal, {from_asked:?} from the \
+             first write asked of it, {took:?} from its first write in the history"
+        );
+        assert!(took <= bound, "seed {seed}: the half reads {took:?}");
+        assert_eq!(
+            from_asked > bound,
+            lost > 0,
+            "seed {seed}: read from the invocations, {from_asked:?}"
+        );
+        if lost > 0 {
+            let reads = report
+                .records
+                .iter()
+                .filter(|r| r.at >= first_asked && r.at < first_return)
+                .filter(|r| match &r.event {
+                    TraceEvent::RaftRead { range: read, .. } => *read == range,
+                    _ => false,
+                })
+                .count();
+            assert!(
+                reads > 0,
+                "seed {seed}: range {range} served no read between the lost write and the first \
+                 return, so nothing here says it was live"
+            );
+        }
+    }
 }
 
 /// Seed 613 under `ApplyWaitsForEveryRange`: **a stall the exemption's range evidence
