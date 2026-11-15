@@ -514,8 +514,9 @@ struct Under {
     splits: usize,
     /// The splits that took an id from a block of an earlier run of its holder.
     from_an_earlier_run: usize,
-    /// The holds an install let go with no replica restored (PROPOSED D-134).
-    released: Released,
+    /// The holds an install let go with no replica restored (PROPOSED D-134), measured only when
+    /// [`under`] is asked to.
+    released: Option<Released>,
 }
 
 /// `high_rate_share` of `sim/tests/node.rs`: a tenth of the tier, at least the gate's twenty.
@@ -531,13 +532,16 @@ fn words_of(violation: &str) -> String {
     rest.split(':').next().unwrap_or(rest).to_owned()
 }
 
-/// Runs `seeds` seeds under the three sets and prints the rate of every check that spoke.
+/// Runs `seeds` seeds under the three sets and prints the rate of every check that spoke. With
+/// `released`, each run also measures PROPOSED D-134's record ([`released_of`]); only the sweep
+/// that prints it asks, since on a run with a release the measure replays the timer check twice.
 fn under(
     name: &str,
     seeds: u64,
     cores: Variants,
     node: NodeVariants,
     range: RangeVariants,
+    released: bool,
 ) -> Vec<Under> {
     let found = sweep(seeds, |seed| {
         let report = shard::run_of(seed, cores, node, range);
@@ -550,7 +554,7 @@ fn under(
                 .collect(),
             splits: report.splits(),
             from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
-            released: released_of(&report),
+            released: released.then(|| released_of(&report)),
         }
     });
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
@@ -577,6 +581,7 @@ fn range_variant(name: &str, seeds: u64, variant: RangeVariant) -> Vec<Under> {
         Variants::default(),
         NodeVariants::correct(),
         RangeVariants::of(&[variant]),
+        false,
     )
 }
 
@@ -587,6 +592,7 @@ fn core_variant(name: &str, variant: Variant) -> Vec<Under> {
         variant.into(),
         NodeVariants::correct(),
         RangeVariants::correct(),
+        false,
     )
 }
 
@@ -937,8 +943,22 @@ fn a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep() 
 // PROPOSED(D-134): the arm's effect on the variant, printed.
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep() {
-    let found = core_variant("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
-    print_released("ResetTimerOnAnyRpc", found.iter().map(|u| &u.released));
+    let found = under(
+        "ResetTimerOnAnyRpc",
+        share(),
+        Variant::ResetTimerOnAnyRpc.into(),
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+        true,
+    );
+    print_released(
+        "ResetTimerOnAnyRpc",
+        found.iter().map(|u| {
+            u.released
+                .as_ref()
+                .expect("measured on every run, as asked")
+        }),
+    );
     assert!(
         said(&found, "timers:") > 0,
         "no timer stayed reset by a stale sender"
@@ -956,6 +976,7 @@ fn a_node_that_refuses_only_one_range_is_caught_by_the_disks_rot_on_the_sharded_
         Variants::default(),
         NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
         RangeVariants::correct(),
+        false,
     );
     assert!(
         said(&found, "state machine safety") > 0,
@@ -2527,7 +2548,9 @@ fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_h
 /// (`reads_back`). The node now traces that release, decided at the hold (`RaftSnapshotReleased`),
 /// and the replay holds the replica from the one to the other. Asserted too: the check as it stood,
 /// `TimerResets::WITHOUT_RELEASED_HOLD`, still flags exactly #227's gap, and it falls inside that
-/// hold, so the day the schedule moves off it this says so.
+/// hold, so the day the schedule moves off it this says so; and the check as it stands,
+/// `TimerResets::ALL`, flags no gap, so the sweep's count of seeds where the two differ reads this
+/// one.
 // PROPOSED(D-131)
 // PROPOSED(D-134): the timer check exempts a hold however it ends.
 #[test]
@@ -2662,6 +2685,16 @@ fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value
                 if record.decided == hold.decided
         )),
         "seed 16725: the hold on range 2 of node 3 ended in no switch"
+    );
+    let with: Vec<String> = report
+        .checked
+        .timer_gaps(raft::TimerResets::ALL)
+        .iter()
+        .map(raft::TimerGap::violation)
+        .collect();
+    assert!(
+        with.is_empty(),
+        "seed 16725: with D-134's arm the check flags no gap, #227's held to its release: {with:?}"
     );
     assert_eq!(
         report.check(),
