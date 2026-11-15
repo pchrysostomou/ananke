@@ -477,8 +477,9 @@ and their node and no server (`invariants::Traced`).
    been appended on a majority of the configuration then in force, which the
    reconstructed logs and `RaftConfig` events show. A group's first configuration —
    the one in force on a replica that has traced no `RaftConfig` — is the voters of its
-   `RangeCreated`, and servers 1 through the cluster's count for a group whose creation
-   the trace does not hold (PROPOSED D-071).
+   first `RangeCreated` that names any, and servers 1 through the cluster's count for a
+   group whose creation the trace does not hold or holds naming none (PROPOSED D-071,
+   D-125).
 4. **State machine safety.** Fold `RaftApply`: a map **per group** from index to
    (term, hash, effect); a second value for an index of a group is a violation, so two
    replicas that apply one entry to different effects — one executing a client's

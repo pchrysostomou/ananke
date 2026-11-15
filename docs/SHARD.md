@@ -1220,11 +1220,11 @@ with their state keyed by range first:
    `RangeCreated` sets its replica's floor as an installed snapshot does
    (invariants.rs:80-106), so a split-born range's log starts at its floor.
 3. **Leader completeness**, with the committed set per range; *commit by majority* takes
-   each range's first configuration from its `RangeCreated`, where today it takes
-   `1..=servers` (invariants.rs:289-295); *commit by current term* and *committed
-   entries stay* per (range, server). Leader completeness rescans the committed set at
-   every `RaftLeader` (invariants.rs:493-520); keyed by range, the rescan is of that
-   range's set.
+   each range's first configuration from its first `RangeCreated` that names voters,
+   where today it takes `1..=servers` (invariants.rs:289-295; PROPOSED D-125); *commit by
+   current term* and *committed entries stay* per (range, server). Leader completeness
+   rescans the committed set at every `RaftLeader` (invariants.rs:493-520); keyed by
+   range, the rescan is of that range's set.
 4. **State machine safety**, a map per range from index to (term, hash, effect): a
    second value is a violation, so two replicas that apply one entry with different
    effects — one writing a key, another refusing it; one taking a split, another

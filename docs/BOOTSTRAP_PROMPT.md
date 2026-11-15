@@ -101,6 +101,14 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-commit-majority-birth` (2026-11-14), off 0d67f99 (S11's tip, #228),
+  **PROPOSED D-125** (footer stays D-133), Closes #105: `Checker::note_group` takes a group's
+  first configuration from its first `RangeCreated` that names voters, falling back on `initial`,
+  so a creation by a node outside the configuration is no birth. Latent on this tree, since no
+  creation names no voters; three unit tests over hand-built records in both orders, each seen to
+  fail under the old reading. The sharded sweep at 10 000 seeds fails none. Found beside it and
+  filed as #235: an install on the node traces no `RaftConfig` for the configuration it puts in
+  force.
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a
   pending right-half write burst or pending right-half gets (`Load::WriteBurst`, `Load::ReadBurst`),

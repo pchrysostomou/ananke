@@ -25252,6 +25252,97 @@ into the lightest shard, shard 1, at 1977.1 -> 2088.6.
 
 ---
 
+## PROPOSED D-125 — Issue #105: a creation with no voters is no group's birth; commit by majority takes a group's first configuration from its first `RangeCreated` that names voters, and `initial` when none does
+
+**The number.** D-125 was held for this issue by open work since de9f4d7 (D-128 names D-116 to
+D-127 as held). It sits after D-123, the highest entry below it in this tree. The footer stays
+D-133. The one code site carries `// PROPOSED(D-125)`, as do the three tests.
+
+**The ruling asked for.** None. This takes issue #105's own fix, as its "Wanted" section states
+it. What else assessing it found is a separate change and is filed (below).
+
+**The defect.** `invariants::Checker::note_group` took the **first** `RangeCreated` traced of a
+group as the group's birth configuration. `initial_voters` feeds that to `commit_majority` for a
+replica that has traced no `RaftConfig` yet. A creation with no voters says only that its node
+holds an empty replica of the group, and nothing about the group's voters. Which node's creation
+the trace holds first is up to the scheduler, not the configuration. Read as the birth, an empty
+creation makes the fallback a majority of nobody: `majority_of(&[])` is `0 * 2 > 0`, which is
+false, so every commit the fallback reads would be reported short on correct code. D-030 and D-039
+treat that as a model error to fix, never a bound to widen, as the issue says.
+
+**Why it is latent on this tree.** The issue found groups whose first creation named no voters on
+`phase-3-stage-b-membership`, where servers 4 and 5 created their replicas with no voters. On this
+tree no creation names none, and each creation site shows why:
+
+- A bootstrap creation names the bootstrap nodes on every node (`server.rs`, PROPOSED(D-097)).
+- A node that joins holds nothing at its start (PROPOSED D-109).
+- A split's right half names the voters of the configuration its parent's replica has in force,
+  and only a voter of that configuration traces it (`server.rs`, the split's apply).
+- An install's creation names the descriptor its snapshot carried (`install.rs`, and
+  `created_from` in `server.rs`).
+
+The fallback itself is live: a split's right half starts its core from its parent's configuration
+and traces no `RaftConfig`, so check 3 reads the right half's creation for it. But that creation
+always names voters. So the fix changes what the check says about a trace the sweeps do not reach.
+It does not change a path they run.
+
+**Why it can move no sweep's verdict.** The new reading differs from the old one only for a group
+whose first creation named no voters. For such a group the old fallback was `[]`, so any commit it
+read was a violation. A seed that passed under the old reading never consulted it, and passes
+under the new one. A seed that failed only through it was a false alarm of this kind. No sweep
+asserts a catch through a creation with no voters. The ones that assert a catch by commit by
+majority are `SendBeforePersist` on the node and on the sharded sweep, and the joint-majority
+variants of `ananke-raft`'s membership tests. Those catches are about durability and joint
+majorities. The first two read creations that name their voters. The one-group server traces no
+creation, so it reads `initial`, as before.
+
+**What changes.**
+1. `Checker::note_group` (`crates/ananke-raft/src/invariants.rs`) takes the first `RangeCreated`
+   of a group that names voters. A group whose creations all name none falls back on
+   `Checker::new`'s `initial`, servers 1 through the cluster's count, as a group whose creation the
+   trace does not hold does. Only the first creation that names voters counts: a later one is
+   another node's creation of the same birth, or an install's, which names its snapshot's
+   descriptor.
+2. The doc comments of `initial`, `born_with`, `note_group`, `initial_voters` and `commit_majority`
+   say so. RAFT.md §2 check 3 and SHARD.md §8 check 3 say so too, with this entry's number.
+
+**The pair.** The issue asked for unit tests over hand-built records for both orderings. There are
+three, all in `crates/ananke-raft/tests/invariants.rs`. Each was run on this tree against a
+temporary plant of the old reading, reverted before the gate:
+
+| Test | Correct reading | Old reading planted |
+|---|---|---|
+| `a_creation_with_no_voters_is_not_a_groups_first_configuration_in_either_order`: creations `[]` and `[4, 5, 6]` in both orders, a commit on 4 and 5 | passes | fails: `... durable on [4, 5] of voters []` |
+| `a_commit_short_of_the_voters_a_creation_named_is_a_violation_in_either_order`: the same creations, a commit on 4 alone | the violation against `[4, 5, 6]` | fails: the message names `voters []` |
+| `a_group_created_only_with_no_voters_takes_the_initial_configuration`: one empty creation, commits on two and on one of servers 1 to 3 | passes, then the violation against `[1, 2, 3]` | fails: `... durable on [1, 2] of voters []` |
+
+The second test checks that the fix widened nothing. A reading that reached the first test by
+skipping a group with an empty creation would pass the first and fail the second. Each test runs
+both orders because which creation comes first is up to the scheduler. Under the plant, the first
+two tests fail in the empty-first order, the one the issue found, which runs first. Their other
+order reads a creation that names voters first, as the old fold did.
+
+**What was also found, and filed.** Issue #105's "a replica installed rather than bootstrapped"
+comes down, on this tree, to a different gap. An install on the node puts the snapshot's
+configuration in force and traces no `RaftConfig`, in `installed` and in `created_by_install`. The
+one-group server's install does trace one (D-058). So after an install, check 3 reads the replica's
+earlier `RaftConfig`, or the group's birth configuration for a replica the install created, instead
+of what the replica has in force. Closing that gap means adding a record to every install in
+`ananke-shard`, with its own pair, pin and coverage. It is a change of its own, filed as issue
+#235, which carries the evidence an earlier, unmerged attempt at #105 measured on an older base.
+The fix here neither depends on it nor hides it.
+
+**The 10 000-seed sharded sweep.** Check 3 runs on every seed of it, so it was run on this tree's
+code, in release, at `ANANKE_SEEDS=10000`: **0 of 10 000 seeds fail.** The run took 43 250 splits,
+30 071 crashes, 4 969 store refusals and 71 836 placeholders. The change is in a fold the checker
+runs after each run, so it draws nothing and no schedule can move.
+
+**The nightly's rows (D-064).** None. The three tests are in `ananke-raft`'s own test binary, which
+runs in the `rest` job, not in a sim shard. No schedule, trace or pinned hash moves: the change is
+in a fold the checker runs after the run. **PROPOSED.**
+
+---
+
 ## PROPOSED D-128 — An install onto a replica with no descriptor replaces its Raft interval and the snapshot's span, not configuration's: the task re-hosts it at the switch, its read-back traces the state, check 8's install clause reads what a switch replaced, `InstallReplacesHostedSpan` keeps the bug beside the fix, and a re-seed after a split reads the right half's keys off the disk; amends D-107 §4
 
 **The number.** Off `main` at de9f4d7, whose footer reads D-116. Open work holds D-113 (S10,
