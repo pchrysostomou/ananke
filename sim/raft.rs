@@ -836,8 +836,14 @@ pub struct SplitCoverage {
     /// Restatements of a right half: a restart that reopened it from its keys
     /// (SHARD.md §5).
     pub right_reopened: usize,
-    /// Live installs switched onto a half after its split — a parent after it split,
-    /// or a right half — each replacing the half's span and no key of the other's.
+    /// Snapshots traced as installed onto a half after its split — a parent after it
+    /// split, or a right half: every `RaftSnapshot { taken: false }` of one. A live
+    /// install replaces the half's span and no key of the other's. A restart's
+    /// restatement of an install, or of a follower's compaction (D-078), says
+    /// `taken: false` too and is counted with them; a restated take says
+    /// `taken: true` and is not.
+    // PROPOSED(D-118): the restatement restates each record's `taken`, so a restated
+    // take is no longer counted here.
     pub halves_installed: usize,
     /// Writes refused at apply on a parent after its split: proposed under the
     /// parent's old span and appended above the split's index (SHARD.md §3, §5).

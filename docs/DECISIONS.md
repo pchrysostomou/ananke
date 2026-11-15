@@ -24754,7 +24754,8 @@ Giving them `audit_tree` moves that shape's schedules and its pins, which is #19
 **The number.** Off S11's tip at 0d67f99 (#228, which carries #226), whose footer reads D-133.
 D-118 was reserved for #126 and #167 and is the lowest free number, so this entry sits after
 D-117 in ascending order and the footer stays D-133, the highest entry plus one. Every code site
-carries `// PROPOSED(D-118)`. Closes #126 and #167.
+carries `// PROPOSED(D-118)`. Closes #126. Closes #167 once the correct node is green at ten
+thousand on this slice's tip, which no run has measured yet (the nightly, below).
 
 **Context.** PROPOSED D-089 aimed `Fault::CrashInstalling` per range, and
 `SnapshotWithoutCurrentLast` was then injected at its moment on the node and caught by nothing
@@ -24810,8 +24811,12 @@ recovered an applied index of 40 in group 3 but its log does not hold index 40".
 
 These are the counts the slice first measured on de9f4d7 (19, 169, and 13 083 on 995): the node
 sweep's schedules on these arms did not move between the two trees. With the flag restated and
-the drain's stamp kept, the correct node fails seed 358 (the plants below). The ten thousand is the
-nightly's, dispatched on this slice's tip, with its run recorded on the PR, as #167 asks.
+the drain's stamp kept, the correct node fails seed 358 (the plants below). The ten thousand has
+not been measured on this tree: no nightly has run on this slice's tip. #167 names the correct node
+green at 1 000 and 10 000 among what closes it, and only the thousand is measured here (and
+reproduced by the review). The ten thousand is the nightly's, which the owner's merge gate
+dispatches on the tip and records on the PR; the `Closes #167` this slice's commits carry holds
+once that run is green, and a red run is a finding against this entry before any merge.
 
 Most of the catches are the sweep's other crashes landing in the window, as D-107 §6 found; two
 are the aimed arm's (seeds 91 and 581). #167 predicted 19 of 1 000 on an older tree, and the
@@ -24857,6 +24862,18 @@ whether a (server, range) ever took, and a restated take did, so it stays. The r
 `taken: false` as an install (`installs`, the split shape's `x_parent_installed_at`, the sharded
 sweep's `right_halves_of`, the membership scenario's joiners) now read installs and no restated
 take, which is what each says it reads.
+
+One more reader of `taken: false`, which the list above left out and the review named:
+`SplitCoverage::halves_installed` (`splits_of`), asserted above zero at every tier on the node's
+raft sweep. It counts every `RaftSnapshot { taken: false }` of a parent after its split or of a
+right half, and its documentation called those live installs. It has also counted, since it was
+written, a restart's restatement of an install and of a follower's compaction (D-078), and until
+this entry every restated take. The restated takes leaving it move it on the correct sweep at the
+gate's twenty seeds from 129 to 90, with every schedule-level figure of that sweep identical
+(the review's measure, on 1d10694); its assertion holds. Its documentation now says what it
+counts. Counting only the live installs, as `snapshots_installed_and_restated` splits them with
+`Restating`, would change what a coverage assertion asks at every tier, so it is left to its own
+change.
 
 **What #126 asked to be shown, the mutation a world of one range could not catch.** Seed 91 is the
 install of one range with the ranges beside it live. The mutation is one flag for the node: every
