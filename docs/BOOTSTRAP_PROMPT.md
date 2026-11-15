@@ -114,7 +114,12 @@ _Update this section at the end of every session._
   the meta convergence bound on 29 of 1 000 (12 before), asserted over the thousand. A fold-by-fold row
   for check 16 on the sharded sweep's trace, 30 of 100. Pins: the plain schedule's fifteen did not
   move; seed 16725 still reaches its situation; 707, 5620, 992 and 18925 run `Schedule::shaped`, the
-  schedule they were found on, with their situations asserted absent from the sweep's.
+  schedule they were found on, with their situations asserted absent from the sweep's. After #240's
+  review: seed 18925's absence names its own situation (it named 992's, false on either schedule),
+  and each of the four asserts its predicate true on its shaped run first; the hold's effect is
+  asserted over the thousand, a first's update after the second's on more than half the seeds meta
+  applied the second's on (293 of 383; 3 of 38 at the hundred with the block taken out); the
+  reordered seeds are printed as well as counted. D-135 §9 asks the owner about both.
 
 - Branch `phase-3-stage-c-workload-shapes` (2026-11-09), off aa5e46c (#224's tip), **PROPOSED D-131,
   #162's S11.** The workload's shapes on `sim/shard.rs`, each drawn from the seed: a split under a

@@ -26408,6 +26408,20 @@ meta's leader's node when the arm began. The correct system passes every seed at
 10 000 (§7). Both the firing and the reorder are well above D-061's 5 %, so the sweep asserts each at
 every tier and prints both.
 
+*Corrected after #240's review.* Those two show that the arm ran and that the order was reached, not
+that the hold made it. With the block taken out (the review's plant A), the sweep's own drops and
+resends still reorder meta on 3 of the hundred seeds, so both pass at CI's hundred without the hold,
+and the gate's twenty would catch its loss about half the time. Below the thousand the hold's effect
+is the variant's test's to show (§4): with the block taken out it reordered on 0 of its twenty seeds
+and failed. Over the thousand that test runs a thousand seeds, on which the drops and resends alone,
+at the 3 % above, would still reorder some thirty, so it would pass there too (an estimate, not run).
+So the correct sweep now asserts, over the thousand, that meta applied a first split's update after
+the second's on more than half of the seeds it applied the second's on: 293 of 383 at the thousand
+and 2 924 of 3 790 at the ten thousand with the hold, 3 of 38 at the hundred with the block taken out.
+Under the thousand the share is read from the printed row and not asserted, its sample, 35 seeds at
+the hundred and eight at the gate's twenty, too small for a share (§9, question 5). The sweep
+also prints the seeds it reordered, beside their count, as §12's exit has them (§9, question 6).
+
 ### 3. The hold, measured before it was asserted (Q39)
 
 How long after the block meta applied the second split's update, over the thousand's 383: median
@@ -26472,6 +26486,16 @@ the shaped schedule moved, and each was re-read:
   the sweep's schedule (`absent_from_the_sweep`), so that the day the schedule reaches it again the
   test says so and the pin can run there. Seed 5620's variant run moves with it.
 
+*Corrected after #240's review.* Seed 18925's absence named seed 992's situation, the restart arm's
+split refused `NoRangeId` on its node's new run, which 18925 never had: its arm's asker spent its
+twelve asks on bounces and took its first `NoRangeId` from node 1, which had not restarted. That
+predicate was false on the shaped run as on the sweep's, so the absence held whatever the schedule.
+Seed 18925 now asserts its own situation absent, the arm's asker spending all its asks before its
+first `NoRangeId` with the driver retrying the arm's range after it; and `absent_from_the_sweep` takes
+each pin's shaped run and asserts its predicate true there before it asserts it false on the sweep's,
+so a predicate naming something else fails on the run the pin was found on. The review's plant E
+showed 707's, 5620's and 992's predicates true on their shaped runs.
+
 The node sweep's pins (seeds 48 and 66 under check 16's comparison) run `raft::run_on_the_node` and
 did not move.
 
@@ -26524,6 +26548,14 @@ owner's next one, on a quiet machine.
    run a schedule the sweep takes on one seed in eight; these run one it took before this entry. The
    alternative is the arm drawn on a share of the shaped seeds, which would cost firing. Recommended:
    keep, the absence on the sweep's schedule asserted.
+5. *The hold's effect, asserted over the thousand as more than half the seeds meta applied the second
+   split's update on* (§2, after #240's review). The documents set no such share. It is 77 % at the
+   thousand and the ten thousand with the hold and 8 % at the hundred without it, so one half sits far
+   from both; under the thousand the variant's test already fails with the hold gone. Recommended:
+   keep, over the thousand only.
+6. *The reordered seeds printed as well as counted* (#240's review). §10 has the sweep print "on how
+   many seeds", §12's exit "the seeds ... are printed". Recommended: print both, as now; at the ten
+   thousand the list is one line of about 2 900 seeds.
 
 ---
 

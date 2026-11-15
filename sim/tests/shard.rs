@@ -9,16 +9,18 @@
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
 //! and per range the run ended with and the meta convergence bound — that nodes 4 and 5
 //! hold nothing, that each of the workload's shapes reached its window (PROPOSED D-131), and that
-//! `Fault::MetaReorder` fired and reordered meta's updates (PROPOSED D-135). It prints the
-//! driver's work, the refusals by the loss that made them (#45), the empty blocks a split finds
-//! (D-092), the shapes' rates, the reorder arm's and its hold's, and the bounds' margins.
+//! `Fault::MetaReorder` fired and reordered meta's updates (PROPOSED D-135); over the thousand,
+//! that it reordered more than half the seeds meta applied its second split's update on. It prints
+//! the driver's work, the refusals by the loss that made them (#45), the empty blocks a split finds
+//! (D-092), the shapes' rates, the reorder arm's and its hold's, the seeds it reordered, and the
+//! bounds' margins.
 // PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{NodeId, RangeCause, RecoveredAs, TraceEvent};
+use ananke_env::{Instant, NodeId, RangeCause, RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::message::Message;
 use ananke_shard::invariants::{self, Fold};
@@ -30,6 +32,8 @@ use ananke_sim::{lin, seeds, sweep, verdict, write_trace};
 
 /// What one seed of the sweep hands back: its verdict and its coverage.
 struct Seen {
+    /// The seed (PROPOSED D-135: the reordered seeds are printed).
+    seed: u64,
     verdict: Result<(), String>,
     uniform: bool,
     drift_exceeded: bool,
@@ -207,6 +211,7 @@ fn seen_of(seed: u64) -> Seen {
             .iter()
             .any(|f| matches!(f, shard::Fault::MetaReorder { .. })),
         reorders: report.meta_reorders(),
+        seed,
         verdict,
     }
 }
@@ -409,6 +414,16 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
          {second_asked} -> meta applied the second split's update {second_applied} -> and an \
          update of the first split after it on {reordered} seeds"
     );
+    // PROPOSED(D-135): the seeds themselves, as SHARD.md §12's exit has them, beside §10's count
+    // (#240's review).
+    println!(
+        "shard: `Fault::MetaReorder`: meta applied the second split's update before the first's on \
+         seeds {:?}",
+        seen.iter()
+            .filter(|s| s.reorders.iter().any(|r| r.reordered))
+            .map(|s| s.seed)
+            .collect::<Vec<_>>(),
+    );
     println!(
         "shard: `Fault::MetaReorder`'s hold of {:?}: meta applied the second split's update {} \
          times, {within} of them within the hold, from the block at median {:?}, p75 {:?}, p90 \
@@ -469,7 +484,11 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         "no client was answered `RangeMismatch` by a split range: no split had load"
     );
     // PROPOSED(D-135): `Fault::MetaReorder`'s firing, and the order it aims at, each at every
-    // tier: fired on 482 and reordered on 293 of 1 000 seeds, well above D-061's 5 %.
+    // tier: fired on 482 and reordered on 293 of 1 000 seeds, well above D-061's 5 %. These two say
+    // the arm ran and the order was reached, not that the hold made it: with the block taken out
+    // the sweep's own drops and resends still reorder meta on 3 of 100 seeds, so both pass at CI's
+    // hundred without it (#240's review). The hold's effect is the variant's test's below the
+    // thousand, and over it the share below's.
     assert!(
         reorder_fired > 0,
         "no reorder arm found a range to split twice led off the meta range's leader's node"
@@ -479,6 +498,18 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         "meta applied no update of a reorder arm's first split after its second's: the order \
          `MetaOverwritesByArrival` needs was not reached"
     );
+    // PROPOSED(D-135): the hold's effect, over the thousand: of the seeds on which meta applied
+    // the second split's update, those it then applied a first's update on, 293 of 383 at the
+    // thousand and 2 924 of 3 790 at the ten thousand with the hold, 3 of 38 at the hundred with
+    // the block taken out (#240's review). Under the thousand the sample is too small for a share.
+    if seeds() >= 1000 {
+        assert!(
+            reordered * 2 > second_applied,
+            "meta applied a first split's update after the second's on {reordered} of the \
+             {second_applied} seeds it applied the second's on, not more than half: the hold no \
+             longer holds the first split's update from meta"
+        );
+    }
 
     let inclusion: Vec<Result<(), String>> = seen.iter().map(|s| s.keys_asked.clone()).collect();
     verdict(&inclusion).unwrap();
@@ -1053,7 +1084,9 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 // its situation on the sweep's schedule and runs it unchanged. Seeds 707, 5620, 992 and 18925 no
 // longer do, each for a reason its pin names, so each runs the schedule it was found on,
 // `shard::Schedule::shaped`, the sweep's before the arm, and asserts its situation absent from the
-// sweep's, so that the day the schedule reaches it again the test says so.
+// sweep's, so that the day the schedule reaches it again the test says so. Corrected after #240's
+// review: the situation is asserted present on the shaped run first, so that a predicate that
+// names something else, false on both schedules, fails there and does not pass as an absence.
 
 /// A shape-drawn pin's run on the schedule it was found on, [`shard::Schedule::shaped`]: the
 /// sweep's before `Fault::MetaReorder` moved it.
@@ -1070,9 +1103,21 @@ fn shaped_of(seed: u64, node: NodeVariants) -> shard::Report {
 
 /// A shape-drawn pin's situation, absent from the sweep's schedule since `Fault::MetaReorder` moved
 /// it: asserted absent, so that the day the schedule reaches it again this says so and the pin can
-/// run the sweep's schedule again (CLAUDE.md).
+/// run the sweep's schedule again (CLAUDE.md). `pinned` is the pin's correct run on the schedule it
+/// was found on, and `reaches` must hold there first: a predicate false on the very run the pin
+/// asserts its mechanism on would assert no absence at all (#240's review, seed 18925).
 // PROPOSED(D-135)
-fn absent_from_the_sweep(seed: u64, what: &str, reaches: impl Fn(&shard::Report) -> bool) {
+fn absent_from_the_sweep(
+    pinned: &shard::Report,
+    what: &str,
+    reaches: impl Fn(&shard::Report) -> bool,
+) {
+    let seed = pinned.seed;
+    assert!(
+        reaches(pinned),
+        "seed {seed} does not reach {what} on the schedule it was found on: the predicate names \
+         something else, and its absence from the sweep's schedule would assert nothing"
+    );
     let report = shard::run(seed);
     assert!(
         report
@@ -1089,7 +1134,7 @@ fn absent_from_the_sweep(seed: u64, what: &str, reaches: impl Fn(&shard::Report)
 }
 
 /// Whether a split the restart arm asked was refused `NoRangeId` on its node's new run: the
-/// situation seeds 992 and 18925 were pinned in.
+/// situation seed 992 was pinned in.
 // PROPOSED(D-135)
 fn restart_arms_split_refused_no_range_id(report: &shard::Report) -> bool {
     report.no_range_ids().iter().any(|empty| {
@@ -1098,6 +1143,42 @@ fn restart_arms_split_refused_no_range_id(report: &shard::Report) -> bool {
                 .restart_arms
                 .iter()
                 .any(|arm| arm.victim == empty.node && arm.seq.is_some())
+    })
+}
+
+/// How many asks the admin of split `seq` sent before `refused` and how many at or after it.
+// PROPOSED(D-135)
+fn asks_around(report: &shard::Report, seq: u64, refused: Instant) -> (usize, usize) {
+    let admin = raft::admin_addr(seq);
+    report
+        .records()
+        .iter()
+        .filter(|record| {
+            matches!(&record.event, TraceEvent::MessageSent { from, .. } if *from == admin)
+        })
+        .fold((0, 0), |(before, after), record| {
+            if record.at < refused {
+                (before + 1, after)
+            } else {
+                (before, after + 1)
+            }
+        })
+}
+
+/// Whether the restart arm's split's asker spent all its asks before its first `NoRangeId`, the
+/// driver retrying the arm's range after it: the situation seed 18925 was pinned in. Its first
+/// `NoRangeId` came from a node that had not restarted, so [`restart_arms_split_refused_no_range_id`]
+/// is false on its shaped run as on the sweep's (#240's review).
+// PROPOSED(D-135)
+fn restart_arms_asker_spent_its_asks_before_its_first_no_range_id(report: &shard::Report) -> bool {
+    let asks = usize::try_from(shard::BOOTSTRAP * 4).expect("small");
+    report.restart_arms.iter().any(|arm| {
+        let (Some(range), Some(seq)) = (arm.range, arm.seq) else {
+            return false;
+        };
+        report.driver.retried.iter().any(|retried| {
+            retried.range == range && asks_around(report, seq, retried.refused).0 == asks
+        })
     })
 }
 
@@ -2288,8 +2369,9 @@ fn seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 #[test]
 fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view() {
     let (node, range) = (1, 19);
+    let report = shaped_of(707, NodeVariants::correct());
     absent_from_the_sweep(
-        707,
+        &report,
         "node 1's restart with its log of range 19 compacted to 119",
         |report| {
             report.records().iter().any(|record| {
@@ -2299,7 +2381,6 @@ fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_
             })
         },
     );
-    let report = shaped_of(707, NodeVariants::correct());
     report.check().unwrap();
     let records = report.records();
     let find = |what: &str, want: &dyn Fn(&TraceRecord) -> bool| {
@@ -2385,12 +2466,12 @@ fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_
 // PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound() {
+    let report = shaped_of(992, NodeVariants::correct());
     absent_from_the_sweep(
-        992,
+        &report,
         "the restart arm's split refused `NoRangeId` on its node's new run",
         restart_arms_split_refused_no_range_id,
     );
-    let report = shaped_of(992, NodeVariants::correct());
     report.check().unwrap();
     assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
     let arm = report.restart_arms[0];
@@ -2481,14 +2562,14 @@ fn seed_992_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_b
 #[test]
 fn seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys() {
     let (node, parent, right, index) = (3, 3, 20, 113);
-    absent_from_the_sweep(5620, "node 1's snapshot of range 3 at 113", |report| {
+    let report = shaped_of(5620, NodeVariants::correct());
+    absent_from_the_sweep(&report, "node 1's snapshot of range 3 at 113", |report| {
         report.records().iter().any(|record| {
             matches!(record.event, TraceEvent::RaftSnapshot {
                 server: 1, range: of, last_index, taken: true, ..
             } if of == parent && last_index == index)
         })
     });
-    let report = shaped_of(5620, NodeVariants::correct());
     report.check().unwrap();
     assert!(
         report.restart_arms.iter().any(|arm| arm.victim == node),
@@ -2734,17 +2815,19 @@ fn seed_16725_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value
 /// `Fault::MetaReorder` moved it (PROPOSED D-135): drawn first of eight faults, the arm split range
 /// 2 twice and reordered meta's updates, and on the sweep's schedule the restart arm finds no range
 /// that can still split and asks no split at all. So the pin runs the schedule it was found on and
-/// asserts that absence.
+/// asserts that absence: of its own situation, the arm's asker spending its asks before its first
+/// `NoRangeId`, which here came from node 1, not from the restarted node 3 (corrected after #240's
+/// review, where the absence named seed 992's situation and held on either schedule).
 // PROPOSED(D-131)
 // PROPOSED(D-135): on the shaped schedule; the situation absent from the sweep's.
 #[test]
 fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id() {
-    absent_from_the_sweep(
-        18925,
-        "the restart arm's split refused `NoRangeId` on its node's new run",
-        restart_arms_split_refused_no_range_id,
-    );
     let report = shaped_of(18925, NodeVariants::correct());
+    absent_from_the_sweep(
+        &report,
+        "the restart arm's asker spending its asks before its first `NoRangeId`",
+        restart_arms_asker_spent_its_asks_before_its_first_no_range_id,
+    );
     report.check().unwrap();
     assert_eq!(report.restart_arms.len(), 1, "{:?}", report.restart_arms);
     let arm = report.restart_arms[0];
@@ -2761,24 +2844,14 @@ fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first
         arm.range,
         "the asker is the arm's: {retried:?}"
     );
-    let admin = raft::admin_addr(seq);
-    let records = report.records();
-    let asks = |before: bool| {
-        records
-            .iter()
-            .filter(|record| {
-                matches!(&record.event, TraceEvent::MessageSent { from, .. } if *from == admin)
-                    && (record.at < retried.refused) == before
-            })
-            .count()
-    };
+    let (before, after) = asks_around(&report, seq, retried.refused);
     assert_eq!(
-        asks(true),
+        before,
         usize::try_from(shard::BOOTSTRAP * 4).expect("small"),
         "seed 18925's asker spent its asks before its first `NoRangeId`: pin it on its mechanism"
     );
     assert!(
-        asks(false) >= 1,
+        after >= 1,
         "the asker made its retry after its first `NoRangeId`"
     );
     assert!(
