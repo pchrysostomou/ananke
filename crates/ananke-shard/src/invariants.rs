@@ -1846,8 +1846,8 @@ impl PlaceholderGrantsNothing {
 
 /// Check 19, the ranges tile the keyspace (SHARD.md §8), over check 7's map: the latest
 /// value of every range — the value at the highest index the map holds for it — with a
-/// range dropped at the first `RangeMerged` that names it as `right` until a later new
-/// value of it is traced. After every record no two of those spans overlap, and after
+/// range dropped at the first `RangeMerged` that names it as `right` until a value of it
+/// above the merge is traced. After every record no two of those spans overlap, and after
 /// every `RaftApply` of a range command — an apply whose effect is `took`, `aborted` or
 /// `refused`, the effects §8 gives a range command — they cover the keyspace with no gap.
 /// Where check 8 is one node, this is the cluster: the descriptors every replica agrees
@@ -1866,10 +1866,17 @@ impl PlaceholderGrantsNothing {
 /// shape back beside the halves that replaced it. The two agree wherever every value is
 /// traced by a replica that applied every entry below it.
 ///
-/// A split's apply traces P's shrunk descriptor before R's creation and its `RaftApply`
-/// after both, so the overlap clause never sees R beside the parent it came from, and the
-/// gap clause, asked at the apply, never sees P shrunk without R. Incremental: the
-/// latest spans by range, recomputed against the keyspace only where one changes.
+/// A split's apply on a voter of P's configuration at the split traces P's shrunk
+/// descriptor before R's creation and its `RaftApply` after both, so the overlap clause
+/// never sees R beside the parent it came from, and the gap clause, asked at the apply,
+/// never sees P shrunk without R. A replica that is not such a voter traces P's shrunk
+/// descriptor and the `RaftApply` with no creation of R (`ServerApplier::split`), and
+/// where it applies the split before any voter has traced R, the gap clause sees R's
+/// span as a gap there on the correct system. Only a learner replaying the split takes
+/// that path (D-107), and no scenario of Stage C drives splits with learners; how
+/// Stage D's non-voters are read is a question for the owner (PROPOSED D-140).
+/// Incremental: the latest spans by range, recomputed against the keyspace only where
+/// one changes.
 // PROPOSED(D-140): check 19 (the owner's ruling on D-093).
 #[derive(Clone, Debug, Default)]
 pub struct Tiling {
@@ -1881,9 +1888,12 @@ pub struct Tiling {
     latest: BTreeMap<u64, Tile>,
     /// The ranges a `RangeMerged` has named as `right`, each dropped at the first.
     merged: BTreeSet<u64>,
-    /// The ranges dropped, each with how many values check 7's map held for it at its
-    /// drop: a value beyond them is a later new value, which brings the range back.
-    dropped: BTreeMap<u64, usize>,
+    /// The ranges dropped, each with the index a value of it must lie above to bring it
+    /// back: the `Subsume` index the `RangeMerged` names, or the highest index check 7's
+    /// map held for it at the drop where that is higher. A value at or below it is one
+    /// traced late for an index below the merge, which is not the range's descriptor now
+    /// and moves no latest span, as in a split's parent.
+    dropped: BTreeMap<u64, u64>,
     /// The first part of the keyspace no latest span holds, as the spans stand.
     gap: Option<(Bytes, Bytes)>,
     violation: Option<String>,
@@ -1926,10 +1936,16 @@ impl Tiling {
             TraceEvent::RangeDescriptor { range, .. } => {
                 self.refresh(*range, descriptors, node, "descriptor", false);
             }
-            TraceEvent::RangeMerged { right, .. } => {
+            TraceEvent::RangeMerged {
+                right, right_index, ..
+            } => {
                 if self.merged.insert(*right) {
-                    let values = descriptors.by_range.get(right).map_or(0, BTreeMap::len);
-                    self.dropped.insert(*right, values);
+                    let highest = descriptors
+                        .by_range
+                        .get(right)
+                        .and_then(BTreeMap::last_key_value)
+                        .map_or(0, |(index, _)| *index);
+                    self.dropped.insert(*right, highest.max(*right_index));
                     self.gap = self.first_gap();
                 }
             }
@@ -1994,10 +2010,7 @@ impl Tiling {
         let Some((index, held)) = values.last_key_value() else {
             return;
         };
-        let back = self
-            .dropped
-            .get(&range)
-            .is_some_and(|at_drop| values.len() > *at_drop);
+        let back = self.dropped.get(&range).is_some_and(|above| index > above);
         if back {
             self.dropped.remove(&range);
         }
@@ -4727,6 +4740,69 @@ mod tests {
         unmerged.push(&created(1, 3, b"k", b"z", 1, &[1, 2, 3]));
         unmerged.push(&grown(5));
         assert!(unmerged.verdict_of(Fold::Tiling).is_err());
+    }
+
+    /// A merged range's value traced late for an index below the merge — a replica of it
+    /// tracing its first apply of an entry after another node's `RangeMerged` — is not the
+    /// range's descriptor now and does not bring it back, as a late value below a split
+    /// does not move its parent's span: only a value above the `Subsume` index the merge
+    /// names does (PROPOSED D-140).
+    // PROPOSED(D-140)
+    #[test]
+    fn a_value_traced_late_below_a_merge_does_not_bring_its_range_back() {
+        let right = |node: u64, index: u64| {
+            record(
+                node,
+                TraceEvent::RangeDescriptor {
+                    range: 3,
+                    index,
+                    applied: index,
+                    start: user_key(b"k"),
+                    end: user_key(b"z"),
+                    generation: 1,
+                    voters: vec![1, 2, 3],
+                    state: RangeState::Live,
+                },
+            )
+        };
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
+        checker.push(&created(1, 3, b"k", b"z", 1, &[1, 2, 3]));
+        checker.push(&right(1, 4));
+        checker.push(&record(
+            1,
+            TraceEvent::RangeMerged {
+                range: 2,
+                right: 3,
+                begun: 4,
+                index: 5,
+                right_index: 4,
+                right_generation: 1,
+                right_applied: 4,
+            },
+        ));
+        checker.push(&record(
+            1,
+            TraceEvent::RangeDescriptor {
+                range: 2,
+                index: 5,
+                applied: 5,
+                start: user_key(b"a"),
+                end: user_key(b"z"),
+                generation: 2,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        ));
+        checker.push(&applied(1, 2, 5, b"a", ApplyEffect::Took));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
+        // Node 2's first apply of range 3's index 2, traced after the merge: a new value in
+        // check 7's map, below the merge.
+        checker.push(&right(2, 2));
+        assert_eq!(checker.verdict_of(Fold::DescriptorAgreement), Ok(()));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
+        checker.push(&applied(1, 2, 6, b"a", ApplyEffect::Took));
+        assert_eq!(checker.verdict_of(Fold::Tiling), Ok(()));
     }
 
     #[test]

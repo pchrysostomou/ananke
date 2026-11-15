@@ -109,7 +109,10 @@ _Update this section at the end of every session._
   trips on exactly the seeds a split took effect on, under the per-fold equivalence test on the node sweep
   and on the sharded sweep, at every tier; check 18's split clause sees the same apply, which D-093 missed.
   The correct node sweep passes seeds 0 to 999; the sharded sweep's ten thousand ran beside the gate and
-  the commit says what they reported. Two nightly rows, into shards 4 and 3.
+  the commit says what they reported. Two nightly rows, into shards 4 and 3. After its review: the sharded
+  half asserts the gap's words and that checks 18 and 19 alone are in violation; a merged range comes back
+  only at a value above its `Subsume` index; a non-voter's apply of a split ahead of every voter would trip
+  the gap clause on the correct system, which Stage C cannot reach and D-140's question 6 puts to the owner.
 - Branch `phase-3-stage-c-timers-abandoned-hold` (2026-11-14), off 0d67f99 (S11's tip, #228),
   **PROPOSED D-134**, Closes #227: the timer check exempted a live install's hold only where it
   ended in a switch, so a hold the node let go with no switch was measured as a running core (seed

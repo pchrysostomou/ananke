@@ -432,6 +432,8 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
 struct Under {
     why: Option<String>,
     tripped: BTreeSet<Fold>,
+    /// Check 19's own verdict, in its words where it is in violation (PROPOSED D-140).
+    tiling: Option<String>,
     splits: usize,
     /// The splits that took an id from a block of an earlier run of its holder.
     from_an_earlier_run: usize,
@@ -460,13 +462,15 @@ fn under(
 ) -> Vec<Under> {
     let found = sweep(seeds, |seed| {
         let report = shard::run_of(seed, cores, node, range);
+        let folded = invariants::folded(report.records());
         Under {
             why: report.check().err(),
-            tripped: invariants::folded(report.records())
+            tripped: folded
                 .verdicts()
                 .into_iter()
                 .filter_map(|(fold, verdict)| verdict.is_err().then_some(fold))
                 .collect(),
+            tiling: folded.verdict_of(Fold::Tiling).err(),
             splits: report.splits(),
             from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
         }
@@ -763,9 +767,12 @@ fn a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep(
 /// right half there and which the run's verdict names, check 19 being asked last. D-104 §2:
 /// splits are asserted only in aggregate, so the seeds a split took effect on are read and
 /// asserted non-empty, and check 19 asserted in violation on every one of them and on no
-/// other. Measured on this tree, release: a split took effect on 99 of 100 seeds and check 19
-/// tripped on the same 99, 19 of the gate's 20 — at every tier (D-061) — and every run stopped
-/// at check 18's split clause. The correct sweep above holds check 19 green on every seed.
+/// other, on each in its gap's words with check 18's split clause the only other fold in
+/// violation, so a right half written over its parent's span, an overlap, does not pass for
+/// the instrument. Measured on this tree, release: a split took effect on 99 of 100 seeds and
+/// check 19 tripped on the same 99, 19 of the gate's 20 — at every tier (D-061) — and every run
+/// stopped at check 18's split clause. The correct sweep above holds check 19 green on every
+/// seed.
 // PROPOSED(D-140)
 #[test]
 fn a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_sweep() {
@@ -793,6 +800,24 @@ fn a_split_that_leaves_its_key_in_no_range_is_caught_by_check_19_on_the_sharded_
              took effect, and the folds in violation are {:?}",
             u.splits,
             u.tripped
+        );
+        if u.splits == 0 {
+            continue;
+        }
+        // A gap and not an overlap, which is why D-093 took this instrument: check 19 in
+        // its gap's words, and beside it check 18's split clause alone, check 8's overlap
+        // clause silent.
+        let words = u.tiling.as_deref().unwrap_or_default();
+        assert!(
+            words.contains("no range's latest span holds") && words.contains("range command"),
+            "seed {seed}: check 19 tripped under SplitLeavesGap in words other than a gap at a \
+             range command's apply: {words}"
+        );
+        assert_eq!(
+            u.tripped,
+            BTreeSet::from([Fold::SplitLineage, Fold::Tiling]),
+            "seed {seed}: under SplitLeavesGap the folds in violation are check 18's split \
+             clause and check 19, and no other"
         );
     }
     let failed: Vec<&str> = found.iter().filter_map(|u| u.why.as_deref()).collect();
