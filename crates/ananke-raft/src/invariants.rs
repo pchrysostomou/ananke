@@ -418,11 +418,11 @@ struct Verdicts {
 /// );
 /// ```
 pub struct Checker {
-    /// The voters of the initial configuration of a group whose `RangeCreated` the
-    /// trace does not hold: servers 1 through `servers`.
+    /// The voters of the initial configuration of a group whose creation the trace
+    /// does not hold, or holds naming no voters: servers 1 through `servers`.
     initial: Vec<u64>,
-    /// Each group's first configuration, from its `RangeCreated` (SHARD.md §8,
-    /// check 3).
+    /// Each group's first configuration, from the first `RangeCreated` of it that
+    /// names voters (SHARD.md §8, check 3; PROPOSED D-125).
     born_with: BTreeMap<Group, Vec<u64>>,
     /// Whether the commit-majority check runs; [`all`] does not ask for it.
     checks_majority: bool,
@@ -630,19 +630,34 @@ impl Checker {
 
     /// A group's first configuration, which the commit-majority check takes from
     /// its `RangeCreated` where today it takes servers 1 through `servers`
-    /// (SHARD.md §8, check 3). The first creation traced of a group is its birth:
-    /// every replica of it is created with the same voters, and a later creation on
-    /// another node — an install's — restates them.
+    /// (SHARD.md §8, check 3): the voters of the first creation traced of the group
+    /// that names any. A creation with no voters states that its node holds an empty
+    /// replica of the group, and nothing about the group's voters; read as the birth,
+    /// it would report every commit the fallback reads short of a majority of nobody,
+    /// since `0 * 2 > 0` is false (issue #105). Which node's creation the trace holds
+    /// first is the scheduler's, not the configuration's, so the first that names
+    /// voters is taken whichever order the two were traced in. No creation of this
+    /// tree names none — a bootstrap's names the bootstrap nodes (D-097), a
+    /// split's the voters its parent has in force, an install's the descriptor its
+    /// snapshot carried, and a node that joins holds nothing at its start
+    /// (D-109) — so this is what the check says of a trace the sweeps do not reach, not
+    /// a path they run. Only the first that names voters counts: a later creation is
+    /// another node's of the same birth, or an install's, which names the descriptor
+    /// its snapshot carried.
+    // PROPOSED(D-125): a creation with no voters is no birth.
     fn note_group(&mut self, event: &TraceEvent) {
-        if let TraceEvent::RangeCreated { range, voters, .. } = event {
+        if let TraceEvent::RangeCreated { range, voters, .. } = event
+            && !voters.is_empty()
+        {
             self.born_with
                 .entry(*range)
                 .or_insert_with(|| voters.clone());
         }
     }
 
-    /// The voters a group started with: its `RangeCreated`'s, or the initial
-    /// configuration for a group whose creation the trace does not hold.
+    /// The voters a group started with: its first `RangeCreated`'s that names any, or
+    /// the initial configuration for a group whose creation the trace does not hold
+    /// or holds naming none.
     fn initial_voters(&self, group: Group) -> Vec<u64> {
         self.born_with
             .get(&group)
@@ -1098,13 +1113,14 @@ where
 /// the leader's term and payload at that index — a majority of both voter sets
 /// while the configuration is joint (thesis §4.3). The configuration in force is
 /// followed through `RaftConfig` events, per (group, server); a replica that has
-/// emitted none yet is on its group's first configuration, the voters of its
-/// `RangeCreated`, or servers 1 through `servers` for a group whose creation the
-/// trace does not hold (SHARD.md §8, check 3). A replica whose compacted prefix
-/// reaches the index holds the entry (RAFT.md §2): a snapshot is the durable
-/// committed prefix through its last index. A leader's own compacted prefix likewise
-/// stands in for entries below its first index, which arises when a restarted leader
-/// re-commits from its snapshot's floor.
+/// emitted none yet is on its group's first configuration, the voters of the
+/// group's first `RangeCreated` that names any, or servers 1 through `servers` for a
+/// group whose creation the trace does not hold or holds naming none (SHARD.md §8,
+/// check 3; PROPOSED D-125). A replica whose compacted prefix reaches the index
+/// holds the entry (RAFT.md §2): a snapshot is the durable committed prefix through
+/// its last index. A leader's own compacted prefix likewise stands in for entries
+/// below its first index, which arises when a restarted leader re-commits from its
+/// snapshot's floor.
 ///
 /// # Errors
 ///

@@ -171,8 +171,8 @@ pub trait Host {
     }
     /// A local input that adds a range to the node: the right half a split's apply
     /// created, with the core the `apply` task built for it and the parent it split
-    /// from (SHARD.md §5; PROPOSED D-100), or a replica a placeholder's install created,
-    /// which has no parent (§5, Q22; PROPOSED D-109). Asked only for a range the node
+    /// from (SHARD.md §5; D-100), or a replica a placeholder's install created,
+    /// which has no parent (§5, Q22; D-109). Asked only for a range the node
     /// does not hold; `None` for every other input.
     fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, Option<RangeId>)> {
         let _ = local;
@@ -186,7 +186,7 @@ pub trait Host {
     /// nothing to persist. The correct placeholder answers an `AppendEntries` as a
     /// refused server does and grants nothing. The default, a host with no
     /// placeholders, does nothing with it.
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     fn unheld(&self, range: RangeId, from: ServerId, message: Message) -> Vec<Output> {
         let _ = (range, from, message);
         Vec::new()
@@ -585,7 +585,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             CoreWork::Step => {}
         }
         if self.cores.core(range).is_none() {
-            // A range added at a split's apply (SHARD.md §5; PROPOSED D-100): the
+            // A range added at a split's apply (SHARD.md §5; D-100): the
             // right half's core takes its place on the node, and where this node's
             // parent leads, the new replica pre-votes at once and every heartbeat
             // interval until it hears from a leader (Q21).
@@ -594,7 +594,7 @@ impl<E: Environment, H: Host> Node<E, H> {
                 // node and nothing more: it was not born at a split, so no parent of
                 // it here led, and its first election is its own timer's (SHARD.md §5,
                 // Q22).
-                // PROPOSED(D-109)
+                // D-109
                 let Some(parent) = parent else {
                     self.cores.insert(range, *core);
                     return Ok(());
@@ -720,7 +720,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             // The placeholders' answers first: they wait on nothing (SHARD.md §5, Q22). A
             // message a placeholder sends nothing for leaves the round as empty as it was,
             // so a round of those alone flushes nothing, as it never did.
-            // PROPOSED(D-109): a message for a range not held is the placeholder's.
+            // D-109: a message for a range not held is the placeholder's.
             let mut answered = false;
             for Unheld {
                 range,
@@ -1010,11 +1010,13 @@ fn received<E: Environment>(
     message: Received,
 ) -> (RangeId, Input, Option<Decision>, usize) {
     // PROPOSED(D-050): when the frame reached the node, for the term change the step
-    // may trace. The inbox does not carry the stamp yet, so the node takes one as it
-    // hands the message to its core; the wire's stamp is the wire slice's to add.
-    // PROPOSED(D-073): the receipt is taken here until the inbox carries the `net`
-    // task's.
-    let at = env.decision();
+    // may trace: the `net` task's stamp, which the inbox entry carries. Until PROPOSED
+    // D-118 the node took the stamp here, as the round drained the message (D-073,
+    // item 4), so a message that waited in the inbox — through the node's start, which
+    // the `net` task is already receiving through — read as received when it was
+    // stepped. A term change from a frame that reached a node before an isolation and
+    // was drained inside it then read as raised inside it (#167, seed 358).
+    // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
     let bytes = message.bytes;
     (
         message.range,
@@ -1023,7 +1025,7 @@ fn received<E: Environment>(
             message: message.message,
             now: now_nanos(env),
         },
-        Some(at),
+        Some(message.received),
         bytes,
     )
 }
@@ -1055,7 +1057,7 @@ pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A, variants: No
 /// has a job pending. A range that stops committing holds the rest for as long as it
 /// is quiet; a closed queue drops what is pending, as the correct task's close drops
 /// nothing.
-// PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
+// D-095: the variant the apply-lag and cross-range hold folds trip on.
 async fn apply_waiting_for_every_range<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
     let mut pending: BTreeMap<RangeId, VecDeque<ApplyJob>> = BTreeMap::new();
     while let Some(job) = jobs.pop().await {
@@ -1606,6 +1608,28 @@ mod tests {
             from: LEADER,
             message,
             bytes: 64,
+            received: unstamped(),
+        }
+    }
+
+    /// The stamp an arrival carries until the harness admits it, at the start of a
+    /// simulation of its own: [`run_with`] stamps every arrival as it admits it, as the
+    /// `net` task does (`on_the_wire`), so no step reads this one.
+    fn unstamped() -> Decision {
+        static STAMP: std::sync::OnceLock<Decision> = std::sync::OnceLock::new();
+        *STAMP.get_or_init(|| {
+            let mut sim = Sim::new(SimConfig::new(0));
+            let node = sim.add_node();
+            sim.env(node).decision()
+        })
+    }
+
+    /// `message` as the `net` task admits it: stamped as it reaches the node (D-050).
+    // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
+    fn on_the_wire(env: &SimEnv, message: &Received) -> Received {
+        Received {
+            received: env.decision(),
+            ..message.clone()
         }
     }
 
@@ -1662,6 +1686,10 @@ mod tests {
         duration: Duration,
         /// How long the socket takes a frame.
         ship: Duration,
+        /// How long the node takes to start before its `raft` task first drains the
+        /// inbox: what a restarted node spends opening its engine while its `net` task
+        /// is already receiving (PROPOSED D-118).
+        start_after: Duration,
         /// The simulation's seed, which is also the scheduling stream's.
         seed: u64,
     }
@@ -1678,6 +1706,7 @@ mod tests {
                 locals: &[],
                 duration: Duration::from_millis(80),
                 ship: Duration::ZERO,
+                start_after: Duration::ZERO,
                 seed: 11,
             }
         }
@@ -1712,18 +1741,23 @@ mod tests {
             probe,
         );
         for arrival in setup.arrivals {
-            assert!(inbox.admit(arrival.clone()).is_admitted());
+            assert!(inbox.admit(on_the_wire(&env, arrival)).is_admitted());
         }
         let taken: Arc<Mutex<Option<Taken>>> = Arc::default();
         // The node's local queue, held here so a check can push the node its own
         // inputs while it runs. The `raft` task races it against the inbox and the
         // ticker whether or not anything is ever pushed.
         let local: Queue<Mine> = Queue::new();
+        let start_after = setup.start_after;
         env.clone().spawn("raft", {
+            let env = env.clone();
             let inbox = inbox.clone();
             let taken = taken.clone();
             let local = local.clone();
             async move {
+                if !start_after.is_zero() {
+                    env.clock().sleep(start_after).await;
+                }
                 let _ = node.raft(&inbox, &local).await;
                 let terms = node
                     .cores()
@@ -1742,7 +1776,11 @@ mod tests {
         let mut elapsed = Duration::ZERO;
         while elapsed < setup.duration {
             while next < setup.feed.len() && setup.feed[next].0 <= elapsed {
-                fed.push(inbox.admit(setup.feed[next].1.clone()).is_admitted());
+                fed.push(
+                    inbox
+                        .admit(on_the_wire(&env, &setup.feed[next].1))
+                        .is_admitted(),
+                );
                 next += 1;
             }
             while next_local < setup.locals.len() && setup.locals[next_local].0 <= elapsed {
@@ -1821,6 +1859,7 @@ mod tests {
                 last_term: 0,
             },
             bytes: 64,
+            received: unstamped(),
         }
     }
 
@@ -2187,6 +2226,52 @@ mod tests {
             1,
             "the variant drops only what is held: {:?}",
             buggy.log
+        );
+    }
+
+    /// A term change carries when the `net` task received the message that caused it,
+    /// the stamp the inbox entry carries, and not when the round drained the message
+    /// (D-050, PROPOSED D-118). The shape is #167's seed 358: a frame of a higher term
+    /// reaches a node that is still starting, and sits in the inbox until the round
+    /// first drains it. Until D-118 the node took the stamp at the drain (D-073, item
+    /// 4), so this change read as received the 30 ms the start took after the frame
+    /// arrived, and a pre-vote check whose isolation began inside those 30 ms read a
+    /// follower taking a leader's term from a message received before it as a raise
+    /// inside it.
+    // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
+    #[test]
+    fn a_term_change_carries_the_nets_receipt_and_not_the_rounds_drain() {
+        let arrivals = [arrival(R1, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(5)),
+            (R2, Duration::from_millis(5)),
+        ];
+        let start_after = Duration::from_millis(30);
+        let run = run_with(Setup {
+            arrivals: &arrivals,
+            start_after,
+            ..Setup::new(NodeVariants::correct(), &delays)
+        });
+        let raised = run
+            .trace
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.event,
+                    ananke_env::TraceEvent::RaftTerm { range, term: 1, .. } if range == R1.get()
+                )
+            })
+            .expect("r1 takes the leader's term from the append");
+        let received = raised
+            .received()
+            .expect("a term change from a peer's message carries its receipt");
+        assert!(
+            raised.decided.duration_since(received) >= start_after,
+            "r1's term change was decided at {:?} and carries a receipt of {received:?}, \
+             where the frame reached the node {start_after:?} before the round first \
+             drained it: the receipt is the drain's and not the `net` task's (PROPOSED \
+             D-118)",
+            raised.decided
         );
     }
 

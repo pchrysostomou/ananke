@@ -21,7 +21,7 @@
 //! which is how D-076 started a joining server. Nothing here yet changes a descriptor
 //! after its first and nothing routes: a client takes its key's range from the
 //! scenario's fixed map and puts it on every message ([`mod@client`](crate::client)).
-//! PROPOSED(D-096).
+//! D-096.
 //!
 //! Each core is seeded from `n{id}/r{range}/protocol` (Q13, D-057): two ranges on one
 //! node draw different election timeouts, which is what keeps four ranges from
@@ -105,7 +105,7 @@ pub struct Range {
 
 impl Range {
     /// Range 0, the root, over the system tenant's root table (SHARD.md §1, §2).
-    // PROPOSED(D-096)
+    // D-096
     #[must_use]
     pub fn root() -> Self {
         let span = system::root_span();
@@ -117,7 +117,7 @@ impl Range {
     }
 
     /// Range 1, the meta range, over the system tenant's meta table.
-    // PROPOSED(D-096)
+    // D-096
     #[must_use]
     pub fn meta() -> Self {
         let span = system::meta_span();
@@ -136,7 +136,7 @@ impl Range {
 
     /// The span over the engine's key order (SHARD.md §1): the system ranges' bounds
     /// as they are, a user range's under the user tenant.
-    // PROPOSED(D-096): every span the node names is an interval of encoded keys.
+    // D-096: every span the node names is an interval of encoded keys.
     #[must_use]
     pub fn span(&self) -> KeyRange<Bytes> {
         if self.is_system() {
@@ -170,8 +170,8 @@ pub struct ServerConfig {
     /// it when a leader's message makes it a placeholder of the range and the snapshot
     /// that placeholder asks for is installed (§2, §5, Q22). A replica whose store
     /// already holds a configuration uses that one instead (D-029).
-    // PROPOSED(D-096): the bootstrap nodes named in configuration.
-    // PROPOSED(D-109): exactly three, and a node that joins holds nothing.
+    // D-096: the bootstrap nodes named in configuration.
+    // D-109: exactly three, and a node that joins holds nothing.
     pub bootstrap: Vec<ServerId>,
     /// The cores' parameters.
     pub raft: RaftConfig,
@@ -191,8 +191,8 @@ pub struct ServerConfig {
     /// The block of range ids a refill grants, and the ids left in a node's block at
     /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and chosen on
     /// D-092's measurement in `sim/shard.rs`, how often a split finds an empty block,
-    /// printed at every tier there (PROPOSED D-099; PROPOSED D-113).
-    // PROPOSED(D-099)
+    /// printed at every tier there (D-099; D-113).
+    // D-099
     pub id_block: u64,
     /// See `id_block`.
     pub refill_at: u64,
@@ -204,7 +204,7 @@ pub struct ServerConfig {
     /// range's apply and the lease record read at the start; and, for its two
     /// instruments, the start's choice of bootstrap and the draw of a replica's
     /// incarnation at a re-seed and at a split.
-    // PROPOSED(D-105): the range layer's own variant set.
+    // D-105: the range layer's own variant set.
     // PROPOSED(D-108): and its two instruments, read at the start and at a creation.
     pub range_variants: RangeVariants,
 }
@@ -213,7 +213,7 @@ pub struct ServerConfig {
 /// three (SHARD.md §2; Q7, Q32). §7's moves are one-for-one and never change a range's
 /// voter count, so the bootstrap nodes fix every range's for good, and five would leave
 /// every range at five voters.
-// PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+// D-109: exactly three bootstrap nodes, enforced.
 pub const BOOTSTRAP_NODES: usize = 3;
 
 /// The group a node that hosts no range opens its engine through (SHARD.md §2): the
@@ -222,7 +222,7 @@ pub const BOOTSTRAP_NODES: usize = 3;
 /// incarnation key, is never a replica, and is what the node's later replicas are
 /// opened beside. A node that hosts a range opens its engine through that range's
 /// store instead, as it always has.
-// PROPOSED(D-109): a node that joins holds nothing, and opens its engine through this.
+// D-109: a node that joins holds nothing, and opens its engine through this.
 pub const ANCHOR_GROUP: u64 = u64::MAX;
 
 /// Whether `bootstrap` names exactly [`BOOTSTRAP_NODES`] nodes, each once (SHARD.md §2;
@@ -231,7 +231,7 @@ pub const ANCHOR_GROUP: u64 = u64::MAX;
 /// # Errors
 ///
 /// Why it does not, in words the node's failure carries.
-// PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+// D-109: exactly three bootstrap nodes, enforced.
 pub fn bootstrap_is_three(bootstrap: &[ServerId]) -> Result<(), String> {
     let mut distinct = bootstrap.to_vec();
     distinct.sort_unstable();
@@ -256,7 +256,7 @@ pub fn bootstrap_is_three(bootstrap: &[ServerId]) -> Result<(), String> {
 /// bootstrap configuration (Q7); in range 1's state a record per user range, keyed by
 /// end key (§1, Q4). Every bootstrap node computes the same bytes from the same
 /// configuration, which is what check 7 reads off their creations.
-// PROPOSED(D-096)
+// D-096
 #[must_use]
 pub fn initial_state(
     bootstrap: &[ServerId],
@@ -280,7 +280,7 @@ pub fn initial_state(
 
 /// The descriptor every range fixed at bootstrap starts with: its span at the first
 /// generation, with the bootstrap nodes as voters (SHARD.md §2).
-// PROPOSED(D-098): `initial_state`'s pieces, so a replica of a system range opened on
+// D-098: `initial_state`'s pieces, so a replica of a system range opened on
 // an empty store can write its index-0 state from configuration alone.
 #[must_use]
 pub fn bootstrap_descriptor(range: &Range, bootstrap: &[ServerId]) -> RangeDescriptor {
@@ -298,7 +298,7 @@ pub fn bootstrap_descriptor(range: &Range, bootstrap: &[ServerId]) -> RangeDescr
 /// Range 0's state at index 0 (SHARD.md §2): the meta range's descriptor, the
 /// range-id counter one past the highest hosted id with no block leased, a node record
 /// per bootstrap node and the digest of the bootstrap configuration.
-// PROPOSED(D-098)
+// D-098
 pub fn root_state_into(
     bootstrap: &[ServerId],
     servers: &[(ServerId, SocketAddr)],
@@ -341,7 +341,7 @@ pub fn root_state_into(
 
 /// Range 1's state at index 0 (SHARD.md §1, §2): a record per user range keyed by its
 /// end key. Returns what `MetaApplied { index: 0 }` names.
-// PROPOSED(D-098)
+// D-098
 pub fn meta_state_into(
     bootstrap: &[ServerId],
     hosted: &[Range],
@@ -389,7 +389,7 @@ pub struct Gaps {
     pub snapshot_actions: u64,
     /// Client requests for a range this node does not host, each answered
     /// `RangeMismatch` at receipt with every descriptor it holds for the key
-    /// (SHARD.md §3; PROPOSED D-097, where D-076 failed the run).
+    /// (SHARD.md §3; D-097, where D-076 failed the run).
     pub requests_for_ranges_not_held: u64,
 }
 
@@ -423,13 +423,13 @@ enum InFlight {
     /// [`Output::Rejected`] and nothing else, so the id it refused is only knowable
     /// here — and without it the entry would be left behind for the life of the node.
     ///
-    /// Two cores refuse at the step: one that does not lead, and — since PROPOSED
+    /// Two cores refuse at the step: one that does not lead, and — since
     /// D-129 — a *leading* one with no lease that can confirm no read. Both return
     /// before `core::on_read` pushes the read, so no `ReadDropped` ever follows for it.
     ///
     /// [`Output::Rejected`]: ananke_raft::core::Output::Rejected
     // PROPOSED(D-076): a refused read's registration is taken back at the step.
-    // PROPOSED(D-129): a leading core refuses at the step too.
+    // D-129: a leading core refuses at the step too.
     Read { id: u64 },
 }
 
@@ -551,12 +551,12 @@ const PROPOSED_REMEMBERED: usize = 4096;
 // PROPOSED(D-076): a replica's outstanding read registrations are bounded, and the
 // node fails when they are not.
 // PROPOSED(D-086): re-measured with the stream arms on the node, by D-076's rule.
-// PROPOSED(D-129): the bound stays; the leader refuses what it could never answer.
+// D-129: the bound stays; the leader refuses what it could never answer.
 const READS_OUTSTANDING: usize = 38;
 
 /// What the host hands the node's `meta` task: a descriptor to tell the meta range
 /// (SHARD.md §1, Q3).
-// PROPOSED(D-098)
+// D-098
 pub enum MetaJob {
     /// A core of `range` took office: its descriptor goes to the meta range.
     Send {
@@ -568,7 +568,7 @@ pub enum MetaJob {
     /// The node's block of range ids is at or below its threshold: a refill goes to
     /// range 0, carrying the run's nonce, until a grant of this run lands (SHARD.md
     /// §5, Q17).
-    // PROPOSED(D-099)
+    // D-099
     Refill {
         /// The run's nonce.
         run: u64,
@@ -579,7 +579,7 @@ pub enum MetaJob {
 /// state and descriptor the split's apply wrote and no configuration names (SHARD.md
 /// §5): one bounded seek per group present in tenant 0 (D-055), each read back from
 /// its descriptor. A group without a descriptor is not a range and is not opened.
-// PROPOSED(D-100)
+// D-100
 async fn discover_ranges<E: Environment>(
     engine: &ananke_storage::Engine<E>,
     named: &[Range],
@@ -619,7 +619,7 @@ async fn discover_ranges<E: Environment>(
 
 /// The client id the node's `meta` task sends under: above every process id a
 /// scenario's clients draw, and the node's own.
-// PROPOSED(D-098)
+// D-098
 #[must_use]
 pub fn meta_client(id: ServerId) -> u64 {
     (1 << 62) | id.0
@@ -650,7 +650,7 @@ pub enum Local {
     Snapshot(SnapAnswer),
     /// A split's apply created the right half here: its core, built by the `apply`
     /// task from the state the apply wrote, takes its place on the node (SHARD.md
-    /// §5; PROPOSED D-100).
+    /// §5; D-100).
     RangeAdded {
         /// The right half.
         range: RangeId,
@@ -698,7 +698,7 @@ pub struct ServerHost<E: Environment> {
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
     /// The range layer's, for the receipt and serving checks.
-    // PROPOSED(D-105)
+    // D-105
     range_variants: RangeVariants,
     gaps: Mutex<Gaps>,
     /// Every hosted replica's descriptor as the store holds it (SHARD.md §1, §3):
@@ -708,19 +708,19 @@ pub struct ServerHost<E: Environment> {
     /// Every replica has one: a bootstrap node's from its initial state, a split's right
     /// half's from the split's batch, an installed one's — a re-seeded replica's, or one
     /// a placeholder's install made — from its stream.
-    // PROPOSED(D-097)
+    // D-097
     descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// The term this node last took office in, per range: a leader's first
     /// `AppendEntries` of a term it had not led is the office taken, and the range's
     /// descriptor goes to the meta range (SHARD.md §1, Q3).
-    // PROPOSED(D-098)
+    // D-098
     led: Mutex<BTreeMap<RangeId, Term>>,
     /// The work the node's `meta` task owes: the descriptors to tell the meta range.
-    // PROPOSED(D-098)
+    // D-098
     meta: Queue<MetaJob>,
     /// The node's block of range ids for this run, shared with the `meta` task, which
     /// adopts the grants (SHARD.md §5, Q17).
-    // PROPOSED(D-099)
+    // D-099
     ids: Arc<Mutex<IdBlocks>>,
     /// The ids left at or below which a refill is asked for.
     refill_at: u64,
@@ -748,7 +748,7 @@ pub struct ServerHost<E: Environment> {
     /// overlaps no initialised replica here. It ends where the range is created: at
     /// the node's apply of the split that makes it, or at its own install. Shared with
     /// the `snapshot` task, which assembles a placeholder's stream.
-    // PROPOSED(D-109): the placeholder is the host's, and is this set.
+    // D-109: the placeholder is the host's, and is this set.
     placeholders: Arc<Mutex<BTreeSet<RangeId>>>,
     /// Whether the node runs on an engine a re-seed built, this start's or an earlier
     /// one's (D-066 opens it as the newest directory not marked lost). Such a node lost
@@ -757,27 +757,30 @@ pub struct ServerHost<E: Environment> {
     /// tell a range it held before its loss from one it never held: every replica a
     /// placeholder's install creates on it is quarantined, as the re-seed's own are
     /// (D-035, Q26).
-    // PROPOSED(D-109): a re-seeded node's placeholders' installs are quarantined.
+    // D-109: a re-seeded node's placeholders' installs are quarantined.
     on_a_reseed: bool,
+    /// Shared with the `apply` task and the `snapshot` task: a switched range's hold
+    /// against its split's apply is let go here, at `Switched` (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
 }
 
 /// What [`lock`] calls first in a test of this crate, with the address of the mutex about
 /// to be taken. It runs before the lock is taken, so a read of the table from here finds
 /// what a task on another worker could find there. It is not compiled into the crate that
 /// other crates build, so no run of the node has it.
-// PROPOSED(D-114)
+// D-114
 #[cfg(test)]
 type LockHook = Option<Box<dyn Fn(usize)>>;
 
 #[cfg(test)]
 thread_local! {
     /// This thread's [`LockHook`]: `split_observed`'s, while it runs.
-    // PROPOSED(D-114)
+    // D-114
     static LOCK_HOOK: std::cell::RefCell<LockHook> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    // PROPOSED(D-114)
+    // D-114
     #[cfg(test)]
     LOCK_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow().as_ref() {
@@ -807,7 +810,7 @@ impl<E: Environment> ServerHost<E> {
     /// range's descriptor to the meta range (SHARD.md §1, Q3). The system ranges send
     /// nothing: meta holds the user ranges' records and range 0 holds meta's, and
     /// neither changes in Phase 3 (Q4).
-    // PROPOSED(D-098)
+    // D-098
     fn took_office(&self, range: RangeId, term: Term) {
         if range == META_RANGE || range == ROOT_RANGE {
             return;
@@ -828,8 +831,8 @@ impl<E: Environment> ServerHost<E> {
     /// ids left are at or below the threshold and no refill is outstanding (SHARD.md
     /// §5, Q17): at the start, where the node holds no block, and after every id
     /// taken. A block at or below its threshold keeps a refill outstanding at all
-    /// times (PROPOSED D-092).
-    // PROPOSED(D-099)
+    /// times (D-092).
+    // D-099
     pub fn refill_if_needed(&self) {
         let mut ids = lock(&self.ids);
         if ids.needs_refill(self.refill_at) && ids.ask() {
@@ -838,7 +841,7 @@ impl<E: Environment> ServerHost<E> {
     }
 
     /// Answers a request `RangeMismatch` with `descriptors`, traced (SHARD.md §3, §8).
-    // PROPOSED(D-097)
+    // D-097
     fn mismatch(
         &self,
         range: RangeId,
@@ -977,7 +980,7 @@ impl<E: Environment> ServerHost<E> {
     // `descriptor` is the one the switch put in place, read back from the store, and
     // `before` the one the replica held: an install creates a replica that held none
     // with the snapshot's descriptor, and changes an initialised one's to it where the
-    // two differ (SHARD.md §8; PROPOSED D-107, D-116).
+    // two differ (SHARD.md §8; D-107, D-116).
     fn installed(
         &self,
         range: RangeId,
@@ -989,9 +992,9 @@ impl<E: Environment> ServerHost<E> {
     ) -> Option<Raft> {
         let changed = descriptor.filter(|descriptor| before != Some(*descriptor));
         // The switched range's span: its descriptor as the host holds it, which a
-        // split's right half has and configuration never names (PROPOSED D-100), and
+        // split's right half has and configuration never names (D-100), and
         // for a replica without one — a re-seed's, before its install — the hosted
-        // list's (PROPOSED D-098).
+        // list's (D-098).
         let span: KeyRange<Bytes> = lock(&self.descriptors)
             .get(&range)
             .map(|descriptor| descriptor.start.clone()..descriptor.end.clone())
@@ -1007,7 +1010,7 @@ impl<E: Environment> ServerHost<E> {
         // range — is a creation, and §8 wants it traced with its cause. On a node whose
         // ranges are fixed at bootstrap this is the re-seed's case: a fresh engine
         // whose replicas are built by the streams that fill it (Q15).
-        // PROPOSED(D-116): a replica that held a descriptor is initialised, whatever it
+        // D-116: a replica that held a descriptor is initialised, whatever it
         // has applied.
         let created = install_creates(
             before.is_some(),
@@ -1043,30 +1046,57 @@ impl<E: Environment> ServerHost<E> {
         // a record whose term or configuration is off is one D-029's revert floor reads
         // wrong.
         // PROPOSED(D-086): a live install moves the `apply` task's applied state.
-        lock(&self.applied).insert(
-            range,
-            Applied {
-                index: at.last_index,
-                term: at.last_term,
-                config: config.clone(),
-            },
-        );
+        //
+        // It moves it *up* to the snapshot and never back. The `snapshot` task set it
+        // to the snapshot at the switch, and this runs later, when the `raft` task
+        // steps `Switched`; between the two the `apply` task may have run a job the
+        // replaced core queued before the hold and applied entries past the snapshot
+        // (issue #113). Taken back to the snapshot, the task applies them a second time
+        // when the new replica's first `Apply` names them; and where a record that
+        // job's core asked for has moved the new replica's compacted prefix past them,
+        // and the watermark with it (`Cores::step`), that `Apply` starts above where the
+        // task was taken back to and the task fails the range on the gap. What stands
+        // past the snapshot here was applied after the switch, on top of it, so it is
+        // kept (`kept_past_the_switch`).
+        // PROPOSED(D-126): the restatement at `Switched` takes nothing back.
+        {
+            let mut applied = lock(&self.applied);
+            let kept = applied
+                .get(&range)
+                .filter(|held| kept_past_the_switch(held.index, at.last_index, self.node))
+                .cloned();
+            applied.insert(
+                range,
+                kept.unwrap_or_else(|| Applied {
+                    index: at.last_index,
+                    term: at.last_term,
+                    config: config.clone(),
+                }),
+            );
+        }
         // And the store's own caches, for the same reason one layer down: the switch
         // wrote this range's hard state, log bounds and applied index without passing
-        // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
+        // through `persist` or `apply`, which are what keep them (PROPOSED D-086). The
+        // applied index, too, only up: an apply after the switch wrote its own key on
+        // top of the repair's (PROPOSED D-126).
         if let Some(store) = lock(&self.stores).get(&range).cloned() {
+            let applied = if kept_past_the_switch(store.applied(), at.last_index, self.node) {
+                store.applied()
+            } else {
+                at.last_index
+            };
             store.restate_after_install(
                 restored.term(),
                 restored.vote(),
                 at.last_index + 1,
                 restored.last_index(),
-                at.last_index,
+                applied,
             );
         }
         if created {
             // The span encoded, as every other creation traces it (D-096); D-096's
             // own install creation traced the configured keys raw, which check 7 saw
-            // the first time it was folded over a re-seed (PROPOSED D-098).
+            // the first time it was folded over a re-seed (D-098).
             //
             // The span, the generation and the voters are the snapshot's descriptor's
             // (SHARD.md §8: the creation carries the replica's descriptor). This
@@ -1074,7 +1104,7 @@ impl<E: Environment> ServerHost<E> {
             // the snapshot held, so a re-seeded replica installed from a range that
             // had split was created at generation 1 with the split's span, a value
             // check 7 holds no range at; a snapshot with no descriptor, which no
-            // take of this tree makes, keeps the old reading (PROPOSED D-107).
+            // take of this tree makes, keeps the old reading (D-107).
             let (generation, voters) = created_from(descriptor, config);
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
@@ -1128,7 +1158,7 @@ impl<E: Environment> ServerHost<E> {
         // so check 7 reads it as a statement and not as a value an apply put; the
         // switch's own records stay at one instant before it (D-091's fourth arm).
         // A creation's descriptor is its `RangeCreated`, above.
-        // PROPOSED(D-107)
+        // D-107
         if !created && let Some(descriptor) = changed {
             state_descriptor(&self.env, descriptor, at.last_index);
         }
@@ -1170,7 +1200,7 @@ impl<E: Environment> ServerHost<E> {
     ///
     /// `None` when the switch left nothing to restore, which the task never hands on:
     /// it opens the store and reads its descriptor back before it says it switched.
-    // PROPOSED(D-109): a placeholder's install creates the replica.
+    // D-109: a placeholder's install creates the replica.
     fn created_by_install(
         &self,
         range: RangeId,
@@ -1208,7 +1238,7 @@ impl<E: Environment> ServerHost<E> {
         );
         // The quarantine the install wrote on a node a re-seed rebuilt (D-035): this
         // replica may be one whose votes were in the engine the node lost.
-        // PROPOSED(D-109)
+        // D-109
         if core.quarantined() {
             self.env.trace(TraceEvent::RaftReseeded {
                 server: self.id.0,
@@ -1264,7 +1294,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 Some((core.clone(), Some(*parent)))
             }
             // A placeholder's install switched: the replica it created (§5, Q22).
-            // PROPOSED(D-109)
+            // D-109
             Local::Snapshot(SnapAnswer::Switched {
                 range,
                 at,
@@ -1298,7 +1328,7 @@ impl<E: Environment> Host for ServerHost<E> {
     /// never votes, and that is the departure from D-033's usual rules SHARD.md makes
     /// for placeholders (Q22). `UninitialisedReplicaVotes` is the hole: it grants every
     /// vote and pre-vote request, keeping nothing, and traces each grant.
-    // PROPOSED(D-109): the placeholder answers as a refused server does.
+    // D-109: the placeholder answers as a refused server does.
     fn unheld(&self, range: RangeId, from: ServerId, message: Message) -> Vec<Output> {
         let mut outputs = Vec::new();
         // A range the node holds a descriptor or a store of is initialised here already
@@ -1309,7 +1339,7 @@ impl<E: Environment> Host for ServerHost<E> {
         // core's are while it is down; they are no placeholder's to answer, and a
         // placeholder made there would answer for a replica that holds the range
         // (SHARD.md §5).
-        // PROPOSED(D-109)
+        // D-109
         let initialised = lock(&self.descriptors).contains_key(&range);
         if initialised || lock(&self.stores).contains_key(&range) {
             return outputs;
@@ -1380,7 +1410,7 @@ impl<E: Environment> Host for ServerHost<E> {
 
     /// The right half is on the node: the `snapshot` task hosts its spans, and where
     /// this node's parent leads, both halves' new descriptors go to the meta range
-    /// (SHARD.md §1, §5; PROPOSED D-100). A leader of the right half tells meta again
+    /// (SHARD.md §1, §5; D-100). A leader of the right half tells meta again
     /// when it takes office, so a node that did not lead the parent sends nothing.
     fn range_added(&self, range: RangeId, parent: RangeId, led: bool) {
         let span = lock(&self.descriptors)
@@ -1451,8 +1481,8 @@ impl<E: Environment> Host for ServerHost<E> {
         // and every other that does. Nothing is proposed. A command that names no key
         // is never mismatched. `TrustStaleDescriptor` takes the range the request
         // names as proof and checks nothing here (§10, Q38).
-        // PROPOSED(D-097): the receipt check, where D-076 failed the run.
-        // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
+        // D-097: the receipt check, where D-076 failed the run.
+        // D-105: `TrustStaleDescriptor` read from the range layer's set.
         let key = request.command.key().map(|key| user_key(key));
         let Some(replica) = self.replica(range) else {
             lock(&self.gaps).requests_for_ranges_not_held += 1;
@@ -1521,7 +1551,7 @@ impl<E: Environment> Host for ServerHost<E> {
             // A meta update is the meta range's alone (SHARD.md §1): asked of any
             // other range it is a mismatch, carrying the meta range's descriptor where
             // this node holds it.
-            // PROPOSED(D-098)
+            // D-098
             Command::MetaUpdate { .. } if range != META_RANGE => {
                 drop(state);
                 let descriptors: Vec<RangeDescriptor> = lock(&self.descriptors)
@@ -1541,7 +1571,7 @@ impl<E: Environment> Host for ServerHost<E> {
             }
             // A refill is range 0's alone (SHARD.md §5): asked of any other range it is
             // a mismatch, carrying range 0's descriptor where this node holds it.
-            // PROPOSED(D-099)
+            // D-099
             Command::Refill { .. } if range != ROOT_RANGE => {
                 drop(state);
                 let descriptors: Vec<RangeDescriptor> = lock(&self.descriptors)
@@ -1560,7 +1590,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 None
             }
             // A read: served by the lease or after a heartbeat round, never through
-            // the log. A lookup is one (SHARD.md §1; PROPOSED D-098).
+            // the log. A lookup is one (SHARD.md §1; D-098).
             Command::Get { .. } | Command::Lookup { .. } => {
                 // A core that does not lead refuses the read with `Rejected` and
                 // never names the id again (`core::on_read`), so the id is carried
@@ -1576,11 +1606,11 @@ impl<E: Environment> Host for ServerHost<E> {
                     now: now_nanos(&self.env),
                 })
             }
-            // A split's proposal (SHARD.md §5; PROPOSED D-100): the leader's checks,
+            // A split's proposal (SHARD.md §5; D-100): the leader's checks,
             // for liveness only — a user range, the key strictly inside the span of
             // the descriptor this node holds, that descriptor `Live` — and the right
             // half's id taken from the node's block. With no id left the split is
-            // refused `NoRangeId`, as Stage C's question 1 proposes (PROPOSED D-092,
+            // refused `NoRangeId`, as Stage C's question 1 proposes (D-092,
             // A), and the asker retries; the block's refill is already outstanding.
             // What the leader cannot see here — the configuration plain, no change in
             // flight — every replica re-checks at the apply (Q23). A copy of a split
@@ -1595,7 +1625,7 @@ impl<E: Environment> Host for ServerHost<E> {
                     // Not this node's to propose: the core answers as it answers any
                     // proposal a follower is handed, with the leader it knows, and no
                     // id is taken for a split that will not be appended (SHARD.md §5;
-                    // PROPOSED D-100).
+                    // D-100).
                     state.in_flight = Some(InFlight::Propose {
                         from,
                         client: request.client,
@@ -1623,6 +1653,17 @@ impl<E: Environment> Host for ServerHost<E> {
                         None => Some(SplitRefusal::NotLive),
                     }
                 };
+                // PROPOSED(D-137): `RefusedAfterRefill`, a node whose block a split found
+                // empty refuses every split once its refill lands, `NotLive`.
+                let refused = refused.or_else(|| {
+                    let ids = lock(&self.ids);
+                    (self
+                        .range_variants
+                        .contains(RangeVariant::RefusedAfterRefill)
+                        && ids.emptied()
+                        && ids.left() > 0)
+                        .then_some(SplitRefusal::NotLive)
+                });
                 let right = if refused.is_none() {
                     lock(&self.ids).take()
                 } else {
@@ -1694,7 +1735,7 @@ impl<E: Environment> Host for ServerHost<E> {
                     from: *from,
                     repair: Box::new(self.repair(*range, core, at.last_index, at.last_term)),
                     // The install is decided here, where the hold is taken (D-047;
-                    // PROPOSED D-098).
+                    // D-098).
                     held: self.env.decision(),
                 });
                 CoreWork::Hold
@@ -1709,14 +1750,14 @@ impl<E: Environment> Host for ServerHost<E> {
             } => {
                 // The descriptor the switch put in place is what the receipt check
                 // reads from here on (SHARD.md §3).
-                // PROPOSED(D-097)
+                // D-097
                 let before = descriptor.as_ref().and_then(|descriptor| {
                     lock(&self.descriptors).insert(*range, (**descriptor).clone())
                 });
                 // And the span the `snapshot` task's plan hosts the range at, which is
                 // what an install of it replaces: an install that moved the span — P's
                 // post-split snapshot onto a replica of P that never applied the
-                // split — re-hosts it, as a split's apply does (PROPOSED D-100), so the
+                // split — re-hosts it, as a split's apply does (D-100), so the
                 // range's next install replaces the span it holds now and no key of a
                 // right half beside it (SHARD.md §5, Q27). A take reads the span from the
                 // descriptor put in place above. The plan holds the span the replica's
@@ -1725,10 +1766,10 @@ impl<E: Environment> Host for ServerHost<E> {
                 // its switch replaced the snapshot's span and the task hosted it there,
                 // at the switch, before this answer existed (`install::switched_spans`).
                 // The switch reads this table for an initialised replica's span and no
-                // longer the plan (PROPOSED D-132); the re-host keeps the plan right for
+                // longer the plan (D-132); the re-host keeps the plan right for
                 // what still reads its copy, `InstallReplacesCopiedSpan`.
-                // PROPOSED(D-107)
-                // PROPOSED(D-128): a span-less replica is re-hosted in the task.
+                // D-107
+                // D-128: a span-less replica is re-hosted in the task.
                 let hosted_at = before
                     .as_ref()
                     .map(|before| before.start.clone()..before.end.clone());
@@ -1745,7 +1786,7 @@ impl<E: Environment> Host for ServerHost<E> {
                         ],
                     });
                 }
-                match self.installed(
+                let work = match self.installed(
                     *range,
                     core,
                     at,
@@ -1755,7 +1796,13 @@ impl<E: Environment> Host for ServerHost<E> {
                 ) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => self.released(*range, *decided),
-                }
+                };
+                // The range's applied index is restated, in the store and in the `apply`
+                // task's state: the switch's hold against the range's split's apply is let
+                // go here and not at the switch, or an entry past the snapshot applied in
+                // between would be applied again after the restate (PROPOSED D-133).
+                self.switching.switched(*range);
+                work
             }
             SnapAnswer::Abandoned { range, decided } => self.released(*range, *decided),
             SnapAnswer::Taken { .. }
@@ -1896,7 +1943,7 @@ impl<E: Environment> Host for ServerHost<E> {
                     None => return Ok(()),
                 }
             };
-            // A lookup (SHARD.md §1, §3; PROPOSED D-098): asked of the root, the meta
+            // A lookup (SHARD.md §1, §3; D-098): asked of the root, the meta
             // range's descriptor; asked of the meta range, the descriptor of the range
             // whose span holds the key, by the bounded seek; asked of any other range,
             // nothing. Served at one engine version as a read is, and traced as one on
@@ -1942,9 +1989,9 @@ impl<E: Environment> Host for ServerHost<E> {
             // subsume applied between receipt and serving answers `RangeMismatch`.
             // `TrustStaleDescriptor` checks nothing here, and `ReadCheckAtReceiptOnly` kept
             // only the receipt check, so a split applied since then goes unseen (§10).
-            // PROPOSED(D-097): the read check.
-            // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
-            // PROPOSED(D-131): `ReadCheckAtReceiptOnly` skips this check and no other.
+            // D-097: the read check.
+            // D-105: `TrustStaleDescriptor` read from the range layer's set.
+            // D-131: `ReadCheckAtReceiptOnly` skips this check and no other.
             let descriptor = if self
                 .range_variants
                 .contains(RangeVariant::TrustStaleDescriptor)
@@ -2024,7 +2071,7 @@ impl<E: Environment> Host for ServerHost<E> {
         // takes the registration `local_input` made — nothing else ever would, and a
         // node that refuses reads for a living would otherwise carry a
         // `(SocketAddr, Request)` for every one of them until it stopped. Two cores
-        // refuse at the step: one that does not lead this range, and — since PROPOSED
+        // refuse at the step: one that does not lead this range, and — since
         // D-129 — a leading one with no lease that can confirm no read, which is
         // exactly the node that refuses reads for a living. Either way the core
         // returned before it registered the read, so no `ReadDropped` follows and
@@ -2104,7 +2151,7 @@ struct ServerApplier<E: Environment> {
     node_variants: NodeVariants,
     /// The range layer's, for the apply check and the meta range's apply, and for the
     /// incarnation a split's right half draws.
-    // PROPOSED(D-105)
+    // D-105
     // PROPOSED(D-108): `IncarnationPerRangeStream` at a split.
     range_variants: RangeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
@@ -2112,17 +2159,26 @@ struct ServerApplier<E: Environment> {
     cores: ananke_raft::core::Variants,
     /// The host's descriptors, for the answer a write refused at apply carries
     /// (SHARD.md §3).
-    // PROPOSED(D-097)
+    // D-097
     descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// Shared with the `snapshot` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
     // PROPOSED(D-083): a live install moves the apply task's state with it.
     applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
     /// The block of range ids a refill grants (SHARD.md §5, Q17).
-    // PROPOSED(D-099)
+    // D-099
     id_block: u64,
-    /// The cores' parameters, for the right half's core at a split (PROPOSED D-100).
+    /// The cores' parameters, for the right half's core at a split (D-100).
     raft: RaftConfig,
+    /// Shared with the `snapshot` task: a range's switch and its split's apply exclude
+    /// each other (PROPOSED D-133).
+    switching: Arc<install::SwitchOrSplit>,
+    /// The descriptor each range configuration names starts with on a bootstrap node, its
+    /// index-0 state's (SHARD.md §2, [`bootstrap_descriptor`]); empty on a node that joins,
+    /// which holds no such replica (D-109). A split's apply reads it on a replica
+    /// that holds no descriptor of its own, a re-seeded user range its log brought back.
+    // PROPOSED(D-138)
+    configured: Arc<BTreeMap<RangeId, RangeDescriptor>>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -2134,7 +2190,7 @@ impl<E: Environment> ServerApplier<E> {
     }
 
     /// The split's apply on this replica of `range`, at `index`, cutting at `key` with
-    /// `right` the right half's id (SHARD.md §5; PROPOSED D-100). Every replica
+    /// `right` the right half's id (SHARD.md §5; D-100). Every replica
     /// re-checks here what the leader checked, against state every replica shares:
     /// the key strictly inside the span of the descriptor in force before `index`,
     /// that descriptor `Live`, and the configuration in force at or below `index`
@@ -2145,13 +2201,28 @@ impl<E: Environment> ServerApplier<E> {
     /// fresh incarnation and, where this replica of the parent is quarantined, its
     /// quarantine (Q20, Q26, D-130); a replica that is not a voter
     /// gets the shrunk descriptor and a range delete of the right span instead, in the
-    /// same atomic step (`RaftStore::apply_removing`, PROPOSED D-107). Then
+    /// same atomic step (`RaftStore::apply_removing`, D-107). Then
     /// the right half's store is opened beside the parent's, its core restored from
     /// the floor, and both handed to the `raft` task as a range added.
     ///
     /// `None` is the entry left to an install: a non-voter's removal waited for the
     /// engine while P's own live install switched P past `index`, which then carries
-    /// the entry's effect, and nothing was written here (PROPOSED D-107).
+    /// the entry's effect, and nothing was written here (D-107); or the apply
+    /// waited out P's own switch, which moved the store to or past `index` (PROPOSED
+    /// D-133).
+    ///
+    /// **P is held against its install's switch** from the read of P's descriptor to both
+    /// halves' descriptors in the host's table: a switch of P in flight is waited out
+    /// before the read, and a switch that reaches its own reads while this apply is in
+    /// flight waits for it (`install::SwitchOrSplit`). So the apply lands before the
+    /// switch reads the table and the store, or after the host has stepped the install's
+    /// `Switched` and restated P's applied index, and never between the engine's numbering
+    /// of the switch and the switch, where it wrote its batch over the switch and narrowed
+    /// the table after the switch had read it, and the switch removed the right half's keys
+    /// (seed 13283 of the sharded sweep, #225), nor between the switch and `Switched`, where
+    /// the job's next entry applied before the restate and again after it.
+    /// `SplitAppliesInsideTheSwitch` holds nothing.
+    // PROPOSED(D-133)
     async fn split(
         &self,
         range: RangeId,
@@ -2160,6 +2231,20 @@ impl<E: Environment> ServerApplier<E> {
         right: u64,
         store: &Arc<RaftStore<E>>,
     ) -> io::Result<Option<(ApplyEffect, Outcome)>> {
+        let inside = if self
+            .node_variants
+            .contains(NodeVariant::SplitAppliesInsideTheSwitch)
+        {
+            None
+        } else {
+            let inside = self.switching.enter(&self.env, range).await;
+            // P's switch moved the store while this waited: the entry is the install's,
+            // as the apply loop skips an entry the store is past (D-083).
+            if store.applied() >= index {
+                return Ok(None);
+            }
+            Some(inside)
+        };
         let prefix = KeyPrefix::group(range.get());
         let held = store
             .engine()
@@ -2167,6 +2252,29 @@ impl<E: Environment> ServerApplier<E> {
             .await?
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
         let refuse = |reason: SplitRefusal| (ApplyEffect::Refused, Outcome::Refused(reason));
+        // A replica that holds no descriptor is a re-seeded replica of a range
+        // configuration names that its log brought back from the first entry: a bootstrap,
+        // a split's batch and an install each write one, and the re-seed writes none for a
+        // user range (it writes a system range's index-0 state, D-098). Its state machine
+        // started from index 0, whose state is configuration's alone (SHARD.md §2), and it
+        // has applied no split since, the first having written one. So the descriptor in
+        // force before `index` is the one configuration names, which every replica that
+        // was never re-seeded holds from its bootstrap, and the split is applied here as it
+        // is there. Refused here, `NotLive`, the entry took everywhere else and state
+        // machine safety saw it (#199). `ReplayedRangeRefusesItsSplit` keeps the refusal.
+        // A range configuration does not name has no replica without a descriptor, and is
+        // refused as before.
+        // PROPOSED(D-138)
+        let held = held.or_else(|| {
+            if self
+                .node_variants
+                .contains(NodeVariant::ReplayedRangeRefusesItsSplit)
+            {
+                None
+            } else {
+                self.configured.get(&range).cloned()
+            }
+        });
         let Some(parent) = held else {
             store.apply(index, WriteBatch::new()).await?;
             return Ok(Some(refuse(SplitRefusal::NotLive)));
@@ -2204,9 +2312,19 @@ impl<E: Environment> ServerApplier<E> {
             voters: parent.voters.clone(),
             state: RangeState::Live,
         };
+        // R starts at the split key; `SplitLeavesGap` starts it one key past it, the key
+        // followed by a zero byte, and leaves the key itself in no range.
+        // PROPOSED(D-140): check 19's instrument, the owner's ruling on D-093.
+        let right_start = if self.range_variants.contains(RangeVariant::SplitLeavesGap) {
+            let mut past = cut.to_vec();
+            past.push(0);
+            Bytes::from(past)
+        } else {
+            cut.clone()
+        };
         let created = RangeDescriptor {
             range: right_id,
-            start: cut.clone(),
+            start: right_start,
             end: parent.end.clone(),
             generation,
             voters: config.voters.clone(),
@@ -2228,7 +2346,7 @@ impl<E: Environment> ServerApplier<E> {
         // A quarantined replica of P has lost its engine (D-035), and this apply cannot
         // tell a first apply of the split from a replay of one the lost engine held, which
         // would make R a second time with its votes gone. R takes the quarantine.
-        // PROPOSED(D-130): the owner's ruling of 2026-11-09 on #175.
+        // D-130: the owner's ruling of 2026-11-09 on #175.
         let quarantined = store.quarantined()
             && !self
                 .node_variants
@@ -2257,7 +2375,7 @@ impl<E: Environment> ServerApplier<E> {
             // engine runs one install at a time, so another install on this node is
             // waited out, and an entry P's own install moves the store past is left
             // to it (`apply_removing_unless_installed`).
-            // PROPOSED(D-107)
+            // D-107
             if !apply_removing_unless_installed(
                 &self.env,
                 store,
@@ -2293,7 +2411,7 @@ impl<E: Environment> ServerApplier<E> {
         // of P after the split carried R's keys as the taker's R held them and an
         // install of it wrote them over the receiver's R (seed 3 of the node sweep
         // under `MetaOverwritesByArrival`, a stale read of `k7` through R; SHARD.md
-        // §5, Q27; PROPOSED D-100).
+        // §5, Q27; D-100).
         self.snaps.push(SnapJob::Host {
             range,
             spans: vec![
@@ -2325,8 +2443,11 @@ impl<E: Environment> ServerApplier<E> {
         // this apply created it too (issue #183). The trace is unchanged: R's creation
         // is traced before its descriptor is in place, as before, and nothing here
         // awaits, so a simulated schedule is the same.
-        // PROPOSED(D-114)
+        // D-114
         put_split_descriptors(&self.descriptors, left, voter.then_some(created));
+        // The store and the table are the split's: a switch of P waiting on it reads them
+        // now (PROPOSED D-133).
+        drop(inside);
         if !voter {
             return Ok(Some((ApplyEffect::Took, Outcome::Done)));
         }
@@ -2337,7 +2458,7 @@ impl<E: Environment> ServerApplier<E> {
         // The quarantine R took from P, stated as a placeholder's install states the one
         // it wrote (`created_by_install`), so that the checks that read a replica's
         // quarantine from the trace read this one too.
-        // PROPOSED(D-130)
+        // D-130
         if recovered.quarantined {
             self.env.trace(TraceEvent::RaftReseeded {
                 server: self.id.0,
@@ -2679,6 +2800,12 @@ impl<E: Environment> Applier for ServerApplier<E> {
             for entry in entries {
                 // The store's own applied index wins when it is ahead: a live install
                 // moved it inside a manifest switch, without an apply (D-083).
+                //
+                // Not closed here: an entry of a job the replaced core queued before the
+                // hold that passes this head before the `snapshot` task restates the
+                // store to the snapshot, and reaches `RaftStore::apply` after it past an
+                // await below, is refused ("applying N after N") and fails the range.
+                // That is PROPOSED D-126 section 7's window, #225's.
                 let applied = lock(&self.applied)
                     .get(&range)
                     .map_or(0, |state| state.index)
@@ -2714,8 +2841,8 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // whatever its key (§10). Every replica holds its descriptor
                 // (`initial_state`, a split's batch, an install); one without is
                 // checked against nothing, and check 9 then sees what it applied.
-                // PROPOSED(D-097): the apply check.
-                // PROPOSED(D-105): `ApplyIgnoresSpan` read from the range layer's set.
+                // D-097: the apply check.
+                // D-105: `ApplyIgnoresSpan` read from the range layer's set.
                 let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
                 {
                     Some(key) if !self.range_variants.contains(RangeVariant::ApplyIgnoresSpan) => {
@@ -2746,7 +2873,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 } else {
                     command.as_ref()
                 };
-                // The meta range's state machine (SHARD.md §1; PROPOSED D-098): a
+                // The meta range's state machine (SHARD.md §1; D-098): a
                 // `MetaUpdate` applied by an entry of range 1 merges its descriptors
                 // into the records as a maximum by generation and writes the
                 // difference with the entry's index; `MetaApplied` is traced with what
@@ -2764,7 +2891,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     ),
                     _ => None,
                 };
-                // A refill of a node's block of range ids (SHARD.md §5, Q17; PROPOSED
+                // A refill of a node's block of range ids (SHARD.md §5, Q17;
                 // D-099): applied by an entry of range 0, it grants the block at the
                 // counter to the asking node's run, writes its lease record and the
                 // counter with the entry's index, traces `RangeIdsLeased`, and answers
@@ -2775,7 +2902,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     Some(Command::Refill { node, run }) => Some((*node, *run)),
                     _ => None,
                 };
-                // A split (SHARD.md §5; PROPOSED D-100): re-checked and applied by
+                // A split (SHARD.md §5; D-100): re-checked and applied by
                 // `split`, which writes both halves and hands the right half's core to
                 // the `raft` task; refused, it applies as nothing and the asker is
                 // told why.
@@ -2790,8 +2917,9 @@ impl<E: Environment> Applier for ServerApplier<E> {
                             outcome
                         }
                         // The entry is P's own install's, which moved the store past it
-                        // while a non-voter's removal waited for the engine: skipped, as
-                        // one the store is past at the head of the loop (PROPOSED D-107).
+                        // while a non-voter's removal waited for the engine, or while the
+                        // apply waited out P's switch: skipped, as one the store is past at
+                        // the head of the loop (PROPOSED D-107, D-133).
                         Ok(None) => continue,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
@@ -2838,7 +2966,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     }
                 } else if let Some(descriptors) = &meta_update {
                     let result = if range == META_RANGE {
-                        // PROPOSED(D-105): `MetaOverwritesByArrival` read from the
+                        // D-105: `MetaOverwritesByArrival` read from the
                         // range layer's set.
                         let as_arrived = self
                             .range_variants
@@ -2904,7 +3032,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     }
                 }
                 // PROPOSED(D-069): `key` and `effect` (SHARD.md §8).
-                // PROPOSED(D-097): `out_of_span` for a keyed command the apply check
+                // D-097: `out_of_span` for a keyed command the apply check
                 // refused.
                 let (key, effect) = match command.as_ref().and_then(Command::key) {
                     Some(key) if refused.is_some() => (Some(key.clone()), ApplyEffect::OutOfSpan),
@@ -2935,7 +3063,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     // that serves the key; the leader keeps its record of the request
                     // (`Replica::proposed`), so a late copy of it is still deduplicated
                     // (SHARD.md §3, Q10; D-026).
-                    // PROPOSED(D-097)
+                    // D-097
                     let reply = match (&refused, key.as_ref()) {
                         (Some(own), Some(key)) => {
                             let descriptors = descriptors_for(
@@ -2986,7 +3114,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
 /// What a `RangeMismatch` for the encoded `key` carries (SHARD.md §3): `own`, the
 /// descriptor of the replica that refused, first if there is one, and every other
 /// descriptor the node holds that serves the key, in range order.
-// PROPOSED(D-097)
+// D-097
 fn descriptors_for(
     held: &BTreeMap<RangeId, RangeDescriptor>,
     own: Option<&RangeDescriptor>,
@@ -3012,7 +3140,7 @@ fn descriptors_for(
 /// never P narrowed with R absent (issue #183). What holds the call site to it is
 /// `a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition` and its
 /// non-voter's, and what those can and cannot see is in the first's doc.
-// PROPOSED(D-114)
+// D-114
 fn put_split_descriptors(
     descriptors: &Mutex<BTreeMap<RangeId, RangeDescriptor>>,
     left: RangeDescriptor,
@@ -3030,12 +3158,14 @@ fn put_split_descriptors(
 /// only when no other runs, so each ask is a look at one lock and the wait is the other
 /// install's, tens of milliseconds for a live install; every range's applies wait with
 /// it (issue #169, Stage D's to measure).
-// PROPOSED(D-107)
-const INSTALL_RETRY: Duration = Duration::from_millis(1);
+// D-107
+// PROPOSED(D-133): and the period a range's switch and its split's apply ask again at
+// while the other holds the range (`install::SwitchOrSplit`).
+pub(crate) const INSTALL_RETRY: Duration = Duration::from_millis(1);
 
 /// Whether `error` is the engine refusing an install because another runs, which
 /// leaves nothing written and is asked again (`ananke_storage::InstallRefused`).
-// PROPOSED(D-107)
+// D-107
 fn install_in_progress(error: &io::Error) -> bool {
     ananke_storage::InstallRefused::from_io(error)
         == Some(ananke_storage::InstallRefused::InProgress)
@@ -3050,7 +3180,7 @@ fn install_in_progress(error: &io::Error) -> bool {
 /// the entry is then the install's, as the apply loop skips an entry the store is past
 /// (D-083). Asking the engine again there failed "applying `index` after" the install's
 /// index, a server failure on correct code (#166's review).
-// PROPOSED(D-107)
+// D-107
 async fn apply_removing_unless_installed<E: Environment>(
     env: &E,
     store: &RaftStore<E>,
@@ -3081,7 +3211,7 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
     env.clock().now().as_nanos()
 }
 
-/// The node's `meta` task (SHARD.md §1, Q3; PROPOSED D-098): every descriptor the
+/// The node's `meta` task (SHARD.md §1, Q3; D-098): every descriptor the
 /// host hands it goes to the meta range's leader as a `MetaUpdate` under the node's
 /// own client id — the last leader it heard of, or range 1's voters in turn — and is
 /// sent again every `resend`, the minimum election timeout, until that leader answers
@@ -3091,7 +3221,7 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// range handed over again before its acknowledgement has the newer descriptor take
 /// the older's place.
 ///
-/// Its second errand is range 0's (SHARD.md §5, Q17; PROPOSED D-099): a refill of
+/// Its second errand is range 0's (SHARD.md §5, Q17; D-099): a refill of
 /// the node's block of range ids, sent to range 0's leader — hinted apart from the
 /// meta range's — and resent on the same timer until a grant of this run lands, as an
 /// answer or read back from the node's lease record before each resend.
@@ -3118,14 +3248,14 @@ async fn meta_sender<E: Environment>(
     // request whose entry is in its log when that entry applies, once, and a refill
     // or an update numbered from 0 at every start was that copy at every restart —
     // dropped until the leader changed or the count passed the old run's (seed 0 of
-    // the node sweep, a restarted node without a block for 1.7 s; PROPOSED D-100).
+    // the node sweep, a restarted node without a block for 1.7 s; D-100).
     let mut seq = lock(&ids).run();
     let mut hint: Option<ServerId> = None;
     let mut turn = 0usize;
     // The refill outstanding, if any: its sequence number and the run it carries,
     // resent on the timer until a grant of this run lands, as an answer or read back
     // from the node's lease record where the node holds a replica of range 0
-    // (SHARD.md §5, Q17; PROPOSED D-099). Range 0's leader is hinted apart from the
+    // (SHARD.md §5, Q17; D-099). Range 0's leader is hinted apart from the
     // meta range's.
     let mut refill: Option<(u64, u64)> = None;
     let mut root_hint: Option<ServerId> = None;
@@ -3231,7 +3361,7 @@ async fn meta_sender<E: Environment>(
                         if root_hint.is_none() {
                             root_turn += 1;
                         }
-                        // PROPOSED(D-113): `RefillNotResent` read from the range layer's
+                        // D-113: `RefillNotResent` read from the range layer's
                         // set.
                         send_refill = resends_refill;
                     }
@@ -3318,7 +3448,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // SHARD.md §2: exactly three bootstrap nodes, the replication factor (Q7, Q32). A
     // node configured with any other number stops before it binds anything, and says
     // why: the bootstrap nodes fix every range's voter count for good.
-    // PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+    // D-109: exactly three bootstrap nodes, enforced.
     if let Err(reason) = bootstrap_is_three(&bootstrap) {
         env.trace(TraceEvent::RaftServerFailed {
             server,
@@ -3333,11 +3463,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // leader's message makes it a placeholder and the snapshot the placeholder asks
     // for is installed (§2, §5, Q22). D-076's interim replicas, the configured ranges
     // on an empty configuration, are retired with the placeholders.
-    // PROPOSED(D-096): the bootstrap nodes host the system ranges.
-    // PROPOSED(D-109): a node that joins holds nothing.
+    // D-096: the bootstrap nodes host the system ranges.
+    // D-109: a node that joins holds nothing.
     let named = bootstrap.contains(&id);
     // `AnyFreshNodeBootstraps`: a node not named takes a fresh store for a bootstrap
-    // anyway, with the address book for the voters it was not given (PROPOSED D-096).
+    // anyway, with the address book for the voters it was not given (D-096).
     // PROPOSED(D-108): the instrument read from the range layer's set.
     let pretends = !named && range_variants.contains(RangeVariant::AnyFreshNodeBootstraps);
     let is_bootstrap = named || pretends;
@@ -3361,6 +3491,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } else {
         Vec::new()
     };
+    // The descriptors those ranges start with, for the `apply` task: a split of a replica
+    // its re-seed left without one applies from these (SHARD.md §2).
+    // PROPOSED(D-138)
+    let configured: Arc<BTreeMap<RangeId, RangeDescriptor>> = Arc::new(
+        hosted
+            .iter()
+            .map(|range| (range.id, bootstrap_descriptor(range, &bootstrap)))
+            .collect(),
+    );
     // The store's recovery must never hand back a state with a hole (RAFT.md §3).
     let engine = EngineConfig {
         allow_manifest_fallback: false,
@@ -3373,7 +3512,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // The run's nonce (SHARD.md §5, Q17): drawn at every start from the node's own
     // generator, as a re-seed draws a store incarnation, and carried by every refill
     // this run sends, so that a grant to an earlier run is never adopted.
-    // PROPOSED(D-099)
+    // D-099
     let ids: Arc<Mutex<IdBlocks>> = Arc::new(Mutex::new(IdBlocks::new(env.rng().next_u64())));
     let addrs: BTreeMap<ServerId, SocketAddr> = servers.iter().copied().collect();
     let inbox = Arc::new(Inbox::new(inbox_bytes));
@@ -3383,9 +3522,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // several ranges, each tagged with its own (Q10, D-072); a client's packet
     // carries the range its key belongs to.
     let snaps: Queue<SnapJob> = Queue::new();
-    // The answers to the node's own `MetaUpdate`s, for its `meta` task (PROPOSED
-    // D-098).
+    // The answers to the node's own `MetaUpdate`s, for its `meta` task
+    // (D-098).
     let meta_answers: Queue<Response> = Queue::new();
+    // Set while the `snapshot` task makes an install, which it answers nothing during.
+    // PROPOSED(D-127)
+    let installing = install::Installing::default();
     env.spawn("net", {
         let env = env.clone();
         let sock = sock.clone();
@@ -3393,6 +3535,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let local = local.clone();
         let snaps = snaps.clone();
         let meta_answers = meta_answers.clone();
+        let installing = installing.clone();
         async move {
             loop {
                 let Ok((from, bytes)) = sock.recv().await else {
@@ -3409,7 +3552,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                         && answered.response.client == meta_client(id)
                     {
                         // An answer to the node's own `MetaUpdate`, for the `meta`
-                        // task (PROPOSED D-098).
+                        // task (D-098).
                         meta_answers.push(answered.response);
                     }
                     continue;
@@ -3417,6 +3560,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 let Ok(decoded) = decode(&bytes) else {
                     continue;
                 };
+                // D-050: when the frame reached the node, a stamp that reads the time
+                // and nothing else (D-047), so it moves no schedule. It rides the
+                // inbox entry of every message of the frame, and the step that takes
+                // the message puts it on a term change, however long the message
+                // waited in the inbox — behind the node's start, a flush or a held
+                // core — before a round drained it, as the one-group server's `net`
+                // task stamps its inbox events (node.rs, `run`).
+                // PROPOSED(D-118): the inbox carries the `net` task's receipt stamp.
+                let received = env.decision();
                 for tagged in decoded.messages {
                     // Issue #96. `Raft::on_message`'s arm for `InstallSnapshot` and
                     // its response is empty, because "the server routes these to it
@@ -3440,6 +3592,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                     ) && !node_variants.contains(NodeVariant::ChunksToTheInbox);
                     if diverted {
                         let range = tagged.range;
+                        // A chunk that reaches the node while the `snapshot` task makes
+                        // an install waits behind it, and the task answers nothing until
+                        // it is made. It is answered here, `Waiting`, so its sender hears
+                        // that it is held rather than counting a silence the length of
+                        // the install against `CHUNK_RESENDS` (#120). The task still
+                        // takes it afterwards and answers it as it always did.
+                        // PROPOSED(D-127): the node answers a chunk while its `snapshot`
+                        // task is installing.
+                        if installing.now()
+                            && !node_variants.contains(NodeVariant::SilentWhileInstalling)
+                            && let Some(answer) = install::queued(id, range, &tagged.frame.message)
+                        {
+                            let _ = sock.send(from, answer).await;
+                        }
                         let from = tagged.frame.from;
                         snaps.push(match tagged.frame.message {
                             message @ Message::InstallSnapshot { .. } => SnapJob::Chunk {
@@ -3455,12 +3621,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                         });
                         continue;
                     }
-                    let admission = inbox.admit(Received {
-                        range: tagged.range,
-                        from: tagged.frame.from,
-                        message: tagged.frame.message,
-                        bytes: tagged.bytes,
-                    });
+                    let admission = inbox.admit(Received::stamped(tagged, received));
                     for dropped in admission.dropped() {
                         env.trace(TraceEvent::RaftInboxDropped {
                             server,
@@ -3488,7 +3649,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     };
     // The store the engine is opened through: the first hosted range's, or the node's
     // anchor on a node that hosts none (`ANCHOR_GROUP`).
-    // PROPOSED(D-109)
+    // D-109
     let first_prefix = hosted.first().map_or_else(
         || KeyPrefix::group(ANCHOR_GROUP),
         |range| KeyPrefix::group(range.id.get()),
@@ -3503,9 +3664,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     )
     .await;
     // Whether this start re-seeded (below), which a bootstrap must never follow: a
-    // re-seed's directory holds no digest and is not a fresh store (PROPOSED D-096).
+    // re-seed's directory holds no digest and is not a fresh store (D-096).
     // The meta range's index-0 state a re-seed wrote, traced after the creations as
-    // the bootstrap's is (PROPOSED D-098).
+    // the bootstrap's is (D-098).
     let mut reseeded_meta: Option<Vec<MetaDescriptor>> = None;
     let mut reseeded_now = false;
     let (anchor, opened): (Arc<RaftStore<E>>, Opened<E>) = match started {
@@ -3544,7 +3705,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // left to the next start's choice of the newest directory not marked lost
             // (D-066). Left as it was, every stream of this start staged, synced and was
             // cleared in the refused directory (#176).
-            // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+            // D-117: the start's tasks run on the directory the re-seed built.
             if !node_variants.contains(NodeVariant::TasksOnTheRefusedDir) {
                 engine = reseeded.engine;
             }
@@ -3561,10 +3722,18 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // SHARD.md §5: a crash after a split's batch restarts both halves from
             // their keys, so the ranges the node opens are every group the engine
             // holds, configuration's and the right halves splits created since — and,
-            // on a node that joined, every replica an install made on it (PROPOSED
-            // D-109); the anchor holds no descriptor and is no range.
-            // PROPOSED(D-100)
-            let discovered = discover_ranges(anchor.engine(), &hosted).await?;
+            // on a node that joined, every replica an install made on it
+            // (D-109); the anchor holds no descriptor and is no range.
+            // D-100
+            // The instrument that drops node 1's right halves at its restart reopens
+            // none of them, nor any replica an install made there (PROPOSED D-141).
+            // PROPOSED(D-141)
+            let discovered =
+                if server == 1 && range_variants.contains(RangeVariant::RestartDropsRightHalves) {
+                    Vec::new()
+                } else {
+                    discover_ranges(anchor.engine(), &hosted).await?
+                };
             for range in hosted.iter().skip(1).cloned().chain(discovered) {
                 let (store, recovered) = anchor
                     .open_sibling(KeyPrefix::group(range.id.get()))
@@ -3592,7 +3761,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // streams, which carry every range's state back, range 0's digest included, and a
     // bootstrap written over them would give each replica the first incarnation
     // again and a leader nothing to forget by (D-042).
-    // PROPOSED(D-096): the initial state, one batch, before the tasks, in the
+    // D-096: the initial state, one batch, before the tasks, in the
     // configured directory alone.
     let engine_of_node = anchor.engine().clone();
     let bootstrapped_now = is_bootstrap
@@ -3601,7 +3770,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         && engine_of_node.get(&system::digest_key()).await?.is_none();
     // Its `MetaApplied { index: 0 }` is traced after the replicas' creations below,
     // so that check 16 finds every descriptor it names already in check 7's map
-    // (SHARD.md §8; PROPOSED D-098).
+    // (SHARD.md §8; D-098).
     let mut bootstrap_meta: Option<Vec<MetaDescriptor>> = None;
     if bootstrapped_now {
         let (batch, descriptors) = initial_state(&bootstrap, &servers, &hosted);
@@ -3614,12 +3783,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // one it cannot name, and every replica a placeholder's install creates here is
     // quarantined (D-035; SHARD.md §5's Q26 reason holds only on a node that lost no
     // engine).
-    // PROPOSED(D-109)
+    // D-109
     let on_a_reseed = reseeded_now || engine.dir != base_dir;
 
     // The node's stores and replicas, shared by the host, the `apply` task and the
     // `snapshot` task and mutable behind a lock: a split adds a range at its apply
-    // (SHARD.md §5; PROPOSED D-100).
+    // (SHARD.md §5; D-100).
     let stores: Arc<Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>> = Arc::default();
     let mut cores = Cores::new(node_variants);
     let replicas: Arc<Mutex<BTreeMap<RangeId, Arc<Mutex<Replica>>>>> = Arc::default();
@@ -3630,7 +3799,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // Every replica's descriptor as the store holds it, for the receipt check and
     // the answers that carry it (SHARD.md §3). A replica without one — a node not
     // named at bootstrap, before its install — has no entry.
-    // PROPOSED(D-097)
+    // D-097
     let descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
     // The initialised replicas this start restated, for `RangesRestated` (§8).
     let mut restated: Vec<u64> = Vec::new();
@@ -3661,6 +3830,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
             .map_or((0, 0), |record| (record.last_index, record.last_term));
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
+        let snap_taken = snapshot_record.as_ref().is_some_and(|record| record.taken);
         let recovered_quarantined = recovered.quarantined;
         // A re-seeded replica is not fresh: its `RangeCreated` is the install's, with
         // `cause: snapshot`, and not a bootstrap's (§8; Q15).
@@ -3705,11 +3876,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // first start, each traced with the span, generation and voters
             // configuration gave it (§8). The voters are the range's, the bootstrap
             // nodes, on every node — which is every node that creates a replica here,
-            // since a node that joins hosts none at its start (PROPOSED D-109) — and
+            // since a node that joins hosts none at its start (D-109) — and
             // the descriptor it is created with is the range's one descriptor, which
             // is what check 7 holds every creation to. D-096 traced `initial` here, so
             // the correct membership scenario disagreed with itself on nodes 4 and 5.
-            // PROPOSED(D-097)
+            // D-097
             let span = range.span();
             env.trace(TraceEvent::RangeCreated {
                 range: id_of.get(),
@@ -3730,12 +3901,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             id_of,
             &core,
             &store,
-            (snap_index, snap_term),
+            (snap_index, snap_term, snap_taken),
             recovered_quarantined,
         );
         // §8: the replica's log restated, then its descriptor at its applied index. A
         // replica with no descriptor — a re-seeded user range before its install —
-        // is not initialised and has none to restate (PROPOSED D-107).
+        // is not initialised and has none to restate (D-107).
         if let Some(descriptor) = lock(&descriptors).get(&id_of) {
             state_descriptor(&env, descriptor, applied);
             restated.push(id_of.get());
@@ -3743,10 +3914,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         cores.insert(id_of, core);
     }
     // §8: `RangesRestated` closes the node's restatement, naming every initialised
-    // replica it restated; check 8 reads the node's spans as complete here.
-    // PROPOSED(D-107)
+    // replica it restated; check 8 reads the node's spans as complete here. It states the
+    // run's nonce too, so check 18 can hold a split's right half to a block of the run
+    // that led it.
+    // D-107
+    // PROPOSED(D-137): the run stated at the node's start.
     restated.sort_unstable();
-    env.trace(TraceEvent::RangesRestated { ranges: restated });
+    let run = lock(&ids).run();
+    env.trace(TraceEvent::RangesRestated {
+        ranges: restated,
+        run,
+    });
     if let Some(descriptors) = bootstrap_meta.or(reseeded_meta) {
         env.trace(TraceEvent::MetaApplied {
             index: 0,
@@ -3757,8 +3935,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // The node's placeholders, shared by the host, which makes them, and the
     // `snapshot` task, which assembles their streams (SHARD.md §5, Q22). None survives
     // a restart: a placeholder holds nothing durable.
-    // PROPOSED(D-109)
+    // D-109
     let placeholders: Arc<Mutex<BTreeSet<RangeId>>> = Arc::default();
+    // A range's switch and its split's apply, held against each other across the `apply`
+    // task, the `snapshot` task and the host (PROPOSED D-133).
+    let switching: Arc<install::SwitchOrSplit> = Arc::default();
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -3772,7 +3953,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         // The six the node hosts, not the four configuration names: `installed` reads
         // a switched range's span here, and with the user ranges alone a system
         // range's live install switched the store and kept the old core — the day
-        // the meta range first compacted (PROPOSED D-098).
+        // the meta range first compacted (D-098).
         ranges: hosted.clone(),
         initial: initial.clone(),
         raft: raft.clone(),
@@ -3788,19 +3969,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         applied: applied_at.clone(),
         placeholders: placeholders.clone(),
         on_a_reseed,
+        switching: switching.clone(),
     };
     // The node's lease record, read back at the start (SHARD.md §5's second rule): a
     // grant of this run is adopted — none can be at a fresh start, whose nonce is
     // fresh — and any other run's is not; `IdBlockResumed` adopts whatever run it was
     // granted to (§10). A node with no replica of range 0 holds no record to read.
     // Then the first refill: a node starts with no block, at the threshold.
-    // PROPOSED(D-099)
+    // D-099
     let root_store = lock(&stores).get(&ROOT_RANGE).cloned();
     if let Some(store) = &root_store
         && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
         && let Ok(record) = LeaseRecord::decode(bytes)
     {
-        // PROPOSED(D-105): `IdBlockResumed` read from the range layer's set.
+        // D-105: `IdBlockResumed` read from the range layer's set.
         let any_run = range_variants.contains(RangeVariant::IdBlockResumed);
         lock(&ids).adopt(&record, any_run);
     }
@@ -3816,7 +3998,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         }
     });
     // The `meta` task: tells the meta range every descriptor a core of this node
-    // takes office over, and resends until acknowledged (SHARD.md §1, Q3; PROPOSED
+    // takes office over, and resends until acknowledged (SHARD.md §1, Q3;
     // D-098).
     env.spawn("meta", {
         let env = env.clone();
@@ -3872,6 +4054,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             cores: variants,
             descriptors: descriptors.clone(),
             applied: applied_at.clone(),
+            switching: switching.clone(),
+            configured: configured.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -3892,12 +4076,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     );
     for range in &hosted {
         // The span the store's descriptor holds, where the store has one: a split
-        // moved it off configuration's (SHARD.md §5; PROPOSED D-100). A replica
+        // moved it off configuration's (SHARD.md §5; D-100). A replica
         // without a descriptor — a node not named at bootstrap, or a re-seeded user
         // range, before its install — is hosted at configuration's span, which its
-        // install does not replace (`install::switched_spans`, PROPOSED D-128): the
+        // install does not replace (`install::switched_spans`, D-128): the
         // plan's copy is what `InstallReplacesHostedSpan` and `InstallReplacesCopiedSpan`
-        // read, and a chunk's check that the range is hosted here (PROPOSED D-132).
+        // read, and a chunk's check that the range is hosted here (D-132).
         let span = lock(&descriptors)
             .get(&range.id)
             .map_or_else(|| range.span(), |d| d.start.clone()..d.end.clone());
@@ -3919,8 +4103,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // Every range the node holds, by its descriptor: `state_of` reads a
             // switched range's span here. The four configuration names left a system
             // range's switch with no state read back and D-091's fourth arm nothing
-            // to pair it with (seed 368's guard, PROPOSED D-099), and a split adds
-            // ranges configuration never named (PROPOSED D-100).
+            // to pair it with (seed 368's guard, D-099), and a split adds
+            // ranges configuration never named (D-100).
             descriptors.clone(),
             applied_at.clone(),
             plan,
@@ -3930,6 +4114,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             anchor,
             on_a_reseed,
             range_variants,
+            switching,
+            installing,
         );
         async move {
             task.run().await;
@@ -4091,7 +4277,7 @@ async fn reseed<E: Environment>(
     };
     // The fresh engine is opened through the first range's store, or, on a node that
     // hosts none, through its anchor (`ANCHOR_GROUP`), as the start opens it.
-    // PROPOSED(D-109)
+    // D-109
     let first_prefix = ranges.first().map_or_else(
         || KeyPrefix::group(ANCHOR_GROUP),
         |range| KeyPrefix::group(range.id.get()),
@@ -4125,7 +4311,7 @@ async fn reseed<E: Environment>(
     let mut first_opened = Some((first_store, first_recovered));
     // A node that hosts no range keeps the store its engine was opened through as its
     // anchor, and no replica.
-    // PROPOSED(D-109)
+    // D-109
     let mut anchor = None;
     if ranges.is_empty()
         && let Some((store, _)) = first_opened.take()
@@ -4157,7 +4343,7 @@ async fn reseed<E: Environment>(
             // its vote and its incarnation from the re-seed and not from a bootstrap
             // (D-096). Its `MetaApplied { index: 0 }` is traced after the creations, as the
             // bootstrap's is.
-            // PROPOSED(D-098)
+            // D-098
             if range.is_system() {
                 let mut initial = WriteBatch::new();
                 initial.put(
@@ -4213,45 +4399,63 @@ type Opened<E> = Vec<(Range, Arc<RaftStore<E>>, Recovered)>;
 
 /// What a re-seed hands back: the store the fresh engine was opened through, each
 /// range's store, the meta range's index-0 state when the re-seed rebuilt a replica of
-/// it (PROPOSED D-098), and the fresh engine's configuration, whose directory the rest
-/// of the start runs on (PROPOSED D-117).
+/// it (D-098), and the fresh engine's configuration, whose directory the rest
+/// of the start runs on (D-117).
 struct Reseeded<E: Environment> {
-    /// The first range's store, or the node's anchor where it hosts none (PROPOSED
-    /// D-109).
+    /// The first range's store, or the node's anchor where it hosts none
+    /// (D-109).
     anchor: Arc<RaftStore<E>>,
     opened: Opened<E>,
     meta: Option<Vec<MetaDescriptor>>,
     /// The fresh engine's configuration: the refused one's, in the directory the
     /// re-seed built beside it.
-    // PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+    // D-117: the start's tasks run on the directory the re-seed built.
     engine: EngineConfig,
 }
 
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the
 /// disk holds it, the snapshot it records, the configuration in force and the term,
 /// each naming the range (§8), and then its descriptor (`state_descriptor`).
+///
+/// `snapshot` is the record's last index and term and its own `taken`: whether the
+/// record is one this replica's take wrote or one an install's repair or a follower's
+/// compaction wrote (RAFT.md §2), restated as the record says, as the one-group server
+/// restates it (ananke-raft node.rs, `incarnation`).
 fn restate<E: Environment>(
     env: &E,
     server: u64,
     range: RangeId,
     core: &Raft,
     store: &RaftStore<E>,
-    snapshot: (Index, Term),
+    snapshot: (Index, Term, bool),
     quarantined: bool,
 ) {
-    let (snap_index, snap_term) = snapshot;
+    let (snap_index, snap_term, taken) = snapshot;
     env.trace(TraceEvent::RaftTruncate {
         server,
         range: range.get(),
         from_index: core.last_index() + 1,
     });
     if snap_index > 0 {
+        // The record's own flag. Until PROPOSED D-118 every restated snapshot was
+        // traced `taken: false`, an install, whatever the record said. A store
+        // switched to without its repair (`SnapshotWithoutCurrentLast` on the node's
+        // switch, PROPOSED D-086) keeps the leader's record, `taken: true`, and the
+        // leader's applied index; a crash between the switch's durability and its
+        // trace restarts onto both, and restated as an install the floor rose to the
+        // record and the applied index needed no log, so state machine safety had
+        // nothing to see (#126, #167). Restated as the record says, a taken snapshot
+        // moves no floor and the applied index its log cannot hold is reported. The
+        // pre-vote check's skip reads an install restated inside an isolation as an
+        // install (`Report::reseeding_during`), and a replica's own take restated
+        // there is now checked, which is why the receipt rides the inbox first (D-050).
+        // PROPOSED(D-118): the restatement restates each record's `taken`.
         env.trace(TraceEvent::RaftSnapshot {
             server,
             range: range.get(),
             last_index: snap_index,
             last_term: snap_term,
-            taken: false,
+            taken,
         });
     }
     // The durable per-replica refused mark, restated per replica and carrying its range
@@ -4340,18 +4544,38 @@ fn restate<E: Environment>(
 /// system range, whose descriptor and index-0 state the re-seed wrote and whose start
 /// restated it, or a bootstrap's replica installed before it applied anything. Read off
 /// the core alone, both were traced as created a second time, which check 8's created-twice
-/// clause sees (PROPOSED D-116 §4).
-// PROPOSED(D-116)
+/// clause sees (D-116 §4).
+// D-116
 fn install_creates(held: bool, applied: Index, last_index: Index, snapshot: (Index, Term)) -> bool {
     !held && applied == 0 && last_index == 0 && snapshot == (0, 0)
+}
+
+/// Whether an applied index `held` past a live install's `snapshot` is kept by the
+/// restatement at `Switched`: what the `apply` task, or the store, stands at above the
+/// snapshot when the `raft` task steps the switch was applied after it, on top of the
+/// state it installed, by a job the replaced core queued before the hold (issue #113).
+/// Taking it back hands those entries to the task a second time. A held index at or
+/// below the snapshot is the replaced replica's and moves up to the snapshot, which is
+/// D-086's restatement. [`NodeVariant::SwitchForgetsLateApplies`] keeps nothing.
+///
+/// The `snapshot` task's own restatement, right after the switch, reads it too: a job
+/// that applied past the snapshot while `install_spans` was in flight wrote above the
+/// switch, and is kept there as here (#113's review, F1). That such an index was applied
+/// above the switch rests there on D-132's second re-check, which leaves only a store
+/// below the snapshot to be numbered; `finish` reads the store at that re-check and asks
+/// this only where it stood below, so `InstallReplacesCopiedSpan`, which skips the
+/// re-check, keeps nothing there past a store that did not (#113's second review, N1).
+// PROPOSED(D-126)
+pub(crate) fn kept_past_the_switch(held: Index, snapshot: Index, variants: NodeVariants) -> bool {
+    held > snapshot && !variants.contains(NodeVariant::SwitchForgetsLateApplies)
 }
 
 /// The generation and the voters an install's creation names (`RangeCreated { cause:
 /// snapshot }`, SHARD.md §8): the descriptor the switch put in place, read back from the
 /// store, and for a snapshot that carries none, which no take of this tree makes, the
-/// first generation and the configuration's voters. Until PROPOSED D-107 the creation
+/// first generation and the configuration's voters. Until D-107 the creation
 /// named the first generation whatever the snapshot held.
-// PROPOSED(D-107)
+// D-107
 fn created_from(descriptor: Option<&RangeDescriptor>, config: &Configuration) -> (u64, Vec<u64>) {
     descriptor.map_or_else(
         || {
@@ -4381,7 +4605,7 @@ fn created_from(descriptor: Option<&RangeDescriptor>, config: &Configuration) ->
 ///
 /// No read happens here: the descriptor is one the node read back already, so a
 /// statement adds a record and no disk operation, and moves no schedule.
-// PROPOSED(D-107): the restatement of §8 at every start, and an install's change.
+// D-107: the restatement of §8 at every start, and an install's change.
 fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, applied: Index) {
     env.trace(TraceEvent::RangeDescriptor {
         range: descriptor.range.get(),
@@ -4395,19 +4619,28 @@ fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, appli
     });
 }
 
+/// What [`split_applied`] is wired to: the host's table, the `snapshot` task's queue, the
+/// node's exclusion between a range's switch and its split's apply, and the node's variants.
+// PROPOSED(D-133)
+#[cfg(test)]
+pub(crate) type SplitWired = (
+    Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
+    Queue<SnapJob>,
+    Arc<install::SwitchOrSplit>,
+    NodeVariants,
+);
+
 /// A split's apply as the `apply` task makes it, for `install.rs`'s directed tests of what
 /// lands around a switch: the real [`ServerApplier::split`] of `parent` at `index`, cutting
-/// at `key`, on a voter of three, over `store`, the host's `table` and the `snapshot` task's
-/// `snaps`. Whether the split took.
-// PROPOSED(D-132)
+/// at `key`, on a voter of three, over `store`, the host's `table`, the `snapshot` task's
+/// `snaps` and the node's `switching`, under `variants`. Whether the split took.
+// D-132
+// PROPOSED(D-133): the exclusion shared with the task, and the node's variants.
 #[cfg(test)]
 pub(crate) async fn split_applied<E: Environment>(
     env: &E,
     store: &Arc<RaftStore<E>>,
-    (table, snaps): (
-        Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
-        Queue<SnapJob>,
-    ),
+    (table, snaps, switching, variants): SplitWired,
     (parent, right): (RangeId, RangeId),
     (index, key): (Index, &'static [u8]),
 ) -> bool {
@@ -4426,7 +4659,7 @@ pub(crate) async fn split_applied<E: Environment>(
         local: Queue::new(),
         snaps,
         engine_dir: PathBuf::from("/n1"),
-        node_variants: NodeVariants::correct(),
+        node_variants: variants,
         range_variants: RangeVariants::correct(),
         cores: Variants::default(),
         descriptors: table,
@@ -4443,6 +4676,8 @@ pub(crate) async fn split_applied<E: Environment>(
         )),
         id_block: 8,
         raft: RaftConfig::default(),
+        switching,
+        configured: Arc::default(),
     };
     matches!(
         applier
@@ -4461,7 +4696,7 @@ mod tests {
     /// and meanwhile finds the store moved past its entry — P's own live install
     /// switched — writes nothing and leaves the entry to the install. Asking the engine
     /// again there failed "applying 9 after 20", a server failure on correct code.
-    // PROPOSED(D-107)
+    // D-107
     #[test]
     fn a_non_voters_split_that_waits_for_the_engine_leaves_an_entry_an_install_moved_past() {
         use ananke_env::sim::{Sim, SimConfig};
@@ -4551,7 +4786,7 @@ mod tests {
     /// there, and keeps what it saw (issue #183). An event traced while the table's lock
     /// is held sees nothing, and is kept as such. `split_observed`'s [`LockHook`] keeps
     /// the same read at every acquisition of the table.
-    // PROPOSED(D-114)
+    // D-114
     #[derive(Clone)]
     struct Observed {
         inner: ananke_env::sim::SimEnv,
@@ -4633,14 +4868,14 @@ mod tests {
     }
 
     /// The name [`split_observed`]'s hook keeps a read under.
-    // PROPOSED(D-114)
+    // D-114
     const AN_ACQUISITION: &str = "an acquisition of the table";
 
     /// Runs `ServerApplier::split` of `parent` at index 9, cutting at `k5` with `right`
     /// the right half's id, on node `id` of the configuration {1, 2, 3}, on a host whose
     /// table starts as `before`, through [`Observed`] and a [`LockHook`] on that table.
     /// What they saw, the table after, and the apply's effect.
-    // PROPOSED(D-114)
+    // D-114
     fn split_observed(
         parent: &RangeDescriptor,
         before: &BTreeMap<RangeId, RangeDescriptor>,
@@ -4722,6 +4957,8 @@ mod tests {
                     )),
                     id_block: 8,
                     raft: RaftConfig::default(),
+                    switching: Arc::default(),
+                    configured: Arc::default(),
                 };
                 let outcome = applier
                     .split(
@@ -4748,7 +4985,7 @@ mod tests {
     }
 
     /// The split [`split_observed`] runs, and the tables a reader can find through it.
-    // PROPOSED(D-114)
+    // D-114
     struct SplitCase {
         r: RangeId,
         parent: RangeDescriptor,
@@ -4763,7 +5000,7 @@ mod tests {
     }
 
     /// P, range 4 over `[k0, k9)`, split at `k5` into R, range 9, with range 5 beside it.
-    // PROPOSED(D-114)
+    // D-114
     fn split_case() -> SplitCase {
         let p = RangeId(4);
         let r = RangeId(9);
@@ -4845,7 +5082,7 @@ mod tests {
     ///   `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` catches R's
     ///   descriptor landing past that await (`sim/tests/node.rs`, D-109 §1.6's rule), not
     ///   two acquisitions as such.
-    // PROPOSED(D-114)
+    // D-114
     #[test]
     fn a_voters_split_puts_both_descriptors_in_the_hosts_table_in_one_acquisition() {
         use crate::install::{Admission, admission};
@@ -4914,7 +5151,7 @@ mod tests {
     /// install is how R would reach it, and the overlap rule admitting one there is right.
     /// Its table goes from P to P narrowed in one acquisition, with the range beside P
     /// untouched. See the voter's test for what these read and what they do not see.
-    // PROPOSED(D-114)
+    // D-114
     #[test]
     fn a_non_voters_split_puts_ps_descriptor_in_the_hosts_table_in_one_acquisition() {
         let case = split_case();
@@ -4954,9 +5191,9 @@ mod tests {
     /// generation only for a snapshot that carries no descriptor. This holds the reading
     /// itself, which a revert of its call site passes. What reaches the call site in a
     /// run is a re-seed after a split, `reseed::run_after_split`, whose test fails on that
-    /// revert (issue #172; PROPOSED D-115).
-    // PROPOSED(D-107)
-    // PROPOSED(D-115): the run that holds the call site, named above.
+    /// revert (issue #172; D-115).
+    // D-107
+    // D-115: the run that holds the call site, named above.
     #[test]
     fn an_install_creation_names_the_snapshots_generation_and_voters() {
         let split = RangeDescriptor {
@@ -4975,9 +5212,9 @@ mod tests {
     /// An install creates only a replica that holds no descriptor and nothing else: what
     /// a re-seed's user range is before its install. A re-seed's system range holds the
     /// descriptor its re-seed wrote, and a bootstrap's replica the one its bootstrap
-    /// wrote, each at applied 0 with an empty log, and neither is created (PROPOSED D-116
+    /// wrote, each at applied 0 with an empty log, and neither is created (D-116
     /// §4). `split::run_cut_from_the_start` reaches the second in a run.
-    // PROPOSED(D-116)
+    // D-116
     #[test]
     fn an_install_creates_only_a_replica_that_holds_no_descriptor() {
         assert!(
@@ -5000,6 +5237,179 @@ mod tests {
             !install_creates(false, 0, 0, (5, 2)),
             "a replica with a snapshot"
         );
+    }
+
+    /// The restatement at `Switched` moves the `apply` task's applied index, and the
+    /// store's, up to the snapshot and never back (issue #113). A switch to 383 stepped
+    /// after a job the replaced core queued before the hold applied 384 to 386 keeps
+    /// 386: taken back to 383, the task applies 384 to 386 again when the new replica's
+    /// first `Apply` names them, and where that job's record compacted the replica past
+    /// them the `Apply` starts at 387 and the task fails the range, "apply of 387 after
+    /// 383". A replaced replica's index at or below the snapshot moves up to it, which is
+    /// D-086's restatement unchanged.
+    ///
+    /// The pair is [`NodeVariant::SwitchForgetsLateApplies`], which takes it back. This
+    /// holds the rule, as `install_creates`' test above holds its reading; its two call
+    /// sites in `installed`, which no sweep reaches at its tiers (PROPOSED D-126 measures
+    /// the late job; seed 13283 of the sharded sweep, past the nightly's range, reached it
+    /// on D-126's own tree and failed on #225's window on the correct node too, and on the
+    /// Stage C integration's tree reaches it on neither schedule, D-126 sections 6 and 7),
+    /// are held by the test below, and the watermark's half of the same variant is paired
+    /// in `round`.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_restatement_at_switched_keeps_what_was_applied_past_the_snapshot() {
+        let correct = NodeVariants::correct();
+        assert!(
+            kept_past_the_switch(386, 383, correct),
+            "entries applied after the switch are kept"
+        );
+        assert!(
+            !kept_past_the_switch(383, 383, correct),
+            "the snapshot itself"
+        );
+        assert!(
+            !kept_past_the_switch(380, 383, correct),
+            "the replaced replica's index moves up to the snapshot"
+        );
+        let buggy = NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies]);
+        assert!(
+            !kept_past_the_switch(386, 383, buggy),
+            "the variant takes the late job's applies back to the snapshot"
+        );
+        assert!(!kept_past_the_switch(380, 383, buggy));
+    }
+
+    /// The restatement at `Switched` through `ServerHost::installed` itself, at both of its
+    /// call sites, the `apply` task's applied state and the store's applied index (#113's
+    /// review, F2): the test above holds the rule, and either call site made to skip it
+    /// passed every test of the tree. R2's task and store stand at `held` when the host
+    /// steps a switch to a snapshot at 30. At 32, what a late job applied past the
+    /// snapshot, the correct host leaves both at 32 and `SwitchForgetsLateApplies` takes
+    /// both back to 30. At 28, a replaced replica's index, both move up to 30 on either,
+    /// which is D-086's restatement unchanged.
+    // PROPOSED(D-126)
+    #[test]
+    fn the_host_keeps_at_switched_what_the_task_and_the_store_applied_past_the_snapshot() {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        const R2: RangeId = RangeId(2);
+        /// What the host left: whether it built the switched replica, the `apply` task's
+        /// applied index and the store's.
+        type Restated = Option<(bool, Option<Index>, Index)>;
+        for (held, buggy, expected) in [
+            (32, false, 32),
+            (32, true, 30),
+            (28, false, 30),
+            (28, true, 30),
+        ] {
+            let mut sim = Sim::new(SimConfig::new(7));
+            let node = sim.add_node();
+            let env = sim.env(node);
+            let restated: Arc<Mutex<Restated>> = Arc::default();
+            env.clone().spawn("test", {
+                let (env, restated) = (env.clone(), restated.clone());
+                async move {
+                    let (store, _) = RaftStore::open_dir(
+                        env.clone(),
+                        EngineConfig::new(PathBuf::from("/n1")),
+                        KeyPrefix::group(R2.get()),
+                    )
+                    .await
+                    .expect("the store opens");
+                    let store = Arc::new(store);
+                    store.installed_at(held);
+                    let voters = vec![ServerId(1), ServerId(2), ServerId(3)];
+                    let config = Configuration::of(&voters);
+                    let descriptor = RangeDescriptor {
+                        range: R2,
+                        start: Bytes::from_static(b"k0"),
+                        end: Bytes::from_static(b"k9"),
+                        generation: FIRST_GENERATION,
+                        voters: voters.clone(),
+                        state: RangeState::Live,
+                    };
+                    let sock = env
+                        .net()
+                        .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                        .await
+                        .expect("a bind");
+                    let host = ServerHost {
+                        env: env.clone(),
+                        id: ServerId(1),
+                        sock: Arc::new(sock),
+                        addrs: BTreeMap::new(),
+                        stores: Arc::new(Mutex::new([(R2, store.clone())].into())),
+                        replicas: Arc::default(),
+                        jobs: Queue::new(),
+                        answers: Queue::new(),
+                        snaps: Queue::new(),
+                        ranges: Vec::new(),
+                        initial: voters.clone(),
+                        raft: RaftConfig::default(),
+                        variants: Variants::default(),
+                        node: if buggy {
+                            NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies])
+                        } else {
+                            NodeVariants::correct()
+                        },
+                        range_variants: RangeVariants::correct(),
+                        gaps: Mutex::new(Gaps::default()),
+                        descriptors: Arc::new(Mutex::new([(R2, descriptor.clone())].into())),
+                        led: Mutex::new(BTreeMap::new()),
+                        meta: Queue::new(),
+                        ids: Arc::new(Mutex::new(IdBlocks::new(1))),
+                        refill_at: 0,
+                        applied: Arc::new(Mutex::new(
+                            [(
+                                R2,
+                                Applied {
+                                    index: held,
+                                    term: 2,
+                                    config: config.clone(),
+                                },
+                            )]
+                            .into(),
+                        )),
+                        placeholders: Arc::default(),
+                        on_a_reseed: false,
+                        switching: Arc::default(),
+                    };
+                    let core = Raft::new(
+                        ServerId(1),
+                        config.clone(),
+                        RaftConfig {
+                            range: R2.get(),
+                            ..RaftConfig::default()
+                        },
+                        7,
+                    );
+                    let at = Identity {
+                        term: 2,
+                        last_index: 30,
+                        last_term: 2,
+                    };
+                    let switched = host.installed(
+                        R2,
+                        &core,
+                        &at,
+                        &config,
+                        Some(&descriptor),
+                        Some(&descriptor),
+                    );
+                    let task = lock(&host.applied).get(&R2).map(|state| state.index);
+                    *lock(&restated) = Some((switched.is_some(), task, store.applied()));
+                }
+            });
+            sim.run_for(Duration::from_secs(1));
+            let restated = lock(&restated).take();
+            assert_eq!(
+                restated,
+                Some((true, Some(expected), expected)),
+                "held {held}, buggy: {buggy}: the replica built, the task's applied index and \
+                 the store's"
+            );
+        }
     }
 
     fn client_addr() -> SocketAddr {
@@ -5028,7 +5438,7 @@ mod tests {
     /// of the node.
     ///
     /// Two cores refuse at the step, and the reasoning covers both: one that does
-    /// **not** lead, and — since PROPOSED D-129 — a *leading* one with no lease that
+    /// **not** lead, and — since D-129 — a *leading* one with no lease that
     /// can confirm no read. `core::on_read` returns before it pushes the read in each
     /// case, so neither is ever named again, and the second is the case that makes this
     /// a live path rather than a follower's housekeeping.
@@ -5099,5 +5509,170 @@ mod tests {
         // `answer_read` takes it when the answer comes.
         assert!(replica.reads.remove(&id).is_some());
         assert!(replica.reads.is_empty());
+    }
+
+    /// What [`split_with_no_descriptor`] found once the split's apply was done: its effect
+    /// and outcome, P's and R's descriptors as the store holds them, the host's table, and
+    /// the store's applied index.
+    type NoDescriptor = (
+        Option<(ApplyEffect, Outcome)>,
+        Option<RangeDescriptor>,
+        Option<RangeDescriptor>,
+        BTreeMap<RangeId, RangeDescriptor>,
+        Index,
+    );
+
+    /// [`split_case`]'s split at index 9, on a voter of three whose replica of P holds no
+    /// descriptor and has applied 1 to 8 with nothing in them, as a re-seeded replica its
+    /// log brings back does; `configured` is what configuration names, and `node_variants`
+    /// the node's set.
+    // PROPOSED(D-138)
+    fn split_with_no_descriptor(
+        configured: BTreeMap<RangeId, RangeDescriptor>,
+        node_variants: NodeVariants,
+    ) -> NoDescriptor {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let mut sim = Sim::new(SimConfig::new(7));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let table: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
+        let found: Arc<Mutex<Option<NoDescriptor>>> = Arc::default();
+        env.clone().spawn("test", {
+            let (env, table, found) = (env.clone(), table.clone(), found.clone());
+            async move {
+                let prefix = KeyPrefix::group(p.get());
+                let (store, _) = RaftStore::open_dir(
+                    env.clone(),
+                    EngineConfig::new(PathBuf::from("/n1")),
+                    prefix.clone(),
+                )
+                .await
+                .expect("the store opens");
+                let store = Arc::new(store);
+                for index in 1..=8 {
+                    store
+                        .apply(index, WriteBatch::new())
+                        .await
+                        .expect("an empty apply");
+                }
+                let sock = env
+                    .net()
+                    .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                    .await
+                    .expect("a bind");
+                let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+                let applier = ServerApplier {
+                    env: env.clone(),
+                    id: ServerId(1),
+                    sock: Arc::new(sock),
+                    stores: Arc::default(),
+                    replicas: Arc::default(),
+                    local: Queue::new(),
+                    snaps: Queue::new(),
+                    engine_dir: PathBuf::from("/n1"),
+                    node_variants,
+                    range_variants: RangeVariants::correct(),
+                    cores: Variants::default(),
+                    descriptors: table.clone(),
+                    applied: Arc::new(Mutex::new(
+                        [(
+                            p,
+                            Applied {
+                                index: 8,
+                                term: 1,
+                                config,
+                            },
+                        )]
+                        .into(),
+                    )),
+                    id_block: 8,
+                    raft: RaftConfig::default(),
+                    switching: Arc::default(),
+                    configured: Arc::new(configured),
+                };
+                let answered = applier
+                    .split(p, 9, &Bytes::from_static(b"k5"), r.get(), &store)
+                    .await
+                    .expect("the split's apply");
+                let held = |range: RangeId| {
+                    let store = store.clone();
+                    async move {
+                        store
+                            .engine()
+                            .get(&KeyPrefix::group(range.get()).descriptor_key())
+                            .await
+                            .expect("a read")
+                            .map(|bytes| RangeDescriptor::decode(bytes).expect("a descriptor"))
+                    }
+                };
+                let (left, right) = (held(p).await, held(r).await);
+                let applied = store.applied();
+                *lock(&found) = Some((answered, left, right, lock(&table).clone(), applied));
+            }
+        });
+        sim.run_for(Duration::from_secs(1));
+        lock(&found).take().expect("the split's apply finished")
+    }
+
+    /// #199: a replica of P that holds no descriptor, a re-seeded user range its log brought
+    /// back from the first entry, applies P's split from the descriptor configuration names
+    /// for P, as a replica holding that descriptor from its bootstrap does: it takes it,
+    /// writes P's left half and R at the next generation, and puts both in the host's table.
+    /// Under `ReplayedRangeRefusesItsSplit` it refuses it, `NotLive`, and writes nothing but
+    /// the applied index, which is the effect state machine safety saw differ. A range
+    /// configuration does not name has no descriptor to fall back on, and is refused as before.
+    // PROPOSED(D-138)
+    #[test]
+    fn a_replica_with_no_descriptor_takes_a_split_from_the_descriptor_configuration_names() {
+        let case = split_case();
+        let (p, r) = (case.parent.range, case.r);
+        let configured: BTreeMap<RangeId, RangeDescriptor> = [(p, case.parent.clone())].into();
+        let left = case.after.get(&p).cloned().expect("P's left half");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(configured.clone(), NodeVariants::correct());
+        assert_eq!(
+            answered,
+            Some((ApplyEffect::Took, Outcome::Done)),
+            "the split is taken from configuration's descriptor"
+        );
+        assert_eq!(held_left.as_ref(), Some(&left), "P's left half is written");
+        assert_eq!(held_right.as_ref(), Some(&case.right), "R is written");
+        assert_eq!(
+            table,
+            [(p, left), (r, case.right.clone())].into(),
+            "both halves are in the host's table"
+        );
+        assert_eq!(applied, 9);
+
+        let expected = Some((
+            ApplyEffect::Refused,
+            Outcome::Refused(SplitRefusal::NotLive),
+        ));
+        let (answered, held_left, held_right, table, applied) = split_with_no_descriptor(
+            configured,
+            NodeVariants::of(&[NodeVariant::ReplayedRangeRefusesItsSplit]),
+        );
+        assert_eq!(answered, expected, "the variant refuses the split");
+        assert_eq!(
+            (held_left, held_right),
+            (None, None),
+            "and writes neither half"
+        );
+        assert!(table.is_empty(), "and puts nothing in the host's table");
+        assert_eq!(applied, 9, "and applies the entry as nothing");
+
+        let (answered, held_left, held_right, table, applied) =
+            split_with_no_descriptor(BTreeMap::new(), NodeVariants::correct());
+        assert_eq!(
+            answered, expected,
+            "a range configuration does not name is refused as before"
+        );
+        assert_eq!((held_left, held_right), (None, None));
+        assert!(table.is_empty());
+        assert_eq!(applied, 9);
     }
 }

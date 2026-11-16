@@ -103,7 +103,7 @@ pub struct Submission {
 /// *placeholder* for the range — no descriptor, no span, no Raft state — and answers
 /// for it as a refused server answers, so the leader that sent it feeds the node the
 /// range's snapshot (`Host::unheld`).
-// PROPOSED(D-109): a message for a range not held is the placeholder's.
+// D-109: a message for a range not held is the placeholder's.
 #[derive(Clone, Debug)]
 pub struct Unheld {
     /// The range the message names, which the node does not hold.
@@ -135,7 +135,7 @@ pub struct Round {
     /// The round's messages for ranges this node holds no core of, in the order they
     /// arrived: each a placeholder's to answer before the round's sync, since a
     /// placeholder has nothing to persist (SHARD.md §5, Q22).
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     pub unheld: Vec<Unheld>,
 }
 
@@ -613,7 +613,7 @@ impl Cores {
             // A message for a range this node does not hold: counted, never silent, and
             // handed to the node, whose placeholder for the range answers it (SHARD.md
             // §5, Q22).
-            // PROPOSED(D-109): a message for a range not held is the placeholder's.
+            // D-109: a message for a range not held is the placeholder's.
             self.meters.messages_for_ranges_not_held += 1;
             if let Input::Message { from, message, .. } = input {
                 round.unheld.push(Unheld {
@@ -644,7 +644,36 @@ impl Cores {
             .config()
             .variants
             .contains(ananke_raft::core::Variant::SendBeforePersist);
+        let prefix_before = slot.core.snapshot().0;
         let outputs = slot.core.step(input);
+        // A compaction the step took carries the watermark up with it. The indices it
+        // drops were applied — a take or a record is written at the `apply` task's own
+        // applied index, the rule `RaftStore::open` reads as `applied.max(snap_index)` —
+        // and an `Apply` names every index from the watermark up, which a log that now
+        // begins above the watermark does not hold.
+        //
+        // On every path the sweeps reach this changes nothing: the task's index is at or
+        // below what was handed to it, so a compaction never passes the watermark. The
+        // one path where it does is a record the *replaced* core asked for (issue
+        // #113). The node holds a range's core across its live install and not its
+        // `apply` task, so a job the old core queued before the hold can land after the
+        // switch: its entries above the snapshot apply, a record queued behind them is
+        // written at that higher index, and its `SnapshotTaken`, held with the range's
+        // other local inputs, is stepped into the replica the switch built
+        // (`Node::restore`, then its replay). That core compacts past the watermark the
+        // switch set to the snapshot, and its next `Apply` named the first index it had
+        // compacted away. The entries are not lost — the task applied them — so the
+        // watermark moves to the prefix and nothing is handed out twice.
+        //
+        // Only a compaction *this step took*: a core put on the node already compacted
+        // brings its watermark with it (`insert`, `installed`), and raising it here on
+        // every step would hide [`NodeVariant::RestartAppliesFromZero`]'s gap behind
+        // this rule. [`NodeVariant::SwitchForgetsLateApplies`] leaves it where it was.
+        // PROPOSED(D-126): a compaction carries the applied watermark with it.
+        let prefix = slot.core.snapshot().0;
+        if prefix > prefix_before && !variants.contains(NodeVariant::SwitchForgetsLateApplies) {
+            applied = applied.max(prefix);
+        }
         let mut persisted = false;
         for output in outputs {
             match output {
@@ -908,6 +937,133 @@ mod tests {
             entries_to_apply(core, correct.applied_sent(R1), 40).is_ok(),
             "from the replica's own index there is nothing owed and no gap"
         );
+    }
+
+    /// A record the replaced core asked for, answered into the replica a live install
+    /// built, raises the watermark with the compaction it makes (issue #113).
+    ///
+    /// The steps are the ones the node takes, in its order. The range is held across its
+    /// install and the switch builds a replica on a snapshot at 383 that keeps the tail
+    /// to 395 its log agreed on (`Cores::installed`). A job the old core queued before
+    /// the hold lands after the switch: the `apply` task applies 384 to 386 from it and
+    /// a record queued behind it is written at 386, and their answers, held with the
+    /// range's other local inputs, are stepped into the new replica after the switch
+    /// (`Node::restore`, then its replay): `Applied(386)`, then `SnapshotTaken` at 386,
+    /// which compacts that core past the watermark the switch set to 383. Then the
+    /// leader's next heartbeat commits 389.
+    ///
+    /// The correct node's `Apply` hands the task 387 to 389. Under
+    /// [`NodeVariant::SwitchForgetsLateApplies`] it names 384, which the core no longer
+    /// holds — the issue's own numbers, "an apply through 389 names index 384", and
+    /// the node stops on it (`a_gap_in_the_applied_stream_fails_the_node_and_an_empty
+    /// _job_is_not_a_job`). No sweep reaches the late job at its tiers (PROPOSED D-126
+    /// measures it; seed 13283 of the sharded sweep, past the nightly's range, reached it on
+    /// D-126's own tree and failed on #225's window on the correct node too, and on the
+    /// Stage C integration's tree reaches it on neither schedule, D-126 sections 6 and 7),
+    /// so this is the variant's pair, beside the restatement's in `server`.
+    // PROPOSED(D-126)
+    #[test]
+    fn a_record_the_replaced_core_asked_for_raises_the_watermark_with_its_compaction() {
+        let run = |variants: NodeVariants| {
+            let env = env();
+            let mut cores = Cores::new(variants);
+            cores.insert(R1, core(R1));
+            cores.hold_for_install(R1);
+            let tail: Vec<Entry> = (384..=395)
+                .map(|index| Entry {
+                    index,
+                    term: 2,
+                    payload: Payload::Command(Bytes::from_static(b"x")),
+                })
+                .collect();
+            let switched = Raft::restore_compacted(
+                ME,
+                Configuration::of(&[ME, LEADER, ServerId(3)]),
+                RaftConfig {
+                    range: R1.get(),
+                    ..RaftConfig::default()
+                },
+                7,
+                2,
+                None,
+                383,
+                2,
+                None,
+                tail,
+                false,
+            );
+            let _ = cores.installed(&env, R1, switched);
+            assert_eq!(
+                cores.applied_sent(R1),
+                383,
+                "the switch sets it to the snapshot"
+            );
+            // The late job's answers, in the order the `apply` task pushed them.
+            let _ = cores.messages(&env, [(R1, Input::Applied(386), None, 0)]);
+            let round = cores.messages(
+                &env,
+                [(
+                    R1,
+                    Input::SnapshotTaken {
+                        index: 386,
+                        term: 2,
+                    },
+                    None,
+                    0,
+                )],
+            );
+            assert_eq!(round.persists.len(), 1, "the compaction persists");
+            let _ = cores.resolved(&env, R1);
+            assert_eq!(
+                cores.core(R1).expect("r1").snapshot().0,
+                386,
+                "the replica compacts to the record"
+            );
+            let heartbeat = Input::Message {
+                from: LEADER,
+                message: Message::AppendEntries {
+                    term: 2,
+                    prev_index: 395,
+                    prev_term: 2,
+                    entries: Vec::new(),
+                    commit: 389,
+                    sent: 0,
+                },
+                now: 0,
+            };
+            let round = cores.messages(&env, [(R1, heartbeat, None, 0)]);
+            let applies: Vec<(Index, Result<Vec<Index>, Index>)> = round
+                .early
+                .iter()
+                .filter_map(|act| match (&act.output, &act.entries) {
+                    (Output::Apply { through }, Some(job)) => Some((
+                        *through,
+                        job.as_ref()
+                            .map(|entries| entries.iter().map(|entry| entry.index).collect())
+                            .map_err(|index| *index),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            (applies, cores.applied_sent(R1))
+        };
+
+        let (applies, sent) = run(NodeVariants::correct());
+        assert_eq!(
+            applies,
+            vec![(389, Ok(vec![387, 388, 389]))],
+            "the correct node hands out what the task has not applied, and no gap"
+        );
+        assert_eq!(sent, 389);
+
+        let (applies, sent) =
+            run(NodeVariants::correct().with(NodeVariant::SwitchForgetsLateApplies));
+        assert_eq!(
+            applies,
+            vec![(389, Err(384))],
+            "the variant names the first index the compaction took: the issue's numbers"
+        );
+        assert_eq!(sent, 383, "and the watermark stays below the prefix");
     }
 
     /// A step's `Persist` is the first of its outputs (`finish`, core.rs:1277-1300),
@@ -1174,7 +1330,7 @@ mod tests {
     /// silence: with four ranges to a node and a rebalancer moving them, a frame
     /// routed by a stale map must not look like no frame at all. And it is handed on,
     /// whole, for the placeholder that answers it (SHARD.md §5, Q22).
-    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    // D-109: a message for a range not held is the placeholder's.
     #[test]
     fn a_message_for_a_range_the_node_does_not_hold_is_counted() {
         let env = env();

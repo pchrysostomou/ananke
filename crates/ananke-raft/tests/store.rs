@@ -598,9 +598,9 @@ fn user_keys_are_tenant_2_and_tenant_1_stays_empty() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Removal {
     /// One step: the batch rides as the repair of the range delete
-    /// (`RaftStore::apply_removing`, PROPOSED D-107).
+    /// (`RaftStore::apply_removing`, D-107).
     OneStep,
-    /// The known-buggy shape the node ran until PROPOSED D-107: the synced batch, then
+    /// The known-buggy shape the node ran until D-107: the synced batch, then
     /// the range delete as a second engine call.
     BatchThenDelete,
 }
@@ -760,11 +760,11 @@ fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> 
 }
 
 /// A right half made on a quarantined replica of its parent takes the quarantine in the
-/// split's own batch, where one made on a replica with no quarantine takes none (PROPOSED
-/// D-130). `RaftStore::quarantined` reads the flag with no I/O, as the store opened or as
+/// split's own batch, where one made on a replica with no quarantine takes none
+/// (D-130). `RaftStore::quarantined` reads the flag with no I/O, as the store opened or as
 /// the re-seed's mark set it, and both halves' flags are the disk's at the next open, which
 /// is what a restart restates.
-// PROPOSED(D-130)
+// D-130
 #[test]
 fn a_right_half_takes_its_parents_quarantine_in_the_splits_batch() {
     use ananke_raft::store::split_state_into;
@@ -834,7 +834,7 @@ fn a_right_half_takes_its_parents_quarantine_in_the_splits_batch() {
 ///
 /// The node sweep never runs this path (every replica votes every range there), so
 /// this directed test is its evidence until Stage D's move after a split reaches it.
-// PROPOSED(D-107): issue #139.
+// D-107: issue #139.
 #[test]
 fn a_non_voters_split_writes_its_batch_and_removes_the_right_span_in_one_step() {
     let seeds = 60u64;

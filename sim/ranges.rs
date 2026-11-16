@@ -1,6 +1,6 @@
 //! The node scenario (SHARD.md §2, §4 and §12's Stage B): three nodes, **four user
 //! ranges on every node**, each range placed as today's one group is, and — since
-//! PROPOSED D-096 — the root and the meta range every bootstrap node hosts, so each
+//! D-096 — the root and the meta range every bootstrap node hosts, so each
 //! node runs six replicas and the three are the bootstrap nodes.
 //!
 //! Every other scenario in this directory runs `ananke_raft::run`, one server that is
@@ -71,13 +71,13 @@ pub const RANGES: u64 = 4;
 /// runs today (`SINGLE_GROUP`).
 pub const FIRST_RANGE: u64 = 2;
 /// Range 0, the root, which every bootstrap node hosts (SHARD.md §1, §2).
-// PROPOSED(D-096)
+// D-096
 pub const ROOT_RANGE: u64 = 0;
 /// Range 1, the meta range, which every bootstrap node hosts (SHARD.md §1, §2).
-// PROPOSED(D-096)
+// D-096
 pub const META_RANGE: u64 = 1;
 /// The ranges a bootstrap node hosts: the two system ranges and [`RANGES`] user ranges.
-// PROPOSED(D-096)
+// D-096
 pub const HOSTED: u64 = RANGES + 2;
 /// The keys the clients draw from: two per range, so a range's liveness is about a
 /// key some client wrote to and not about the one key the cluster has.
@@ -100,15 +100,15 @@ pub const SNAPSHOT_CAP: usize = RANGES as usize;
 /// The block of range ids a refill grants a node, and the ids left in its block at
 /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and the same on
 /// every node scenario. Chosen on D-092's measurement, how often a split finds an empty
-/// block in `sim/shard.rs`, printed at every tier there (PROPOSED D-113 §8): at eight and two no
+/// block in `sim/shard.rs`, printed at every tier there (D-113 §8): at eight and two no
 /// block is spent, each `NoRangeId` being a restarted node's whose refill has not landed, where
 /// four and one spends them. Sixteen and four spends none either, and is refused on 4 seeds of a
 /// thousand against these 6, too few to choose by. A node takes an id only for a
-/// split, which only the node sweep's split arms (`sim/raft.rs`, PROPOSED D-100) and the
+/// split, which only the node sweep's split arms (`sim/raft.rs`, D-100) and the
 /// sharded sweep's driver ask; in the other node scenarios every node asks once at its start
 /// and at every restart.
-// PROPOSED(D-099)
-// PROPOSED(D-113): the pair measured, and kept.
+// D-099
+// D-113: the pair measured, and kept.
 pub const ID_BLOCK: u64 = 8;
 /// See [`ID_BLOCK`].
 pub const REFILL_AT: u64 = 2;
@@ -311,7 +311,7 @@ impl Report {
 
     /// How many replicas were created at bootstrap: three nodes times six ranges — the
     /// two system ranges and the four user ranges — on a run where no node's store
-    /// was replaced (PROPOSED D-096).
+    /// was replaced (D-096).
     #[must_use]
     pub fn bootstrap_creations(&self) -> usize {
         self.records()
@@ -391,8 +391,10 @@ impl Report {
 
     /// The longest a live range took after the last heal to complete a client write:
     /// the recovery time proper, under the same bound and with the same meaning of
-    /// `asked` ([`raft::Report::writes_after_heal_by_range`]).
+    /// `asked` ([`raft::Report::writes_after_heal_by_starting_range`]). This scenario
+    /// takes no split, so the map it started with is the one it ends with.
     // PROPOSED(D-076): the recovery time proper is asked per range.
+    // PROPOSED(D-121): the reading renamed for the map it reads.
     #[must_use]
     pub fn worst_range_recovery(&self, asked: bool) -> Option<Duration> {
         if asked && !self.checked.uniform() {
@@ -400,7 +402,7 @@ impl Report {
         }
         let live = self.checked.ranges_with_a_majority_up();
         self.checked
-            .writes_after_heal_by_range()
+            .writes_after_heal_by_starting_range()
             .into_iter()
             .filter(|(range, _)| live.contains(range))
             .filter_map(|(_, took)| took)
@@ -762,7 +764,7 @@ pub fn server_config_of(
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
         node,
-        // PROPOSED(D-105): the range layer's set beside the node's.
+        // D-105: the range layer's set beside the node's.
         // PROPOSED(D-108): the sweep and the scenarios beside it run none; the
         // refusal scenario runs `IncarnationPerRangeStream` (`refused_whole`).
         range_variants: range,
@@ -1353,7 +1355,7 @@ async fn client<E: Environment>(env: E, n: u64, stats: Arc<Mutex<ClientStats>>) 
                 // moves, so a mismatch is counted and the client tries elsewhere;
                 // the sweep's client (`raft::client_on`) is the one with a cache to
                 // merge it into (SHARD.md §3).
-                // PROPOSED(D-097)
+                // D-097
                 Some(Reply::RangeMismatch { .. }) => {
                     stats.lock().expect("the stats").mismatched += 1;
                     if now >= deadline {
@@ -1391,7 +1393,7 @@ async fn client<E: Environment>(env: E, n: u64, stats: Arc<Mutex<ClientStats>>) 
                         Outcome::Swapped(swapped) => ClientResult::Swapped(swapped),
                         Outcome::Value(value) => ClientResult::Value(value),
                         // A refusal answers a split, which no client sends as an
-                        // operation (SHARD.md §5, §9; PROPOSED D-100).
+                        // operation (SHARD.md §5, §9; D-100).
                         Outcome::Refused(reason) => {
                             unreachable!("a split's refusal, {reason:?}, as an operation")
                         }
@@ -1536,7 +1538,7 @@ pub fn run_with_of(
     if stopped.is_none() {
         advance(&mut sim, schedule.settle, &mut stopped);
     }
-    // Where the run stopped, for the liveness readings' end (PROPOSED D-102): the
+    // Where the run stopped, for the liveness readings' end (D-102): the
     // report this run is checked as carries no schedule of this scenario's.
     let ended = sim.now();
     let records = sim.trace();

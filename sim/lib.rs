@@ -10,7 +10,7 @@
 //! 1000 under `scripts/premerge.sh` in release on the machine in front of you, and
 //! 10 000 in the nightly workflow on GitHub, the only place ten thousand run. A sweep
 //! of a released phase's system runs [`released_seeds`] instead, which the premerge
-//! alone lowers, to CI's hundred (PROPOSED D-094). A seed that fails a sweep has its
+//! alone lowers, to CI's hundred (D-094). A seed that fails a sweep has its
 //! trace written through [`write_trace`] so the nightly can upload it and the studio
 //! can open it.
 
@@ -72,7 +72,7 @@ pub fn seeds() -> u64 {
 /// the current phase's, and a released phase's assertion gated `>= 1000` runs in the
 /// nightly alone, which sets nothing and sweeps every test at ten thousand. The gate
 /// and CI set nothing either, so their twenty and hundred are unchanged.
-// PROPOSED(D-094): the released phases' sweeps at CI's hundred under the premerge.
+// D-094: the released phases' sweeps at CI's hundred under the premerge.
 #[must_use]
 pub fn released_seeds() -> u64 {
     std::env::var("ANANKE_RELEASED_SEEDS")

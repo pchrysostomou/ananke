@@ -167,21 +167,21 @@ pub enum Variant {
     /// (`READS_OUTSTANDING`) is what catches it, on the directed run that holds a
     /// leader there with clients reading (`reseed::run_unconfirmable_reads`). The
     /// leader still traces the state: only the refusal and the drop are gone.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     UnconfirmableReadKept,
     /// A re-seeded replica of the **root**, range 0, grants votes and pre-votes past
     /// its quarantine, where every other replica of the node keeps D-035. It still
     /// never campaigns and still makes no lease promise: the one rule broken is "grants
     /// no vote". The cut then elects whoever is left on the root, where the keeper alone
-    /// is no majority. Until PROPOSED D-119 this passed ten thousand seeds of the sharded
+    /// is no majority. Until D-119 this passed ten thousand seeds of the sharded
     /// quorum scenario, which asked its hold of the user ranges alone (issue #143). A
     /// server of one group runs range 2 (`node::SINGLE_GROUP`), so this changes nothing
     /// there: it is a bug a node hosting the root can have and one group cannot.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     ReseededRootReplicaVotes,
     /// [`Variant::ReseededRootReplicaVotes`] on the **meta range**, range 1, and on no
     /// other: the second of the two ranges where the cluster's routing lives.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     ReseededMetaReplicaVotes,
 }
 
@@ -513,7 +513,7 @@ pub enum Input {
     /// half's replica on the node whose parent led at the split's apply. A pre-vote
     /// changes no term, so a repeat disturbs nothing; a quarantined server, a
     /// non-voter and a server that knows a leader do nothing with it.
-    // PROPOSED(D-100)
+    // D-100
     Campaign,
     /// The snapshot task completed a [`SnapshotAction::Take`]: a checkpoint at
     /// `index`, whose entry has `term`, is on disk and recorded (RAFT.md §1).
@@ -847,7 +847,7 @@ struct Progress {
     /// partitioned or silent follower keeps what it last said, and one that has said
     /// nothing yet counts as able, since that transient is the one D-076's bound was
     /// measured over.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     echoed_zero: bool,
 }
 
@@ -918,7 +918,7 @@ pub struct Raft {
     election_timeout: u64,
     heartbeat_elapsed: u64,
     /// Q21's hurry: repeat the pre-vote every heartbeat interval until a leader is
-    /// heard or the election timer fires (PROPOSED D-100).
+    /// heard or the election timer fires (D-100).
     hurry: bool,
     /// Ticks led since the last election won: a fresh leader defers threshold
     /// snapshots until it has led a while (D-030).
@@ -934,7 +934,7 @@ pub struct Raft {
     /// ([`TraceEvent::RaftReadsConfirmable`]). `on_read` does not read this: it asks
     /// the question afresh, since a configuration entry can change the answer between
     /// two looks.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     reads_confirmable: bool,
     reads: Vec<PendingRead>,
     /// The follower a transfer waits to catch up before TimeoutNow is sent.
@@ -1209,7 +1209,7 @@ impl Raft {
     /// Whether a membership change is under way on this server: the configuration in
     /// force is joint, or this leader is catching servers up as learners before its
     /// joint entry (D-032). What a leader refuses a split under (SHARD.md §5, Q23).
-    // PROPOSED(D-100)
+    // D-100
     #[must_use]
     pub fn changing(&self) -> bool {
         self.change.is_some() || self.membership.new_voters.is_some()
@@ -1330,7 +1330,7 @@ impl Raft {
     /// with nobody named the one-group server answers `NotLeader { leader: None }`,
     /// which a client takes as a reason to back off and try elsewhere. The node takes
     /// the registration back at the same output (`Replica::refuse`, D-076).
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     fn on_read(&mut self, id: u64, now: u64) {
         if self.role != Role::Leader {
             self.outputs.push(Output::Rejected {
@@ -1388,7 +1388,7 @@ impl Raft {
     /// store that answers so is re-seeded and quarantined for good, or refused and on
     /// its way there (D-035). A follower gone silent has said nothing of the kind, so
     /// it counts as able, and a read may wait on it for as long as it stays silent.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     fn can_confirm(&self, acks: &[ServerId]) -> bool {
         let mut on: Vec<ServerId> = self
             .progress
@@ -1419,7 +1419,7 @@ impl Raft {
     /// one way an install drops a read is a configuration entry taken into force since
     /// that look, which can narrow a majority with no recompute of its own — and such a
     /// read is one no round can confirm, which is what the drop is for.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     fn note_reads_confirmable(&mut self, follower: ServerId) {
         let confirmable = self.can_confirm(&[]);
         let mut dropped = 0u64;
@@ -1680,7 +1680,7 @@ impl Raft {
     }
 
     /// [`Input::Campaign`]: the pre-vote now, and the hurry set until a leader is
-    /// heard or the timer fires (SHARD.md §5, Q21; PROPOSED D-100).
+    /// heard or the timer fires (SHARD.md §5, Q21; D-100).
     fn on_campaign(&mut self) {
         if self.role != Role::Follower || self.leader.is_some() || !self.may_campaign() {
             return;
@@ -1796,7 +1796,7 @@ impl Raft {
                     self.outputs.push(Output::Snapshot(SnapshotAction::Record));
                 }
                 // Q21's hurry: the pre-vote again every heartbeat interval while no
-                // leader is heard, until the timer fires (PROPOSED D-100). Only while
+                // leader is heard, until the timer fires (D-100). Only while
                 // the pre-vote is what is in flight: a candidacy the pre-vote won waits
                 // for its votes under the election timeout, since a pre-vote started
                 // over it a heartbeat later would discard votes on their way and burn a
@@ -2093,7 +2093,7 @@ impl Raft {
             // incarnation, whether or not the progress itself is reset — the
             // record is what SHARD.md §8's `RaftMatchStarted` is keyed on.
             progress.match_started = false;
-            // PROPOSED(D-129): whether the store can confirm a read is what the old
+            // D-129: whether the store can confirm a read is what the old
             // store said, whether or not the progress itself is reset. The answer
             // this one came with, if it is an AppendEntries answer, says it again.
             progress.echoed_zero = false;
@@ -2173,7 +2173,7 @@ impl Raft {
         // PROPOSED(D-069): an install's answer raises `matched` under the
         // incarnation it carried, as an AppendEntries success does.
         self.note_match_started(to, before);
-        // PROPOSED(D-129): an install at a new incarnation forgot what the old store
+        // D-129: an install at a new incarnation forgot what the old store
         // said of this follower's reads, so the side can change here and is traced
         // here, as it is at an answer. Placed after `note_incarnation` cleared
         // `echoed_zero` and after the borrow of `progress` ends, and *before*
@@ -2751,7 +2751,7 @@ impl Raft {
 
     /// Whether D-035's quarantine refuses this replica a vote or a pre-vote: it does
     /// on every re-seeded replica, but for the one range a known-buggy variant names.
-    // PROPOSED(D-119): the hold clauses ask the system ranges too.
+    // D-119: the hold clauses ask the system ranges too.
     fn quarantine_refuses_votes(&self) -> bool {
         let votes_anyway = match self.config.range {
             0 => self
@@ -3044,7 +3044,7 @@ impl Raft {
         // never a read's confirmation, since it grants votes to nobody and a vote
         // majority need not cross it: such a follower commits and keeps the leader in
         // office, and cannot confirm a read for it, so the latest answer is kept
-        // (PROPOSED D-129). A rejection *carrying the refused mark* is a
+        // (D-129). A rejection *carrying the refused mark* is a
         // refused server's, one that holds nothing of this log: a sign of life that
         // check quorum counts only beside re-seed progress in the same window. A
         // quarantined follower that holds the log answers without the mark and
@@ -3066,7 +3066,7 @@ impl Raft {
             progress.active = true;
         }
         progress.quiet_ticks = 0;
-        // PROPOSED(D-129): a leader refuses a read it can never confirm.
+        // D-129: a leader refuses a read it can never confirm.
         progress.echoed_zero = echo == 0;
         if echo != 0 {
             progress.promise = progress.promise.max(Some(echo));
@@ -3086,7 +3086,7 @@ impl Raft {
                 }
             }
         }
-        // PROPOSED(D-129): after this answer's acknowledgement is on the reads it
+        // D-129: after this answer's acknowledgement is on the reads it
         // confirms, so a read it just made confirmable is not dropped.
         self.note_reads_confirmable(from);
         let Some(progress) = self.progress.get_mut(&from) else {

@@ -99,7 +99,7 @@ sent after the read arrived, waits until its applied index reaches the read inde
 serves the read from the engine at that state. If it has not yet committed an entry of
 its term, it waits for the no-op.
 
-A leader refuses a read it can never confirm (the owner's ruling, 2026-11-06; PROPOSED
+A leader refuses a read it can never confirm (the owner's ruling, 2026-11-06;
 D-129). It keeps, per follower, whether the follower's latest AppendEntries answer echoed
 zero (below, and §3): it sets that on such an answer, clears it on an answer with any
 other echo, and forgets it at a new store incarnation (D-042), so a store an operator
@@ -166,7 +166,7 @@ the slowest clock, the only way such a server ever leads. A server on a re-seede
 makes no promise (D-035): its responses echo zero, and the leader counts such a
 response for nothing in the lease or a read-index round, since that server grants votes
 to nobody and a vote majority need not cross it. A leader whose followers' latest answers
-leave it no majority refuses the reads no lease covers (above, PROPOSED D-129).
+leave it no majority refuses the reads no lease covers (above, D-129).
 
 **Membership changes by joint consensus (thesis §4.3).** A change from C_old to C_new
 is two log entries: `C_old,new` and, once that is committed, `C_new`. While the joint
@@ -253,7 +253,13 @@ an admitted assembly holds is given up when that range's own Raft supersedes its
 sender — a chunk of that range from a leader at a higher term takes it — and on a
 leader change the node observes for a range, the node ends the assembly the old leader
 held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
-proposed). On the node a chunk and its response are taken off the wire by the `net`
+proposed). On the node a chunk the receiver holds is never left unanswered, since its
+sender cannot tell silence from loss and counts it against the resend bound: a chunk of
+a stream whose install is pending is answered `Waiting`, and a chunk that arrives while
+the `snapshot` task makes an install, which it answers nothing during, is answered
+`Waiting` by the `net` task; and an answer counts from when it reaches the sender's node,
+so a chunk whose answer waits behind the sender's own work is not resent or counted
+(issue #120; D-127, proposed). On the node a chunk and its response are taken off the wire by the `net`
 task and handed to the `snapshot` task before the node's inbox sees them, so they are
 charged to that task's receive cap and not to the inbox's byte bound, and so they
 arrive at all: the core's arm for them is empty because the server is expected to route
@@ -410,8 +416,8 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
-| `RaftReadsConfirmable` | a follower's latest word showed a leader's reads changing sides: it and the followers able to confirm stopped, or started again, to form a majority of every voter set in force, or that word dropped reads with no change of side (PROPOSED D-129). An AppendEntries answer is one such word; a completed install is the other, which forgets what the follower's old store said (D-042) and so can only widen the side to `true` | `term`, `confirmable`, `follower`: whose word showed it, `dropped`: the pending reads it dropped |
-| `RaftReadRefused` | a leader refused a read no round can ever confirm (PROPOSED D-129) | `term` |
+| `RaftReadsConfirmable` | a follower's latest word showed a leader's reads changing sides: it and the followers able to confirm stopped, or started again, to form a majority of every voter set in force, or that word dropped reads with no change of side (D-129). An AppendEntries answer is one such word; a completed install is the other, which forgets what the follower's old store said (D-042) and so can only widen the side to `true` | `term`, `confirmable`, `follower`: whose word showed it, `dropped`: the pending reads it dropped |
+| `RaftReadRefused` | a leader refused a read no round can ever confirm (D-129) | `term` |
 | `RaftTransfer` | a leader sent TimeoutNow | `to` |
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
@@ -439,7 +445,7 @@ closes the node's restatement. A live install that changes an initialised replic
 descriptor traces a `RangeDescriptor` at the snapshot's last index after the switch's
 `RaftRecovered`. Both carry the applied index as `index` too, and follow the
 `RaftRecovered` that states it, which is how check 7 tells them from an apply's change
-(PROPOSED D-107).
+(D-107).
 
 Each event carries the node's persistent term, so the studio's per-term filter (issue
 #3) needs nothing more. Every check reads the trace of a run. Checks 1 to 4 and the
@@ -477,8 +483,9 @@ and their node and no server (`invariants::Traced`).
    been appended on a majority of the configuration then in force, which the
    reconstructed logs and `RaftConfig` events show. A group's first configuration —
    the one in force on a replica that has traced no `RaftConfig` — is the voters of its
-   `RangeCreated`, and servers 1 through the cluster's count for a group whose creation
-   the trace does not hold (PROPOSED D-071).
+   first `RangeCreated` that names any, and servers 1 through the cluster's count for a
+   group whose creation the trace does not hold or holds naming none (PROPOSED D-071,
+   D-125).
 4. **State machine safety.** Fold `RaftApply`: a map **per group** from index to
    (term, hash, effect); a second value for an index of a group is a violation, so two
    replicas that apply one entry to different effects — one executing a client's
@@ -754,7 +761,7 @@ it neither votes nor serves until a snapshot rebuilds it. A refused server trace
 is before it adopts an install or opens its store, and it answers every AppendEntries,
 whatever its term and entries, with a rejection carrying the request's term and
 previous index, a hint of 1, an echo of zero, so no lease promise or read confirmation
-is measured from it and a leader counts it as unable to confirm a read (§1, PROPOSED
+is measured from it and a leader counts it as unable to confirm a read (§1,
 D-129), store incarnation 0, since it has no store (D-042), and **the
 refused mark** (PROPOSED D-087). That
 rejection is how a leader learns the server needs a re-seed. It is a sign of life and
@@ -789,7 +796,7 @@ and counts for commit majorities, but grants no vote and no pre-vote, never camp
 and makes no lease promise, across any number of restarts and any later install on
 that history, since the state it lost may have included a vote. So it never confirms a
 read on that store, and with two of three quarantined the leader commits and refuses
-reads no lease covers until an operator replaces a store (§1, PROPOSED D-129).
+reads no lease covers until an operator replaces a store (§1, D-129).
 
 **The message codec.** `Message` is `PreVote`, `PreVoteResponse`, `RequestVote`,
 `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`, `InstallSnapshot`,
@@ -1025,9 +1032,9 @@ no known-buggy variant: its crash test,
 | `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
 | `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
 | `FollowerNeverCompacts` | §1 above: a replica that is not leading compacts to its own applied index once its log is more than `snapshot_threshold` entries past its prefix (D-065); the variant is the server as it was built before that, whose follower log shrinks only by truncation or install | the follower-log bound, `raft::FOLLOWER_LOG_BOUND`, 768 entries, asked of every replica on every seed: caught on 5 of the first 1 000 seeds (116, 429, 512, 577, 757), by that bound on all five, with 878 entries — 73 × the threshold — the largest, on seed 512. The rate is half a per cent, far under the gate's twenty seeds, so the pair is pinned at seed 512 rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound` | a replica that trails its leader and is never streamed a snapshot, over a run long enough for the lag to pass the bound's 768 entries |
-| `UnconfirmableReadKept` | §1: a leader refuses a read it can never confirm and drops the pending ones (the owner's ruling, PROPOSED D-129); the variant keeps them, the leader as built before it | the node's bound on registered reads, `READS_OUTSTANDING`, 38: a leader in the state commits, keeps its office and confirms nothing, and every fresh get adds a registration nothing will answer. Caught by the bound on every seed of the directed run, `reseed::run_unconfirmable_reads`, asserted at every tier (D-061) | a leader with both followers re-seeded and its clients reading, which the directed run builds on every seed. The one-group server holds no such bound, so the pair runs on the node. S10's sweep reaches the state on its own (seeds 128 and 643) |
-| `ReseededRootReplicaVotes` | §3: a re-seeded replica grants no vote and no pre-vote, for the rest of its life on that store (D-035); the variant grants them on the root, range 0, and on no other range (PROPOSED D-119) | the sharded quorum scenario's election clause: the keeper is elected on the root in the hold, where it alone is no majority and the re-seeded replica should not have made it one | a node hosting the root, with the root's leader on the far side of the cut |
-| `ReseededMetaReplicaVotes` | the same rule on the meta range, range 1, and on no other (PROPOSED D-119) | the same clause, on the meta range | the same, with the meta range's leader on the far side |
+| `UnconfirmableReadKept` | §1: a leader refuses a read it can never confirm and drops the pending ones (the owner's ruling, D-129); the variant keeps them, the leader as built before it | the node's bound on registered reads, `READS_OUTSTANDING`, 38: a leader in the state commits, keeps its office and confirms nothing, and every fresh get adds a registration nothing will answer. Caught by the bound on every seed of the directed run, `reseed::run_unconfirmable_reads`, asserted at every tier (D-061) | a leader with both followers re-seeded and its clients reading, which the directed run builds on every seed. The one-group server holds no such bound, so the pair runs on the node. S10's sweep reaches the state on its own (seeds 128 and 643) |
+| `ReseededRootReplicaVotes` | §3: a re-seeded replica grants no vote and no pre-vote, for the rest of its life on that store (D-035); the variant grants them on the root, range 0, and on no other range (D-119) | the sharded quorum scenario's election clause: the keeper is elected on the root in the hold, where it alone is no majority and the re-seeded replica should not have made it one | a node hosting the root, with the root's leader on the far side of the cut |
+| `ReseededMetaReplicaVotes` | the same rule on the meta range, range 1, and on no other (D-119) | the same clause, on the meta range | the same, with the meta range's leader on the far side |
 
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's

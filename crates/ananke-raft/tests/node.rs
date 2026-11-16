@@ -91,7 +91,7 @@ fn on_node<T: Send + 'static>(
 /// here by hand, since the frames are all this test is about: they grant what they are
 /// asked and answer every AppendEntries as a quarantined server does. A write in the same
 /// state commits through them, which is the asymmetry D-035 decides.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_one_group_leader_answers_a_read_it_can_never_confirm_naming_nobody() {
     let mut sim = Sim::new(SimConfig::new(11));

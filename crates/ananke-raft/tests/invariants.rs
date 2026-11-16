@@ -328,6 +328,116 @@ fn a_group_may_not_commit_on_a_minority_of_the_voters_it_was_created_with() {
     );
 }
 
+/// A group's two creations as issue #105 found them, in both orders the scheduler can
+/// trace them: one naming the group's voters, and one by a node outside the
+/// configuration, which names none.
+fn creations_in_either_order() -> [[TraceEvent; 2]; 2] {
+    [
+        [created(B, &[], 0, 0), created(B, &[4, 5, 6], 0, 0)],
+        [created(B, &[4, 5, 6], 0, 0), created(B, &[], 0, 0)],
+    ]
+}
+
+/// A creation with no voters states that its node holds an empty replica of the
+/// group, and nothing about the group's voters (issue #105): the configuration a
+/// replica with no `RaftConfig` commits on is that of the first creation that names
+/// any, whichever order the two were traced in. Read as the birth, the empty one
+/// gives a majority of nobody, `0 * 2 > 0`, and this commit on two of the three voters
+/// reads "durable on [4, 5] of voters []".
+// PROPOSED(D-125): a creation with no voters is no birth.
+#[test]
+fn a_creation_with_no_voters_is_not_a_groups_first_configuration_in_either_order() {
+    for creations in creations_in_either_order() {
+        let mut events = creations.to_vec();
+        events.extend([
+            append(4, B, 1, 1, 0xbb),
+            append(5, B, 1, 1, 0xbb),
+            leader(4, B, 1),
+            commit(4, B, 1, 1),
+        ]);
+        invariants::commit_majority(&events, SERVERS).unwrap();
+    }
+}
+
+/// And it has widened nothing: a commit short of a majority of the voters the creation
+/// named is the violation it always was, in both orders. A check that reached the case
+/// above by skipping a group with an empty creation would pass it and not this one.
+// PROPOSED(D-125): a creation with no voters is no birth.
+#[test]
+fn a_commit_short_of_the_voters_a_creation_named_is_a_violation_in_either_order() {
+    for creations in creations_in_either_order() {
+        let mut events = creations.to_vec();
+        events.extend([
+            append(4, B, 1, 1, 0xbb),
+            leader(4, B, 1),
+            commit(4, B, 1, 1),
+        ]);
+        assert_eq!(
+            invariants::commit_majority(&events, SERVERS).unwrap_err(),
+            "commit majority: leader 4 committed index 1 of group 3 (term 1) in term 1 with it durable on [4] of voters [4, 5, 6]"
+        );
+    }
+}
+
+/// A group every creation of which names no voters has told the trace nothing of its
+/// voters, and is read as a group whose creation the trace does not hold: servers 1
+/// through the cluster's count (`Checker::new`'s `initial`), on both sides of a
+/// majority of them.
+// PROPOSED(D-125): a creation with no voters is no birth.
+#[test]
+fn a_group_created_only_with_no_voters_takes_the_initial_configuration() {
+    let on_two = [
+        created(B, &[], 0, 0),
+        append(1, B, 1, 1, 0xbb),
+        append(2, B, 1, 1, 0xbb),
+        leader(1, B, 1),
+        commit(1, B, 1, 1),
+    ];
+    invariants::commit_majority(&on_two, SERVERS).unwrap();
+    let on_one = [
+        created(B, &[], 0, 0),
+        append(1, B, 1, 1, 0xbb),
+        leader(1, B, 1),
+        commit(1, B, 1, 1),
+    ];
+    assert_eq!(
+        invariants::commit_majority(&on_one, SERVERS).unwrap_err(),
+        "commit majority: leader 1 committed index 1 of group 3 (term 1) in term 1 with it durable on [1] of voters [1, 2, 3]"
+    );
+}
+
+/// Only the first creation that names voters is the birth: a later one naming others,
+/// as an install's names the descriptor its snapshot carried, does not replace it. A
+/// split's right half traces no `RaftConfig`, so a checker that took the last creation
+/// would read an install's voters as the right half's first configuration. Born on 4,
+/// 5 and 6 and then created naming 1, 2 and 3, the group commits on 4 and 5, and a
+/// commit on 1 and 2 is short of the voters it was born with; a checker that took the
+/// last creation reads both the other way round.
+// PROPOSED(D-125): only the first creation that names voters is the birth.
+#[test]
+fn a_later_creation_naming_other_voters_does_not_replace_the_groups_birth() {
+    let born = [created(B, &[4, 5, 6], 0, 0), created(B, &[1, 2, 3], 0, 0)];
+    let mut on_born = born.to_vec();
+    on_born.extend([
+        append(4, B, 1, 1, 0xbb),
+        append(5, B, 1, 1, 0xbb),
+        leader(4, B, 1),
+        commit(4, B, 1, 1),
+    ]);
+    invariants::commit_majority(&on_born, SERVERS).unwrap();
+    let mut on_later = born.to_vec();
+    on_later.extend([
+        append(1, B, 1, 1, 0xbb),
+        append(2, B, 1, 1, 0xbb),
+        leader(1, B, 1),
+        commit(1, B, 1, 1),
+    ]);
+    assert_eq!(
+        invariants::commit_majority(&on_later, SERVERS).unwrap_err(),
+        "commit majority: leader 1 committed index 1 of group 3 (term 1) in term 1 with it durable on [1, 2] of voters [4, 5, 6]"
+    );
+}
+
 /// The rescan at every `RaftLeader` is of that group's committed set: a new leader
 /// of B need hold nothing of what A committed. A checker with one committed set
 /// reads this as a leader missing a committed entry.

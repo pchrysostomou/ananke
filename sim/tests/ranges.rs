@@ -40,7 +40,7 @@ fn correct(seed: u64) -> ranges::Report {
 fn a_node_holds_four_ranges_from_its_configuration_and_every_one_of_them_runs() {
     let report = correct(1);
     report.check().expect("the correct node passes seed 1");
-    // PROPOSED(D-096): the two system ranges are created at bootstrap beside the four.
+    // D-096: the two system ranges are created at bootstrap beside the four.
     assert_eq!(
         report.bootstrap_creations(),
         (ranges::NODES * ranges::HOSTED) as usize,
@@ -58,7 +58,7 @@ fn a_node_holds_four_ranges_from_its_configuration_and_every_one_of_them_runs() 
             "range {range} applied nothing: {applies:?}"
         );
     }
-    // The run's end is the run's (PROPOSED D-102). The report this scenario is checked
+    // The run's end is the run's (D-102). The report this scenario is checked
     // as carries `Schedule::none()`, whose total is zero, and until D-102 the liveness
     // readings took the end from it: every run of this scenario ended at the origin by
     // that reading and a write pending at the end was never excused here. This
@@ -157,7 +157,7 @@ fn every_seed_passes_on_the_correct_node() {
         bound.saturating_sub(worst_recovery)
     );
     // The shape the keyed checks need, on every seed: six ranges on every node, the
-    // two system ranges included (PROPOSED D-096), each electing and applying.
+    // two system ranges included (D-096), each electing and applying.
     // Asserted at every tier, since it is what says the sweep can tell a keyed check
     // from a wrongly keyed one at all.
     assert_eq!(
@@ -560,7 +560,7 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
     for seed in 1..=4 {
         let records = ranges::alone(seed, std::time::Duration::from_millis(600));
         let first = ranges::first_campaigns(&records);
-        // PROPOSED(D-096): a bootstrap node hosts ranges 0 and 1 beside its four.
+        // D-096: a bootstrap node hosts ranges 0 and 1 beside its four.
         assert_eq!(
             first.len(),
             ranges::HOSTED as usize,
@@ -578,7 +578,7 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
              whose cores share one seed looks like"
         );
         // The figure measured above is the four user ranges', and stays theirs: the
-        // system ranges' draws are two more, read beside them (PROPOSED D-096).
+        // system ranges' draws are two more, read beside them (D-096).
         let user_at: BTreeSet<_> = first
             .iter()
             .filter(|(range, _)| **range >= ranges::FIRST_RANGE)
@@ -613,7 +613,7 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
 #[test]
 fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
     let for_ = std::time::Duration::from_millis(600);
-    // PROPOSED(D-096): the two system ranges go down with the node too.
+    // D-096: the two system ranges go down with the node too.
     let every_range: BTreeSet<u64> = [ranges::ROOT_RANGE, ranges::META_RANGE]
         .into_iter()
         .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))
@@ -715,7 +715,7 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
         RangeVariants::correct(),
     ));
-    // The store that opens first is range 0's since PROPOSED D-096, so that is the one
+    // The store that opens first is range 0's since D-096, so that is the one
     // range the variant refuses.
     assert_eq!(
         one_range.replicas_refused,
@@ -873,7 +873,7 @@ fn each_range_draws_its_election_timer_from_its_own_stream() {
             "ranges: seed {seed} campaign ticks with four ranges {with_four:?}, with three \
              {with_three:?}"
         );
-        // PROPOSED(D-096): the two system ranges campaign beside the three.
+        // D-096: the two system ranges campaign beside the three.
         assert_eq!(
             with_three.len(),
             three.len() + 2,
@@ -924,7 +924,7 @@ fn each_range_draws_its_election_timer_from_its_own_stream() {
 #[test]
 fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again() {
     let for_ = std::time::Duration::from_millis(600);
-    // PROPOSED(D-096): the two system ranges go down with the node too.
+    // D-096: the two system ranges go down with the node too.
     let every_range: BTreeSet<u64> = [ranges::ROOT_RANGE, ranges::META_RANGE]
         .into_iter()
         .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))

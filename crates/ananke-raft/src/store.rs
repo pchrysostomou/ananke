@@ -105,7 +105,7 @@ pub const PURPOSE_SNAPSHOT: u64 = 3;
 /// changes it. Its content is the range layer's (`ananke_shard::descriptor`); this
 /// crate names a group, never a range, and only keeps the key beside the group's
 /// other state so the whole of a replica is one key interval.
-// PROPOSED(D-096): the descriptor beside the replica's Raft state.
+// D-096: the descriptor beside the replica's Raft state.
 pub const PURPOSE_DESCRIPTOR: u64 = 4;
 const NO_VOTE: u64 = u64::MAX;
 
@@ -215,7 +215,7 @@ impl KeyPrefix {
         self.key(PURPOSE_SNAPSHOT, b"snapshot")
     }
 
-    /// The key the range's descriptor lives under (SHARD.md §1; PROPOSED D-096).
+    /// The key the range's descriptor lives under (SHARD.md §1; D-096).
     #[must_use]
     pub fn descriptor_key(&self) -> Bytes {
         self.key(PURPOSE_DESCRIPTOR, b"descriptor")
@@ -792,7 +792,7 @@ pub struct RaftStore<E: Environment> {
     /// the core's own flag (`core.quarantined()`), and the core and this store agree. A
     /// split's apply reads it here and not from the engine, so that a seed with no
     /// quarantine has the schedule it had before the rule that reads it (D-130).
-    // PROPOSED(D-130): a right half made on a quarantined parent takes the quarantine.
+    // D-130: a right half made on a quarantined parent takes the quarantine.
     quarantined: bool,
 }
 
@@ -1069,7 +1069,7 @@ impl<E: Environment> RaftStore<E> {
     /// is not a voter of the parent, whose switch replaces this key's one-key span, so
     /// that a read at a version below it finds the applied index absent, which reads
     /// as zero. Nothing reads a non-voter's applied index at such a version: the path
-    /// is reached by no scenario until Stage D's move after a split (PROPOSED D-107).
+    /// is reached by no scenario until Stage D's move after a split (D-107).
     ///
     /// Zero where the key is absent at that version, which is to say where nothing
     /// had applied when it was taken. A served read cannot see it: the core holds a
@@ -1217,7 +1217,7 @@ impl<E: Environment> RaftStore<E> {
 
     /// Whether this replica is quarantined on this store (D-035): the flag as it opened
     /// or as [`mark_reseeded`](Self::mark_reseeded) wrote it, with no read of the engine.
-    // PROPOSED(D-130)
+    // D-130
     #[must_use]
     pub fn quarantined(&self) -> bool {
         self.quarantined
@@ -1345,7 +1345,7 @@ impl<E: Environment> RaftStore<E> {
     /// ([`ananke_storage::InstallRefused::InProgress`]) while another install runs on
     /// the engine, with nothing written, which the caller retries; refused for spans
     /// that overlap when `removed` holds a written key.
-    // PROPOSED(D-107): a split's non-voter writes its batch and the right span's
+    // D-107: a split's non-voter writes its batch and the right span's
     // removal in one switch (SHARD.md §5; issue #139).
     pub async fn apply_removing(
         &self,
@@ -1445,7 +1445,7 @@ pub(crate) fn encode_entry(entry: &Entry) -> Bytes {
 /// is written for them. What the batch is synced with, and what else it carries, is
 /// the caller's; `open` reads a configuration at index 0 as the store's own with
 /// nothing in the log (D-029).
-// PROPOSED(D-096): a bootstrap node writes every range's initial state in one batch.
+// D-096: a bootstrap node writes every range's initial state in one batch.
 pub fn initial_state_into(prefix: &KeyPrefix, config: &Configuration, batch: &mut WriteBatch) {
     batch.put(prefix.config_key(), encode_config(0, config));
     batch.put(
@@ -1464,8 +1464,8 @@ pub fn initial_state_into(prefix: &KeyPrefix, config: &Configuration, batch: &mu
 /// on this store: where it is set the right half takes the quarantine flag in the same
 /// batch, since the split may be a replay of one the node applied before its loss, and
 /// the vote the right half's lost replica cast went with that loss (D-035, D-130).
-// PROPOSED(D-100)
-// PROPOSED(D-130): a right half made on a quarantined parent takes the quarantine.
+// D-100
+// D-130: a right half made on a quarantined parent takes the quarantine.
 pub fn split_state_into(
     prefix: &KeyPrefix,
     config: &Configuration,

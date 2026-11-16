@@ -41,7 +41,7 @@ pub fn user_key(user: &[u8]) -> Bytes {
 
 /// The user key an encoded key of the user's store carries: the inverse of
 /// [`user_key`], `None` for a key of another tenant or table.
-// PROPOSED(D-100): a restart reads a split's right half back from its descriptor.
+// D-100: a restart reads a split's right half back from its descriptor.
 #[must_use]
 pub fn user_key_of(encoded: &[u8]) -> Option<&[u8]> {
     let prefix = user_key(&[]);
@@ -98,7 +98,7 @@ pub enum Command {
     /// state machine applies as a maximum by generation. An entry, applied by the
     /// range layer before [`apply_command`] sees it; this crate reads nothing of it
     /// (SHARD.md, Q40), and a one-group server never receives one.
-    // PROPOSED(D-098)
+    // D-098
     MetaUpdate {
         /// The descriptors, encoded.
         descriptors: Vec<Bytes>,
@@ -107,7 +107,7 @@ pub enum Command {
     /// asked of the meta range, the descriptor of the range whose span holds `key`.
     /// A read, served as a get is and never an entry, and not a command that touches
     /// `key`: it asks *about* it (Q36), so [`Command::key`] is `None`.
-    // PROPOSED(D-098)
+    // D-098
     Lookup {
         /// The key asked about.
         key: Bytes,
@@ -118,7 +118,7 @@ pub enum Command {
     /// the range layer before [`apply_command`] sees it, as a `MetaUpdate` is; this
     /// crate reads nothing of it, and a one-group server never receives one. It
     /// touches no key of the command's own, so [`Command::key`] is `None`.
-    // PROPOSED(D-099)
+    // D-099
     Refill {
         /// The asking node.
         node: u64,
@@ -133,7 +133,7 @@ pub enum Command {
     /// reads nothing of, and a one-group server never receives. It touches no key of
     /// its own: `key` is where the span is cut, so [`Command::key`] is `None` and
     /// the range layer checks it against the span itself.
-    // PROPOSED(D-100)
+    // D-100
     Split {
         /// The right half's first key.
         key: Bytes,
@@ -161,7 +161,7 @@ impl Command {
     }
 
     /// Whether the command is a read: served at an applied index, never an entry.
-    // PROPOSED(D-098)
+    // D-098
     #[must_use]
     pub fn is_read(&self) -> bool {
         matches!(self, Command::Get { .. } | Command::Lookup { .. })
@@ -178,13 +178,13 @@ pub enum Outcome {
     /// What a get found.
     Value(Option<Bytes>),
     /// A split was refused, at its proposal or at its apply (SHARD.md §5, Q23;
-    /// PROPOSED D-100), with the reason.
+    /// D-100), with the reason.
     Refused(SplitRefusal),
 }
 
 /// Why a split was refused (SHARD.md §5): the leader's checks at proposal, for
 /// liveness, and every replica's re-check at apply, against shared state.
-// PROPOSED(D-100)
+// D-100
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitRefusal {
     /// The key is not strictly inside the range's span.
@@ -194,7 +194,7 @@ pub enum SplitRefusal {
     /// The configuration in force at the split is joint, or a change is in flight.
     ConfigurationChanging,
     /// The node's block of range ids holds none and range 0 has not refilled it
-    /// (Stage C's question 1, PROPOSED D-092).
+    /// (Stage C's question 1, D-092).
     NoRangeId,
     /// The range is a system range, which neither splits nor merges in Phase 3
     /// (SHARD.md §1).
@@ -460,7 +460,7 @@ pub async fn apply_command<E: Environment>(
         }
         Some(Command::Get { key }) => Outcome::Value(store.engine().get(&user_key(key)).await?),
         // A meta update is the range layer's, applied by the node's applier before
-        // this is called; a lookup is a read and never an entry (PROPOSED D-098).
+        // this is called; a lookup is a read and never an entry (D-098).
         Some(Command::Transfer { .. })
         | Some(Command::Change { .. })
         | Some(Command::MetaUpdate { .. })

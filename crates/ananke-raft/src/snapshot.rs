@@ -954,7 +954,7 @@ pub async fn staged_record<E: Environment>(
 /// # Errors
 ///
 /// As [`staged_record`]'s.
-// PROPOSED(D-109): a placeholder's install reads the streamed descriptor before it
+// D-109: a placeholder's install reads the streamed descriptor before it
 // switches.
 pub async fn staged_value<E: Environment>(
     env: &E,
@@ -1019,7 +1019,7 @@ pub async fn staged_value<E: Environment>(
 ///
 /// As [`staged_record`]'s, and `InvalidInput` for a `next` that does not sort after the
 /// record's key, which the walk could not see.
-// PROPOSED(D-110): an install onto an initialised replica reads the streamed span
+// D-110: an install onto an initialised replica reads the streamed span
 // for the overlap rule, in the record's own walk.
 pub async fn staged_record_and_next<E: Environment>(
     env: &E,
@@ -1656,7 +1656,7 @@ pub fn waiting(term: Term, staged: (Index, Term)) -> Message {
 /// so this is not a [`start_over`] and RAFT.md:210-212's restart bound does not count
 /// it (#177). Only a node's receiver sends it; the one-group server holds one group and
 /// never does.
-// PROPOSED(D-110): the overlap rule's refusal is its own status.
+// D-110: the overlap rule's refusal is its own status.
 #[must_use]
 pub fn overlaps(term: Term, staged: (Index, Term)) -> Message {
     Message::InstallSnapshotResponse {
@@ -1793,7 +1793,7 @@ mod tests {
     /// rule off. Six layouts: the descriptor in the record's table; in a later table
     /// beside a key after it; alone in a table; absent; behind a key between the two,
     /// which the walk skips; and in two tables, where the newer wins.
-    // PROPOSED(D-110): the record's walk reads the descriptor, wherever it is.
+    // D-110: the record's walk reads the descriptor, wherever it is.
     #[test]
     fn the_records_walk_finds_the_descriptor_in_any_table_and_nothing_where_there_is_none() {
         let prefix = KeyPrefix::group(2);
@@ -1884,7 +1884,7 @@ mod tests {
 
     /// A key that does not sort after the record's is refused, since the walk starts at
     /// the record's key and could never see it.
-    // PROPOSED(D-110)
+    // D-110
     #[test]
     fn the_records_walk_refuses_a_key_it_could_not_see() {
         let refused = on_a_node(|env| async move {

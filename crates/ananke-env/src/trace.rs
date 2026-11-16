@@ -385,7 +385,7 @@ pub enum TraceEvent {
         /// The highest sequence number it held.
         max_seq: u64,
         /// The smallest key the manifest says it held: what attributes the loss to the
-        /// ranges whose keys it covers (#45; PROPOSED D-113).
+        /// ranges whose keys it covers (#45; D-113).
         first_key: Bytes,
         /// The largest.
         last_key: Bytes,
@@ -732,7 +732,7 @@ pub enum TraceEvent {
     /// the followers able to confirm a read stopped, or started again, to form a majority
     /// of every voter set in force. A follower is able unless its latest AppendEntries
     /// answer echoed 0. Traced too where the answer dropped reads with no change of side.
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     RaftReadsConfirmable {
         /// The leader.
         server: u64,
@@ -749,7 +749,7 @@ pub enum TraceEvent {
     },
     /// A leader refused a read no round can ever confirm: no lease held, and it and the
     /// followers able to confirm form no majority of some voter set in force (RAFT.md §1).
-    // PROPOSED(D-129): a leader refuses a read it can never confirm.
+    // D-129: a leader refuses a read it can never confirm.
     RaftReadRefused {
         /// The leader.
         server: u64,
@@ -922,6 +922,20 @@ pub enum TraceEvent {
         /// The offset within the current file the stream resumed from.
         offset: u64,
     },
+    /// A leader gave a snapshot stream up on RAFT.md's resend bound: the chunk outstanding
+    /// on it fell due once more than the bound allows with no answer from the follower
+    /// since it was last answered, and the stream ends without asking for a fresh take.
+    /// It is the bound reached, and on a receiver that answers what it holds it means the
+    /// follower went silent or the network lost every exchange in that time.
+    // PROPOSED(D-127): the resend bound's give-up is traced.
+    RaftSnapshotGaveUp {
+        /// The leader.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The follower.
+        to: u64,
+    },
     /// A Raft server adopted a completed snapshot install at its start (RAFT.md
     /// §1): the staged store was copied into the server's store directory and
     /// its `CURRENT` switched to it, and the incarnation that follows runs on the
@@ -1001,7 +1015,7 @@ pub enum TraceEvent {
     /// streams again after a minimum election timeout
     /// ([`TraceEvent::RaftSnapshotRestream`]); nothing is counted against RAFT.md's
     /// restart bound.
-    // PROPOSED(D-110): the leader's half of the overlap rule.
+    // D-110: the leader's half of the overlap rule.
     RaftSnapshotOverlapped {
         /// The leader.
         server: u64,
@@ -1017,7 +1031,7 @@ pub enum TraceEvent {
     /// when `retake`, because the checkpoint predates the range's last split or merge
     /// and only a newer snapshot can stop overlapping, and otherwise from the same
     /// checkpoint, the overlap being the receiver's to clear (SHARD.md §5, Q27).
-    // PROPOSED(D-110): the leader's half of the overlap rule.
+    // D-110: the leader's half of the overlap rule.
     RaftSnapshotRestream {
         /// The leader.
         server: u64,
@@ -1115,7 +1129,7 @@ pub enum TraceEvent {
         range: u64,
         /// The index the descriptor took this value at: the apply's. A restatement
         /// and an install do not keep it and carry the replica's applied index here
-        /// too, as `applied` (PROPOSED D-107).
+        /// too, as `applied` (D-107).
         index: u64,
         /// The replica's applied index: the snapshot's last index for an install,
         /// the replica's own at a restatement.
@@ -1135,11 +1149,16 @@ pub enum TraceEvent {
     /// restatement at a start.
     // PROPOSED(D-069): defined and exported here; emitted by the stage that
     // builds what it reports.
-    // PROPOSED(D-107): emitted at every start of a node.
+    // D-107: emitted at every start of a node.
     RangesRestated {
         /// The ranges restated, sorted: every initialised replica the node holds, one
-        /// with a descriptor (PROPOSED D-107).
+        /// with a descriptor (D-107).
         ranges: Vec<u64>,
+        /// The run nonce this start drew (SHARD.md §5, Q17), which every refill the run
+        /// sends carries and every `RangeIdsLeased` granted to the run names: check 18
+        /// holds a split's right half to a block of the run that led it.
+        // PROPOSED(D-137): the run stated at the node's start.
+        run: u64,
     },
     /// A node made a placeholder for a range it does not hold (SHARD.md §5).
     // PROPOSED(D-069): defined and exported here; emitted by the stage that
@@ -1584,9 +1603,9 @@ pub enum StartOver {
     /// The answer is `SnapshotStatus::Overlaps`, not a start-over: the sender ends the
     /// stream, counts nothing against its restart bound, and streams again after a
     /// minimum election timeout, by when the replica it overlapped may have moved on
-    /// (PROPOSED D-110). Until D-110 it was answered `Restart` (#177).
-    // PROPOSED(D-109): a placeholder's install is refused where it would overlap.
-    // PROPOSED(D-110): and so is an install onto an initialised replica, with an
+    /// (D-110). Until D-110 it was answered `Restart` (#177).
+    // D-109: a placeholder's install is refused where it would overlap.
+    // D-110: and so is an install onto an initialised replica, with an
     // answer of its own.
     Overlaps,
 }

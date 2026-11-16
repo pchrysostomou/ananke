@@ -1,4 +1,4 @@
-//! `Input::Campaign` (SHARD.md §5, Q21; PROPOSED D-100): a follower with no leader
+//! `Input::Campaign` (SHARD.md §5, Q21; D-100): a follower with no leader
 //! pre-votes at once and again every heartbeat interval until it hears from a leader
 //! or its own timer fires, and a pre-vote changes no term.
 

@@ -63,7 +63,7 @@ pub enum Reply {
     },
     /// The key is not the named range's to serve here (SHARD.md §3): refused at
     /// receipt, at a read's serving or at apply, and never taken effect.
-    // PROPOSED(D-097): `RangeMismatch` beside `NotLeader` (SHARD.md §11, raft 5).
+    // D-097: `RangeMismatch` beside `NotLeader` (SHARD.md §11, raft 5).
     RangeMismatch {
         /// The descriptors the node holds whose span contains the key, each encoded
         /// by the range layer (`ananke_shard::descriptor::RangeDescriptor`); empty

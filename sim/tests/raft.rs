@@ -31,17 +31,17 @@ fn same_seed_gives_byte_identical_trace() {
 /// (`moirae_trace::trace_hash`) over the **body**, every line after the header, whose
 /// crate version must not move the pin. The whole file is 13 241 905 bytes and hashes
 /// to SHA-256 `c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`, the
-/// figure PROPOSED D-097 and D-098 recorded by hand while nothing asserted it (issue
+/// figure D-097 and D-098 recorded by hand while nothing asserted it (issue
 /// #97). The value moves only in a commit that moves the one-group schedule or its
 /// trace, which updates it and says why (CLAUDE.md).
-// PROPOSED(D-105): seed 42's one-group trace asserted, not only written (#97).
+// D-105: seed 42's one-group trace asserted, not only written (#97).
 const SEED_42_BODY_HASH: &str = "63099038ab531265";
 
 /// The seed-42 trace is written for the studio, and its body hashes to the pinned
 /// value. The run is the studio's example and not a seed a sweep found, so what is
 /// pinned is the trace itself rather than a mechanism. It is written first, so a
 /// mismatch leaves the new bytes on disk to diff.
-// PROPOSED(D-105): seed 42's one-group trace asserted, not only written (#97).
+// D-105: seed 42's one-group trace asserted, not only written (#97).
 #[test]
 fn the_seed_42_trace_is_written_for_the_studio() {
     let report = raft::run(42, Variant::Correct);
@@ -2693,7 +2693,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // schedule again it was 58 of the first thousand, 5.8 %, every one of the 58 the
     // `match starts` oracle's rather than state machine safety's — D-078's own entry
     // says so and D-079 re-measured it, on that branch and on `main` alike. On the tree
-    // of PROPOSED D-113 it is **54 of the first thousand, 5.4 %**, still the first at
+    // of D-113 it is **54 of the first thousand, 5.4 %**, still the first at
     // seed 20 and still every one the oracle's. The 0.7 % this comment argued from, and
     // the seven seeds it named, are the figures of the tree before D-078.
     //
@@ -2714,7 +2714,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 }
 
 /// `RefusalNotDurable` tripping the match-starts fold for its own reason, at every tier: the
-/// sweep above asserts the catch only from the thousand (D-056), and PROPOSED D-113 §5 made the
+/// sweep above asserts the catch only from the thousand (D-056), and D-113 §5 made the
 /// fold read a reset to 0 as a window where the follower holds a store. Here it does not: node 2
 /// has refused its store, its answer stamped 0 is its own, and the number comes back only because
 /// its refusal did not survive the crash after it, so the second rise is a store that lost its

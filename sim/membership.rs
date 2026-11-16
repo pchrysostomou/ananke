@@ -619,7 +619,7 @@ pub fn node_server_config(
             .collect(),
         ranges: crate::ranges::ranges(),
         // SHARD.md §2: the bootstrap nodes are the same list on every node; a node not
-        // among them starts its replicas with an empty configuration (PROPOSED D-096).
+        // among them starts its replicas with an empty configuration (D-096).
         bootstrap: (1..=INITIAL_VOTERS).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
@@ -638,7 +638,7 @@ pub fn node_server_config(
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
-        // PROPOSED(D-105): the range layer's set beside the node's.
+        // D-105: the range layer's set beside the node's.
         // PROPOSED(D-108): `AnyFreshNodeBootstraps` is the one range-layer variant this
         // scenario runs.
         range_variants: range,
@@ -683,13 +683,13 @@ fn spawn_server(
 /// attempt and then fall back. The node's joiners are fed by a snapshot all the same:
 /// a node that joins holds nothing (SHARD.md §2), the leader's first message to it
 /// makes it a placeholder of the range, and the placeholder's refused server's answer
-/// has whichever leader it is take a snapshot and stream it (§5, Q22; PROPOSED D-109),
+/// has whichever leader it is take a snapshot and stream it (§5, Q22; D-109),
 /// which [`Report::check`] asserts of every joiner and every range (until D-109 a
 /// joiner here started with the configured ranges as replicas of an empty
 /// configuration, D-076's interim, caught up by the log alone, and the snapshot path
 /// was asserted absent here).
 // PROPOSED(D-084): the one-group server's grow asks a compacted leader.
-// PROPOSED(D-109): the node's joiners are fed through their placeholders.
+// D-109: the node's joiners are fed through their placeholders.
 #[must_use]
 pub fn feeds_joiners_by_snapshot(cluster: Cluster) -> bool {
     match cluster {
@@ -860,9 +860,9 @@ impl Report {
     /// which is the wedge the clause is there to see. A planted wedge of range 5's
     /// writes showed it over ten thousand seeds: on each of the 3 626 runs it wedged, the
     /// history held no write of range 5 after the heal while the clients had asked for
-    /// three to twenty-four (PROPOSED D-103). A history-based "asked" would have passed
+    /// three to twenty-four (D-103). A history-based "asked" would have passed
     /// every one of them.
-    // PROPOSED(D-103): a range no client asked for a write after the heal is no evidence.
+    // D-103: a range no client asked for a write after the heal is no evidence.
     #[must_use]
     pub fn write_asked_after_heal_of(&self, range: u64) -> bool {
         let key_range = self.cluster.key_range();
@@ -886,7 +886,7 @@ impl Report {
     /// What a range not asked for a write after the heal is still held to: asked for
     /// operations and answering none of them, it served nothing after the heal, which
     /// is a wedge whatever the operations were.
-    // PROPOSED(D-103): a range asked after the heal and answering nothing still fails.
+    // D-103: a range asked after the heal and answering nothing still fails.
     #[must_use]
     pub fn operations_after_heal_of(&self, range: u64) -> (usize, usize) {
         let key_range = self.cluster.key_range();
@@ -967,14 +967,14 @@ impl Report {
     /// asked, so nothing unanswered is evidence. That is a hole, not the "fails such a
     /// range outright" an earlier version of this comment said: on 314ac8f, seed 1969
     /// showed the outright reading failing a range that was asked only reads and served
-    /// every one (PROPOSED D-103). The membership sweep's `ranges_not_asked_after_heal`
+    /// every one (D-103). The membership sweep's `ranges_not_asked_after_heal`
     /// coverage counts the runs that reach it, at every tier (none on the correct node
     /// at ten thousand seeds), and the driver write to each range after the heal that
     /// D-103 recommends to the owner is what would close it. This is still the weaker of
     /// the two clauses, and not, as an earlier draft of this comment had it, the one with
     /// the most to be wrong about.
     // PROPOSED(D-084): an availability check of a node is a check of each of its ranges.
-    // PROPOSED(D-103): a range asked no write that answered once passes both clauses.
+    // D-103: a range asked no write that answered once passes both clauses.
     #[must_use]
     pub fn longest_completion_gap_of(&self, range: u64) -> Option<Duration> {
         let key_range = self.cluster.key_range();
@@ -1278,7 +1278,7 @@ impl Report {
     /// Whether server `joiner`'s replica of `range` was created by an install into the
     /// placeholder it made of the range: a `RangeReplicaCreated` of the range on its
     /// node, and after it a `RangeCreated { cause: snapshot }` there (SHARD.md §5, Q22).
-    // PROPOSED(D-109): a node that joins gets every range through its placeholder.
+    // D-109: a node that joins gets every range through its placeholder.
     #[must_use]
     pub fn installed_into_a_placeholder(&self, joiner: u64, range: u64) -> bool {
         let on = |record: &TraceRecord| {
@@ -1340,7 +1340,7 @@ impl Report {
             return fail(violation);
         }
         // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 on the node cluster (Q40).
-        // PROPOSED(D-097)
+        // D-097
         if self.cluster == Cluster::Node
             && let Err(violation) = ananke_shard::invariants::all(&self.records)
         {
@@ -1359,7 +1359,7 @@ impl Report {
         // `RaftMatchStarted` states, folded here as in the raft sweep — this is the
         // scenario that drives changes, so it is where learners and re-tracked
         // followers raise a match.
-        // PROPOSED(D-096): the oracle holds a record's range to every range hosted, the
+        // D-096: the oracle holds a record's range to every range hosted, the
         // two system ranges included; the membership changes stay the user ranges'.
         if let Err(violation) = raft::payload_is_well_formed(&self.records, &self.cluster.hosted())
         {
@@ -1409,7 +1409,7 @@ impl Report {
         // this scenario's threshold still keeps out is the leaders' compaction, and that
         // half of the absence stays asserted with its reason (PROPOSED D-086).
         // PROPOSED(D-084): the node's compaction asserted absent.
-        // PROPOSED(D-109): and its joiners fed through their placeholders, asserted.
+        // D-109: and its joiners fed through their placeholders, asserted.
         if self.cluster == Cluster::Node {
             let highest = self.highest_index();
             if highest >= NODE_SNAPSHOT_THRESHOLD {
@@ -1480,7 +1480,7 @@ impl Report {
                     // (seed 1969 on 314ac8f). What it *was* asked for still is: a range
                     // asked for operations after the heal that answered none of them
                     // served nothing, and fails here.
-                    // PROPOSED(D-103): a range not asked for a write after the heal is
+                    // D-103: a range not asked for a write after the heal is
                     // no evidence; one asked for anything and answering nothing still is.
                     None if !self.write_asked_after_heal_of(range) => {
                         let (asked, returned) = self.operations_after_heal_of(range);
@@ -1785,7 +1785,7 @@ impl Driver {
                     }
                     // An operator's command names no key, so no server answers it
                     // with a mismatch; one that did is tried elsewhere all the same.
-                    // PROPOSED(D-097)
+                    // D-097
                     Some(Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. })
                     | None => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
@@ -2300,6 +2300,12 @@ mod tests {
     /// liveness clause called it wedged because no write of it completed.
     const SEED_1969: u64 = 1969;
 
+    /// The run seed 1969's shape is built from since PROPOSED D-127 moved seed 1969 off it:
+    /// the first seed after it with a range asked reads, each answered, before its first
+    /// write after the heal.
+    // PROPOSED(D-127)
+    const SHAPE_SEED: u64 = 1972;
+
     /// Seed 1969, pinned in CLAUDE.md's absence form: **on this tree no range of its run
     /// is left unasked for a write after the heal**, so the situation it was pinned for is
     /// absent, and this asserts the absence rather than a bare green.
@@ -2312,7 +2318,7 @@ mod tests {
     /// brings a range of this seed back to no write asked, this fails, and the pin is
     /// upgraded to its mechanism — the run passes, and that range answered what it was
     /// asked — which the test below builds from this run's own records meanwhile.
-    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence.
+    // D-103: a range not asked for a write after the heal is no evidence.
     #[test]
     fn seed_1969_no_longer_leaves_a_range_unasked_for_a_write_after_the_heal() {
         let report = run_on(Cluster::Node, SEED_1969, Variant::Correct);
@@ -2333,10 +2339,14 @@ mod tests {
         );
     }
 
-    /// Seed 1969's shape, built from seed 1969's own run on this tree, and the clause's
-    /// answer to it and to the wedges beside it (PROPOSED D-103). No record is invented:
-    /// every case is the run's own records, cut short, with some left out or with one
-    /// range's answers kept.
+    /// Seed 1969's shape, built from a run of this tree, and the clause's answer to it and
+    /// to the wedges beside it (D-103). No record is invented: every case is the
+    /// run's own records, cut short, with some left out or with one range's answers kept.
+    ///
+    /// The run was seed 1969's own until PROPOSED D-127, whose answers to the chunks a node
+    /// holds moved its schedule so that no range of it is asked reads before its first write
+    /// after the heal any more. It is [`SHAPE_SEED`]'s now, the first seed after 1969 whose
+    /// run has such a range.
     ///
     /// On 314ac8f the seed's range 5 was asked for reads and no write after the heal, and
     /// answered every read. On this tree no range of the run is left so (the pin above),
@@ -2354,12 +2364,13 @@ mod tests {
     ///   the invocations;
     /// - cut just after the range's leader proposed one of its writes, it fails the same
     ///   way: proposed, and never applied.
-    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence; one
+    // D-103: a range not asked for a write after the heal is no evidence; one
     // asked for anything and answering nothing still is.
+    // PROPOSED(D-127): built on seed 1972, since D-127 moved seed 1969 off the shape.
     #[test]
     fn a_range_not_asked_for_a_write_after_the_heal_is_no_evidence_and_one_asked_still_is() {
-        let mut report = run_on(Cluster::Node, SEED_1969, Variant::Correct);
-        assert!(report.uniform(), "seed 1969 is uniformly scheduled");
+        let mut report = run_on(Cluster::Node, SHAPE_SEED, Variant::Correct);
+        assert!(report.uniform(), "seed {SHAPE_SEED} is uniformly scheduled");
         let ran = report.records.clone();
         let heal = report.last_heal;
         let key_range = Cluster::Node.key_range();
@@ -2394,12 +2405,15 @@ mod tests {
                 None
             })
             .max_by_key(|&(_, cut, _)| cut)
-            .expect(
-                "some range of seed 1969 was asked reads after the heal, each answered, before its \
-                 first write: if the schedule has moved off it, build the shape on another seed",
-            );
+            .unwrap_or_else(|| {
+                panic!(
+                    "some range of seed {SHAPE_SEED} was asked reads after the heal, each \
+                     answered, before its first write: if the schedule has moved off it, build \
+                     the shape on another seed"
+                )
+            });
         let wedged = Some(format!(
-            "seed {SEED_1969}: liveness: no client write of range {range} completed after the \
+            "seed {SHAPE_SEED}: liveness: no client write of range {range} completed after the \
              last heal at {heal:?}"
         ));
         let is_answer = |record: &TraceRecord| {
@@ -2445,7 +2459,7 @@ mod tests {
         assert_eq!(
             verdict(&mut report, unanswered.clone()),
             Some(format!(
-                "seed {SEED_1969}: liveness: range {range} completed no operation after the last \
+                "seed {SHAPE_SEED}: liveness: range {range} completed no operation after the last \
                  heal at {heal:?}, of {} asked, none of them a write",
                 reads.len()
             )),

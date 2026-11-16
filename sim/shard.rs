@@ -24,7 +24,7 @@
 //! - a **leadership transfer** (`Command::Transfer`, thesis §3.10) of any range, the two
 //!   system ranges included, to one of its other voters.
 //!
-//! **The workload's shapes** (SHARD.md §10, §12's Stage C; PROPOSED D-131), each aimed at the
+//! **The workload's shapes** (SHARD.md §10, §12's Stage C; D-131), each aimed at the
 //! window one of §10's variants breaks and each drawn from the seed, so a shape is a schedule
 //! the sweep can take. Stream `shard-load` gives each of the driver's splits a [`Load`]: the
 //! clients' traffic alone (§10's "any split with load"), a burst of right-half writes pending
@@ -34,7 +34,14 @@
 //! Stream `shard-restart` adds one [`Fault::SplitFromRestarted`]: a node that has taken an id
 //! from its block is crashed and restarted, handed the lead of a range and asked to split it.
 //! One seed in [`PLAIN_ONE_IN`] draws none of it ([`Schedule::plain`]), which is the schedule
-//! the sweep was before them and the schedule every pinned seed was found on.
+//! the sweep was before them and the schedule most pinned seeds were found on.
+//!
+//! **`Fault::MetaReorder`** (SHARD.md §10; PROPOSED D-135), on stream `meta-reorder`, one on every
+//! seed that draws a shape, in the first half of the faults: a range that can split twice, led off
+//! the meta range's leader's node, is split with its leader's link to that node blocked one way;
+//! its left half's lead goes to the third node, which splits it again over an open link, so the
+//! first split's update, resent until acknowledged, reaches meta after the second's. That is the
+//! order `MetaOverwritesByArrival` breaks on, which the correct meta range takes nothing from.
 //!
 //! **The clients**: [`CLIENTS`] of them over [`KEYS`] keys, `k00` to `k15`, so a range
 //! keeps at least [`MIN_KEYS`] of them however the driver splits. They are the node
@@ -57,7 +64,7 @@
 //!
 //! **The checks** ([`Report::check`]): the raft sweep's, over this run's trace
 //! (`raft::Report::over_a_run`) — checks 1 to 4 keyed by range; the range layer's folds,
-//! checks 7, 8, 9, 10, 16, 17, 18 and 20, in one incremental checker that stops the run
+//! checks 7, 8, 9, 10, 16, 17, 18, 19 and 20, in one incremental checker that stops the run
 //! at its first violation and again over the whole trace (D-046); linearizability of
 //! every key across every split (§9), which with the drifting clocks is check 6, lease
 //! safety under drift, as Phase 2 built it; pre-vote's property per (range, server);
@@ -65,15 +72,19 @@
 //! per range the run ended with (`raft::Report::liveness_by_final_range`), where a range
 //! whose replicas on refused nodes leave it no majority is asked nothing (§8) — then this
 //! sweep's own: the meta convergence bound (§8), less the right halves the owner's ruling of
-//! 2026-11-09 excuses from it and from nothing else (#220), the shape (nodes 4 and 5 hold nothing;
-//! every bootstrap node created ranges 0, 1 and 2), and D-092's per-seed assertion wherever
-//! a split was refused for want of a range id. Check 19 is S7's, which waits on D-093.
-// PROPOSED(D-113): `sim/shard.rs`, Stage C's sharded sweep.
+//! 2026-11-09 excuses from it and from nothing else (#220), a replica quarantined under D-130
+//! counting there as a voter that cannot vote by the owner's ruling of 2026-11-15 (D-142), the
+//! shape (nodes 4 and 5 hold nothing; every bootstrap node created ranges 0, 1 and 2), and
+//! D-092's per-seed assertion wherever a split was refused for want of a range id. Check 19,
+//! the ranges tile the keyspace, is S7's and among the folds since the owner's ruling on
+//! D-093, its instrument `SplitLeavesGap` (PROPOSED D-140).
+// D-113: `sim/shard.rs`, Stage C's sharded sweep.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
@@ -132,8 +143,8 @@ pub const BITROT: f64 = 0.02;
 const DRIVER: u64 = 96 << 32;
 /// How long a split's admin waits for each answer before it tries the next node.
 const SPLIT_WAIT: Duration = Duration::from_millis(600);
-/// How long the split's admin waits before asking again after `NoRangeId` (PROPOSED
-/// D-092's A: the asker retries): the node sweep's `SPLIT_RETRY`.
+/// How long the split's admin waits before asking again after `NoRangeId`
+/// (D-092's A: the asker retries): the node sweep's `SPLIT_RETRY`.
 const SPLIT_RETRY: Duration = Duration::from_millis(150);
 /// How long a transfer's admin waits for its answer.
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
@@ -144,7 +155,7 @@ const DRIVER_DRAIN: Duration = Duration::from_secs(5);
 pub const PLAIN_ONE_IN: u64 = 8;
 /// The process the shapes' own clients trace under, beside the sweep's clients: a split's
 /// burst as `LOAD | j`, the stale-cache shape's writer as `LOAD | WRITER | j` and its reader as
-/// `LOAD | READER | j`, where `j` is the action's number from 1 (PROPOSED D-131).
+/// `LOAD | READER | j`, where `j` is the action's number from 1 (D-131).
 const LOAD: u64 = 95 << 32;
 /// See [`LOAD`].
 const WRITER: u64 = 1 << 16;
@@ -162,12 +173,27 @@ const STALE_ADMIN: u64 = 200;
 /// What a split's asker adds to its request's number when it asks anew, past every admin
 /// number (PROPOSED D-131).
 const ASK_ANEW: u64 = 1 << 16;
-/// How many times a split's asker asks before it stops: round the bootstrap nodes four times.
-/// Its first `NoRangeId` starts the count again (PROPOSED D-131).
+/// How many times a split's asker asks before its first `NoRangeId`: round the bootstrap nodes
+/// four times (D-131). From that refusal on it asks until its window closes, not by a count
+/// ([`window_closes`]; D-143, amending D-131 after #259).
 const ASKS: u64 = BOOTSTRAP * 4;
+/// How long a split's asker waits for each answer once a `NoRangeId` has opened its window, before
+/// it tries the next node and asks anew: [`SPLIT_RETRY`], where it waits [`SPLIT_WAIT`] before the
+/// window opens, so that one lost answer costs it one short wait and cannot carry it over D-092's
+/// bound. Also the one wait [`window_closes`] adds for the last ask's answer (D-143).
+// PROPOSED(D-143): the ruling's "about `SPLIT_RETRY`" read as `SPLIT_RETRY` itself.
+const RETRY_WAIT: Duration = SPLIT_RETRY;
 /// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
 /// correct system before it is asserted (Q39; D-113 §6).
 pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
+/// [`Fault::MetaReorder`]'s hold (SHARD.md §10): how long the link from the first split's
+/// leader's node to the meta range's leader's node stays blocked. Measured on the correct
+/// system before it is asserted (Q39; PROPOSED D-135).
+pub const META_REORDER_HOLD: Duration = Duration::from_millis(700);
+/// The admin numbers a [`Fault::MetaReorder`] takes: `META_ADMIN + 3i` for its first split,
+/// `+ 1` for its transfer and `+ 2` for its second split, `i` the fault's index (PROPOSED
+/// D-135). Past the restart arm's and short of the stale-cache shape's.
+const META_ADMIN: u64 = 150;
 
 /// The meta convergence bound: how long past the last heal, or past a descriptor's first
 /// statement if that is later, meta may take to name a live range's descriptor.
@@ -214,20 +240,38 @@ pub enum Fault {
         /// How long it stays down.
         down: Duration,
     },
-    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; PROPOSED D-131): a node some split has
+    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; D-131): a node some split has
     /// taken an id from, picked among them when the arm fires, crashes and restarts after
     /// `down`. Then `transfer_after` later it is handed the lead of a user range that can still
     /// split, and `split_after` after that it is asked to split it. A correct node's new run
     /// waits for a block of its own (§5's second rule); the variant's resumes its record's and
     /// takes the same ids again. Where no split has taken an id yet the arm does nothing: no
     /// crash, no transfer and no split.
-    // PROPOSED(D-131): §12, Stage C's fourth shape.
+    // D-131: §12, Stage C's fourth shape.
     SplitFromRestarted {
         /// How long the node stays down.
         down: Duration,
         /// From the restart to the transfer.
         transfer_after: Duration,
         /// From the transfer to the split.
+        split_after: Duration,
+    },
+    /// §10's `Fault::MetaReorder` (stream `meta-reorder`; SHARD.md §1, §10; PROPOSED D-135): a
+    /// user range that can split twice, led on a node `a` other than the meta range's leader's
+    /// node `m`, picked among them when the arm fires. The link from `a` to `m` is blocked one
+    /// way for [`META_REORDER_HOLD`], and the range is asked to split at once, so `a`'s update
+    /// of the first split cannot reach meta. `transfer_after` later the left half's lead is
+    /// handed to the third node `c` (`TimeoutNow`, D-028), and `split_after` after that `c` is
+    /// asked to split the left half again; its updates reach meta by an unblocked link. `a`
+    /// resends the first update until it is acknowledged (§1), so it arrives after the second
+    /// wherever the second split's update applies within the hold. The block also stalls `a`'s
+    /// sends to `m` of every range `a` leads, which is why it is held for a bound. Where no range
+    /// can split twice, or every one is led on `m`'s node, the arm does nothing.
+    // PROPOSED(D-135): §12, Stage C's `Fault::MetaReorder`.
+    MetaReorder {
+        /// From the block and the first split's ask to the transfer.
+        transfer_after: Duration,
+        /// From the transfer to the second split's ask.
         split_after: Duration,
     },
 }
@@ -243,6 +287,7 @@ impl Fault {
             Self::Crash { down, .. }
             | Self::CrashLeader { down }
             | Self::SplitFromRestarted { down, .. } => *down,
+            Self::MetaReorder { .. } => META_REORDER_HOLD,
         }
     }
 }
@@ -256,9 +301,9 @@ pub enum ActionKind {
     Transfer,
 }
 
-/// The load a driver's split is drawn under (SHARD.md §10, "the workload itself"; PROPOSED
+/// The load a driver's split is drawn under (SHARD.md §10, "the workload itself";
 /// D-131): which of §10's shapes it is. A transfer's is always [`Load::Clients`].
-// PROPOSED(D-131): §12, Stage C's shapes.
+// D-131: §12, Stage C's shapes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Load {
     /// The clients' traffic and nothing beside it: §10's "any split with load".
@@ -336,24 +381,64 @@ pub struct Schedule {
     pub skews: Vec<i64>,
     /// How long after the liveness window opens the clients stay cut off from every node,
     /// the window's start not moved and its length not changed: what a cluster nothing can
-    /// write to for that long looks like to the write bound read from the heal (PROPOSED
-    /// D-113 §5). `None` in every schedule [`Schedule::draw`] draws, so no run of the sweep
+    /// write to for that long looks like to the write bound read from the heal
+    /// (D-113 §5). `None` in every schedule [`Schedule::draw`] draws, so no run of the sweep
     /// has one; a test sets it.
     pub clients_held_off: Option<Duration>,
 }
 
 impl Schedule {
-    /// The schedule the sweep runs for `seed`: [`Schedule::plain`] and, on all but one seed in
-    /// [`PLAIN_ONE_IN`], the shapes of SHARD.md §10 and §12's Stage C over it. Each from a
-    /// stream of its own (D-031), so every draw of the plain schedule falls where it fell:
-    /// stream `shard-load` gives each of the driver's splits a [`Load`], one each of the three
-    /// shaped loads and the clients' traffic alone by quarters, and stream `shard-restart` adds
-    /// one [`Fault::SplitFromRestarted`] in the second half of the faults, where a split has had
-    /// its chance to take an id. The driver's actions keep the times the plain schedule gave
-    /// them, against faults the arm may have moved later.
-    // PROPOSED(D-131): §12, Stage C's shapes.
+    /// The schedule the sweep runs for `seed`: [`Schedule::shaped`] and, on every seed that
+    /// draws its shapes, one [`Fault::MetaReorder`] from stream `meta-reorder` (D-031) in the
+    /// first half of the faults, where a range can still split twice. On the one seed in
+    /// [`PLAIN_ONE_IN`] that draws no shape it adds nothing, so that seed runs
+    /// [`Schedule::plain`] as before. The driver's actions keep the times the plain schedule
+    /// gave them, against faults the arms may have moved later.
+    // PROPOSED(D-135): §12, Stage C's `Fault::MetaReorder`.
     #[must_use]
     pub fn draw(seed: u64) -> Self {
+        let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
+            Duration::from_millis(lo + rng.below(hi - lo + 1))
+        };
+        let mut schedule = Self::shaped(seed);
+        if Self::draws_no_shape(seed) {
+            return schedule;
+        }
+        let mut reorder = moirae_sched::stream(seed, "meta-reorder");
+        let half = schedule.faults.len() / 2;
+        let at = usize::try_from(reorder.below(half as u64 + 1)).expect("small");
+        let transfer_after = ms(&mut reorder, 100, 200);
+        let split_after = ms(&mut reorder, 100, 200);
+        let quiet = ms(&mut reorder, 450, 700);
+        schedule.faults.insert(
+            at,
+            Fault::MetaReorder {
+                transfer_after,
+                split_after,
+            },
+        );
+        schedule.gaps.insert(at, quiet);
+        schedule.picks.insert(at, reorder.below(1 << 16));
+        schedule
+    }
+
+    /// Whether `seed` is the one in [`PLAIN_ONE_IN`] that draws no shape and no arm, and runs
+    /// [`Schedule::plain`].
+    fn draws_no_shape(seed: u64) -> bool {
+        moirae_sched::stream(seed, "shard-load").below(PLAIN_ONE_IN) == 0
+    }
+
+    /// The schedule the sweep ran before [`Fault::MetaReorder`] (D-131): [`Schedule::plain`]
+    /// and, on all but one seed in [`PLAIN_ONE_IN`], the shapes of SHARD.md §10 and §12's Stage C
+    /// over it. Each from a stream of its own (D-031), so every draw of the plain schedule falls
+    /// where it fell: stream `shard-load` gives each of the driver's splits a [`Load`], one each
+    /// of the three shaped loads and the clients' traffic alone by quarters, and stream
+    /// `shard-restart` adds one [`Fault::SplitFromRestarted`] in the second half of the faults,
+    /// where a split has had its chance to take an id. The pins found on it run it (PROPOSED
+    /// D-135).
+    // D-131: §12, Stage C's shapes.
+    #[must_use]
+    pub fn shaped(seed: u64) -> Self {
         let ms = |rng: &mut moirae_sched::Pcg32, lo: u64, hi: u64| {
             Duration::from_millis(lo + rng.below(hi - lo + 1))
         };
@@ -552,7 +637,7 @@ pub fn bootstrap_range() -> Range {
 
 /// Every key's first range, which the run's checks of `raft::Report` read as the key's
 /// range: range 2, from which every user range here descends with its voters
-/// (PROPOSED D-113). [`Report::check`] asks the write bound again per range the run
+/// (D-113). [`Report::check`] asks the write bound again per range the run
 /// ended with.
 #[must_use]
 pub fn first_range_of_key(_key: &Bytes) -> u64 {
@@ -598,7 +683,7 @@ pub fn initial_cache(n: u64) -> Cache {
 
 /// One node's configuration: five nodes, the three bootstrap nodes named, range 2 alone
 /// among the user ranges, the node sweep's tick, drift bound and threshold, and the
-/// range-id block D-092 has measured here (PROPOSED D-113).
+/// range-id block D-092 has measured here (D-113).
 #[must_use]
 pub fn server_config(
     id: u64,
@@ -676,7 +761,7 @@ impl Spans {
     /// Folds one record.
     pub fn push(&mut self, record: &TraceRecord) {
         let (range, start, end, generation, voters) = match &record.event {
-            // PROPOSED(D-131): who has taken an id, what the restart arm picks from.
+            // D-131: who has taken an id, what the restart arm picks from.
             TraceEvent::RangeIdsLeased {
                 node, first, last, ..
             } => {
@@ -782,7 +867,7 @@ fn split_keys(span: &Span) -> Vec<u64> {
     held[min..=held.len() - min].to_vec()
 }
 
-/// What the driver did over a run (PROPOSED D-113).
+/// What the driver did over a run (D-113).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DriverStats {
     /// Splits asked.
@@ -795,7 +880,7 @@ pub struct DriverStats {
     /// Every `NoRangeId` answer, as (the node that answered, when).
     pub no_range_id: Vec<(u64, Instant)>,
     /// Every split a `NoRangeId` answered at least once: what its asker's retries came to
-    /// (PROPOSED D-092's per-seed assertion).
+    /// (D-092's per-seed assertion).
     pub retried: Vec<Retried>,
     /// Splits asked of every node in turn and answered by none in time.
     pub splits_unanswered: u64,
@@ -810,7 +895,7 @@ pub struct DriverStats {
 }
 
 /// One `NoRangeId` read against the trace: what emptied the node's block
-/// (PROPOSED D-092's figures).
+/// (D-092's figures).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoRangeId {
     /// The node that answered it.
@@ -831,21 +916,30 @@ pub struct NoRangeId {
 }
 
 /// A split `NoRangeId` answered at least once, and what its asker's retries came to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retried {
     /// The range asked of.
     pub range: u64,
+    /// The key the split was asked at, as the asker sent it.
+    // PROPOSED(D-137): what the retry was to take effect as.
+    pub key: Bytes,
     /// When the first `NoRangeId` came.
     pub refused: Instant,
     /// When the asker stopped asking.
     pub ended: Instant,
     /// Whether it stopped on an answer: done, or refused for a reason it does not retry.
     pub answered: bool,
+    /// The refusal it stopped on, where it stopped on one; `None` where it was answered done,
+    /// or not answered.
+    // PROPOSED(D-137): what the retry was answered.
+    pub refusal: Option<SplitRefusal>,
 }
 
 impl Retried {
     /// Whether it was still asking when the last fault healed at `heal`, so that some retry
     /// of its came after the heal.
+    // PROPOSED(D-137): `ended` is on the asker's clock and `heal` is global, here and in
+    // `took`; reading the heal on the asker's clock too is #245.
     #[must_use]
     pub fn asking_at(&self, heal: Instant) -> bool {
         self.ended >= heal
@@ -857,15 +951,31 @@ impl Retried {
         self.ended.duration_since(self.refused.max(heal))
     }
 
-    /// What D-092 asks of this asker, where the last fault healed at `heal` and the bound is
-    /// `bound`: "the same asker's retry after the heal takes effect within the liveness
-    /// bound". One that stopped before the heal made no retry after it and is asked nothing.
-    /// Any other is asked for an answer, within the bound of the heal, or of its first
-    /// refusal if that came after the heal. The violation, in words, if it did neither.
-    // PROPOSED(D-092): answer A; the asker retries.
-    // PROPOSED(D-113): read from the heal, §8.
+    /// What D-092 asks of this asker, where the last fault healed at `heal`, the bound is
+    /// `bound`, and `fate` is what the trace says became of the split it asked for: "the same
+    /// asker's retry after the heal takes effect within the liveness bound". One that stopped
+    /// before the heal made no retry after it and is asked nothing. Any other is asked for an
+    /// answer by which the split had taken effect — a replica applied it, whether the answer
+    /// was done or a refusal that follows from it, such as `KeyOutsideSpan` to an asker that
+    /// asks anew after the split landed — or, answered `KeyOutsideSpan`, by which its range had
+    /// left its key outside its span, a split of that range at another key having landed
+    /// first, so that the split it asked for can no longer take effect and the answer is the
+    /// true one; and for the answer within the bound of the heal, or of its first refusal if
+    /// that came after the heal. The violation, in words, if it did not.
+    ///
+    /// An answer alone was enough until #222: a retry refused for another reason, the split
+    /// never applied, passed.
+    // D-092: answer A; the asker retries.
+    // D-113: read from the heal, §8.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    // D-143: the asker asks until its window closes, so "no answer" is past the bound.
     #[must_use]
-    pub fn took_no_effect(&self, heal: Instant, bound: Duration) -> Option<String> {
+    pub fn took_no_effect(
+        &self,
+        heal: Instant,
+        bound: Duration,
+        fate: SplitFate,
+    ) -> Option<String> {
         if !self.asking_at(heal) {
             return None;
         }
@@ -875,6 +985,19 @@ impl Retried {
                 "the split of range {} refused at {:?} stopped asking at {:?}, {took:?} past the \
                  last heal at {heal:?}, with no answer",
                 self.range, self.refused, self.ended
+            ));
+        }
+        let by_the_answer = |at: Option<Instant>| at.is_some_and(|at| at <= self.ended);
+        let took_effect = by_the_answer(fate.applied);
+        let superseded =
+            self.refusal == Some(SplitRefusal::KeyOutsideSpan) && by_the_answer(fate.outside);
+        if !took_effect && !superseded {
+            let answer = self.refusal.map_or("done", SplitRefusal::name);
+            return Some(format!(
+                "the split of range {} at {:?} refused at {:?} was answered `{answer}` at {:?}, \
+                 {took:?} past the last heal at {heal:?}, and took no effect: no replica had \
+                 applied it by then ({fate:?})",
+                self.range, self.key, self.refused, self.ended
             ));
         }
         (took > bound).then(|| {
@@ -887,6 +1010,21 @@ impl Retried {
     }
 }
 
+/// What the trace says became of the split an asker asked for, each time read on the clock of
+/// the node the driver's admins run on, the clock [`Retried`]'s times are on
+/// ([`Report::split_fate`]).
+// PROPOSED(D-137): the retry takes effect, not only gets an answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitFate {
+    /// When it first applied, on any replica: its first `RangeSplit`.
+    pub applied: Option<Instant>,
+    /// When a value of its range first left its key outside the range's span: its own split's
+    /// apply does, and so does a split of that range at another key below it. From then no split
+    /// of that range at that key can take effect, since Stage C has no merge, and
+    /// `KeyOutsideSpan` is the true answer to it.
+    pub outside: Option<Instant>,
+}
+
 type Driver = Arc<Mutex<DriverStats>>;
 
 fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -894,10 +1032,71 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// When a split's asker stops asking, once its first `NoRangeId`, at `refused`, has opened its
+/// window: D-092's bound, `election_max() * LIVENESS_TIMEOUTS`, past the last fault's heal,
+/// `heal`, or past `refused` if that came later, and one wait more for the last ask's answer, the
+/// asker's `RETRY_WAIT` once refused, `SPLIT_RETRY`. Both times are read on the admins' clock,
+/// where the asker reads its own; the heal is known from the schedule before the run. The wait is
+/// also longer than the admins' clock's offset from the global heal D-092's check reads (#245),
+/// so an asker that stops here with no answer has asked past the bound by the check's own reading
+/// (D-143).
+#[must_use]
+pub fn window_closes(heal: Instant, refused: Instant) -> Instant {
+    heal.max(refused) + election_max() * LIVENESS_TIMEOUTS + RETRY_WAIT
+}
+
+/// How an answer ended a split's asker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answered {
+    /// Done: proposed, and applied on the leader that answered.
+    Done,
+    /// Refused for a reason the asker does not retry.
+    Refused(SplitRefusal),
+}
+
+/// The reply in `bytes`, where it answers split `n`'s asker: under its number, or one it asked
+/// anew under.
+fn reply_to(n: u64, bytes: Bytes) -> Option<Reply> {
+    let answer = RangedResponse::decode(bytes).ok()?;
+    (answer.response.seq % ASK_ANEW == n).then_some(answer.response.reply)
+}
+
+/// What an answer other than `NoRangeId` does to a split's asker, counted in the driver's
+/// figures: done or a refusal ends it; `NotLeader` and `RangeMismatch` move its target on.
+fn answered(reply: Reply, target: &mut u64, stats: &Driver) -> Option<Answered> {
+    match reply {
+        Reply::Outcome(Outcome::Refused(reason)) => {
+            *lock(stats).refused.entry(reason.name()).or_default() += 1;
+            Some(Answered::Refused(reason))
+        }
+        Reply::Outcome(_) => {
+            lock(stats).splits_done += 1;
+            Some(Answered::Done)
+        }
+        Reply::NotLeader { leader } => {
+            *target = leader.map_or(*target % BOOTSTRAP + 1, |leader| leader.0);
+            None
+        }
+        Reply::RangeMismatch { .. } => {
+            *target = *target % BOOTSTRAP + 1;
+            None
+        }
+    }
+}
+
+/// The datagrams already on `sock`, taken without waiting for one (D-143).
+fn queued(sock: &impl Socket) -> Vec<Bytes> {
+    let mut held = Vec::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    while let Poll::Ready(Ok((_, bytes))) = pin!(sock.recv()).poll(&mut cx) {
+        held.push(bytes);
+    }
+    held
+}
+
 /// The split's admin: asks `range`'s leader, `target` first, to split at `key`, follows
-/// `NotLeader` round the bootstrap nodes twice, retries after `NoRangeId` (PROPOSED
-/// D-092's A), and records every answer. Under a burst it asks `delay` after the action fired
-/// (PROPOSED D-131).
+/// `NotLeader` round the bootstrap nodes, retries after `NoRangeId` (D-092's A), and records
+/// every answer it reads. Under a burst it asks `delay` after the action fired (D-131).
 ///
 /// A leader answers a split's copy with silence once its entry is in the log, and answers the
 /// entry once, at its apply (SHARD.md §5): an asker that heard `NoRangeId`, then asked again,
@@ -907,12 +1106,26 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// where it has already landed. Seed 992 found it: the split took effect 130 ms after its
 /// first refusal and its asker was answered 3.2 s later (PROPOSED D-131).
 ///
-/// The asks before the first `NoRangeId` and the retries after it are counted apart. D-092's
-/// check is about the retries, and it reports an asker still asking at the last heal that ends
-/// with no answer. An asker whose tries went on `NotLeader` bounces and whose first `NoRangeId`
-/// came on its last one has made no retry, and the check would be reading the bounces. So the
-/// first `NoRangeId` gives the asker [`ASKS`] again, and only the first, so an asker every
-/// node keeps refusing still stops and is still reported. Seed 18925 found it (PROPOSED D-131).
+/// The asks before the first `NoRangeId` and the retries after it are told apart. Before it, the
+/// asker asks [`ASKS`] times, round the bootstrap nodes four times, waiting [`SPLIT_WAIT`] for
+/// each answer. Its first `NoRangeId` opens D-092's window, and from then it asks until the window
+/// closes ([`window_closes`], from `heal`, the last fault's heal on its own clock), waiting
+/// [`RETRY_WAIT`] for each answer. D-092's check reports an asker still asking at the last heal
+/// that ends with no answer, and the window makes that a report of the system: an asker stops
+/// with no answer only past the bound the check holds it to. Until D-143 the retries were
+/// counted too, [`ASKS`] again from the first refusal (D-131, seed 18925, whose asks went on
+/// `NotLeader` bounces and whose first `NoRangeId` came on its last). Seed 781 found that count
+/// short in #259's nightly: its asker spent 5 of its 12 retries inside the fault and stopped
+/// 1.15 s past the heal with no answer, 91 ms after the id it waited for had landed.
+///
+/// It never reads an answer queued before an ask as that ask's answer: before each ask, and
+/// before it stops, it takes what its socket already holds ([`queued`]). Retries share one
+/// number, so the number cannot tell a network duplicate or a late answer of an earlier ask from
+/// the answer to the next one, and read as that answer a stale `NoRangeId` can hide a lost ask.
+/// A queued `NoRangeId` is dropped, the ask about to go being its retry; any other answer is
+/// taken as one read after an ask is (D-143).
+// D-092: answer A; the asker retries.
+// D-143: the asker asks until its window closes.
 #[allow(clippy::too_many_arguments)]
 async fn split_admin<E: Environment>(
     env: E,
@@ -923,6 +1136,7 @@ async fn split_admin<E: Environment>(
     key: Bytes,
     stats: Driver,
     delay: Duration,
+    heal: Instant,
 ) {
     let Ok(sock) = env.net().bind(admin_addr(n)).await else {
         lock(&stats).outstanding -= 1;
@@ -932,11 +1146,36 @@ async fn split_admin<E: Environment>(
         env.clock().sleep(delay).await;
     }
     let mut tries = ASKS;
-    let mut done = false;
+    // How an answer ended the asker, where one did.
+    // PROPOSED(D-137): the refusal the asker stopped on, if it stopped on one, is kept here.
+    let mut ended_on: Option<Answered> = None;
     let mut first_refused: Option<Instant> = None;
     let mut seq = n;
-    while tries > 0 && !done {
-        tries -= 1;
+    loop {
+        // D-143: what the socket already holds answers an earlier ask, never the next one.
+        // PROPOSED(D-143): a queued `NoRangeId` dropped and not counted, any other answer taken
+        // as after an ask, and the queue read before the asker stops as well as before each ask.
+        for bytes in queued(&sock) {
+            match reply_to(n, bytes) {
+                None | Some(Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId))) => {}
+                Some(reply) => ended_on = answered(reply, &mut target, &stats),
+            }
+            if ended_on.is_some() {
+                break;
+            }
+        }
+        if ended_on.is_some() {
+            break;
+        }
+        match first_refused {
+            None if tries == 0 => break,
+            None => tries -= 1,
+            // D-143: the retries ask until the window closes; see above.
+            // PROPOSED(D-143): the window gates asks only; the last answer may be awaited past
+            // it (P6).
+            Some(refused) if env.clock().now() >= window_closes(heal, refused) => break,
+            Some(_) => {}
+        }
         let request = RangedRequest {
             range: RangeId(range),
             generation,
@@ -956,12 +1195,18 @@ async fn split_admin<E: Environment>(
         {
             break;
         }
+        let wait = if first_refused.is_some() {
+            RETRY_WAIT
+        } else {
+            SPLIT_WAIT
+        };
         let answer = {
             let recv = pin!(sock.recv());
-            let timer = pin!(env.clock().sleep(SPLIT_WAIT));
+            let timer = pin!(env.clock().sleep(wait));
             race(&env, recv, timer).await
         };
         let Either::Left(Ok((_, bytes))) = answer else {
+            // PROPOSED(D-143): once refused, a silent wait still moves the asker to the next node.
             target = target % BOOTSTRAP + 1;
             // PROPOSED(D-131): the copy of a split the log holds is answered once; see above.
             if first_refused.is_some() {
@@ -969,56 +1214,45 @@ async fn split_admin<E: Environment>(
             }
             continue;
         };
-        let Ok(answer) = RangedResponse::decode(bytes) else {
+        let Some(reply) = reply_to(n, bytes) else {
             continue;
         };
-        if answer.response.seq % ASK_ANEW != n {
-            continue;
-        }
-        match answer.response.reply {
-            Reply::Outcome(Outcome::Refused(reason)) => {
+        match reply {
+            Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId)) => {
                 let now = env.clock().now();
                 {
                     let mut stats = lock(&stats);
-                    *stats.refused.entry(reason.name()).or_default() += 1;
-                    if reason == SplitRefusal::NoRangeId {
-                        stats.no_range_id.push((target, now));
-                    }
+                    *stats
+                        .refused
+                        .entry(SplitRefusal::NoRangeId.name())
+                        .or_default() += 1;
+                    stats.no_range_id.push((target, now));
                 }
-                if reason == SplitRefusal::NoRangeId {
-                    // PROPOSED(D-131): the retries get the budget whole; see above.
-                    if first_refused.is_none() {
-                        tries = ASKS;
-                    }
-                    first_refused.get_or_insert(now);
-                    env.clock().sleep(SPLIT_RETRY).await;
-                    continue;
-                }
-                done = true;
+                // D-143: the first opens the window the retries ask in; see above.
+                first_refused.get_or_insert(now);
+                env.clock().sleep(SPLIT_RETRY).await;
             }
-            Reply::Outcome(_) => {
-                lock(&stats).splits_done += 1;
-                done = true;
-            }
-            Reply::NotLeader { leader } => {
-                target = leader.map_or(target % BOOTSTRAP + 1, |leader| leader.0);
-            }
-            Reply::RangeMismatch { .. } => {
-                target = target % BOOTSTRAP + 1;
-            }
+            // PROPOSED(D-143): inside the window a bounce is asked again at once, as before it, its
+            // asks bounded by the window's time and not by a count (P7).
+            reply => ended_on = answered(reply, &mut target, &stats),
         }
     }
     let ended = env.clock().now();
     let mut stats = lock(&stats);
-    if !done {
+    if ended_on.is_none() {
         stats.splits_unanswered += 1;
     }
     if let Some(refused) = first_refused {
         stats.retried.push(Retried {
             range,
+            key,
             refused,
             ended,
-            answered: done,
+            answered: ended_on.is_some(),
+            refusal: match ended_on {
+                Some(Answered::Refused(reason)) => Some(reason),
+                Some(Answered::Done) | None => None,
+            },
         });
     }
     stats.outstanding -= 1;
@@ -1089,12 +1323,12 @@ fn burst_process(j: u64) -> u64 {
 
 /// The burst of [`Load::WriteBurst`] and [`Load::ReadBurst`]: `ops`, one every `every`, at the
 /// parent's leader `target`, under the parent's range and generation, each answered as it comes
-/// (PROPOSED D-131). Unlike the Figure 8 driver's burst (`raft::burst`, D-031), which only
+/// (D-131). Unlike the Figure 8 driver's burst (`raft::burst`, D-031), which only
 /// needs its appends, this one takes its answers, so a write a variant acknowledges and a read
 /// it serves are in the history. Each is sent once: a write it hears nothing of, or is told is
 /// not this range's, stays pending or leaves the history at its apply, as a client's does
 /// (SHARD.md §9).
-// PROPOSED(D-131): the workload's bursts (D-031's shape for a driver).
+// D-131: the workload's bursts (D-031's shape for a driver).
 async fn load_burst<E: Environment>(
     env: E,
     j: u64,
@@ -1168,7 +1402,7 @@ async fn load_burst<E: Environment>(
     }
 }
 
-/// One of the two stale-cache shape's clients (PROPOSED D-131): asks `op` of `range` at
+/// One of the two stale-cache shape's clients (D-131): asks `op` of `range` at
 /// `generation` through `target`, following `NotLeader` round the bootstrap nodes, and traces
 /// its call and its answer as a client's. Whether it was answered with an outcome.
 ///
@@ -1241,7 +1475,7 @@ async fn ask_once<E: Environment, S: Socket>(
             // A `RangeMismatch` is the correct server's answer to the reader, and its call
             // leaves the history as one never proposed (SHARD.md §9).
             Some(Reply::RangeMismatch { .. }) => return false,
-            // PROPOSED(D-131): one try for a write, as above.
+            // D-131: one try for a write, as above.
             None if op.is_write() => return false,
             Some(Reply::NotLeader { leader: None }) | None => target = target % BOOTSTRAP + 1,
         }
@@ -1249,7 +1483,7 @@ async fn ask_once<E: Environment, S: Socket>(
     false
 }
 
-/// [`Load::StaleCache`]'s two clients, as action `j`'s (PROPOSED D-131): the writer puts a
+/// [`Load::StaleCache`]'s two clients, as action `j`'s (D-131): the writer puts a
 /// right-half key through the right half, and once it has its answer the reader, whose cache
 /// still names the parent, gets that key through the parent at the generation it had.
 async fn stale_clients<E: Environment>(
@@ -1365,10 +1599,14 @@ enum Step {
     RestartTransfer(usize),
     /// Fault `i`'s [`Fault::SplitFromRestarted`] asks its restarted node to split the range.
     RestartSplit(usize),
+    /// Fault `i`'s [`Fault::MetaReorder`] hands the left half's lead to the third node.
+    MetaTransfer(usize),
+    /// Fault `i`'s [`Fault::MetaReorder`] asks the third node to split the left half again.
+    MetaSplit(usize),
 }
 
 /// What a shape resolved to when it fired, as a split's [`Load`] and a restart arm do not
-/// know until then (PROPOSED D-131).
+/// know until then (D-131).
 #[derive(Clone, Debug)]
 struct Aimed {
     /// The parent.
@@ -1379,7 +1617,7 @@ struct Aimed {
     cut: u64,
 }
 
-/// The arm [`Fault::SplitFromRestarted`] as it fired, read against the trace (PROPOSED D-131).
+/// The arm [`Fault::SplitFromRestarted`] as it fired, read against the trace (D-131).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartArm {
     /// The node crashed and restarted.
@@ -1388,6 +1626,29 @@ pub struct RestartArm {
     pub range: Option<u64>,
     /// The sequence number of the split its admin asked, where it asked one.
     pub seq: Option<u64>,
+}
+
+/// The arm [`Fault::MetaReorder`] as it fired, read against the trace (PROPOSED D-135).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaArm {
+    /// When the block began and the first split was asked.
+    pub at: Instant,
+    /// The node `a` leading the range when the arm fired, whose link to `to` was blocked.
+    pub from: u64,
+    /// The meta range's leader's node `m` when the arm fired.
+    pub to: u64,
+    /// The third voter `c`, handed the left half's lead and asked the second split.
+    pub third: u64,
+    /// The range split twice.
+    pub range: u64,
+    /// Its generation when the first split was asked.
+    pub generation: u64,
+    /// The key the first split cuts at.
+    pub first_cut: u64,
+    /// Whether the first split had landed at the transfer's step, so the lead was handed on.
+    pub transferred: bool,
+    /// The key the second split cuts at, where it was asked.
+    pub second_cut: Option<u64>,
 }
 
 /// What one run produced.
@@ -1409,10 +1670,15 @@ pub struct Report {
     pub checked: raft::Report,
     /// When the last fault healed: the heal D-092 reads its asker's retry from, where
     /// `checked.last_heal`, the liveness window's start, is past the driver's drain and so
-    /// past every asker the drain saw finish (PROPOSED D-113 §8).
+    /// past every asker the drain saw finish (D-113 §8).
     pub last_fault_healed: Instant,
     /// Each [`Fault::SplitFromRestarted`] that found a node to crash.
     pub restart_arms: Vec<RestartArm>,
+    /// Each [`Fault::MetaReorder`] that found a range to split twice (PROPOSED D-135).
+    pub meta_arms: Vec<MetaArm>,
+    /// The node the driver's admins run on, on whose clock [`Retried`]'s times are read.
+    // PROPOSED(D-137)
+    pub admin: NodeId,
 }
 
 /// Runs the correct system on `seed`.
@@ -1447,7 +1713,7 @@ pub fn run_of(
 
 /// [`run_of`] with no violation stopping it: the same run for as long as the sweep's
 /// would have lasted, and past that to its schedule's end, so a check about time can be read
-/// of a variant another check would have stopped first (PROPOSED D-113).
+/// of a variant another check would have stopped first (D-113).
 #[must_use]
 pub fn run_to_the_end(
     seed: u64,
@@ -1465,7 +1731,7 @@ pub fn run_to_the_end(
     )
 }
 
-/// [`run_to_the_end`] on a schedule the caller names (PROPOSED D-131).
+/// [`run_to_the_end`] on a schedule the caller names (D-131).
 #[must_use]
 pub fn run_to_the_end_with(
     seed: u64,
@@ -1564,6 +1830,20 @@ fn run_watched(
                 Step::RestartSplit(i),
             ));
         }
+        // PROPOSED(D-135): the reorder arm's later steps fall inside its hold.
+        if let Fault::MetaReorder {
+            transfer_after,
+            split_after,
+        } = fault
+        {
+            let began = at - fault.length();
+            steps.push((began + *transfer_after, 2, Step::MetaTransfer(i)));
+            steps.push((
+                began + *transfer_after + *split_after,
+                2,
+                Step::MetaSplit(i),
+            ));
+        }
         at += *gap;
     }
     for (j, action) in schedule.actions.iter().enumerate() {
@@ -1579,6 +1859,18 @@ fn run_watched(
         }
     }
     steps.sort_by_key(|(at, order, _)| (*at, *order));
+    // D-143: where a split's asker's window opens, the last fault's heal, known from the schedule
+    // before the run and read on the admins' clock, where the asker reads its own times.
+    let heals = steps
+        .iter()
+        .filter(|(_, _, step)| matches!(step, Step::End(_)))
+        .map(|(at, _, _)| *at)
+        .max()
+        .unwrap_or(begin);
+    let heal = sim
+        .run_header()
+        .node_time(admin, heals)
+        .expect("the admins' node is one of the run's");
 
     let all: Vec<NodeId> = nodes
         .iter()
@@ -1589,9 +1881,10 @@ fn run_watched(
     let mut isolations: Vec<(u64, Instant, Instant)> = Vec::new();
     // The fault in force: its victim node, if it has one, and when it began.
     let mut open: Option<(u64, Instant)> = None;
-    // What the shapes resolved to when they fired (PROPOSED D-131).
+    // What the shapes resolved to when they fired (D-131).
     let mut aimed: Vec<Option<Aimed>> = vec![None; schedule.actions.len()];
     let mut restart_arms: Vec<Option<RestartArm>> = vec![None; schedule.faults.len()];
+    let mut meta_arms: Vec<Option<MetaArm>> = vec![None; schedule.faults.len()];
     let mut last_heal = sim.now();
     for (at, _, step) in steps {
         advance_to(&mut sim, at, &mut watch);
@@ -1641,7 +1934,7 @@ fn run_watched(
                         sim.crash(nodes[leader as usize - 1]);
                         open = Some((leader, sim.now()));
                     }
-                    // PROPOSED(D-131): a node some split has taken an id from, as the trace
+                    // D-131: a node some split has taken an id from, as the trace
                     // says when the arm fires.
                     Fault::SplitFromRestarted { .. } => {
                         watch.look(&sim);
@@ -1658,6 +1951,22 @@ fn run_watched(
                                 (victim, sim.now())
                             });
                     }
+                    // PROPOSED(D-135): a range that can split twice, led off meta's leader's
+                    // node, as the trace says when the arm fires.
+                    Fault::MetaReorder { .. } => {
+                        watch.look(&sim);
+                        meta_arms[i] = block_meta_and_split(
+                            &mut sim,
+                            &nodes,
+                            admin,
+                            i,
+                            pick,
+                            &watch.spans,
+                            &driver,
+                            heal,
+                        );
+                        open = None;
+                    }
                 }
             }
             Step::End(i) => {
@@ -1668,7 +1977,7 @@ fn run_watched(
                             isolations.push((node, from, sim.now()));
                         }
                     }
-                    Fault::OneWay { .. } => sim.heal(),
+                    Fault::OneWay { .. } | Fault::MetaReorder { .. } => sim.heal(),
                     Fault::Crash { .. }
                     | Fault::CrashLeader { .. }
                     | Fault::SplitFromRestarted { .. } => {
@@ -1687,9 +1996,17 @@ fn run_watched(
                 if watch.checks.stopped.is_some() {
                     break;
                 }
-                aimed[j] = act(&sim, admin, j, &schedule.actions[j], &watch.spans, &driver);
+                aimed[j] = act(
+                    &sim,
+                    admin,
+                    j,
+                    &schedule.actions[j],
+                    &watch.spans,
+                    &driver,
+                    heal,
+                );
             }
-            // PROPOSED(D-131): the shapes' later steps, each resolved against the trace as
+            // D-131: the shapes' later steps, each resolved against the trace as
             // it stands when it fires, each doing nothing where its split did not land.
             Step::StaleTransfer(j) => {
                 watch.look(&sim);
@@ -1748,6 +2065,36 @@ fn run_watched(
                         schedule.picks[i],
                         &watch.spans,
                         &driver,
+                        heal,
+                    );
+                }
+            }
+            // PROPOSED(D-135): the reorder arm's later steps, each resolved against the trace
+            // as it stands when it fires, each doing nothing where the first split did not land.
+            Step::MetaTransfer(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = meta_arms[i].as_mut() {
+                    hand_the_left_half_to_the_third(&sim, admin, i, arm, &watch.spans, &driver);
+                }
+            }
+            Step::MetaSplit(i) => {
+                watch.look(&sim);
+                if watch.checks.stopped.is_some() {
+                    break;
+                }
+                if let Some(arm) = meta_arms[i].as_mut() {
+                    split_the_left_half_through_the_third(
+                        &sim,
+                        admin,
+                        i,
+                        arm,
+                        schedule.picks[i],
+                        &watch.spans,
+                        &driver,
+                        heal,
                     );
                 }
             }
@@ -1760,8 +2107,13 @@ fn run_watched(
         advance(&mut sim, SLICE, &mut watch);
     }
     let last_fault_healed = last_heal;
+    // D-143: the asker's window opened at the heal D-092's check reads from.
+    assert!(
+        watch.checks.stopped.is_some() || last_fault_healed == heals,
+        "the last fault healed at {last_fault_healed:?}, where the schedule said {heals:?}"
+    );
     last_heal = last_heal.max(sim.now());
-    // The instrument for the bound read from the heal (PROPOSED D-113 §5): the same window,
+    // The instrument for the bound read from the heal (D-113 §5): the same window,
     // its first stretch with no client reaching any node. `last_heal` is not moved, as the
     // cluster's own slowness would not move it.
     if let Some(held) = schedule.clients_held_off {
@@ -1814,14 +2166,16 @@ fn run_watched(
         checked,
         last_fault_healed,
         restart_arms: restart_arms.into_iter().flatten().collect(),
+        meta_arms: meta_arms.into_iter().flatten().collect(),
+        admin,
     }
 }
 
-/// [`Load::StaleCache`]'s second step (PROPOSED D-131): where the right half is led from the
+/// [`Load::StaleCache`]'s second step (D-131): where the right half is led from the
 /// parent's leader's node, asks that its lead move to another voter, so that the right half's
 /// writes commit on two nodes and the parent's leader may lag them. Leaves it alone where a
 /// fault or a transfer already moved it, and where the split has not landed.
-// PROPOSED(D-131)
+// D-131
 fn move_right_half_off(
     sim: &Sim,
     admin: NodeId,
@@ -1870,10 +2224,10 @@ fn move_right_half_off(
     );
 }
 
-/// [`Load::StaleCache`]'s last step (PROPOSED D-131): one client writes a right-half key
+/// [`Load::StaleCache`]'s last step (D-131): one client writes a right-half key
 /// through the right half and another, whose cache still names the parent, reads it through
 /// the parent.
-// PROPOSED(D-131)
+// D-131
 fn ask_through_both(sim: &Sim, admin: NodeId, j: usize, aim: &Aimed, pick: u64, spans: &Spans) {
     let Some((right, span)) = spans.starting_at(&user_key(&key(aim.cut))) else {
         return;
@@ -1903,10 +2257,10 @@ fn ask_through_both(sim: &Sim, admin: NodeId, j: usize, aim: &Aimed, pick: u64, 
     );
 }
 
-/// [`Fault::SplitFromRestarted`]'s first step after the restart (PROPOSED D-131): picks a user
+/// [`Fault::SplitFromRestarted`]'s first step after the restart (D-131): picks a user
 /// range that can still split, and asks its leader to hand it to the restarted node. No range
 /// can, and the arm has only been a crash.
-// PROPOSED(D-131)
+// D-131
 fn hand_restarted_a_range(
     sim: &Sim,
     admin: NodeId,
@@ -1952,9 +2306,11 @@ fn hand_restarted_a_range(
     );
 }
 
-/// [`Fault::SplitFromRestarted`]'s last step (PROPOSED D-131): asks the restarted node to split
-/// the range it was handed.
-// PROPOSED(D-131)
+/// [`Fault::SplitFromRestarted`]'s last step (D-131): asks the restarted node to split
+/// the range it was handed. `heal` is the last fault's on the admins' clock, where the asker's
+/// window opens (D-143).
+// D-131
+#[allow(clippy::too_many_arguments)]
 fn split_from_restarted(
     sim: &Sim,
     admin: NodeId,
@@ -1963,6 +2319,7 @@ fn split_from_restarted(
     pick: u64,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) {
     let Some(range) = arm.range else {
         return;
@@ -1995,12 +2352,210 @@ fn split_from_restarted(
             key(at),
             driver.clone(),
             Duration::ZERO,
+            heal,
+        ),
+    );
+}
+
+/// The keys a first split of `span` may cut at so that its left half can split again: those
+/// that leave twice [`MIN_KEYS`] of the clients' keys on the left and [`MIN_KEYS`] on the right
+/// (PROPOSED D-135).
+fn twice_split_keys(span: &Span) -> Vec<u64> {
+    let held = keys_in(span);
+    let min = usize::try_from(MIN_KEYS).expect("small");
+    if held.len() < 3 * min {
+        return Vec::new();
+    }
+    held[2 * min..=held.len() - min].to_vec()
+}
+
+/// [`Fault::MetaReorder`]'s first step (SHARD.md §10; PROPOSED D-135): picks a user range that
+/// can split twice and is led on a node other than the meta range's leader's, blocks that node's
+/// link to meta's leader's node one way, and asks the range's leader to split it. No range
+/// qualifies, and the arm does nothing. `heal` is the last fault's on the admins' clock, where the
+/// asker's window opens (D-143).
+// PROPOSED(D-135)
+#[allow(clippy::too_many_arguments)]
+fn block_meta_and_split(
+    sim: &mut Sim,
+    nodes: &[NodeId],
+    admin: NodeId,
+    i: usize,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+    heal: Instant,
+) -> Option<MetaArm> {
+    let to = raft::leader_of_range(sim, META_RANGE);
+    let candidates: Vec<(u64, &Span, u64, Vec<u64>)> = spans
+        .user()
+        .map(|(range, span)| {
+            (
+                range,
+                span,
+                raft::leader_of_range(sim, range),
+                twice_split_keys(span),
+            )
+        })
+        .filter(|(_, span, from, cuts)| {
+            *from != to
+                && !cuts.is_empty()
+                && span.voters.contains(from)
+                && span.voters.contains(&to)
+        })
+        .collect();
+    let (range, span, from, cuts) =
+        candidates.get(usize::try_from(pick % candidates.len().max(1) as u64).expect("small"))?;
+    let third = span
+        .voters
+        .iter()
+        .copied()
+        .find(|voter| voter != from && *voter != to)?;
+    let first_cut = cuts[usize::try_from(pick % cuts.len() as u64).expect("small")];
+    sim.block(
+        nodes[usize::try_from(*from).expect("small") - 1],
+        nodes[usize::try_from(to).expect("small") - 1],
+    );
+    {
+        let mut stats = lock(driver);
+        stats.splits_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small");
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-split",
+        split_admin(
+            inner,
+            n,
+            *from,
+            *range,
+            span.generation,
+            key(first_cut),
+            driver.clone(),
+            Duration::ZERO,
+            heal,
+        ),
+    );
+    Some(MetaArm {
+        at: sim.now(),
+        from: *from,
+        to,
+        third,
+        range: *range,
+        generation: span.generation,
+        first_cut,
+        transferred: false,
+        second_cut: None,
+    })
+}
+
+/// Whether the trace's latest descriptor of the arm's range is the first split's left half:
+/// the first split landed and nothing has split the left half since.
+fn left_half_of_the_first(arm: &MetaArm, spans: &Spans) -> Option<Span> {
+    spans
+        .latest()
+        .get(&arm.range)
+        .filter(|span| span.end == user_key(&key(arm.first_cut)))
+        .cloned()
+}
+
+/// [`Fault::MetaReorder`]'s second step (PROPOSED D-135): where the first split has landed, asks
+/// the left half's leader to hand it to the third node, whose link to meta's leader's node is
+/// open.
+// PROPOSED(D-135)
+fn hand_the_left_half_to_the_third(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut MetaArm,
+    spans: &Spans,
+    driver: &Driver,
+) {
+    let Some(span) = left_half_of_the_first(arm, spans) else {
+        return;
+    };
+    arm.transferred = true;
+    let leader = raft::leader_of_range(sim, arm.range);
+    if leader == arm.third {
+        return;
+    }
+    {
+        let mut stats = lock(driver);
+        stats.transfers_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small") + 1;
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-transfer",
+        transfer_admin(
+            inner,
+            n,
+            leader,
+            arm.range,
+            span.generation,
+            arm.third,
+            driver.clone(),
+        ),
+    );
+}
+
+/// [`Fault::MetaReorder`]'s last step (PROPOSED D-135): asks the third node to split the left
+/// half again, where the lead was handed on and nothing has split the left half since. `heal` is
+/// the last fault's on the admins' clock, where the asker's window opens (D-143).
+// PROPOSED(D-135)
+#[allow(clippy::too_many_arguments)]
+fn split_the_left_half_through_the_third(
+    sim: &Sim,
+    admin: NodeId,
+    i: usize,
+    arm: &mut MetaArm,
+    pick: u64,
+    spans: &Spans,
+    driver: &Driver,
+    heal: Instant,
+) {
+    if !arm.transferred {
+        return;
+    }
+    let Some(span) = left_half_of_the_first(arm, spans) else {
+        return;
+    };
+    let keys = split_keys(&span);
+    let Some(&at) = keys.get(usize::try_from(pick % keys.len().max(1) as u64).expect("small"))
+    else {
+        return;
+    };
+    arm.second_cut = Some(at);
+    {
+        let mut stats = lock(driver);
+        stats.splits_asked += 1;
+        stats.outstanding += 1;
+    }
+    let n = META_ADMIN + 3 * u64::try_from(i).expect("small") + 2;
+    let env = sim.env(admin);
+    let inner = env.clone();
+    env.spawn(
+        "reorder-split",
+        split_admin(
+            inner,
+            n,
+            arm.third,
+            arm.range,
+            span.generation,
+            key(at),
+            driver.clone(),
+            Duration::ZERO,
+            heal,
         ),
     );
 }
 
 /// The `count` operations of a burst of action `n`: right-half keys taken in turn from the
-/// one `pick` names, puts under distinct values or gets (PROPOSED D-131).
+/// one `pick` names, puts under distinct values or gets (D-131).
 fn burst_ops(n: u64, right: &[u64], count: u64, pick: u64, writes: bool) -> Vec<ClientOp> {
     let len = right.len() as u64;
     (0..count)
@@ -2020,7 +2575,8 @@ fn burst_ops(n: u64, right: &[u64], count: u64, pick: u64, writes: bool) -> Vec<
 }
 
 /// Fires the driver's action `j`, resolved against `spans` as they stand. What a split aimed at,
-/// for the shape's later steps (PROPOSED D-131).
+/// for the shape's later steps (D-131). `heal` is the last fault's on the admins' clock, where a
+/// split's asker's window opens (D-143).
 fn act(
     sim: &Sim,
     admin: NodeId,
@@ -2028,6 +2584,7 @@ fn act(
     action: &Action,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) -> Option<Aimed> {
     let n = u64::try_from(j).expect("small") + 1;
     let env = sim.env(admin);
@@ -2052,7 +2609,7 @@ fn act(
                 stats.splits_asked += 1;
                 stats.outstanding += 1;
             }
-            // PROPOSED(D-131): a burst starts as the action fires, and the split goes after
+            // D-131: a burst starts as the action fires, and the split goes after
             // the burst's first `lead`.
             let burst = match action.load {
                 Load::WriteBurst { count, every, lead } => Some((true, count, every, lead)),
@@ -2073,6 +2630,7 @@ fn act(
                     key(at),
                     driver.clone(),
                     delay,
+                    heal,
                 ),
             );
             if let Some((writes, count, every, _)) = burst {
@@ -2386,7 +2944,7 @@ pub fn meta_lags_of(records: &[TraceRecord], last_heal: Instant) -> Vec<MetaLag>
 
 /// Why a voter holding nothing of a right half can never be initialised by an apply: the second
 /// half of what #220's owner ruling excuses from the meta convergence bound.
-// PROPOSED(D-113): §6, #220.
+// D-113: §6, #220.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stuck {
     /// Its replica of the parent reached the split by an install, at this index, so it never
@@ -2398,7 +2956,7 @@ pub enum Stuck {
 
 /// What a right half's voters and leaders had come to where the trace ends: the three conditions
 /// under which the meta convergence bound excuses the range ([`RightHalf::excused`]).
-// PROPOSED(D-113): §6, #220.
+// D-113: §6, #220.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RightHalf {
     /// The range it was split from, as the first `RangeSplit` naming it says.
@@ -2411,8 +2969,20 @@ pub struct RightHalf {
     /// The voters holding nothing of it that no apply can ever end, by why.
     pub stuck: BTreeMap<u64, Stuck>,
     /// Every other voter of it: impaired while holding a replica, or holding nothing where an
-    /// apply could still end that.
+    /// apply could still end that. A replica quarantined under D-130 is among them, as it was
+    /// before D-142: every reading of this set but the exception's is as it was.
     pub others: BTreeSet<u64>,
+    /// The voters of `others` holding a replica quarantined under D-130 where the trace ends,
+    /// which #220's exception alone counts with the voters that cannot vote, as it counts a
+    /// stuck placeholder (D-142, the owner's ruling of 2026-11-15). Under D-130 is D-130's rule
+    /// and nothing wider: the replica was made by a split's apply on its node's replica of the
+    /// parent while that replica was quarantined, by any route, read recursively. Its own
+    /// statements, `RaftReseeded` and `RaftRecovered` stating it quarantined, carry that and
+    /// make none: a replica quarantined only by its own re-seed (D-035) or by an install onto a
+    /// re-seeded node's placeholder (D-109 §2) is not here and keeps the range asked. It ends at
+    /// a restatement saying the disk carries no mark, after which the replica can vote, and at
+    /// the replica's next creation, which a refusal leaves to whatever the node holds after it.
+    pub quarantined: BTreeSet<u64>,
     /// How many `RaftLeader`s of it were traced at or after the heal the reading was given.
     pub led_since_heal: usize,
     /// The server that became its leader and had not left office where the trace ends.
@@ -2422,14 +2992,49 @@ pub struct RightHalf {
 impl RightHalf {
     /// Whether the meta convergence bound excuses the range (owner's ruling of 2026-11-09,
     /// #220): fewer than two voters able to vote, no leader traced since the last heal and none
-    /// standing at the end, and every other voter a placeholder that no apply can ever end.
-    /// Any one of them missing and the bound asks of the range as it asks of any other.
+    /// standing at the end, and every other voter one that cannot vote: a placeholder that no
+    /// apply can ever end, or, by the owner's ruling of 2026-11-15 (D-142) and until #220 is
+    /// fixed, a replica quarantined under D-130, so long as #220 is part of the wedge
+    /// ([`RightHalf::a_majority_were_220_fixed`]). Any one of them missing and the bound asks of
+    /// the range as it asks of any other.
+    // D-142: the owner's ruling of 2026-11-15, in this exception alone.
     #[must_use]
     pub fn excused(&self) -> bool {
         self.able.len() < 2
             && self.led_since_heal == 0
             && self.leader_at_end.is_none()
-            && self.others.is_empty()
+            && self.others_that_keep_it_asked().is_empty()
+            && self.a_majority_were_220_fixed()
+    }
+
+    /// Whether the voters able to vote and the placeholders no apply can end are a majority of
+    /// the range's voters: whether the range could elect were #220 fixed, so that #220 is part of
+    /// what wedges it. A range wedged by quarantined replicas alone lies outside the exception,
+    /// which lasts until #220 is fixed and no longer (D-142). Where `others` is empty, as the
+    /// exception before the owner's ruling of 2026-11-15 asked, every voter is one of the two, so
+    /// this holds and that exception is as it was.
+    // D-142
+    #[must_use]
+    pub fn a_majority_were_220_fixed(&self) -> bool {
+        let could = self.able.len() + self.stuck.len();
+        2 * could > could + self.others.len()
+    }
+
+    /// The voters of `others` that keep the range asked under condition three: all of them but
+    /// the replicas quarantined under D-130, which the exception counts as unable to vote
+    /// (D-142). Only [`RightHalf::excused`] reads it this way.
+    // D-142
+    #[must_use]
+    pub fn others_that_keep_it_asked(&self) -> BTreeSet<u64> {
+        self.others.difference(&self.quarantined).copied().collect()
+    }
+
+    /// Whether the range is excused only by D-142's reading: excused, with a voter in `others`
+    /// that the exception before the owner's ruling of 2026-11-15 would have kept it asked by.
+    // D-142
+    #[must_use]
+    pub fn excused_by_the_quarantine(&self) -> bool {
+        self.excused() && !self.others.is_empty()
     }
 }
 
@@ -2437,8 +3042,10 @@ impl RightHalf {
 /// convergence bound. `heal` is the last heal and `impaired` is the raft report's
 /// `impaired_voters`, the majority rule's own reading, which this adds to and does not change.
 /// A range no `RangeSplit` names is no right half and has no entry here, so the bound asks of it.
-/// A refusal ends everything the node held: its replicas, its applies and its installs.
-// PROPOSED(D-113): §6, #220.
+/// A refusal ends everything the node held: its replicas, its applies and its installs, and
+/// since D-142 the quarantines it read for D-130's rule.
+// D-113: §6, #220.
+// D-142: the replicas quarantined under D-130, read for the exception alone.
 #[must_use]
 pub fn right_halves_of(
     records: &[TraceRecord],
@@ -2451,6 +3058,14 @@ pub fn right_halves_of(
     let mut applied_the_split: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut installed: BTreeMap<(u64, u64), u64> = BTreeMap::new();
     let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // D-142: the replicas quarantined by any route where the trace has come to, ended as the
+    // quarantine ends: what D-130's rule reads of a parent. `quarantined` above, which `able`
+    // reads, is left as it was.
+    let mut under_quarantine: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // D-142: the replicas D-130's rule quarantined, made by a split's apply on a replica of their
+    // parent in `under_quarantine`: what the exception counts. Only a creation puts one here, and
+    // each creation decides it afresh.
+    let mut made_quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut split_of: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     let mut leader: BTreeMap<u64, u64> = BTreeMap::new();
     let mut led_since: BTreeMap<u64, usize> = BTreeMap::new();
@@ -2462,18 +3077,35 @@ pub fn right_halves_of(
                 applied_the_split.retain(|(_, on)| on != server);
                 installed.retain(|(_, on), _| on != server);
                 leader.retain(|_, by| by != server);
+                // D-142: a quarantine is for the replica's life on its store (D-035), and the
+                // refusal ends the store. What the node holds after it states its own, and a
+                // replica it holds after it is held from a creation, which reads D-130's rule
+                // afresh.
+                under_quarantine.retain(|(_, on)| on != server);
             }
             TraceEvent::RaftReseeded { server, range } => {
                 quarantined.insert((*range, *server));
+                under_quarantine.insert((*range, *server));
             }
             TraceEvent::RaftRecovered {
                 server,
                 range,
-                state: RecoveredAs::Quarantined,
+                state,
                 ..
-            } => {
-                quarantined.insert((*range, *server));
-            }
+            } => match state {
+                RecoveredAs::Quarantined => {
+                    quarantined.insert((*range, *server));
+                    under_quarantine.insert((*range, *server));
+                }
+                // D-142: the disk carries no mark, so the replica can vote from here. Only a
+                // store that lost its mark says this of a quarantined replica.
+                RecoveredAs::Neither => {
+                    under_quarantine.remove(&(*range, *server));
+                    made_quarantined.remove(&(*range, *server));
+                }
+                // Refused: the re-seed's mark is on the disk, which ends nothing.
+                _ => {}
+            },
             TraceEvent::RaftSnapshot {
                 server,
                 range,
@@ -2484,9 +3116,27 @@ pub fn right_halves_of(
                 let to = installed.entry((*range, *server)).or_default();
                 *to = (*to).max(*last_index);
             }
-            TraceEvent::RangeCreated { range, .. } => {
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                parent,
+                ..
+            } => {
                 if let Some(node) = node {
                     held.insert((*range, node));
+                    // D-142: a right half a split's apply makes on a quarantined replica of its
+                    // parent takes the quarantine in the split's own batch (D-130), before the
+                    // statement, which a crash can leave to the next start. That is D-130's rule,
+                    // and the only way into `made_quarantined`. A replica made any other way,
+                    // its own install among them, is not D-130's, whatever it states after.
+                    if *cause == RangeCause::Split
+                        && parent.is_some_and(|parent| under_quarantine.contains(&(parent, node)))
+                    {
+                        under_quarantine.insert((*range, node));
+                        made_quarantined.insert((*range, node));
+                    } else {
+                        made_quarantined.remove(&(*range, node));
+                    }
                 }
             }
             TraceEvent::RangeSplit {
@@ -2533,6 +3183,7 @@ pub fn right_halves_of(
                 able: BTreeSet::new(),
                 stuck: BTreeMap::new(),
                 others: BTreeSet::new(),
+                quarantined: BTreeSet::new(),
                 led_since_heal: led_since.get(&range).copied().unwrap_or(0),
                 leader_at_end: leader.get(&range).copied(),
             };
@@ -2554,6 +3205,12 @@ pub fn right_halves_of(
                     half.stuck.insert(voter, stuck);
                 } else {
                     half.others.insert(voter);
+                    // D-142: a replica quarantined under D-130 is one the exception counts as
+                    // unable to vote. It stays in `others` for every other reading. A node
+                    // refused since the creation holds nothing it made before.
+                    if holds && made_quarantined.contains(&(range, voter)) {
+                        half.quarantined.insert(voter);
+                    }
                 }
             }
             Some((range, half))
@@ -2567,8 +3224,8 @@ pub fn right_halves_of(
 /// so on the correct meta range this is none. `MetaOverwritesByArrival` stores it, and the
 /// update of a parent's old descriptor that arrives this way is what check 16 and the meta
 /// convergence bound then see. Generation one is left out: before the first split every update
-/// names it and the variant has no path (PROPOSED D-098).
-// PROPOSED(D-113): §10's shape for `MetaOverwritesByArrival`, asserted at every tier (D-061).
+/// names it and the variant has no path (D-098).
+// D-113: §10's shape for `MetaOverwritesByArrival`, asserted at every tier (D-061).
 #[must_use]
 pub fn meta_resends_stored_of(records: &[TraceRecord]) -> usize {
     let mut names = MetaNames::default();
@@ -2594,11 +3251,74 @@ pub fn meta_resends_stored_of(records: &[TraceRecord]) -> usize {
     found
 }
 
+/// What one [`Fault::MetaReorder`] came to on the trace (SHARD.md §10; PROPOSED D-135).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetaReorder {
+    /// The arm as it fired.
+    pub arm: MetaArm,
+    /// How long after the block began meta first applied an update of the second split: its
+    /// left half's or its right half's. `None` where it applied none, or none was asked.
+    pub second_applied: Option<Duration>,
+    /// Whether meta applied an update of the first split's left half after one of the second's:
+    /// the order `MetaOverwritesByArrival` needs, a record of a lower generation arriving over
+    /// one of a higher. The correct meta range takes nothing from it.
+    pub reordered: bool,
+}
+
+/// What each [`Fault::MetaReorder`] of `arms` came to on the trace `records`, by the first apply
+/// of each meta index, as the meta convergence bound reads them ([`MetaReorder`]). The first
+/// split's update is its left half's, the range with the first cut as its end; the second's is
+/// the range with the second cut as its end, or the right half from the second cut to the first.
+// PROPOSED(D-135): §10, the seeds on which meta applied the second split's update first.
+#[must_use]
+pub fn meta_reorders_of(records: &[TraceRecord], arms: &[MetaArm]) -> Vec<MetaReorder> {
+    arms.iter()
+        .map(|arm| {
+            let mut found = MetaReorder {
+                arm: *arm,
+                second_applied: None,
+                reordered: false,
+            };
+            let Some(second_cut) = arm.second_cut else {
+                return found;
+            };
+            let first = user_key(&key(arm.first_cut));
+            let second = user_key(&key(second_cut));
+            let mut highest: Option<u64> = None;
+            let mut second_at: Option<u64> = None;
+            for record in records {
+                let TraceEvent::MetaApplied { index, descriptors } = &record.event else {
+                    continue;
+                };
+                if highest.is_some_and(|highest| *index <= highest) {
+                    continue;
+                }
+                highest = Some(*index);
+                let of_first = descriptors
+                    .iter()
+                    .any(|d| d.range == arm.range && d.end == first);
+                let of_second = descriptors.iter().any(|d| {
+                    (d.range == arm.range && d.end == second)
+                        || (d.start == second && d.end == first)
+                });
+                if of_second && second_at.is_none() {
+                    second_at = Some(*index);
+                    found.second_applied = record.at.checked_duration_since(arm.at);
+                }
+                if of_first && second_at.is_some_and(|at| *index > at) {
+                    found.reordered = true;
+                }
+            }
+            found
+        })
+        .collect()
+}
+
 /// How many splits, each by its first `RangeSplit`, took their right half's id from a block
 /// granted before its holder's latest restart: `IdBlockResumed`'s shape (SHARD.md §5's second
 /// rule, §10). A new run of the correct node holds no id until a grant of its own lands, so
 /// there it can only be a split proposed before the restart and first applied after it.
-// PROPOSED(D-113): §10's shape for `IdBlockResumed`, asserted at every tier (D-061).
+// D-113: §10's shape for `IdBlockResumed`, asserted at every tier (D-061).
 #[must_use]
 pub fn splits_from_a_block_of_an_earlier_run_of(records: &[TraceRecord]) -> usize {
     // Each block by its first id: its last, its holder, whether the holder has restarted since.
@@ -2638,7 +3358,7 @@ pub fn splits_from_a_block_of_an_earlier_run_of(records: &[TraceRecord]) -> usiz
 }
 
 /// What the workload's shapes reached on one run, each read off the trace and each something
-/// the correct system does only because the shape was reached (SHARD.md §10; PROPOSED D-131).
+/// the correct system does only because the shape was reached (SHARD.md §10; D-131).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Shapes {
     /// A burst's write the split's apply check refused: `RangeMismatchSent { at: Apply }` to a
@@ -2668,7 +3388,7 @@ impl Shapes {
 
 /// What the shapes reached on the trace `records` of a run whose restart arms are `arms`
 /// ([`Shapes`]).
-// PROPOSED(D-131)
+// D-131
 #[must_use]
 pub fn shapes_of(records: &[TraceRecord], arms: &[RestartArm]) -> Shapes {
     let mut shapes = Shapes::default();
@@ -2729,8 +3449,8 @@ pub fn shapes_of(records: &[TraceRecord], arms: &[RestartArm]) -> Shapes {
 
 /// How many of the stale-cache reader's gets the parent answered with a value: under the
 /// correct server none, which refuses every one at receipt, and under `TrustStaleDescriptor`
-/// the shape reached (PROPOSED D-131).
-// PROPOSED(D-131)
+/// the shape reached (D-131).
+// D-131
 #[must_use]
 pub fn stale_reads_served_of(records: &[TraceRecord]) -> usize {
     records
@@ -2744,10 +3464,17 @@ pub fn stale_reads_served_of(records: &[TraceRecord]) -> usize {
 
 impl Report {
     /// What the workload's shapes reached ([`Shapes`]).
-    // PROPOSED(D-131)
+    // D-131
     #[must_use]
     pub fn shapes(&self) -> Shapes {
         shapes_of(self.records(), &self.restart_arms)
+    }
+
+    /// What each [`Fault::MetaReorder`] came to ([`meta_reorders_of`]).
+    // PROPOSED(D-135)
+    #[must_use]
+    pub fn meta_reorders(&self) -> Vec<MetaReorder> {
+        meta_reorders_of(self.records(), &self.meta_arms)
     }
 
     /// The trace as records.
@@ -2837,7 +3564,7 @@ impl Report {
     /// Every right half at the run's end, read for #220's exception ([`right_halves_of`]). "The
     /// last heal" is the last fault's, the earlier of the two this report holds, so a leader
     /// traced in the driver's drain counts against the exception.
-    // PROPOSED(D-113): §6, #220.
+    // D-113: §6, #220.
     #[must_use]
     pub fn right_halves(&self) -> BTreeMap<u64, RightHalf> {
         right_halves_of(
@@ -2868,7 +3595,7 @@ impl Report {
     /// The lags the meta convergence bound is asked of: [`Report::meta_lags_of_live_ranges`]
     /// less the ones #220's exception excuses ([`RightHalf::excused`]). The exception is this
     /// bound's alone; the majority rule means what it meant to every other check.
-    // PROPOSED(D-113): §6, #220.
+    // D-113: §6, #220.
     #[must_use]
     pub fn meta_lags_asked(&self) -> Vec<MetaLag> {
         let halves = self.right_halves();
@@ -2879,13 +3606,31 @@ impl Report {
     }
 
     /// The lags #220's exception excuses from the bound: what the sweep prints.
-    // PROPOSED(D-113): §6, #220.
+    // D-113: §6, #220.
     #[must_use]
     pub fn meta_lags_excused(&self) -> Vec<MetaLag> {
         let halves = self.right_halves();
         self.meta_lags_of_live_ranges()
             .into_iter()
             .filter(|lag| halves.get(&lag.range).is_some_and(RightHalf::excused))
+            .collect()
+    }
+
+    /// The lags of [`Report::meta_lags_excused`] that only D-142's reading excuses: a right half
+    /// with a replica quarantined under D-130 among its other voters, which the exception before
+    /// the owner's ruling of 2026-11-15 kept asked ([`RightHalf::excused_by_the_quarantine`]).
+    /// What the sweep prints of the ruling.
+    // D-142
+    #[must_use]
+    pub fn meta_lags_excused_by_the_quarantine(&self) -> Vec<MetaLag> {
+        let halves = self.right_halves();
+        self.meta_lags_of_live_ranges()
+            .into_iter()
+            .filter(|lag| {
+                halves
+                    .get(&lag.range)
+                    .is_some_and(RightHalf::excused_by_the_quarantine)
+            })
             .collect()
     }
 
@@ -2906,7 +3651,7 @@ impl Report {
     /// # Errors
     ///
     /// The first live range meta names late or not at all.
-    // PROPOSED(D-113): §6, #220.
+    // D-113: §6, #220.
     pub fn meta_converges_without_the_exception(&self) -> Result<(), String> {
         self.meta_converges_over(self.meta_lags_of_live_ranges())
     }
@@ -2936,6 +3681,35 @@ impl Report {
         Ok(())
     }
 
+    /// The last fault's heal read on the admins' clock: where a split's asker's window opens
+    /// (D-143), the asker reading its own times on that clock.
+    // D-143
+    #[must_use]
+    pub fn heal_on_the_admins_clock(&self) -> Instant {
+        self.checked
+            .run
+            .node_time(self.admin, self.last_fault_healed)
+            .expect("the admins' node is one of the run's")
+    }
+
+    /// The askers refused `NoRangeId` that stopped with no answer before their window closed
+    /// ([`window_closes`]): none on any run, an asker refused asking until its window closes
+    /// unless an answer ends it first (D-143). A run a check stopped has its heal read where it
+    /// stopped, at or before the one the askers were given, so it can only find fewer.
+    // D-143
+    #[must_use]
+    pub fn askers_short_of_their_window(&self) -> Vec<Retried> {
+        let heal = self.heal_on_the_admins_clock();
+        self.driver
+            .retried
+            .iter()
+            .filter(|retried| {
+                !retried.answered && retried.ended < window_closes(heal, retried.refused)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The askers [`Report::retries_take_effect`] asks of: on a uniformly scheduled seed whose
     /// ranges 0 and the asked range have a majority, each still asking when the last fault
     /// healed.
@@ -2954,15 +3728,58 @@ impl Report {
             .filter(|retried| {
                 live.contains(&retried.range) && retried.asking_at(self.last_fault_healed)
             })
-            .copied()
+            .cloned()
             .collect()
     }
 
+    /// What became of the split `retried` asked for ([`SplitFate`]), read off the trace, each
+    /// time on the admins' clock, where the asker read its own times. The records' times are
+    /// global and that node's clock is skewed and drifts like any other, by up to 50 ms on this
+    /// sweep, so the two are compared on one clock: compared across them, 17 of the 76 askers the
+    /// correct system's ten thousand seeds ask of read as answered done before their split
+    /// applied, which a leader that answers after its own apply never does (PROPOSED D-137).
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    #[must_use]
+    pub fn split_fate(&self, retried: &Retried) -> SplitFate {
+        let cut = user_key(&retried.key);
+        let on_the_admins_clock = |at: Instant| {
+            self.checked
+                .run
+                .node_time(self.admin, at)
+                .expect("the admins' node is one of the run's")
+        };
+        let leaves_it_outside = |start: &Bytes, end: &Bytes| !(*start < cut && cut < *end);
+        let mut fate = SplitFate::default();
+        for record in self.records() {
+            match &record.event {
+                TraceEvent::RangeSplit { range, key, .. }
+                    if *range == retried.range && *key == cut =>
+                {
+                    fate.applied.get_or_insert(on_the_admins_clock(record.at));
+                }
+                TraceEvent::RangeDescriptor {
+                    range, start, end, ..
+                }
+                | TraceEvent::RangeCreated {
+                    range, start, end, ..
+                } if *range == retried.range && leaves_it_outside(start, end) => {
+                    fate.outside.get_or_insert(on_the_admins_clock(record.at));
+                }
+                _ => {}
+            }
+        }
+        fate
+    }
+
     /// D-092's assertion where a split was refused for want of a range id, per seed: each of
-    /// [`Report::retries_asked`] ends on an answer, and within the write bound of the last
-    /// fault's heal ([`Retried::took_no_effect`]).
+    /// [`Report::retries_asked`] ends on an answer, by which the split it asked for took effect,
+    /// or was answered `KeyOutsideSpan` once another split of its range had left its key outside
+    /// ([`Report::split_fate`]), within the write bound of the last fault's heal
+    /// ([`Retried::took_no_effect`]).
     ///
-    /// An answer is any but `NoRangeId`, so one that refuses the split for another reason passes.
+    /// Until #222 an answer was any but `NoRangeId`, so one that refused the split for another
+    /// reason passed; the retry now has to take effect, which `RefusedAfterRefill` breaks
+    /// (PROPOSED D-137).
     ///
     /// As first written this check could not fail, and the fix changed two things (#216's review,
     /// B6). The origin: it read `checked.last_heal`, which opens the liveness window past the
@@ -2976,20 +3793,23 @@ impl Report {
     /// # Errors
     ///
     /// The first asker whose retries took no effect.
-    // PROPOSED(D-092): answer A; the asker retries.
-    // PROPOSED(D-113): read from the heal, §8.
+    // D-092: answer A; the asker retries.
+    // D-113: read from the heal, §8.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    // D-143: the asker asks until its window closes, so "no answer" is past the bound.
     pub fn retries_take_effect(&self) -> Result<(), String> {
         let seed = self.seed;
         let bound = election_max() * LIVENESS_TIMEOUTS;
         for retried in self.retries_asked() {
-            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound) {
+            let fate = self.split_fate(&retried);
+            if let Some(why) = retried.took_no_effect(self.last_fault_healed, bound, fate) {
                 return Err(format!("seed {seed}: NoRangeId: {why}"));
             }
         }
         Ok(())
     }
 
-    /// Every `NoRangeId` of the run, read against the trace (PROPOSED D-092's figures).
+    /// Every `NoRangeId` of the run, read against the trace (D-092's figures).
     #[must_use]
     pub fn no_range_ids(&self) -> Vec<NoRangeId> {
         self.driver
@@ -3162,7 +3982,7 @@ impl Report {
 mod tests {
     //! The readings' reasoning on records written by hand, one shape each.
 
-    use ananke_env::MetaDescriptor;
+    use ananke_env::{MetaDescriptor, RangeRemovedCause};
 
     use super::*;
 
@@ -3220,17 +4040,27 @@ mod tests {
 
     /// D-092's asker read from the last fault's heal, on what #216's review found the check
     /// could not say when it was read from the liveness window's start.
-    // PROPOSED(D-113): read from the heal, §8.
+    // D-113: read from the heal, §8.
     #[test]
     fn an_askers_retries_are_asked_of_from_the_heal() {
         let (heal, bound) = (at(5000), Duration::from_secs(2));
         let asker = |refused, ended, answered| Retried {
             range: 2,
+            key: Bytes::from_static(b"k05"),
             refused: at(refused),
             ended: at(ended),
             answered,
+            refusal: None,
         };
-        let no_effect = |of: Retried| of.took_no_effect(heal, bound);
+        // The split applied as its answer came, so what is read here is the answer and its
+        // time (PROPOSED D-137).
+        let no_effect = |of: Retried| {
+            let fate = SplitFate {
+                applied: Some(of.ended),
+                outside: Some(of.ended),
+            };
+            of.took_no_effect(heal, bound, fate)
+        };
         assert_eq!(no_effect(asker(4900, 5300, true)), None, "answered in time");
         assert_eq!(
             no_effect(asker(4900, 7000, true)),
@@ -3252,6 +4082,91 @@ mod tests {
         // ...and from its refusal for one refused after it.
         assert_eq!(no_effect(asker(6000, 7900, true)), None);
         let why = no_effect(asker(6000, 8001, true)).expect("over the bound");
+        assert!(why.contains("over 2s"), "{why}");
+    }
+
+    /// D-092's "the same asker's retry ... takes effect" (issue #222): an answer is not
+    /// enough, the split it asked for has to have applied by then, or, answered
+    /// `KeyOutsideSpan`, to have been left impossible by another split of its range. The
+    /// reading that took any answer but `NoRangeId` passed each of the first three cases.
+    // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    #[test]
+    fn an_askers_retry_has_to_take_effect_and_not_only_be_answered() {
+        let (heal, bound) = (at(5000), Duration::from_secs(2));
+        let asker = |ended, refusal| Retried {
+            range: 2,
+            key: Bytes::from_static(b"k05"),
+            refused: at(4900),
+            ended: at(ended),
+            answered: true,
+            refusal,
+        };
+        let fate = |applied: Option<u64>, outside: Option<u64>| SplitFate {
+            applied: applied.map(at),
+            outside: outside.map(at),
+        };
+        let not_live = asker(5300, Some(SplitRefusal::NotLive));
+        let why = not_live
+            .took_no_effect(heal, bound, fate(None, None))
+            .expect("refused for another reason, the split never applied");
+        assert!(
+            why.contains("answered `not-live`") && why.contains("took no effect"),
+            "{why}"
+        );
+        // A wrong reason stays wrong where another split had left the key outside: only the
+        // true one, `KeyOutsideSpan`, is read as final.
+        assert!(
+            not_live
+                .took_no_effect(heal, bound, fate(None, Some(5100)))
+                .is_some()
+        );
+        // A split that applied only after the asker had its answer did not take effect by it.
+        let done = asker(5300, None);
+        let why = done
+            .took_no_effect(heal, bound, fate(Some(5301), Some(5301)))
+            .expect("applied after the answer");
+        assert!(why.contains("answered `done`"), "{why}");
+        // Done, the split applied before the answer: the retry took effect.
+        assert_eq!(
+            done.took_no_effect(heal, bound, fate(Some(5200), Some(5200))),
+            None
+        );
+        // `KeyOutsideSpan` to an asker that asked anew after its split landed: an answer that
+        // follows from the split's effect (seed 992).
+        let outside = asker(5300, Some(SplitRefusal::KeyOutsideSpan));
+        assert_eq!(
+            outside.took_no_effect(heal, bound, fate(Some(5100), Some(5100))),
+            None
+        );
+        // `KeyOutsideSpan` where a split of the range at another key landed first and left the
+        // key outside: the split asked for can no longer take effect, and the answer is true
+        // (seeds 1032 and 3181 of the correct system's ten thousand).
+        assert_eq!(
+            outside.took_no_effect(heal, bound, fate(None, Some(5250))),
+            None
+        );
+        // The same refusal where the trace shows the key still inside, and no split, is none.
+        assert!(
+            outside
+                .took_no_effect(heal, bound, fate(None, None))
+                .is_some()
+        );
+        assert!(
+            outside
+                .took_no_effect(heal, bound, fate(None, Some(5301)))
+                .is_some(),
+            "left outside only after the answer"
+        );
+        // Still not asked: an asker that stopped before the heal, however it ended.
+        assert_eq!(
+            asker(4950, Some(SplitRefusal::NotLive)).took_no_effect(heal, bound, fate(None, None)),
+            None
+        );
+        // And the bound still holds of one that took effect.
+        let late = asker(7001, None);
+        let why = late
+            .took_no_effect(heal, bound, fate(Some(7000), Some(7000)))
+            .expect("over the bound");
         assert!(why.contains("over 2s"), "{why}");
     }
 
@@ -3430,6 +4345,77 @@ mod tests {
         )
     }
 
+    // D-142
+    fn reseeded(ms: u64, node: u32, range: u64) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftReseeded {
+                server: u64::from(node),
+                range,
+            },
+        )
+    }
+
+    // D-142
+    fn recovered(ms: u64, node: u32, range: u64, state: RecoveredAs) -> TraceRecord {
+        record(
+            ms,
+            node,
+            TraceEvent::RaftRecovered {
+                server: u64::from(node),
+                range,
+                term: 1,
+                applied: SPLIT_AT,
+                last_index: SPLIT_AT,
+                incarnation: 2,
+                state,
+            },
+        )
+    }
+
+    /// The right half as a split's apply on `node` makes it, naming its parent, as the node
+    /// traces it: what D-130's rule reads.
+    // D-142
+    fn made_by_the_split(ms: u64, node: u32) -> TraceRecord {
+        let mut made = created(ms, node, RIGHT);
+        if let TraceEvent::RangeCreated { parent, .. } = &mut made.event {
+            *parent = Some(PARENT);
+        }
+        made
+    }
+
+    /// D-130's shape on `node`: its replica of the parent re-seeded and so quarantined, the
+    /// split's apply making the right half on it, and the right half stated quarantined after.
+    // D-142
+    fn made_under_d130(ms: u64, node: u32) -> [TraceRecord; 4] {
+        [
+            reseeded(ms, node, PARENT),
+            applied_the_split(ms + 1, node),
+            made_by_the_split(ms + 1, node),
+            reseeded(ms + 2, node, RIGHT),
+        ]
+    }
+
+    /// The right half's descriptor at a later generation, with `voters`.
+    // D-142
+    fn voters_of_the_right_half(ms: u64, voters: &[u64]) -> TraceRecord {
+        record(
+            ms,
+            1,
+            TraceEvent::RangeDescriptor {
+                range: RIGHT,
+                index: ms,
+                applied: ms,
+                start: Bytes::from_static(b"m"),
+                end: Bytes::from_static(b"z"),
+                generation: 3,
+                voters: voters.to_vec(),
+                state: RangeState::Live,
+            },
+        )
+    }
+
     /// The parent on every node; node 2 applied the split and alone holds the right half; and
     /// nodes 1 and 3 reached the split by an install, so they never apply it.
     fn wedged() -> Vec<TraceRecord> {
@@ -3462,7 +4448,8 @@ mod tests {
     }
 
     /// The shape the owner excused, each of its parts read: without this case the ones below
-    /// could pass on a fold that excuses nothing.
+    /// could pass on a fold that excuses nothing. With no other voter the exception as it stood
+    /// before the owner's ruling of 2026-11-15 excuses it, so D-142's reading is not what does.
     #[test]
     fn a_right_half_with_no_possible_majority_is_excused() {
         let half = read(&wedged());
@@ -3472,6 +4459,11 @@ mod tests {
         assert!(half.others.is_empty());
         assert_eq!((half.led_since_heal, half.leader_at_end), (0, None));
         assert!(half.excused());
+        // D-142
+        assert!(
+            !half.excused_by_the_quarantine(),
+            "excused with no other voter, as before the ruling"
+        );
     }
 
     /// A child of a wedged parent: its voters hold no replica of the parent, so nothing there can
@@ -3575,8 +4567,12 @@ mod tests {
         assert!(!half.excused());
     }
 
-    /// Condition one: two voters able to vote can elect. And a replica that holds the range
-    /// and cannot vote is not a placeholder, so it is not one of what condition three names.
+    /// Condition one: two voters able to vote can elect. And a replica that holds the range and
+    /// cannot vote: impaired with no quarantine, or quarantined by its own re-seed and not by
+    /// D-130's rule, it is not one of what condition three names and keeps the range asked; made
+    /// on a quarantined replica of its parent and so quarantined under D-130, it is one, a voter
+    /// that cannot vote, by the owner's ruling of 2026-11-15 (D-142), where until then it kept the
+    /// range asked too.
     #[test]
     fn a_range_with_two_voters_able_to_vote_is_not_excused() {
         let mut records = wedged();
@@ -3592,50 +4588,457 @@ mod tests {
         assert_eq!(half.others, BTreeSet::from([1]), "impaired, holding it");
         assert!(!half.excused());
 
-        records.push(record(
-            31,
-            1,
-            TraceEvent::RaftReseeded {
-                server: 1,
-                range: RIGHT,
-            },
-        ));
+        records.push(reseeded(31, 1, RIGHT));
         let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
         assert_eq!(half.others, BTreeSet::from([1]), "quarantined, holding it");
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "by its own re-seed, which is not D-130's rule (D-142)"
+        );
         assert!(!half.excused());
+
+        // D-142: excused, where before the ruling it was not.
+        let mut records = wedged();
+        records.remove(5);
+        records.extend(made_under_d130(30, 1));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(3, past(60))]));
+        assert_eq!(half.others, BTreeSet::from([1]), "quarantined, holding it");
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::from([1]),
+            "made on a quarantined parent, so under D-130 and a voter that cannot vote (D-142)"
+        );
+        assert!(half.excused(), "D-142");
+        assert!(
+            half.excused_by_the_quarantine(),
+            "and by D-142's reading alone"
+        );
     }
 
     /// A replica stated quarantined by `RaftRecovered` alone counts as quarantined, as one
     /// `RaftReseeded` names does: a restart states it that way, and with the arm gone it read
     /// as able to vote. The state the arm reads is the point, so a replica recovered with none
-    /// stays able (#223).
+    /// stays able (#223). A statement makes no quarantine under D-130, so that replica keeps the
+    /// range asked. A parent stated quarantined that way passes its quarantine on at the split's
+    /// apply, and the right half that apply makes is one the exception counts as unable to vote
+    /// (D-142).
     #[test]
     fn a_right_half_stated_quarantined_at_a_recovery_cannot_vote() {
-        let recovered = |state| {
-            record(
-                31,
-                1,
-                TraceEvent::RaftRecovered {
-                    server: 1,
-                    range: RIGHT,
-                    term: 1,
-                    applied: SPLIT_AT,
-                    last_index: SPLIT_AT,
-                    incarnation: 2,
-                    state,
-                },
-            )
-        };
         let mut records = wedged();
-        records.extend([created(30, 1, RIGHT), recovered(RecoveredAs::Neither)]);
+        records.extend([
+            created(30, 1, RIGHT),
+            recovered(31, 1, RIGHT, RecoveredAs::Neither),
+        ]);
         assert_eq!(read(&records).able, BTreeSet::from([1, 2]), "no quarantine");
 
         let mut records = wedged();
-        records.extend([created(30, 1, RIGHT), recovered(RecoveredAs::Quarantined)]);
+        records.extend([
+            created(30, 1, RIGHT),
+            recovered(31, 1, RIGHT, RecoveredAs::Quarantined),
+        ]);
         let half = read(&records);
         assert_eq!(half.able, BTreeSet::from([2]), "quarantined, and not able");
         assert_eq!(half.others, BTreeSet::from([1]), "and it holds the range");
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "not by D-130's rule (D-142)"
+        );
         assert!(!half.excused());
+
+        // D-142
+        let mut records = wedged();
+        records.remove(5);
+        records.extend([
+            recovered(25, 1, PARENT, RecoveredAs::Quarantined),
+            applied_the_split(30, 1),
+            made_by_the_split(30, 1),
+            recovered(31, 1, RIGHT, RecoveredAs::Quarantined),
+        ]);
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::from([1]),
+            "its parent stated quarantined by `RaftRecovered` alone (D-142)"
+        );
+        assert!(half.excused(), "D-142");
+    }
+
+    /// D-142 reads "quarantine (D-130)" as D-130's rule: a right half made by a split's apply on a
+    /// quarantined replica of its parent. A replica of the right half quarantined by another
+    /// route keeps the range asked, though the trace states it the same way: its own re-seed (in
+    /// the two tests above), an install onto a re-seeded node's placeholder (D-109 §2), and such
+    /// an install making it again after a replica D-130's rule quarantined was collected. Whether
+    /// the exception should count those too is a question for the owner, and nothing here
+    /// counts them.
+    // D-142
+    #[test]
+    fn a_replica_quarantined_otherwise_than_by_d130s_rule_keeps_the_range_asked() {
+        let installed_quarantined = |ms| {
+            let mut made = created(ms, 3, RIGHT);
+            if let TraceEvent::RangeCreated { cause, .. } = &mut made.event {
+                *cause = RangeCause::Snapshot;
+            }
+            [
+                made,
+                reseeded(ms + 1, 3, RIGHT),
+                recovered(ms + 1, 3, RIGHT, RecoveredAs::Quarantined),
+            ]
+        };
+        let mut records = wedged();
+        records.extend(installed_quarantined(30));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(1, past(60))]));
+        assert_eq!(half.others, BTreeSet::from([3]), "quarantined, holding it");
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "by D-109's install, not by D-130's rule"
+        );
+        assert!(!half.excused());
+
+        let mut records = wedged();
+        records.remove(6);
+        records.extend(made_under_d130(30, 3));
+        assert_eq!(
+            read(&records).quarantined,
+            BTreeSet::from([3]),
+            "the control"
+        );
+        records.push(record(
+            39,
+            3,
+            TraceEvent::RangeRemoved {
+                range: RIGHT,
+                generation: 2,
+                incarnation: 1,
+                cause: RangeRemovedCause::Collected,
+            },
+        ));
+        records.extend(installed_quarantined(40));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([3]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "made again, by D-109's install"
+        );
+        assert!(!half.excused());
+    }
+
+    /// D-142 counts a replica quarantined under D-130 as unable to vote and nothing else: a voter
+    /// that holds the range and is impaired with no quarantine keeps it asked, and so does a
+    /// placeholder an apply should have ended beside a quarantined replica, which excuses only
+    /// itself. Of three voters the majority were #220 fixed keeps that second shape asked as well,
+    /// so five voters show condition three keeping it asked alone.
+    // D-142
+    #[test]
+    fn an_other_voter_not_quarantined_still_keeps_the_range_asked() {
+        let mut records = wedged();
+        records.push(created(30, 1, RIGHT));
+        let impaired = BTreeMap::from([(RIGHT, BTreeSet::from([1]))]);
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.others, BTreeSet::from([1]), "impaired, holding it");
+        assert_eq!(half.quarantined, BTreeSet::new(), "and not quarantined");
+        assert_eq!(half.others_that_keep_it_asked(), BTreeSet::from([1]));
+        assert!(half.a_majority_were_220_fixed());
+        assert!(!half.excused());
+
+        // Node 1 quarantined under D-130; node 3's parent has no install, so it should have
+        // applied the split.
+        let mut records = wedged();
+        records.remove(6);
+        records.remove(5);
+        records.extend(made_under_d130(30, 1));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.others, BTreeSet::from([1, 3]));
+        assert_eq!(half.quarantined, BTreeSet::from([1]));
+        assert_eq!(half.others_that_keep_it_asked(), BTreeSet::from([3]));
+        assert!(!half.excused());
+
+        // Five voters: node 2 able, nodes 3 and 4 placeholders no apply can end, node 1
+        // quarantined under D-130, and node 5 holding the parent with no install. Were #220
+        // fixed three of five could elect, so node 5 alone keeps the range asked.
+        let mut records = wedged();
+        records.remove(5);
+        records.extend(made_under_d130(30, 1));
+        records.extend([
+            created(40, 5, PARENT),
+            voters_of_the_right_half(41, &[1, 2, 3, 4, 5]),
+        ]);
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(
+            half.stuck,
+            BTreeMap::from([(3, past(60)), (4, Stuck::NoParent)])
+        );
+        assert_eq!(half.others, BTreeSet::from([1, 5]));
+        assert_eq!(half.quarantined, BTreeSet::from([1]));
+        assert!(half.a_majority_were_220_fixed());
+        assert_eq!(half.others_that_keep_it_asked(), BTreeSet::from([5]));
+        assert!(!half.excused());
+    }
+
+    /// Condition one holds of a range with a quarantined replica as of any other: with two
+    /// voters able to vote a majority was possible, so the range is asked whatever the third
+    /// voter is (D-142).
+    // D-142
+    #[test]
+    fn a_range_with_a_quarantined_replica_and_two_voters_able_to_vote_is_not_excused() {
+        let mut records = wedged();
+        records.remove(6);
+        records.push(created(30, 1, RIGHT));
+        records.extend(made_under_d130(30, 3));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([1, 2]), "a majority of three");
+        assert_eq!(half.others, BTreeSet::from([3]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::from([3]),
+            "quarantined under D-130, holding it"
+        );
+        assert!(half.others_that_keep_it_asked().is_empty());
+        assert!(half.a_majority_were_220_fixed());
+        assert!(!half.excused(), "condition one");
+        assert!(!half.excused_by_the_quarantine());
+    }
+
+    /// A range wedged by quarantined replicas alone is not #220's wedge, and the exception lasts
+    /// until #220 is fixed and no longer: whatever #220's fix did there, the range would still have
+    /// no majority, so the bound asks of it (D-142). Here nodes 1 and 3 make the right half by the
+    /// split's apply on a re-seeded parent and node 2 alone can vote, with no placeholder at all.
+    /// Then node 1 is a placeholder and nodes 2 and 3 are quarantined, where the placeholder ended
+    /// would leave no voter of three able.
+    // D-142
+    #[test]
+    fn a_right_half_wedged_by_quarantine_alone_is_not_excused() {
+        let mut records = wedged();
+        records.remove(6);
+        records.remove(5);
+        records.extend(made_under_d130(30, 1));
+        records.extend(made_under_d130(30, 3));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::new(), "no placeholder");
+        assert_eq!(half.quarantined, BTreeSet::from([1, 3]));
+        assert!(
+            half.others_that_keep_it_asked().is_empty(),
+            "condition three holds"
+        );
+        assert!(!half.a_majority_were_220_fixed());
+        assert!(!half.excused());
+
+        let mut records = vec![
+            created(1, 1, PARENT),
+            created(1, 2, PARENT),
+            created(1, 3, PARENT),
+            installed(20, 1, PARENT, 60),
+        ];
+        records.extend(made_under_d130(30, 2));
+        records.extend(made_under_d130(30, 3));
+        let half = read(&records);
+        assert_eq!(half.able, BTreeSet::new());
+        assert_eq!(
+            half.stuck,
+            BTreeMap::from([(1, past(60))]),
+            "one placeholder"
+        );
+        assert_eq!(half.quarantined, BTreeSet::from([2, 3]));
+        assert!(
+            half.others_that_keep_it_asked().is_empty(),
+            "condition three holds"
+        );
+        assert!(
+            !half.a_majority_were_220_fixed(),
+            "one voter of three were #220 fixed"
+        );
+        assert!(!half.excused());
+    }
+
+    /// A quarantine lasts for the replica's life on its store (D-035), and the trace shows its
+    /// ends. Its node's refusal ends the store, and what the node holds after it is read from its
+    /// own creation: a replica made by the split's apply on a parent made after the refusal and
+    /// not quarantined is not quarantined, though the majority rule's reading, which never
+    /// forgets a `RaftReseeded`, still holds it unable to vote; and a node that holds only the
+    /// parent after it holds no replica to count. A restatement saying the disk carries no mark
+    /// ends it too, since the replica can vote from there, and a parent so restated passes no
+    /// quarantine on. Each way the voter keeps the range asked (D-142).
+    // D-142
+    #[test]
+    fn a_replica_whose_quarantine_ended_keeps_the_range_asked() {
+        let mut quarantined = wedged();
+        quarantined.remove(5);
+        quarantined.extend(made_under_d130(30, 1));
+        assert!(read(&quarantined).excused(), "quarantined, the control");
+
+        // The refusal, then a replica made by the split's apply on a parent not quarantined.
+        let mut records = quarantined.clone();
+        records.extend([
+            refused(40, 1),
+            created(50, 1, PARENT),
+            applied_the_split(55, 1),
+            made_by_the_split(55, 1),
+        ]);
+        let half = read(&records);
+        assert_eq!(
+            half.others,
+            BTreeSet::from([1]),
+            "the reading `able` takes keeps the old quarantine"
+        );
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "its store and its parent's ended at the refusal"
+        );
+        assert!(!half.excused(), "the refusal ended the quarantine");
+        // The refusal, then the parent alone: node 1 holds no replica of the range.
+        let mut records = quarantined.clone();
+        records.extend([refused(40, 1), created(50, 1, PARENT)]);
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]), "a parent, and no install");
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "it holds nothing it made before the refusal"
+        );
+        assert!(!half.excused());
+        // A replica it makes on a parent re-seeded after the refusal is quarantined again.
+        let mut again = quarantined.clone();
+        again.extend([refused(40, 1), created(50, 1, PARENT)]);
+        again.extend(made_under_d130(51, 1));
+        assert_eq!(read(&again).quarantined, BTreeSet::from([1]));
+        assert!(read(&again).excused());
+
+        // A restatement with no mark.
+        let mut records = quarantined.clone();
+        records.push(recovered(60, 1, RIGHT, RecoveredAs::Neither));
+        let half = read(&records);
+        assert_eq!(half.others, BTreeSet::from([1]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "the disk carries no mark"
+        );
+        assert!(!half.excused(), "the restatement ended the quarantine");
+        // And of the parent's: a split's apply after it makes a replica with no quarantine, which
+        // the majority rule reads down here.
+        let mut records = wedged();
+        records.remove(5);
+        records.extend([
+            reseeded(25, 1, PARENT),
+            recovered(26, 1, PARENT, RecoveredAs::Neither),
+            applied_the_split(30, 1),
+            made_by_the_split(30, 1),
+        ]);
+        let impaired = BTreeMap::from([(RIGHT, BTreeSet::from([1]))]);
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.others, BTreeSet::from([1]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "its parent's disk carries no mark"
+        );
+        assert!(!half.excused());
+    }
+
+    /// A right half a split's apply makes on a quarantined replica of its parent is quarantined
+    /// from its creation, in the split's own batch (D-130), before the statement a crash can leave
+    /// to the next start. Here node 3, re-seeded, makes it and is read down by the majority rule,
+    /// as a refused node's replay is until its restatement. With no quarantine of its parent the
+    /// same replica keeps the range asked, and so it does with the parent quarantined on another
+    /// node only, since D-130's rule reads the replica of the parent the split's apply is on
+    /// (D-142).
+    // D-142
+    #[test]
+    fn a_right_half_made_on_a_quarantined_parent_is_quarantined_before_its_statement() {
+        let impaired = BTreeMap::from([(RIGHT, BTreeSet::from([3]))]);
+        let mut records = vec![
+            created(1, 1, PARENT),
+            created(1, 2, PARENT),
+            created(1, 3, PARENT),
+            applied_the_split(10, 2),
+            created(10, 2, RIGHT),
+            installed(20, 1, PARENT, 60),
+            applied_the_split(12, 3),
+            made_by_the_split(12, 3),
+        ];
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.others, BTreeSet::from([3]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "its parent is not quarantined"
+        );
+        assert!(!half.excused());
+
+        let mut elsewhere = records.clone();
+        elsewhere.insert(3, reseeded(5, 1, PARENT));
+        let half = read_impaired(&elsewhere, &impaired);
+        assert_eq!(half.stuck, BTreeMap::from([(1, past(60))]));
+        assert_eq!(half.others, BTreeSet::from([3]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::new(),
+            "node 1's parent is quarantined, and node 3's is not"
+        );
+        assert!(!half.excused());
+
+        records.insert(3, reseeded(5, 3, PARENT));
+        let half = read_impaired(&records, &impaired);
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(1, past(60))]));
+        assert_eq!(half.others, BTreeSet::from([3]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::from([3]),
+            "made on a quarantined parent, with no statement yet"
+        );
+        assert!(half.excused());
+
+        // Read recursively: the right half's own split, applied on node 3 before any statement,
+        // makes a range on a replica quarantined by the rule alone, and that one takes it too.
+        const GRAND: u64 = 20;
+        let split_of_the_right_half = |node| {
+            record(
+                70,
+                node,
+                TraceEvent::RangeSplit {
+                    range: RIGHT,
+                    right: GRAND,
+                    key: Bytes::from_static(b"t"),
+                    index: 70,
+                },
+            )
+        };
+        let mut made = created(70, 3, GRAND);
+        if let TraceEvent::RangeCreated { parent, .. } = &mut made.event {
+            *parent = Some(RIGHT);
+        }
+        records.extend([
+            split_of_the_right_half(2),
+            created(70, 2, GRAND),
+            split_of_the_right_half(3),
+            made,
+        ]);
+        let impaired = BTreeMap::from([(GRAND, BTreeSet::from([3]))]);
+        let half = right_halves_of(&records, at(HEAL), &impaired)
+            .remove(&GRAND)
+            .expect("a right half");
+        assert_eq!(half.able, BTreeSet::from([2]));
+        assert_eq!(half.stuck, BTreeMap::from([(1, Stuck::NoParent)]));
+        assert_eq!(
+            half.quarantined,
+            BTreeSet::from([3]),
+            "made on a right half the rule quarantined, before either statement"
+        );
+        assert!(half.excused());
     }
 
     /// A run's report with its trace replaced by `records`: the last fault healed at [`HEAL`],
@@ -3742,7 +5145,7 @@ mod tests {
     /// already names at its generation or a newer one. A win over an older one is what the
     /// correct meta range makes, the first generation's resends have no older descriptor to
     /// bring back, and an index already folded is not read again.
-    // PROPOSED(D-113): §10's shape.
+    // D-113: §10's shape.
     #[test]
     fn a_resend_counts_only_where_it_repeats_a_split_meta_already_names() {
         let count = meta_resends_stored_of;
@@ -3765,7 +5168,7 @@ mod tests {
 
     /// The shape of `IdBlockResumed`: a right half out of a block its holder was granted before
     /// it last restarted. Not a block of the new run, and not the other node's.
-    // PROPOSED(D-113): §10's shape.
+    // D-113: §10's shape.
     #[test]
     fn a_split_counts_only_from_a_block_granted_before_its_holders_latest_restart() {
         let leased = |ms, node, first, last| {
@@ -3930,7 +5333,7 @@ mod tests {
     /// split's apply, which reaches no window; a sweep client's mismatch from a range nothing
     /// has split is the bootstrap's stale caches; and a restart arm's split counts only where
     /// it was proposed on the restarted node, and only once however many replicas apply it.
-    // PROPOSED(D-131)
+    // D-131
     #[test]
     fn the_shapes_are_read_off_the_trace() {
         let burst = LOAD | 3;
@@ -3999,14 +5402,80 @@ mod tests {
         assert_eq!(done(proposed(102, 1)), 0, "another admin's split");
     }
 
+    /// The reorder arm's reading (PROPOSED D-135): range 2 split first at `k08` and its left half
+    /// again at `k04`, into `[.., k04)` and range 20 over `[k04, k08)`. Meta's order is read by
+    /// the first apply of each index, as the meta convergence bound reads it.
+    // PROPOSED(D-135)
+    #[test]
+    fn an_update_of_the_first_split_applied_after_one_of_the_second_is_the_reorder() {
+        let arm = MetaArm {
+            at: at(1000),
+            from: 1,
+            to: 2,
+            third: 3,
+            range: 2,
+            generation: 1,
+            first_cut: 8,
+            transferred: true,
+            second_cut: Some(4),
+        };
+        let applied = |ms: u64, index: u64, range: u64, from: u64, to: u64| {
+            let (start, end) = (user_key(&key(from)), user_key(&key(to)));
+            record(
+                ms,
+                2,
+                TraceEvent::MetaApplied {
+                    index,
+                    descriptors: vec![MetaDescriptor {
+                        range,
+                        start: start.clone(),
+                        end: end.clone(),
+                        generation: 0,
+                        voters: vec![1, 2, 3],
+                        won: vec![(start, end)],
+                    }],
+                },
+            )
+        };
+        let first = |ms, index| applied(ms, index, 2, 0, 8);
+        let left = |ms, index| applied(ms, index, 2, 0, 4);
+        let right = |ms, index| applied(ms, index, 20, 4, 8);
+        let read = |records: &[TraceRecord]| meta_reorders_of(records, &[arm])[0];
+
+        // In order: the first split's update, then the second's two.
+        let in_order = [first(1100, 10), left(1300, 11), right(1310, 12)];
+        let found = read(&in_order);
+        assert_eq!(found.second_applied, Some(Duration::from_millis(300)));
+        assert!(!found.reordered);
+        // The first's update resent past the block and applied after the second's.
+        let mut late = in_order.to_vec();
+        late.push(first(1800, 13));
+        assert!(read(&late).reordered);
+        // The second's right half alone before it is the second's update too.
+        let found = read(&[right(1300, 11), first(1400, 12)]);
+        assert_eq!(found.second_applied, Some(Duration::from_millis(300)));
+        assert!(found.reordered);
+        // Another replica's apply of an earlier index is not a later update.
+        assert!(!read(&[first(1100, 10), left(1300, 11), first(1320, 10)]).reordered);
+        // No second split asked: nothing to read.
+        let none = MetaArm {
+            second_cut: None,
+            ..arm
+        };
+        let found = meta_reorders_of(&late, &[none])[0];
+        assert_eq!((found.second_applied, found.reordered), (None, false));
+    }
+
     /// A shape is a schedule the sweep can take: a drawn schedule keeps every draw of the plain
     /// one (D-031's stream of its own), adds the shapes, and on one seed in [`PLAIN_ONE_IN`]
-    /// adds nothing.
+    /// adds nothing. Over the shaped schedule it adds the reorder arm and nothing else (PROPOSED
+    /// D-135).
     // PROPOSED(D-131)
     #[test]
     fn the_shapes_are_drawn_over_the_plain_schedule_from_streams_of_their_own() {
         let mut none = 0;
         let (mut clients, mut writes, mut reads, mut stale, mut arms) = (0, 0, 0, 0, 0);
+        let mut reorders = 0;
         for seed in 0..512 {
             let plain = Schedule::plain(seed);
             assert!(
@@ -4043,15 +5512,290 @@ mod tests {
                 .faults
                 .iter()
                 .copied()
-                .filter(|f| !matches!(f, Fault::SplitFromRestarted { .. }))
+                .filter(|f| {
+                    !matches!(
+                        f,
+                        Fault::SplitFromRestarted { .. } | Fault::MetaReorder { .. }
+                    )
+                })
                 .collect();
             assert_eq!(rest, plain.faults);
-            arms += usize::from(rest.len() + 1 == drawn.faults.len());
+            let count = |want: fn(&Fault) -> bool| drawn.faults.iter().filter(|f| want(f)).count();
+            arms += count(|f| matches!(f, Fault::SplitFromRestarted { .. }));
+            // PROPOSED(D-135): one reorder arm in the first half of the faults, over the
+            // schedule D-131 drew, every other draw where it fell.
+            let at = drawn
+                .faults
+                .iter()
+                .position(|f| matches!(f, Fault::MetaReorder { .. }))
+                .expect("a shaped seed draws the reorder arm");
+            assert_eq!(count(|f| matches!(f, Fault::MetaReorder { .. })), 1);
+            assert!(
+                at <= (drawn.faults.len() - 1) / 2,
+                "in the first half: {at}"
+            );
+            let mut shaped = drawn.clone();
+            shaped.faults.remove(at);
+            shaped.gaps.remove(at);
+            shaped.picks.remove(at);
+            assert_eq!(shaped, Schedule::shaped(seed));
+            reorders += 1;
         }
         assert!(
             none > 0 && none < 512 / 4,
             "about one seed in {PLAIN_ONE_IN} draws none: {none} of 512"
         );
         assert!(writes > 0 && reads > 0 && stale > 0 && clients > 0 && arms > 0);
+        assert_eq!(
+            reorders + none,
+            512,
+            "every shaped seed draws the reorder arm"
+        );
+    }
+
+    /// What a scripted server answers the `k`th ask the asker sends, counted across the three
+    /// servers from 0, under number `seq`: each reply sent after a wait in milliseconds, the waits
+    /// one after another from the ask's arrival.
+    type Script = dyn Fn(usize, u64) -> Vec<(u64, Reply)> + Send + Sync;
+
+    /// The number the scripted asker asks under.
+    const ASKER: u64 = 7;
+
+    /// One split's asker against three scripted servers on a network with neither drops nor
+    /// duplicates, its window opened from a heal at `heal` ms (D-143): every ask the servers
+    /// received, as (when, which server, under what number), and the driver's record.
+    fn asker_against(heal: u64, script: Arc<Script>) -> (Vec<(Instant, u64, u64)>, DriverStats) {
+        let mut sim = Sim::new(SimConfig::new(7));
+        let asks: Arc<Mutex<Vec<(Instant, u64, u64)>>> = Arc::default();
+        for id in 1..=BOOTSTRAP {
+            let node = sim.add_node();
+            let env = sim.env(node);
+            let inner = env.clone();
+            let (asks, script) = (asks.clone(), script.clone());
+            env.spawn("scripted-server", async move {
+                let sock = inner.net().bind(server_addr(id)).await.expect("bound");
+                while let Ok((from, bytes)) = sock.recv().await {
+                    let asked = RangedRequest::decode(bytes).expect("a ranged request");
+                    let (client, seq) = (asked.request.client, asked.request.seq);
+                    let k = {
+                        let mut asks = lock(&asks);
+                        asks.push((inner.clock().now(), id, seq));
+                        asks.len() - 1
+                    };
+                    for (after, reply) in script(k, seq) {
+                        inner.clock().sleep(Duration::from_millis(after)).await;
+                        let answer = RangedResponse {
+                            range: asked.range,
+                            response: ananke_raft::client::Response { client, seq, reply },
+                        };
+                        let _ = sock.send(from, answer.encode()).await;
+                    }
+                }
+            });
+        }
+        let admin = sim.add_node();
+        let driver: Driver = Arc::default();
+        lock(&driver).outstanding += 1;
+        let env = sim.env(admin);
+        let inner = env.clone();
+        env.spawn(
+            "split-admin",
+            split_admin(
+                inner,
+                ASKER,
+                1,
+                20,
+                FIRST_GENERATION,
+                key(5),
+                driver.clone(),
+                Duration::ZERO,
+                at(heal),
+            ),
+        );
+        sim.run_until(at(10_000));
+        let stats = lock(&driver).clone();
+        assert_eq!(stats.outstanding, 0, "the asker stopped");
+        let asks = lock(&asks).clone();
+        (asks, stats)
+    }
+
+    fn no_range_id() -> Reply {
+        Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId))
+    }
+
+    fn split_done() -> Reply {
+        Reply::Outcome(Outcome::Done)
+    }
+
+    /// D-143's (2): from its first `NoRangeId` the asker asks until its window closes, D-092's
+    /// bound past the heal or past that refusal, whichever is later, and one `RETRY_WAIT` more;
+    /// not the thirteen asks D-131's count gave it. Against servers that refuse every split
+    /// `NoRangeId` it stops with no answer at the window's close and asks nothing at or after it.
+    // D-143
+    #[test]
+    fn the_asker_refused_asks_until_its_window_closes_and_not_by_a_count() {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        assert_eq!(
+            window_closes(at(3_000), at(2)),
+            at(3_000) + bound + RETRY_WAIT
+        );
+        assert_eq!(window_closes(at(0), at(2)), at(2) + bound + RETRY_WAIT);
+        for heal in [3_000, 0] {
+            let (asks, stats) = asker_against(heal, Arc::new(|_, _| vec![(0, no_range_id())]));
+            assert_eq!(stats.retried.len(), 1, "{stats:?}");
+            let retried = &stats.retried[0];
+            assert!(!retried.answered, "{retried:?}");
+            let closes = window_closes(at(heal), retried.refused);
+            assert!(
+                asks.iter().all(|(when, _, _)| *when < closes),
+                "an ask at or after the window closed at {closes:?}: {asks:?}"
+            );
+            assert!(
+                retried.ended >= closes && retried.ended < closes + SPLIT_RETRY + RETRY_WAIT,
+                "heal at {heal} ms: stopped at {:?}, the window closing at {closes:?}",
+                retried.ended
+            );
+            let count = usize::try_from(ASKS).expect("small") + 1;
+            assert!(
+                asks.len() > count,
+                "heal at {heal} ms: {} asks, no more than D-131's count",
+                asks.len()
+            );
+            assert_eq!(stats.splits_unanswered, 1);
+        }
+    }
+
+    /// D-143's (1): an answer already queued when the asker asks is not that ask's answer. Here
+    /// the first ask's `NoRangeId` arrives twice, as a network duplicate would bring it, and the
+    /// second ask is answered done 50 ms after it arrives. The copy is dropped, not read as the
+    /// second ask's refusal; counted once; and the asker asks twice and ends on the done.
+    // D-143
+    #[test]
+    fn the_asker_reads_no_queued_answer_as_the_answer_to_its_next_ask() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id()), (0, no_range_id())],
+                _ => vec![(50, split_done())],
+            }),
+        );
+        assert_eq!(asks.len(), 2, "{asks:?}");
+        assert_eq!(stats.refused.get("no-range-id"), Some(&1), "{stats:?}");
+        assert_eq!(stats.no_range_id.len(), 1, "{stats:?}");
+        assert_eq!(stats.splits_done, 1);
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            retried.ended >= asks[1].0 + Duration::from_millis(50),
+            "ended on the second ask's own answer: {retried:?}, {asks:?}"
+        );
+    }
+
+    /// D-143's (1), the other half: a done found queued is taken, not dropped. The first ask is
+    /// refused `NoRangeId` and then answered done 100 ms later, inside the asker's
+    /// `SPLIT_RETRY`, as where a copy of the split had been proposed; every later ask is met with
+    /// silence. The asker ends on that done before it asks again.
+    // D-143
+    #[test]
+    fn the_asker_takes_a_done_it_finds_queued() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id()), (100, split_done())],
+                _ => Vec::new(),
+            }),
+        );
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(stats.splits_done, 1, "{stats:?}");
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            retried.ended < retried.refused + SPLIT_RETRY + Duration::from_millis(5),
+            "ended on the queued done, before asking again: {retried:?}"
+        );
+    }
+
+    /// D-143's (3): once refused, the asker waits `RETRY_WAIT` for an answer, not `SPLIT_WAIT`,
+    /// then tries the next node under a number the leader has not seen. Here the second ask is met
+    /// with silence and the next node answers done.
+    // D-143
+    #[test]
+    fn the_asker_refused_waits_a_short_while_for_an_answer_and_then_asks_anew() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id())],
+                1 => Vec::new(),
+                _ => vec![(0, split_done())],
+            }),
+        );
+        assert_eq!(asks.len(), 3, "{asks:?}");
+        assert_eq!(
+            (asks[1].1, asks[1].2, asks[2].1, asks[2].2),
+            (1, ASKER, 2, ASKER + ASK_ANEW),
+            "the silent ask's next goes to the next node under a new number: {asks:?}"
+        );
+        let silent = asks[2].0.duration_since(asks[1].0);
+        assert!(
+            silent >= SPLIT_RETRY && silent < SPLIT_RETRY + Duration::from_millis(5),
+            "waited {silent:?} on the silent ask, where about `SPLIT_RETRY` is the wait"
+        );
+        assert!(stats.retried[0].answered, "{stats:?}");
+    }
+
+    /// Seed 18925's mechanism, D-131's fix, which D-143 keeps: an asker whose count went on
+    /// bounces and whose first `NoRangeId` came on the count's last ask still opens its window and
+    /// retries after it. Here every node answers `NotLeader` naming none to the count's first
+    /// `ASKS - 1` asks, `NoRangeId` to its last and done to every ask after it: the asker asks
+    /// `ASKS + 1` times, the last a retry `SPLIT_RETRY` after the refusal, and ends on its done.
+    /// With the refusal on the count's last ask ending the asker, seed 18925's bug, it fails.
+    // D-131
+    // D-143
+    #[test]
+    fn the_asker_refused_on_the_last_ask_of_its_count_still_retries() {
+        let count = usize::try_from(ASKS).expect("small");
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(move |k, _| {
+                if k + 1 < count {
+                    vec![(0, Reply::NotLeader { leader: None })]
+                } else if k + 1 == count {
+                    vec![(0, no_range_id())]
+                } else {
+                    vec![(0, split_done())]
+                }
+            }),
+        );
+        assert_eq!(asks.len(), count + 1, "{asks:?}");
+        assert_eq!(stats.no_range_id.len(), 1, "{stats:?}");
+        assert_eq!(stats.retried.len(), 1, "{stats:?}");
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            asks[count - 1].0 <= retried.refused && asks[count].0 >= retried.refused + SPLIT_RETRY,
+            "the refusal came on the count's last ask and the retry after it: {retried:?}, {asks:?}"
+        );
+        assert_eq!(stats.splits_done, 1, "{stats:?}");
+        assert_eq!(stats.splits_unanswered, 0, "{stats:?}");
+    }
+
+    /// Before its first `NoRangeId` the asker still asks `ASKS` times and stops (D-131): an asker
+    /// every node answers `NotLeader` naming none is no retry, opens no window and is not
+    /// recorded as one.
+    // D-131
+    // D-143
+    #[test]
+    fn the_asker_never_refused_stops_after_its_count() {
+        let (asks, stats) = asker_against(
+            3_000,
+            Arc::new(|_, _| vec![(0, Reply::NotLeader { leader: None })]),
+        );
+        assert_eq!(
+            asks.len(),
+            usize::try_from(ASKS).expect("small"),
+            "{asks:?}"
+        );
+        assert!(stats.retried.is_empty(), "{stats:?}");
+        assert_eq!(stats.splits_unanswered, 1);
     }
 }

@@ -2,7 +2,7 @@
 //! every seed (SHARD.md §12; §11, storage 8).
 //!
 //! The scenario is `ananke_sim::reseed`: three servers of six replicas each — four user
-//! ranges and, since PROPOSED D-096, the root and the meta range — one of them refused by
+//! ranges and, since D-096, the root and the meta range — one of them refused by
 //! its store's lost mark at a restart, its cap on streams received set to two so the four
 //! user ranges' re-seeds share two slots, and a `reseed-crash` arm that crashes it on the
 //! trace event of one of those replicas' refused mark and restarts it. The two system
@@ -16,25 +16,32 @@
 //! - (c)'s second half — a replica answering *after its own install* — is shown not to be
 //!   a constant, which is what it was when it was keyed on the mark alone;
 //! - a re-seeded node's right half, which configuration never names, comes back through
-//!   its placeholder quarantined (`reseed::run_after_split`, PROPOSED D-109 §2), and the
+//!   its placeholder quarantined (`reseed::run_after_split`, D-109 §2), and the
 //!   node, re-seeded and not restarted, writes nothing into the directory it refused
-//!   (D-041, PROPOSED D-117);
+//!   (D-041, D-117);
 //! - `TasksOnTheRefusedDir`, the start that re-seeded handing its tasks the refused
-//!   directory, is caught there on every seed (PROPOSED D-117);
+//!   directory, is caught there on every seed (D-117);
 //! - a right half made after a re-seed takes the parent's quarantine, so its node neither
 //!   leads it nor takes a checkpoint of it (`reseed::run_split_after_reseed`, D-130), and a
 //!   node that does lead one, under `SplitLeavesQuarantineBehind`, takes and sweeps in the
-//!   directory it runs on, and the variant is caught there too (PROPOSED D-117);
+//!   directory it runs on, and the variant is caught there too (D-117);
 //! - the same run's install of the parent is created at the split's generation and agrees
-//!   with check 7's map at its floor (issue #172; PROPOSED D-107 §2, D-115);
+//!   with check 7's map at its floor (issue #172; D-107 §2, D-115);
 //! - the same run's right half keeps its keys, whichever of the node's two installs lands
 //!   first, off the node's disk, and `InstallReplacesHostedSpan` loses them exactly where
-//!   the right half's lands first (PROPOSED D-128);
+//!   the right half's lands first (D-128);
 //! - a leader with both followers re-seeded refuses the reads it can never confirm and goes
 //!   on committing, and the leader as it was is caught by the read bound
-//!   (`reseed::run_unconfirmable_reads`, PROPOSED D-129).
+//!   (`reseed::run_unconfirmable_reads`, D-129);
+//! - issue #113's recipe, the shape with a second restart over the replicas its installs
+//!   filled, holds on the issue's seed 26 with no late job, and `RestartAppliesFromZero` is
+//!   caught there by its gap (`reseed::run_restarted_again`, PROPOSED D-126);
+//! - a re-seeded node takes the split of a range its log brought back, which holds no
+//!   descriptor, from the descriptor configuration names, and `ReplayedRangeRefusesItsSplit`,
+//!   the refusal it made before, is caught by state machine safety on every seed
+//!   (`reseed::run_split_of_a_replayed_range`, #199, PROPOSED D-138).
 
-use ananke_env::{RecoveredAs, TraceEvent};
+use ananke_env::{ApplyEffect, RecoveredAs, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_shard::invariants::Fold;
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -77,8 +84,8 @@ fn with(seed: u64, variant: NodeVariant) -> Report {
 /// Uncapped, the premerge's thousand would be some 170 to 210 CPU seconds and the
 /// nightly's ten thousand some 1 700 to 2 100, a whole nightly shard (D-064), for clauses
 /// that hold or fail on every seed at twenty. Like this shape's, that cap is the owner's
-/// to rule on (PROPOSED D-115).
-// PROPOSED(D-115): the second shape's cap, on its own figures.
+/// to rule on (D-115).
+// D-115: the second shape's cap, on its own figures.
 const TIER_CAP: u64 = 200;
 
 /// The seeds this binary's sweeps run: the tier's, capped.
@@ -103,7 +110,7 @@ fn tier(what: &str, run: u64) {
 }
 
 /// [`tier`], naming the entry whose figures the cap stands on for this run.
-// PROPOSED(D-115)
+// D-115
 fn tier_under(what: &str, run: u64, entry: &str) {
     println!(
         "reseed shape, {what}: ANANKE_SEEDS={} ran {run} seeds (TIER_CAP={TIER_CAP}, \
@@ -339,13 +346,13 @@ fn caught(variant: NodeVariant, run: u64) {
 }
 
 /// A re-seeded node's right half comes back through its placeholder, quarantined
-/// (PROPOSED D-109 §2), the node writes nothing into the directory it refused (PROPOSED
-/// D-117), and P's install is created at the split's generation (PROPOSED D-115):
+/// (D-109 §2), the node writes nothing into the directory it refused
+/// (D-117), and P's install is created at the split's generation (D-115):
 /// `reseed::run_after_split`, on every seed of the tier.
 ///
 /// What it holds, per seed, on the correct node:
 ///
-/// - **the quarantine** (PROPOSED D-109 §2). The node held the right half before its
+/// - **the quarantine** (D-109 §2). The node held the right half before its
 ///   loss: its own apply of the split created it, and it may have voted in it. The
 ///   re-seed rebuilds configuration's replicas, and configuration never names a right
 ///   half, so the right half is not among them; the fresh engine holds no key of it. So
@@ -353,7 +360,7 @@ fn caught(variant: NodeVariant, run: u64) {
 ///   creates is quarantined — stated so, `RaftReseeded` and `RaftRecovered { state:
 ///   quarantined }` — and grants the right half nothing. Before that fix it was
 ///   installed unquarantined, and this failed on every seed;
-/// - **the refused directory untouched** (D-041, PROPOSED D-117). The node is not
+/// - **the refused directory untouched** (D-041, D-117). The node is not
 ///   restarted after its re-seed, so the start that re-seeded is the one that receives
 ///   both streams, its re-seed's of P and the right half's to its placeholder. Not one
 ///   entry of the refused directory, at any depth, changes from the audit before the
@@ -362,7 +369,7 @@ fn caught(variant: NodeVariant, run: u64) {
 ///   is left in either staging directory. Before that fix the start's tasks were handed the
 ///   refused directory and both streams staged, synced and were cleared there: this failed
 ///   on 200 of 200 seeds (#176);
-/// - **an install creation's generation** (issue #172; PROPOSED D-107 §2, D-115). `x`
+/// - **an install creation's generation** (issue #172; D-107 §2, D-115). `x`
 ///   applied the split before its loss, and P's leader compacted past it while `x` was
 ///   down, so the install that creates P on `x`'s fresh engine puts P's left half in place,
 ///   `[k0, k1)` at generation 2. Its `RangeCreated { cause: snapshot }` must name that
@@ -374,7 +381,7 @@ fn caught(variant: NodeVariant, run: u64) {
 ///   Some(3)'s replica of range 2 was installed at index 128 with Held { …, generation: 1,
 ///   … }, where the range's descriptor there is Held { …, generation: 2, … }". The unit
 ///   test of `created_from` passes that revert, so this run is what holds the call site.
-// PROPOSED(D-115): the parent's install creation, asked on the same run.
+// D-115: the parent's install creation, asked on the same run.
 #[test]
 fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() {
     let run = shape_seeds();
@@ -383,7 +390,7 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
         let report = reseed::run_after_split(seed);
         report.check()?;
         report.reached()?;
-        // PROPOSED(D-117)
+        // D-117
         report.refused_untouched()?;
         report.staged_where_it_runs()?;
         report.parent_created_at_the_splits_generation()?;
@@ -429,7 +436,7 @@ fn a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined() 
 ///
 /// The run is otherwise the correct one, and the test asks that too: every check of the
 /// trace passes the variant, so the audit is what catches it.
-// PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
+// D-117: the start's tasks run on the directory the re-seed built.
 #[test]
 fn a_node_whose_tasks_stay_on_the_refused_directory_is_caught() {
     let run = HIGH_RATE_SHARE;
@@ -495,7 +502,7 @@ fn unconfirmable_figures(what: &str, run: u64, reports: &[(u64, u64, u64, usize)
 /// replica holds bounded, none confirmed there, writes committing the whole time. The state
 /// is built on every seed and each clause holds there by construction, so it is asserted at
 /// every tier (D-061), and the run is capped as this binary's are (`TIER_CAP`).
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_leader_that_can_confirm_no_read_refuses_it_and_goes_on_committing() {
     let run = shape_seeds();
@@ -525,7 +532,7 @@ fn a_leader_that_can_confirm_no_read_refuses_it_and_goes_on_committing() {
 /// bound that stays at 38 and is what the sweep tripped on (S10's seeds 128 and 643). Caught
 /// on every seed by that bound and nothing else, so asserted at every tier (D-061), on
 /// [`HIGH_RATE_SHARE`] seeds as this binary's other high-rate variants are.
-// PROPOSED(D-129): a leader refuses a read it can never confirm.
+// D-129: a leader refuses a read it can never confirm.
 #[test]
 fn a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound() {
     let run = HIGH_RATE_SHARE;
@@ -572,8 +579,8 @@ fn a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound() {
     verdict(&verdicts).expect("the leader as it was is caught by the bound on every seed");
 }
 
-/// How a refused follower counts, the one thing the verifiers read differently (PROPOSED
-/// D-129 §2): the same as a quarantined one, since the mark is no promise of a later
+/// How a refused follower counts, the one thing the verifiers read differently
+/// (D-129 §2): the same as a quarantined one, since the mark is no promise of a later
 /// confirmation and a stream can stall for as long as the leader's other follower keeps it
 /// in office. So the second follower's stream is lost for good here, it stays refused, and
 /// the correct leader refuses reads and commits on exactly as in the state's other shape.
@@ -591,7 +598,7 @@ fn a_leader_that_keeps_the_reads_it_can_never_confirm_is_caught_by_the_bound() {
 /// figures in the entry's table were measured the same way. The revert's own unit case is
 /// `paper.rs`'s `a_refused_followers_echo_of_zero_counts_as_a_quarantined_ones`, which it
 /// also fails; this run is what holds the reading under the fault model.
-// PROPOSED(D-129): a refused follower's echo of 0 counts as a quarantined one's.
+// D-129: a refused follower's echo of 0 counts as a quarantined one's.
 #[test]
 fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {
     let run = HIGH_RATE_SHARE;
@@ -617,7 +624,7 @@ fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {
 }
 
 /// A re-seeded node's right half keeps its keys, whichever of its two installs lands first
-/// (SHARD.md §5, §11 storage 5; PROPOSED D-128): `reseed::run_after_split`, on every seed
+/// (SHARD.md §5, §11 storage 5; D-128): `reseed::run_after_split`, on every seed
 /// of the tier.
 ///
 /// The re-seed hosts P, which has no descriptor in the fresh engine, at configuration's
@@ -628,7 +635,7 @@ fn a_refused_follower_whose_stream_stalls_counts_as_unable_to_confirm() {
 /// when the run is over, read off its disk. The run writes each key once, so nothing
 /// puts one back. Every traced descriptor is right whichever span the switch replaced,
 /// so only the keys, and check 8's install clause, can say.
-// PROPOSED(D-128)
+// D-128
 #[test]
 fn a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first() {
     let run = shape_seeds();
@@ -665,7 +672,7 @@ fn a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first() {
     );
 }
 
-/// The pair's buggy half (CLAUDE.md; PROPOSED D-128): `InstallReplacesHostedSpan` on
+/// The pair's buggy half (CLAUDE.md; D-128): `InstallReplacesHostedSpan` on
 /// `reseed::run_after_split`, the same seeds as the correct node's test above.
 ///
 /// On every seed where the right half's install lands before P's the switch of P replaces
@@ -674,7 +681,7 @@ fn a_reseeded_nodes_right_half_keeps_its_keys_whichever_install_lands_first() {
 /// clause and check 7 stay green. On a seed where P's lands first the variant is the
 /// correct node, and all of them hold. Measured on the tier's seeds, about a third, so
 /// asserted at every tier (D-061).
-// PROPOSED(D-128)
+// D-128
 #[test]
 fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_check_8_says_so() {
     let run = shape_seeds();
@@ -736,7 +743,7 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 }
 
 /// A node that leads a right half made after its re-seed takes its checkpoints and sweeps
-/// them in the directory it runs on (D-041, PROPOSED D-117): `reseed::run_split_after_reseed`,
+/// them in the directory it runs on (D-041, D-117): `reseed::run_split_after_reseed`,
 /// on [`HIGH_RATE_SHARE`] seeds, under `SplitLeavesQuarantineBehind`, alone and with
 /// `TasksOnTheRefusedDir`.
 ///
@@ -761,12 +768,13 @@ fn a_span_less_install_that_replaces_its_hosted_span_loses_the_right_half_and_ch
 /// and every version directory is in the refused directory and none in the fresh one.
 /// Measured on 200 of 200. It catches the two ways to leave a task behind that
 /// `run_after_split` cannot: the `apply` task's `engine_dir`, by where the versions are, and
-/// the `snapshot` task's, by the sweep that empties nothing (PROPOSED D-117 gives the table).
+/// the `snapshot` task's, by the sweep that empties nothing (D-117 gives the table).
 ///
-/// It splits P's left half and not a range the log rebuilt, whose split fails state machine
-/// safety on the re-seeded node, which is #199's.
-// PROPOSED(D-117): the start's tasks run on the directory the re-seed built.
-// PROPOSED(D-130): on a node that may lead a right half made after its re-seed, the variant's.
+/// It splits P's left half, which came back by a stream. A range the log rebuilt is
+/// `a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back`'s, whose split failed
+/// state machine safety on the re-seeded node until D-138 (#199).
+// D-117: the start's tasks run on the directory the re-seed built.
+// D-130: on a node that may lead a right half made after its re-seed, the variant's.
 #[test]
 fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs() {
     let run = HIGH_RATE_SHARE;
@@ -817,7 +825,7 @@ fn a_node_leading_a_right_half_after_its_reseed_takes_and_sweeps_where_it_runs()
 /// never its leader, for all the leaders the run crashes to make it one. The day a re-seeded
 /// node can lead again this fails, and the test above can ask its question of the correct
 /// node once more.
-// PROPOSED(D-130): the situation D-117's run reached is absent on the correct node.
+// D-130: the situation D-117's run reached is absent on the correct node.
 #[test]
 fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_nor_takes() {
     let run = HIGH_RATE_SHARE;
@@ -858,4 +866,166 @@ fn a_right_half_made_after_a_reseed_is_quarantined_and_its_node_neither_leads_no
         Ok(())
     });
     verdict(&verdicts).expect("a right half made after a re-seed is quarantined on every seed");
+}
+
+/// Seed 26, issue #113's: the shape with a second restart after its `AFTER` window, a node
+/// restarted over the replicas its installs filled (`reseed::run_restarted_again`; PROPOSED
+/// D-126). On the tree the recipe was filed from, this seed failed the correct system with
+/// "an apply through 389 names index 384, which the core does not hold" (D-081).
+///
+/// What it pins:
+///
+/// - **the situation**: at the second start every streamed range's replica restates a
+///   compacted prefix, so the restart is over replicas an install filled, the issue's
+///   title;
+/// - **the correct system** meets (a) to (e), the node still running at the end;
+/// - **`RestartAppliesFromZero`** is caught there by its gap: the first `Apply` after the
+///   restart names index 1, which a compacted replica does not hold. D-081 paired it as a
+///   unit because the shape reaches a restart over a compacted replica only when an install
+///   lands before the arm's crash; this is the run beside that pair, which stays;
+/// - **the late job is absent**, and asserted absent: an index applied above a snapshot
+///   after the install's hold and before the replica commits on top of it
+///   (`reseed::late_applies`), #113's precondition. No seed measured on this tree reaches
+///   it (PROPOSED D-126), so `SwitchForgetsLateApplies` is paired as a unit in
+///   `ananke_shard::round` and `ananke_shard::server` and not run here. The correct node
+///   keeps what such a job applies, so the day a schedule reaches it here this assertion
+///   says so, and the pin is upgraded to assert that, and the variant run on it.
+///
+/// One seed and not the tier: over the tier's seeds this run's traces come within a few
+/// thousand records of the runaway cap, and a seed past the tier passes it (PROPOSED
+/// D-126 measures both), so a sweep of it would fail the correct system on the harness's
+/// cap the first time a change lengthened the run. The record count is printed here
+/// against the cap.
+// PROPOSED(D-126)
+#[test]
+fn seed_26_a_node_restarted_over_the_replicas_its_installs_filled_holds_the_shape() {
+    let seed = 26;
+    let report = reseed::run_restarted_again(seed, Variants::default(), NodeVariants::correct());
+    println!(
+        "seed {seed}, second restart: {} trace records, of the runaway cap's {}; late applies {:?}",
+        report.records.len(),
+        ananke_sim::ranges::TRACE_CAP,
+        report.late_applies()
+    );
+    assert_eq!(
+        report.compacted_at_the_last_start(),
+        Report::streamed_ranges(),
+        "seed {seed}: the second start is not over replicas the installs filled, so this pins \
+         nothing of issue #113"
+    );
+    report
+        .check()
+        .expect("the correct system meets (a) to (e) after a second restart");
+    assert!(
+        report.late_applies().is_empty(),
+        "seed {seed} now reaches issue #113's late job: {:?}. The correct node keeps what it \
+         applied, so upgrade this pin to assert that and run SwitchForgetsLateApplies on it",
+        report.late_applies()
+    );
+
+    let variant = NodeVariant::RestartAppliesFromZero;
+    let why = reseed::run_restarted_again(
+        seed,
+        Variants::default(),
+        NodeVariants::correct().with(variant),
+    )
+    .check()
+    .expect_err("RestartAppliesFromZero is caught on a restart over compacted replicas");
+    assert!(
+        why.contains("which the core does not hold"),
+        "seed {seed}: {variant} caught by something other than its gap: {why}"
+    );
+}
+
+/// A re-seeded node takes the split of a range its log brought back (#199; PROPOSED D-138):
+/// `reseed::run_split_of_a_replayed_range`, on every seed of the tier.
+///
+/// The re-seed writes a user range no descriptor, and range 3, which no writer writes and
+/// whose leader never compacts, comes back to `x` by its log from the first entry, never by
+/// a stream, so `x`'s replica of it holds none when the split reaches it. On every seed the
+/// run reaches that (`replayed_reached`: `x` installed no snapshot of range 3 after its
+/// refusal and applied the split's entry), every check of the trace passes, state machine
+/// safety among them, and `x` applies the split as a first apply does
+/// (`replayed_split_taken`): its apply took, it traced the split and range 3's descriptor
+/// over `[k2, k3)` at the second generation, and it created the right half over `[k3, k4)`
+/// with every server its voter.
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_takes_the_split_of_a_range_its_log_brought_back() {
+    let run = shape_seeds();
+    tier_under(
+        "the split of a range the log rebuilt, correct",
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report = reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct());
+        report.replayed_reached()?;
+        report.check()?;
+        report.replayed_split_taken()
+    });
+    verdict(&verdicts)
+        .expect("a re-seeded node takes the split of a range its log brought back on every seed");
+}
+
+/// The pair's buggy half (CLAUDE.md; PROPOSED D-138): `ReplayedRangeRefusesItsSplit` on
+/// `reseed::run_split_of_a_replayed_range`, on [`HIGH_RATE_SHARE`] seeds, the first of the
+/// correct node's above.
+///
+/// On every seed the run reaches its situation as the correct node's does, `x` applies the
+/// split's entry to `refused` and traces no split of range 3, and state machine safety
+/// names that entry of range 3 applied to `took` on one server and `refused` on another.
+/// #199 measured it on 40 of 40 seeds, so it is asserted at every tier (D-061).
+// PROPOSED(D-138)
+#[test]
+fn a_reseeded_node_that_refuses_the_split_of_a_range_its_log_brought_back_is_caught() {
+    let run = HIGH_RATE_SHARE;
+    let variant = NodeVariant::ReplayedRangeRefusesItsSplit;
+    tier_under(
+        &format!("the split of a range the log rebuilt, {variant}"),
+        run,
+        "D-138",
+    );
+    let verdicts = sweep(run, |seed| {
+        let report =
+            reseed::run_split_of_a_replayed_range(seed, NodeVariants::correct().with(variant));
+        report.replayed_reached()?;
+        let x = report.x;
+        let range = reseed::REPLAYED_RANGE;
+        let (index, _) = report
+            .replayed_split()
+            .expect("`replayed_reached` names the split");
+        let effect = report.applied_after_refusal(range, index);
+        if effect != Some(ApplyEffect::Refused) || report.second_right.is_some() {
+            return Err(format!(
+                "seed {seed}: {variant}: node {x} applied entry {index} of range {range} to \
+                 {effect:?} and made the right half {:?}: it should refuse it and make none",
+                report.second_right
+            ));
+        }
+        let expected = format!(
+            "seed {seed}: state machine safety: index {index} of group {range} was applied to \
+             effect "
+        );
+        match report.check() {
+            Err(words)
+                if words.starts_with(&expected)
+                    && words.contains("took")
+                    && words.contains("refused") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "seed {seed}: {variant} should fail state machine safety at entry {index} of \
+                 range {range}, and the checks said {other:?}"
+            )),
+        }
+    });
+    let caught = verdicts.iter().filter(|verdict| verdict.is_ok()).count();
+    println!(
+        "reseed: {variant} failed state machine safety at the split of range {} on {caught} of \
+         {run} seeds",
+        reseed::REPLAYED_RANGE
+    );
+    verdict(&verdicts).expect("the refusal is caught by state machine safety on every seed");
 }

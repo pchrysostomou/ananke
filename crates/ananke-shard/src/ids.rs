@@ -14,10 +14,10 @@
 //! and harmless; so is a block abandoned at a restart, or one a node stopped using.
 //!
 //! What a split does on a node whose block has run out while range 0 is unreachable
-//! is Stage C's first question (PROPOSED D-092), which the owner has not ruled on. A
-//! split's leader takes its right half's id here ([`IdBlocks::take`], PROPOSED D-100),
-//! and a block with none left refuses the split `NoRangeId` at proposal: D-092's
-//! answer A, built as proposed before a ruling, which replaces it in place (D-104).
+//! is Stage C's first question (D-092), which the owner answered A on 2026-11-14 (D-139).
+//! A split's leader takes its right half's id here ([`IdBlocks::take`], D-100), and a
+//! block with none left refuses the split `NoRangeId` at proposal: answer A, built as
+//! proposed before the ruling (D-104).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -37,7 +37,7 @@ use crate::system::{self, FIRST_USER_RANGE, LeaseRecord};
 /// # Errors
 ///
 /// The engine's, or a counter that does not decode; a counter at the end of `u64`.
-// PROPOSED(D-099)
+// D-099
 pub async fn grant<E: Environment>(
     engine: &Engine<E>,
     node: ServerId,
@@ -61,7 +61,7 @@ pub async fn grant<E: Environment>(
 
 /// The node's block of range ids for one run (SHARD.md §5): the run's nonce, the
 /// block it takes from and its position in it, and the blocks it adopted, each once.
-// PROPOSED(D-099)
+// D-099
 #[derive(Debug)]
 pub struct IdBlocks {
     /// The nonce drawn at this run's start; every refill carries it.
@@ -72,6 +72,9 @@ pub struct IdBlocks {
     adopted: BTreeSet<u64>,
     /// Whether a refill is outstanding: asked and not yet answered by a grant.
     asked: bool,
+    /// Whether a split has found this run's block empty: what `RefusedAfterRefill`
+    /// reads (PROPOSED D-137). The correct node reads nothing of it.
+    emptied: bool,
 }
 
 impl IdBlocks {
@@ -83,6 +86,7 @@ impl IdBlocks {
             block: None,
             adopted: BTreeSet::new(),
             asked: false,
+            emptied: false,
         }
     }
 
@@ -124,13 +128,21 @@ impl IdBlocks {
         true
     }
 
+    /// Whether a split has found this run's block empty ([`IdBlocks::take`] with no id
+    /// left), whatever was adopted since.
+    // PROPOSED(D-137): what `RefusedAfterRefill` reads.
+    #[must_use]
+    pub fn emptied(&self) -> bool {
+        self.emptied
+    }
+
     /// The next id of the block held, if one is left: what a split's right half takes
     /// (§5). Taken from memory, each id once.
     pub fn take(&mut self) -> Option<u64> {
-        let (next, last) = self.block?;
-        if next > last {
+        let Some((next, last)) = self.block.filter(|(next, last)| next <= last) else {
+            self.emptied = true;
             return None;
-        }
+        };
         self.block = if next == last {
             None
         } else {
@@ -188,5 +200,25 @@ mod tests {
         assert!(ids.adopt(&record(1, 9, 9), false));
         assert_eq!(ids.take(), Some(9));
         assert_eq!(ids.take(), None);
+    }
+
+    // PROPOSED(D-137)
+    #[test]
+    fn a_take_that_finds_the_block_empty_is_remembered_for_the_run() {
+        let mut ids = IdBlocks::new(1);
+        assert!(!ids.emptied(), "a new run has found nothing empty yet");
+        assert!(ids.adopt(&record(1, 3, 3), false));
+        assert_eq!(ids.take(), Some(3));
+        assert!(
+            !ids.emptied(),
+            "the last id taken is not an empty block found"
+        );
+        assert_eq!(ids.take(), None);
+        assert!(ids.emptied());
+        assert!(ids.adopt(&record(1, 9, 10), false));
+        assert!(ids.emptied(), "a refill does not undo what the run found");
+        let mut fresh = IdBlocks::new(2);
+        assert_eq!(fresh.take(), None);
+        assert!(fresh.emptied(), "a run that holds no block finds it empty");
     }
 }

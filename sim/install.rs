@@ -17,7 +17,7 @@
 //! placeholder's refused server's answer puts it behind the compacted prefix, so each
 //! range's leader must stream to *both at once* — four ranges times two followers,
 //! eight streams, which is what makes "per range and per follower" a claim this
-//! scenario can check rather than a phrase. Until PROPOSED D-109 the five were all
+//! scenario can check rather than a phrase. Until D-109 the five were all
 //! bootstrap nodes and the late two bootstrapped their own replicas when they started;
 //! there are exactly three bootstrap nodes now (§2; Q7, Q32), and the late two get
 //! every replica through an install into a placeholder.
@@ -81,7 +81,7 @@ use crate::ranges::{DIR, FIRST_RANGE, RANGES, SNAPSHOT_CAP, range_of_key};
 
 /// The nodes in the cluster, and every range's voters once the operator's change lands.
 pub const NODES: u64 = 5;
-/// The three that start at once, the bootstrap nodes (SHARD.md §2; PROPOSED D-109): the
+/// The three that start at once, the bootstrap nodes (SHARD.md §2; D-109): the
 /// cluster's voters until the two that join are added.
 pub const NODES_AT_ONCE: u64 = 3;
 /// How many keys the writer cycles through.
@@ -212,6 +212,29 @@ impl Report {
             }
         }
         counts
+    }
+
+    /// Every stream given up on RAFT.md's resend bound, as (leader, range, follower),
+    /// once per give-up (`RaftSnapshotGaveUp`).
+    ///
+    /// Nothing in this scenario silences a receiver: no node crashes, nothing is
+    /// partitioned, and a message is lost one time in fifty, so five exchanges of one
+    /// chunk lost in a row is the only way the network alone reaches the bound. A
+    /// stream given up here is a receiver that held the chunk and did not say so —
+    /// #120, which gave up 21 streams on 14 of the 32 seeds before D-127, with every
+    /// install landing regardless. [`Report::check`] asserts there are none.
+    // PROPOSED(D-127): a stream given up here is the bound tripped by a live receiver.
+    #[must_use]
+    pub fn gave_up(&self) -> Vec<(u64, u64, u64)> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshotGaveUp { server, range, to } => {
+                    Some((*server, *range, *to))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Takes made, as (server, range).
@@ -353,8 +376,8 @@ impl Report {
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
         // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 — `ananke_shard::invariants`'
-        // seven folds — over this node scenario's trace (Q40; PROPOSED D-097, D-098).
-        // Every node scenario folds them, the sharded quorum scenario since PROPOSED
+        // seven folds — over this node scenario's trace (Q40; D-097, D-098).
+        // Every node scenario folds them, the sharded quorum scenario since
         // D-106 (#140).
         if let Err(violation) = ananke_shard::invariants::all(&self.records) {
             return Err(format!("seed {seed}: {violation}"));
@@ -428,6 +451,22 @@ impl Report {
             ));
         }
 
+        // No stream was given up on the resend bound. Every receiver here is up and
+        // answering, so a give-up is a receiver that held the chunk and stayed silent
+        // while it installed, and the sender counting that silence as a lost chunk:
+        // the install lands anyway and nothing above can tell (#120).
+        // PROPOSED(D-127): a stream given up here is the bound tripped by a live receiver.
+        let gave_up = self.gave_up();
+        if let Some(first) = gave_up.first() {
+            return Err(format!(
+                "seed {seed}: {} streams were given up on the resend bound, the first \
+                 (leader, range, follower) {first:?}, in a scenario where no receiver is \
+                 ever down: a receiver that holds a chunk and answers nothing while it \
+                 installs is a lost chunk to its sender (#120, D-127)",
+                gave_up.len()
+            ));
+        }
+
         // And the part no count of events can reach: **what landed**. Each installed
         // (server, range) is compared with the take that fed it, paired by the
         // snapshot's identity. A take that dropped the range's user keys, or carried
@@ -447,7 +486,7 @@ impl Report {
             // The replica's applied index is the snapshot's last index: an install
             // that left it anywhere else has a state machine out of step with the
             // metadata describing it. An install into a placeholder, which every one
-            // owed here is since PROPOSED D-109, reads its state back before its store
+            // owed here is since D-109, reads its state back before its store
             // is opened and traces it after, with the applied index the opened store
             // reports. Until #174's review (N1) it traced the snapshot's own index, and
             // this clause could not fail. A repair planted one index short is now
@@ -541,7 +580,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
         ranges: crate::ranges::ranges(),
-        // PROPOSED(D-109): exactly three bootstrap nodes; the late two join.
+        // D-109: exactly three bootstrap nodes; the late two join.
         bootstrap: (1..=NODES_AT_ONCE).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
@@ -557,7 +596,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
-        // PROPOSED(D-105): no range-layer variant runs on this scenario.
+        // D-105: no range-layer variant runs on this scenario.
         range_variants: RangeVariants::correct(),
     }
 }
@@ -659,7 +698,7 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
                 // This writer routes by the scenario's fixed map, which no split
                 // moves here, so a mismatch is not a route it can follow: it drops
                 // the hint and tries elsewhere, as it does for a leader it lost.
-                // PROPOSED(D-097)
+                // D-097
                 Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. } => {
                     leaders.remove(&range);
                     break;
@@ -680,7 +719,7 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
 /// learners, which reaches them as placeholders (SHARD.md §5); a leadership change
 /// before the joint entry abandons the change (D-032), and the operator's next ask
 /// starts it again, which a request for the same voters makes harmless.
-// PROPOSED(D-109): the late two are added by a change, as a node that joins is.
+// D-109: the late two are added by a change, as a node that joins is.
 async fn operator<E: Environment>(env: E) {
     let Ok(sock) = env.net().bind(client_addr(2)).await else {
         return;
@@ -771,7 +810,7 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
     let wrote = *committed.lock().expect("the counter");
     // And the other two arrive, holding nothing, and the operator asks every range
     // for them: each range's leader adds them, and feeds each its range's snapshot
-    // through the placeholder its first message makes of it (PROPOSED D-109).
+    // through the placeholder its first message makes of it (D-109).
     for id in NODES_AT_ONCE + 1..=NODES {
         spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
     }
@@ -1013,7 +1052,7 @@ fn busiest_leader(records: &[TraceRecord]) -> Option<u64> {
 /// crashed and starts again on a store marked lost, so it is refused and re-seeded
 /// (Q15). It hosts nothing, so the re-seed rebuilds no replica: every replica it held
 /// comes back through its placeholder's install, and on a node that runs on an engine a
-/// re-seed built that install is quarantined (PROPOSED D-109 §2). Then the bootstrap node
+/// re-seed built that install is quarantined (D-109 §2). Then the bootstrap node
 /// leading the most user ranges is crashed, so those ranges elect among the rest and ask
 /// the joiner's replicas for votes.
 #[must_use]

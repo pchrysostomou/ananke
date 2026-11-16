@@ -58,6 +58,7 @@ use std::net::SocketAddr;
 use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ananke_env::{
@@ -124,7 +125,7 @@ pub enum SnapJob {
         /// the install is decided (D-047): the switch is traced as decided here and
         /// not when this task gets to the repair, since a node behind on every range
         /// queues an install per range and the last one's hold began a queue ago.
-        // PROPOSED(D-098)
+        // D-098
         held: Decision,
     },
     /// A take of `range` completed: its versions are swept, and only its own
@@ -134,7 +135,7 @@ pub enum SnapJob {
         range: RangeId,
     },
     /// The node holds `range` from now: a split's right half, with the spans an
-    /// install of it switches (SHARD.md §5; PROPOSED D-100).
+    /// install of it switches (SHARD.md §5; D-100).
     Host {
         /// The range.
         range: RangeId,
@@ -209,7 +210,7 @@ pub enum SnapAnswer {
         config: Box<Configuration>,
         /// The descriptor the switch put in place, read back from the store: what
         /// the host's receipt check reads for this range from here on (SHARD.md §3).
-        // PROPOSED(D-097)
+        // D-097
         descriptor: Option<Box<RangeDescriptor>>,
         /// The install's decision: for a range the node held, the step that took the
         /// hold (D-047). A switch that rebuilds no replica lets the hold go with the
@@ -248,9 +249,20 @@ impl SnapAnswer {
 /// How many times one chunk is resent before its stream is given up, as the
 /// one-group task counts them (RAFT.md §1).
 ///
-/// **The correct node trips this bound, and it is left alone on purpose.** It reads 4
-/// while RAFT.md:210 says eight and the one-group task counts to eight, so correcting
-/// it looked like part of D-090's sentence — until it was measured. `sim/install.rs`,
+/// **The correct node no longer trips it, and the number is still 4** (PROPOSED D-127).
+/// What D-090 found below was the receiver, not the bound: it held a chunk and said
+/// nothing — while the install a stream completed was pending, and for the whole of any
+/// install its `snapshot` task made — and the sender counted that silence as a lost
+/// chunk. On `c5cd18d`, `sim/install.rs`'s 32 seeds gave up 21 streams on 14 seeds with
+/// every receiver up; with the receiver answering what it holds (`Task::held`,
+/// [`Installing`]) and an answer counted once it has reached the node (`answered_in`),
+/// they give up none, and the longest run of resends of one chunk is 3.
+/// `NodeVariant::SilentWhileInstalling` keeps the silence beside the fix.
+///
+/// D-090's finding, as it stood: **the correct node trips this bound, and it is left
+/// alone on purpose.** It reads 4 while RAFT.md:210 says eight and the one-group task
+/// counts to eight, so correcting it looked like part of D-090's sentence — until it
+/// was measured. `sim/install.rs`,
 /// 32 seeds in release, correct node: **2 112 streams given up on this bound**, with
 /// runs of up to **nine** consecutive resends of one chunk, so raising 4 to 8 would not
 /// have stopped it either. The cause is not the number: the receiver answers *nothing*
@@ -261,7 +273,85 @@ impl SnapAnswer {
 /// slice, and it is reported rather than papered over: **issue #120**, and D-090's
 /// consequences.
 // PROPOSED(D-090): measured, tripped by the correct node, and deliberately not widened.
+// PROPOSED(D-127): the trip was the receiver's silence, and the number is unchanged.
 const CHUNK_RESENDS: u32 = 4;
+
+/// Whether the node's `snapshot` task is making an install, shared with the node's
+/// `net` task.
+///
+/// The `snapshot` task is the only part of the node that answers a chunk, and it makes
+/// an install inline — a placeholder's whole creation, a live install's switch — and
+/// answers nothing else until it is done. Measured on `sim/install.rs` before D-127,
+/// one install took 80 to 145 ms of the task's time there, and installs that land
+/// together run back to back, so a chunk that reached the node behind two of them sat
+/// unanswered for longer than the 250 ms a sender's `CHUNK_RESENDS` allows a receiver
+/// gone silent. The `net` task takes every chunk off the wire, and it answers one that
+/// arrives while this is set with [`queued`]: the chunk is held, behind an install,
+/// and nothing about its stream has changed.
+// PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+#[derive(Clone, Debug, Default)]
+pub struct Installing(Arc<AtomicBool>);
+
+impl Installing {
+    /// Whether an install is being made now.
+    #[must_use]
+    pub fn now(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Marks an install as being made until the mark is dropped, which it is however
+    /// the install ends.
+    fn mark(&self) -> Making {
+        self.0.store(true, Ordering::SeqCst);
+        Making(self.0.clone())
+    }
+}
+
+/// One install being made: see [`Installing::mark`].
+struct Making(Arc<AtomicBool>);
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// What the node's `net` task answers a chunk that reaches the node while an install is
+/// being made ([`Installing`]): `Waiting` at the chunk's own term and identity, framed
+/// for its range and sent as from `id`. `None` for anything but a chunk.
+///
+/// It is the answer the `snapshot` task gives a stream it holds and has not finished
+/// with (`Task::held`), and the sender takes it the same way: the resend count starts
+/// again, nothing is counted against either bound, and the chunk falls due on the
+/// ordinary resend timer (`booked`, `Step::Wait`). The `snapshot` task still takes
+/// the chunk itself once the install is made and answers it as it always did, so a
+/// sender hears this first and the chunk's own answer after. The incarnation is 0: a
+/// sender reads only an `Installed` answer's (D-042), and this one has no store to
+/// read it from.
+// PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+#[must_use]
+pub fn queued(id: ServerId, range: RangeId, message: &Message) -> Option<Bytes> {
+    let Message::InstallSnapshot {
+        term,
+        last_index,
+        last_term,
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let encoded = Frame {
+        from: id,
+        message: snapshot::waiting(*term, (*last_index, *last_term)),
+    }
+    .encode();
+    let mut builder = crate::frame::Builder::new(MAX_FRAME_LEN);
+    if !builder.fits(encoded.len()) {
+        return None;
+    }
+    builder.push(range, &encoded);
+    Some(builder.finish())
+}
 
 /// How many times a stream is restarted from its first byte before the sender counts
 /// the checkpoint unusable and asks for a fresh take: RAFT.md:210-212, "restarted from
@@ -285,7 +375,8 @@ const STREAM_RESTARTS: u32 = 2;
 struct Counted {
     /// Resends of the chunk outstanding on this stream, which [`CHUNK_RESENDS`]
     /// bounds. Any answer at all clears it: that bound is for a receiver gone silent,
-    /// and a receiver that answers is not silent.
+    /// and a receiver that answers is not silent. An answer counts from when it reaches
+    /// the node, not from when this task reads it (`answered_in`, PROPOSED D-127).
     resends: u32,
     /// How many times this stream has been restarted from its first byte at a
     /// receiver's ask, which [`STREAM_RESTARTS`] bounds. Cap-waits are not counted
@@ -359,7 +450,7 @@ enum Step {
     /// Until D-110 this answer was a [`Step::Restart`], which spent RAFT.md:210-212's
     /// bound on a checkpoint nothing was wrong with: at the third refusal the leader
     /// counted it unusable and retook (#177).
-    // PROPOSED(D-110): the overlap rule's refusal ends the stream and counts nothing.
+    // D-110: the overlap rule's refusal ends the stream and counts nothing.
     Overlapped,
 }
 
@@ -379,7 +470,7 @@ fn step_for(status: SnapshotStatus, restarts: u32, variants: NodeVariants) -> St
         SnapshotStatus::More => Step::Resume,
         SnapshotStatus::Installed => Step::Done,
         SnapshotStatus::Waiting => Step::Wait,
-        // PROPOSED(D-110): the overlap rule's refusal, counted against no bound.
+        // D-110: the overlap rule's refusal, counted against no bound.
         SnapshotStatus::Overlaps => Step::Overlapped,
         SnapshotStatus::Restart if bounded && restarts >= STREAM_RESTARTS => Step::Unusable,
         SnapshotStatus::Restart => Step::Restart,
@@ -418,7 +509,7 @@ fn booked(step: Step, counted: Counted) -> Counted {
         },
         // The stream ends here, and its bookkeeping ends with it. An overlap refusal
         // ends it too and counts nothing: the next stream after the wait opens with
-        // counters of its own (PROPOSED D-110).
+        // counters of its own (D-110).
         Step::Done | Step::Unusable | Step::Overlapped => counted,
     }
 }
@@ -437,10 +528,23 @@ fn booked(step: Step, counted: Counted) -> Counted {
 fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
     match status {
         SnapshotStatus::Waiting => snapshot::waiting(term, at),
-        // PROPOSED(D-110): the overlap rule's refusal says so on the wire.
+        // D-110: the overlap rule's refusal says so on the wire.
         SnapshotStatus::Overlaps => snapshot::overlaps(term, at),
         _ => snapshot::start_over(term, at),
     }
+}
+
+/// Whether an answer from `to` about `range`'s stream waits in the `snapshot` task's
+/// queue: a stream whose answer has reached the node, which RAFT.md:231-233's resend
+/// bound does not count as unanswered (`Task::due`).
+///
+/// A free function over the queue for the reason [`step_for`] is one: the bound's
+/// reading is a thing a check drives directly rather than a branch inside an async loop.
+// PROPOSED(D-127): an answer in the queue is an answer.
+fn answered_in(snaps: &Queue<SnapJob>, range: RangeId, to: ServerId) -> bool {
+    snaps.count(|job| {
+        matches!(job, SnapJob::Response { range: of, from, .. } if *of == range && *from == to)
+    }) > 0
 }
 
 /// Whether the stream a refusal for overlap ended is streamed again from a fresh take,
@@ -463,7 +567,7 @@ fn refusal(status: SnapshotStatus, term: Term, at: (Index, Term)) -> Message {
 /// A free function for the reason [`step_for`] and [`booked`] are (D-090), and #180's
 /// review is why: inside the task's loop the decision was one expression that no test
 /// could fail, since no run of the tree computed anything but "no".
-// PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+// D-110: the fresh take, read by the checkpoint's generation.
 fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDescriptor>) -> bool {
     match (streamed, now) {
         (Some(streamed), Some(now)) => streamed.generation != now.generation,
@@ -473,8 +577,8 @@ fn retake_after_overlap(streamed: Option<&RangeDescriptor>, now: Option<&RangeDe
 
 /// What SHARD.md §5's overlap rule (Q27) says of a completed stream of `range`, on a
 /// node whose initialised replicas' descriptors are `held`.
-// PROPOSED(D-110): one decision for both install paths, failing closed.
-// PROPOSED(D-114): read by the split's test in `server.rs`.
+// D-110: one decision for both install paths, failing closed.
+// D-114: read by the split's test in `server.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
     /// Install it.
@@ -502,8 +606,8 @@ pub(crate) enum Admission {
 /// overlaps; it keeps the refusal of a placeholder's install of a range created on the
 /// node meanwhile, which is the same replica made twice rather than an overlap, and it
 /// keeps the refusal of a snapshot that names no span.
-// PROPOSED(D-110): one decision for both install paths, failing closed.
-// PROPOSED(D-114): read by the split's test in `server.rs`, which holds what a reader of
+// D-110: one decision for both install paths, failing closed.
+// D-114: read by the split's test in `server.rs`, which holds what a reader of
 // the host's table sees at a split against this rule.
 pub(crate) fn admission(
     range: RangeId,
@@ -544,7 +648,7 @@ pub(crate) fn admission(
 /// replica no longer holds and the keys of a right half beside it. P's post-split snapshot
 /// onto a P that never applied the split takes the right half's keys out with the rest,
 /// since no replica on the node owns them (the overlap rule keeps it so, SHARD.md §5,
-/// Q27). [`NodeVariant::InstallReplacesCopiedSpan`] replaces the copy (PROPOSED D-132).
+/// Q27). [`NodeVariant::InstallReplacesCopiedSpan`] replaces the copy (D-132).
 ///
 /// **A replica with none** holds no key the node can call its own: a re-seeded user
 /// range, or a joining node's replica, hosted at configuration's span only because
@@ -559,8 +663,8 @@ pub(crate) fn admission(
 /// A free function for the reason [`admission`] is: inside `finish` this was one field
 /// of the install read at one call, and no run of the tree told the two apart until the
 /// sharded sweep linearized a key that span had removed.
-// PROPOSED(D-128): a span-less replica's install replaces the snapshot's span alone.
-// PROPOSED(D-132): an initialised replica's, the host's descriptor's span at the switch.
+// D-128: a span-less replica's install replaces the snapshot's span alone.
+// D-132: an initialised replica's, the host's descriptor's span at the switch.
 fn switched_spans(
     prefix: &KeyPrefix,
     hosted: &[KeyRange<Bytes>],
@@ -575,6 +679,107 @@ fn switched_spans(
     }
     let span = in_force.unwrap_or(streamed);
     vec![prefix.span(), span.start.clone()..span.end.clone()]
+}
+
+/// For each range, an install's switch and that range's split's apply exclude each other:
+/// a split applies before the switch reads what it replaces, or after the installed replica
+/// is in place, and never between (PROPOSED D-133). Shared by the `snapshot` task, which
+/// holds a range from its switch's re-check, the `apply` task, which holds the parent from a
+/// split's read of its descriptor to both halves' descriptors in the host's table, and the
+/// host, which lets go of a switched range's hold when it steps `Switched`.
+///
+/// The node's hold stops a range's core and not the `apply` task, so an apply job queued
+/// before the hold still lands while the switch runs (`Task::finish`, the re-checks).
+/// `Engine::install_spans` numbers an install at the call and switches tens of milliseconds
+/// later (D-107), and a split's apply landing there wrote its batch at a higher number and
+/// narrowed the host's table after the switch had read it: the switch removed the right
+/// half's keys, and where the apply carried the store past the snapshot's index the switch
+/// took it back there (seed 13283 of the sharded sweep, #225). A split in flight at the
+/// switch's reads is the same, from the other side.
+///
+/// **The switch's hold ends at `Switched`, not at the switch.** The host restates the
+/// range's applied index, in the store and in the `apply` task's state, to the snapshot's
+/// when it steps `Switched` (`ServerHost::installed`), so an entry past the snapshot that
+/// the `apply` task applies between the switch and that step is applied again after it.
+/// Let go at the switch, seed 13283's split waited out the switch, was the install's, and
+/// the job's next entry, 168, applied before the host stepped `Switched` and again after it:
+/// "applied index 168 of group 44 after 166". Held to `Switched`, the job's next entry waits
+/// behind the split.
+///
+/// Each side asks again every `INSTALL_RETRY` (`server.rs`, a millisecond) while the
+/// other holds the range, as a non-voter's split waits out another install
+/// (`apply_removing_unless_installed`). Nothing awaits where the range is free, so a run in
+/// which the two never meet is the run it was. The `apply` task takes one job at a time and
+/// the `snapshot` task one switch, so a range is never held twice by one side.
+/// [`NodeVariant::SplitAppliesInsideTheSwitch`] holds nothing.
+// PROPOSED(D-133)
+#[derive(Debug, Default)]
+pub struct SwitchOrSplit {
+    state: std::sync::Mutex<Holds>,
+}
+
+/// The ranges a [`SwitchOrSplit`] holds, and of those the switched ones the host lets go of
+/// at `Switched`.
+#[derive(Debug, Default)]
+struct Holds {
+    held: BTreeSet<RangeId>,
+    until_switched: BTreeSet<RangeId>,
+}
+
+impl SwitchOrSplit {
+    /// Holds `range` for the caller once no one holds it, until the [`Inside`] handed back
+    /// is dropped or handed to the host ([`Inside::until_switched`]).
+    pub(crate) async fn enter<E: Environment>(self: &Arc<Self>, env: &E, range: RangeId) -> Inside {
+        loop {
+            if lock(&self.state).held.insert(range) {
+                return Inside {
+                    owner: Some(self.clone()),
+                    range,
+                };
+            }
+            env.clock().sleep(crate::server::INSTALL_RETRY).await;
+        }
+    }
+
+    /// The host stepped `range`'s `Switched`: the hold its switch handed over is let go. A
+    /// range held by anyone else, or by no one, is left as it is.
+    pub(crate) fn switched(&self, range: RangeId) {
+        let mut state = lock(&self.state);
+        if state.until_switched.remove(&range) {
+            state.held.remove(&range);
+        }
+    }
+
+    /// Whether anyone holds `range` now: what a directed test waits on.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, range: RangeId) -> bool {
+        lock(&self.state).held.contains(&range)
+    }
+}
+
+/// One hold of a range in a [`SwitchOrSplit`], let go when dropped.
+// PROPOSED(D-133)
+pub(crate) struct Inside {
+    owner: Option<Arc<SwitchOrSplit>>,
+    range: RangeId,
+}
+
+impl Inside {
+    /// A switch made: the hold is the host's to let go of, when it steps `Switched` and
+    /// the range's applied index is restated (`SwitchOrSplit::switched`).
+    pub(crate) fn until_switched(mut self) {
+        if let Some(owner) = self.owner.take() {
+            lock(&owner.state).until_switched.insert(self.range);
+        }
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            lock(&owner.state).held.remove(&self.range);
+        }
+    }
 }
 
 /// The status a receiver answers a cap-wait with: a wait of its own, or — under the
@@ -593,7 +798,7 @@ fn cap_status(variants: NodeVariants) -> SnapshotStatus {
 
 /// A stream its receiver refused under the overlap rule (SHARD.md §5, Q27), ended and
 /// waiting out a minimum election timeout before its range's core may stream again.
-// PROPOSED(D-110): the leader's wait.
+// D-110: the leader's wait.
 struct Overlapped {
     /// When the wait is over.
     due: ananke_env::Instant,
@@ -617,8 +822,10 @@ struct Inbound {
     /// The last file completed: where an acknowledgement points between files.
     last_done: Option<(Bytes, u64)>,
     /// The install this stream completed into, waiting on the `raft` task's repair.
-    /// While it is set the sender's further chunks are ignored: it retries once the
-    /// switch settles, as the one-group receiver makes it (node.rs:1956-1959).
+    /// While it is set the sender's further chunks are answered `Waiting` and nothing
+    /// else (`Task::held`): the install's own answer ends the stream once it is made.
+    /// Until PROPOSED D-127 they were ignored, as the one-group receiver ignores them
+    /// (node.rs:1956-1959), and the sender gave the stream up for the silence (#120).
     pending: Option<Box<Install>>,
 }
 
@@ -633,7 +840,7 @@ pub struct Task<E: Environment> {
     variants: NodeVariants,
     engine_dir: PathBuf,
     /// The host's descriptors: a switched range's span is read here (SHARD.md §3;
-    /// PROPOSED D-100, where the node's ranges stopped being configuration's).
+    /// D-100, where the node's ranges stopped being configuration's).
     descriptors: Arc<std::sync::Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// Shared with the `apply` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
@@ -646,34 +853,56 @@ pub struct Task<E: Environment> {
     receiving: BTreeMap<(RangeId, ServerId), Inbound>,
     /// The streams refused under the overlap rule, waiting out a minimum election
     /// timeout before their range's core may ask for them again (SHARD.md §5, Q27).
-    // PROPOSED(D-110): the leader's wait.
+    // D-110: the leader's wait.
     overlapped: BTreeMap<(RangeId, ServerId), Overlapped>,
     /// The host's placeholders (SHARD.md §5, Q22): the ranges this node holds no
     /// replica of and has had messages for, whose streams this task assembles and
     /// installs into a replica of its own creating.
-    // PROPOSED(D-109)
+    // D-109
     placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
     /// The ranges the plan hosts as placeholders, at their Raft interval alone: a
     /// placeholder's span is the snapshot's, and unknown until its stream completes.
-    // PROPOSED(D-109)
+    // D-109
     as_placeholder: BTreeSet<RangeId>,
     /// The store the node's engine was opened through — its first range's, or its
     /// anchor on a node that hosts none — which a placeholder's install opens the new
-    /// replica's store beside (PROPOSED D-109).
+    /// replica's store beside (D-109).
     anchor: Arc<RaftStore<E>>,
     /// Whether the node runs on an engine a re-seed built: a placeholder's install then
     /// writes the quarantine (the host's `on_a_reseed`; D-035).
-    // PROPOSED(D-109)
+    // D-109
     on_a_reseed: bool,
     /// The range layer's variants: a placeholder's install is a creation, and draws its
     /// incarnation as `IncarnationPerRangeStream` says (PROPOSED D-108, D-109).
     range_variants: RangeVariants,
+    /// Set while this task makes an install, for the node's `net` task to read.
+    // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+    installing: Installing,
     /// What a directed test lands at the switch, after the last await of the task's own
     /// and before what the switch reads: where an apply job queued before the hold lands.
     /// Timing it by the simulator's disk would move with every read on the path.
-    // PROPOSED(D-132)
+    // D-132
     #[cfg(test)]
     at_the_switch:
+        std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    /// Shared with the `apply` task: a range's switch and its split's apply exclude each
+    /// other (PROPOSED D-133).
+    switching: Arc<SwitchOrSplit>,
+    /// What a directed test spawns once the switch is numbered, at `Engine::install_spans`'s
+    /// call, and before it is awaited: where a split's apply that begins inside the switch
+    /// lands. Spawned and not awaited, since on the correct node that apply waits out the
+    /// switch.
+    // PROPOSED(D-133)
+    #[cfg(test)]
+    at_the_numbering:
+        std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
+    /// What a directed test lands while the switch is in flight, after the engine has
+    /// numbered it and before this task restates the applied state: where a job the
+    /// replaced core queued before the hold lands when it applies past the snapshot
+    /// during `install_spans` (#113's review, F1).
+    // PROPOSED(D-126)
+    #[cfg(test)]
+    after_the_switch:
         std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>,
 }
 
@@ -703,6 +932,8 @@ impl<E: Environment> Task<E> {
         anchor: Arc<RaftStore<E>>,
         on_a_reseed: bool,
         range_variants: RangeVariants,
+        switching: Arc<SwitchOrSplit>,
+        installing: Installing,
     ) -> Self {
         Self {
             env,
@@ -726,8 +957,14 @@ impl<E: Environment> Task<E> {
             anchor,
             on_a_reseed,
             range_variants,
+            installing,
             #[cfg(test)]
             at_the_switch: std::sync::Mutex::new(None),
+            switching,
+            #[cfg(test)]
+            at_the_numbering: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_the_switch: std::sync::Mutex::new(None),
         }
     }
 
@@ -762,7 +999,7 @@ impl<E: Environment> Task<E> {
 
     /// The nearest deadline of a chunk outstanding on any stream, or of a wait after
     /// an overlap refusal.
-    // PROPOSED(D-110): the leader's wait is a deadline of the task's loop.
+    // D-110: the leader's wait is a deadline of the task's loop.
     fn deadline(&self) -> Option<ananke_env::Instant> {
         self.sending
             .values()
@@ -806,7 +1043,7 @@ impl<E: Environment> Task<E> {
     /// another's.
     async fn due(&mut self) {
         let now = self.env.clock().now();
-        // PROPOSED(D-110): every overlap refusal's wait that is over, first.
+        // D-110: every overlap refusal's wait that is over, first.
         self.waited(now).await;
         let due: Vec<(RangeId, ServerId)> = self
             .sending
@@ -814,7 +1051,22 @@ impl<E: Environment> Task<E> {
             .filter(|(_, out)| out.deadline <= now)
             .map(|(key, _)| *key)
             .collect();
+        let timeout = self.chunk_timeout();
         for (range, to) in due {
+            // A stream whose receiver's answer has reached the node and waits in this
+            // task's queue is not unanswered, whatever this task's clock says: the
+            // answer was late only in being read, because the task was busy. It is
+            // neither resent nor counted, and falls due again a chunk timeout on, by
+            // which time its answer has said where it stands. Before D-127 the bound
+            // counted from the last answer *read*, and it gave up streams whose answer
+            // was in hand (#120).
+            // PROPOSED(D-127): an answer in the queue is an answer.
+            if answered_in(&self.snaps, range, to) {
+                if let Some(out) = self.sending.get_mut(&(range, to)) {
+                    out.deadline = now + timeout;
+                }
+                continue;
+            }
             let give_up = {
                 let Some(out) = self.sending.get_mut(&(range, to)) else {
                     continue;
@@ -823,6 +1075,12 @@ impl<E: Environment> Task<E> {
                 out.counted.resends > CHUNK_RESENDS
             };
             if give_up {
+                // PROPOSED(D-127): the resend bound's give-up is traced.
+                self.env.trace(TraceEvent::RaftSnapshotGaveUp {
+                    server: self.id.0,
+                    range: range.get(),
+                    to: to.0,
+                });
                 self.sending.remove(&(range, to));
                 self.plan.sent(range, to);
                 self.local
@@ -862,7 +1120,7 @@ impl<E: Environment> Task<E> {
         // A stream refused under the overlap rule waits out its minimum election
         // timeout whoever asks meanwhile — a core that changed role asks again at once
         // — and the wait's end lets the core ask again (`waited`).
-        // PROPOSED(D-110): the leader's wait.
+        // D-110: the leader's wait.
         if self.overlapped.contains_key(&(range, to)) {
             return;
         }
@@ -1035,7 +1293,7 @@ impl<E: Environment> Task<E> {
         // and whose store is not yet is being created here — a split's apply traced its
         // creation and is opening its store — and is no placeholder's any more: the
         // chunk goes unanswered, and the sender's resend lands on the replica.
-        // PROPOSED(D-109)
+        // D-109
         let creating = store.is_none() && lock(&self.descriptors).contains_key(&range);
         let placeholder = store.is_none() && !creating && lock(&self.placeholders).contains(&range);
         if store.is_none() && !placeholder {
@@ -1064,8 +1322,21 @@ impl<E: Environment> Task<E> {
             .get(&(range, from))
             .is_some_and(|inbound| inbound.pending.is_some())
         {
-            // Mid-decision: the sender retries once the switch settles.
-            return;
+            // Mid-decision: the install this stream completed is being decided, and
+            // whatever it decides is answered once it is made. Until then the chunk
+            // is answered as what it is — held, nothing changed, ask again — and
+            // never left to silence, which the sender cannot tell from a lost chunk
+            // and counts against `CHUNK_RESENDS` (#120).
+            // PROPOSED(D-127): a stream whose install is pending is answered `Waiting`.
+            return self
+                .held(
+                    range,
+                    from,
+                    held_term(),
+                    (last_index, last_term),
+                    incarnation(),
+                )
+                .await;
         }
         let at = Identity {
             term,
@@ -1173,7 +1444,7 @@ impl<E: Environment> Task<E> {
                 if placeholder {
                     // No core to hold and no replica's state to repair: the install is
                     // made here (SHARD.md §5, Q22).
-                    // PROPOSED(D-109)
+                    // D-109
                     return self.install_placeholder(range, from, *install).await;
                 }
                 self.receiving.entry((range, from)).or_default().pending = Some(install);
@@ -1277,7 +1548,7 @@ impl<E: Environment> Task<E> {
                 // core is let ask again, and `waited` says whether from a fresh take.
                 // The core's own ask stays outstanding meanwhile, so it asks nothing
                 // else of this follower until then.
-                // PROPOSED(D-110): the leader's half of the overlap rule.
+                // D-110: the leader's half of the overlap rule.
                 let version = out.sender.dir().to_path_buf();
                 self.sending.remove(&(range, from));
                 self.plan.sent(range, from);
@@ -1313,6 +1584,9 @@ impl<E: Environment> Task<E> {
     /// The `raft` task's repair for a stream that completed: D-066's live install, in
     /// one manifest switch, with the node's other ranges left running.
     async fn finish(&mut self, range: RangeId, from: ServerId, repair: Repair, held: Decision) {
+        // Until this returns, the task answers nothing, and the `net` task answers for it.
+        // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+        let _making = self.installing.mark();
         let Some(install) = self
             .receiving
             .get_mut(&(range, from))
@@ -1339,7 +1613,7 @@ impl<E: Environment> Task<E> {
         }
         // D-047: the install is decided when the `raft` task hands the repair over
         // and takes the range's hold, and it is traced once the manifest switch that
-        // carries it is durable. The decision was this task's own until PROPOSED
+        // carries it is durable. The decision was this task's own until
         // D-098, taken when it got to the repair: on a node behind on every range —
         // five streams landing at once, the meta range's among them for the first
         // time — the fifth's hold began a queue of installs earlier, and the timer
@@ -1353,7 +1627,7 @@ impl<E: Environment> Task<E> {
         // descriptor beside it, read in the record's own walk
         // so the walk's reads, and the run's schedule, are what they were before the
         // overlap rule read it (`staged_record_and_next`).
-        // PROPOSED(D-110)
+        // D-110
         let (config, streamed) = match snapshot::staged_record_and_next(
             &self.env,
             &install.source,
@@ -1382,7 +1656,7 @@ impl<E: Environment> Task<E> {
         // descriptor cannot be found is refused** as a start-over, as the placeholder's
         // path refuses one (`admission`): it was installed "as before" until #180's
         // review, so a walk that missed the descriptor switched the rule off unseen.
-        // PROPOSED(D-110): the same rule for an install onto an initialised replica,
+        // D-110: the same rule for an install onto an initialised replica,
         // failing closed.
         let admitted = admission(
             range,
@@ -1413,7 +1687,7 @@ impl<E: Environment> Task<E> {
         }
         // Admitted, so the descriptor names a span (`admission`): the snapshot's, which a
         // replica with no descriptor is made of, and what its switch replaces.
-        // PROPOSED(D-128)
+        // D-128
         let Some(streamed) = streamed else {
             return self
                 .restart(range, from, &install, &store, installing)
@@ -1447,13 +1721,33 @@ impl<E: Environment> Task<E> {
         // the snapshot's 113 and the table held `[k03, k10)`, and here at 113 and
         // `[k03, k05)` with the right half made. So the store is asked again, which keeps a
         // snapshot at or below an entry applied meanwhile from taking the replica
-        // backwards, and the span is what the host holds now. A split's apply that lands
-        // after the numbering is D-132's window, named there and not closed here.
-        // `InstallReplacesCopiedSpan` asks neither (PROPOSED D-132).
+        // backwards, and the span is what the host holds now. `InstallReplacesCopiedSpan`
+        // asks neither (D-132).
+        //
+        // And from here to the host's `Switched` the range is held against its split's apply,
+        // which waits for it, as this waits for a split in flight: the engine numbers the
+        // switch at the call and makes it tens of milliseconds later, and a split's apply that
+        // landed between wrote its batch over the switch and narrowed the table after it was
+        // read, so the switch removed the right half's keys (seed 13283 of the sharded sweep,
+        // #225). `SplitAppliesInsideTheSwitch` holds nothing.
+        // PROPOSED(D-133)
+        let inside = if self
+            .variants
+            .contains(NodeVariant::SplitAppliesInsideTheSwitch)
+        {
+            None
+        } else {
+            Some(self.switching.enter(&self.env, range).await)
+        };
         let copied = self
             .variants
             .contains(NodeVariant::InstallReplacesCopiedSpan);
-        if !copied && store.applied() >= install.at.last_index {
+        // The store at the numbering, which the restatement after the switch reads again:
+        // an index past the snapshot there was applied after the numbering only if the
+        // store stood below the snapshot here (PROPOSED D-126).
+        let at_the_numbering = store.applied();
+        if !copied && at_the_numbering >= install.at.last_index {
+            drop(inside);
             drop(source);
             return self
                 .caught_up(range, from, &install, repair.term, &store, installing)
@@ -1499,11 +1793,8 @@ impl<E: Environment> Task<E> {
                 .config
                 .variants
                 .contains(ananke_raft::core::Variant::SnapshotWithoutCurrentLast);
-        let switched = if with_repair {
-            store
-                .engine()
-                .install_spans(spans.clone(), source, batch)
-                .await
+        let numbered = if with_repair {
+            store.engine().install_spans(spans.clone(), source, batch)
         } else {
             // The variant: the switch is made without the range's repair carried in it
             // (D-066), so the store comes back holding the *leader's* tenant 0 — its
@@ -1511,12 +1802,27 @@ impl<E: Environment> Task<E> {
             store
                 .engine()
                 .install_spans(spans.clone(), source, ananke_storage::WriteBatch::new())
-                .await
         };
+        #[cfg(test)]
+        {
+            let landing = lock(&self.at_the_numbering).take();
+            if let Some(landing) = landing {
+                self.env.spawn("landing", landing);
+            }
+        }
+        let switched = numbered.await;
         if switched.is_err() {
+            drop(inside);
             return self
                 .restart(range, from, &install, &store, installing)
                 .await;
+        }
+        #[cfg(test)]
+        {
+            let landing = lock(&self.after_the_switch).take();
+            if let Some(landing) = landing {
+                landing.await;
+            }
         }
         // The switch moved this range's applied index, its term and the configuration
         // in force, without an apply: the store's cached index and the `apply` task's
@@ -1525,16 +1831,77 @@ impl<E: Environment> Task<E> {
         // would have had the next take of this range write a record with the old
         // replica's term and configuration in it.
         // PROPOSED(D-083): a live install moves the applied state with it.
-        store.installed_at(install.at.last_index);
+        //
+        // Up to the snapshot, and never back, as the host's restatement at `Switched`
+        // does. The engine numbered the switch at the call and the hold stops the core,
+        // not the `apply` task, so a job the replaced core queued before the hold can
+        // apply past the snapshot while `install_spans` is in flight: its batches are
+        // numbered above the switch's and survive it, the store's applied-index key
+        // among them (`Engine::install_spans`). Taken back here, both the store and the
+        // task stand at the snapshot, the restatement at `Switched` then finds nothing
+        // past it to keep, and the new replica's first `Apply` hands those entries out a
+        // second time (#113's review, F1). `SwitchForgetsLateApplies` takes it back.
+        //
+        // That an index past the snapshot was applied after the numbering rests on the
+        // re-check before the switch: it sends a store at or past the snapshot to
+        // `caught_up`, and nothing awaits between it and the numbering, so the correct
+        // node's store stood below the snapshot there and every apply past it was
+        // numbered above the switch. `InstallReplacesCopiedSpan` skips that re-check, so
+        // its store can stand at or past the snapshot at the numbering, with what it
+        // applied there numbered below the switch and overwritten by it. Kept, the store
+        // and the task would stand above the applied-index key the switch wrote and no
+        // `Apply` would hand those entries out again, so their writes would be gone for
+        // good. So only a store below the snapshot at the numbering keeps, which on the
+        // correct node is every store that reaches here, and under that variant this
+        // restatement takes back as it did before D-132 (#113's second review, N1).
+        //
+        // What no index rule here closes: a late job's entries at or below the snapshot that
+        // land between the numbering and this restatement apply again over the installed
+        // state, and one that passed the `apply` task's head before it and reaches the store
+        // after it is refused ("applying N after N") and fails the range. That is D-126
+        // section 7's window, D-132's for any apply, which #225 tracks. Seed 13283 of the
+        // sharded sweep, past the nightly's range, reached the late job on this route on
+        // D-126's own tree (D-126 section 6); on the Stage C integration's tree it reaches
+        // it on neither schedule, `SwitchForgetsLateApplies` leaving both runs the correct
+        // node's (D-126 section 7).
+        // PROPOSED(D-126): the snapshot task's restatement takes nothing back either.
+        let below_at_the_numbering = at_the_numbering < install.at.last_index;
+        let keeps_the_store = below_at_the_numbering
+            && crate::server::kept_past_the_switch(
+                store.applied(),
+                install.at.last_index,
+                self.variants,
+            );
+        if !keeps_the_store {
+            store.installed_at(install.at.last_index);
+        }
         if let Ok(mut applied) = self.applied.lock() {
+            let kept = applied
+                .get(&range)
+                .filter(|held| {
+                    below_at_the_numbering
+                        && crate::server::kept_past_the_switch(
+                            held.index,
+                            install.at.last_index,
+                            self.variants,
+                        )
+                })
+                .cloned();
             applied.insert(
                 range,
-                crate::server::Applied {
+                kept.unwrap_or_else(|| crate::server::Applied {
                     index: install.at.last_index,
                     term: install.at.last_term,
                     config: config.clone(),
-                },
+                }),
             );
+        }
+        // The hold is the host's from here: it lets go when it steps `Switched` and has
+        // restated the range's applied index, so a split's apply waiting on the range goes in
+        // after that, finds an entry at or below the snapshot's index the install's, and the
+        // job's next entry applies once, after the restate (PROPOSED D-133).
+        if let Some(inside) = inside {
+            inside.until_switched();
         }
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
@@ -1544,7 +1911,7 @@ impl<E: Environment> Task<E> {
         // replica. The host's comparison at `Switched` is for a replica it holds a
         // descriptor of; waiting for it left the plan at configuration's span for as long
         // as the raft task took to step.
-        // PROPOSED(D-128): the re-host in this task.
+        // D-128: the re-host in this task.
         if !initialised {
             self.plan
                 .host(range, vec![store.prefix().span(), span.clone()]);
@@ -1558,7 +1925,7 @@ impl<E: Environment> Task<E> {
         //
         // The descriptor the switch put in place, for the host's receipt check
         // (SHARD.md §3), read back rather than carried in the stream's record: it is
-        // what the store holds now, whatever the take put in (PROPOSED D-097). It is
+        // what the store holds now, whatever the take put in (D-097). It is
         // read **before** the state, because the timer check's live-install arm reads
         // `RaftSnapshotState` and `RaftSnapshot` as one switch only at one instant
         // (`Report::reads_back`, D-091), and D-097 put this read between them: every
@@ -1566,7 +1933,7 @@ impl<E: Environment> Task<E> {
         // none of them, and the hold it exempts was measured against the bound again
         // — which seed 368 of the raft sweep's arms found, a node streamed five
         // snapshots at once holding one range through four other installs
-        // (PROPOSED D-098).
+        // (D-098).
         let descriptor = store
             .engine()
             .get(&KeyPrefix::group(range.get()).descriptor_key())
@@ -1578,7 +1945,7 @@ impl<E: Environment> Task<E> {
         // The state, over the span the replica's descriptor names or, on a replica the
         // host holds none of yet, the snapshot's: the host puts it in place at `Switched`,
         // after this (D-083).
-        // PROPOSED(D-128): the creation's read-back reads the streamed span.
+        // D-128: the creation's read-back reads the streamed span.
         let read = self.user_span(range).unwrap_or(span);
         self.state_of(range, install.at, &store, read).await;
         self.env.trace_decided(
@@ -1637,7 +2004,7 @@ impl<E: Environment> Task<E> {
     /// as a placeholder that has a store now — its node applied the split that makes it
     /// — is hosted at its descriptor's span, as the split's own `Host` job hosts it, so
     /// a stream that completes into it replaces its whole span.
-    // PROPOSED(D-109)
+    // D-109
     fn host_as(&mut self, range: RangeId, placeholder: bool) {
         if placeholder {
             if self.as_placeholder.insert(range) {
@@ -1665,7 +2032,7 @@ impl<E: Environment> Task<E> {
     /// installing it would put two owners on the right half's keys until the parent
     /// moved on. The refusal is answered `Overlaps` (traced `StartOver::Overlaps`), and
     /// the leader streams again after a minimum election timeout, counting nothing
-    /// against its restart bound (PROPOSED D-110): by then the parent here may have
+    /// against its restart bound (D-110): by then the parent here may have
     /// applied the split, which creates the right half and ends the placeholder, or
     /// installed a snapshot past it, which moves its span off the right half's.
     ///
@@ -1681,9 +2048,11 @@ impl<E: Environment> Task<E> {
     /// never held, and quarantines both (D-035). The switch writes the replica's whole
     /// state under its prefix and replaces its span's keys, in one manifest switch
     /// (D-066), and the store is opened on what it wrote.
-    // PROPOSED(D-109): a placeholder's install creates the replica, quarantined on a
+    // D-109: a placeholder's install creates the replica, quarantined on a
     // re-seeded node, and is refused where it would overlap.
     async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
+        // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+        let _making = self.installing.mark();
         let installing = self.env.decision();
         let prefix = KeyPrefix::group(range.get());
         let at = install.at;
@@ -1710,7 +2079,7 @@ impl<E: Environment> Task<E> {
         // range itself initialised meanwhile — this node applied the split that makes it
         // while the stream was read — is refused as an overlap: the replica is here now,
         // and the sender's next stream lands on it (`admission`).
-        // PROPOSED(D-110): the overlap rule's one decision.
+        // D-110: the overlap rule's one decision.
         let admitted = admission(
             range,
             descriptor.as_ref(),
@@ -1743,7 +2112,7 @@ impl<E: Environment> Task<E> {
         // generator, or, under `RangeVariant::IncarnationPerRangeStream`, from the range's own stream,
         // which gives a replica created again for the same (range, node) the number its
         // predecessor drew, as the split's creation and the re-seed's do.
-        // PROPOSED(D-109)
+        // D-109
         let incarnation = if self
             .range_variants
             .contains(RangeVariant::IncarnationPerRangeStream)
@@ -1810,7 +2179,7 @@ impl<E: Environment> Task<E> {
         // answer them as its placeholder's, and a chunk of it is no placeholder's either
         // (SHARD.md §5: the placeholder becomes a replica at the install). It is what the
         // host's receipt check reads from here on.
-        // PROPOSED(D-109)
+        // D-109
         lock(&self.descriptors).insert(range, descriptor.clone());
         // What landed, read back out of the engine before the store is opened on it
         // (`read_back`): counting events says a stream flowed, and nothing about what is
@@ -1886,9 +2255,9 @@ impl<E: Environment> Task<E> {
     /// A placeholder's install refused: its staged bytes go, and the sender is asked
     /// for the stream again, saying why. A refusal under the overlap rule is answered
     /// `Overlaps`, which the sender counts against no bound and streams again after a
-    /// minimum election timeout (PROPOSED D-110); every other is a start-over.
-    // PROPOSED(D-109)
-    // PROPOSED(D-110): the overlap rule's refusal answered as itself.
+    /// minimum election timeout (D-110); every other is a start-over.
+    // D-109
+    // D-110: the overlap rule's refusal answered as itself.
     async fn placeholder_refused(
         &mut self,
         range: RangeId,
@@ -1983,7 +2352,7 @@ impl<E: Environment> Task<E> {
             }
         }
         // And a version an overlap refusal's wait will read, until the wait is over.
-        // PROPOSED(D-110)
+        // D-110
         for (key, wait) in &self.overlapped {
             if key.0 == range
                 && let Some((_, index, take)) = wait
@@ -2073,12 +2442,12 @@ impl<E: Environment> Task<E> {
     /// rather than its store: what a placeholder's install reads back before the store
     /// is opened on what it wrote, since the open itself deletes the log keys it finds
     /// at or below the snapshot's index, and a take that streamed the log would be read
-    /// back already tidied (`TakeStreamsTheLogToo`; PROPOSED D-109). What it reads there
+    /// back already tidied (`TakeStreamsTheLogToo`; D-109). What it reads there
     /// is therefore the state the switch left, which no opened store serves: the log
     /// keys at or below the snapshot's index it counts are gone once the open runs, and
     /// everything else it reads the open leaves as it is. `span` is the range's: the
     /// caller's to say, since a creation's descriptor is not yet the host's when this
-    /// reads it (PROPOSED D-128). `None` where the scan of its user keys fails, and
+    /// reads it (D-128). `None` where the scan of its user keys fails, and
     /// nothing is traced.
     async fn read_back(
         &self,
@@ -2188,6 +2557,32 @@ impl<E: Environment> Task<E> {
             .await;
     }
 
+    /// Answers a chunk of a stream whose install is pending — staged whole, the `raft`
+    /// task holding the range or about to — with `Waiting`: held, nothing changed, ask
+    /// again. The sender's resend count starts again and nothing is counted against
+    /// either bound (`booked`, [`Step::Wait`]); what ends the stream is the answer the
+    /// install gives once it is made.
+    ///
+    /// Before D-127 these chunks were answered nothing, and the sender, which cannot
+    /// tell a receiver's silence from a lost chunk, gave the stream up on
+    /// [`CHUNK_RESENDS`] while its install was being made (#120).
+    /// [`NodeVariant::SilentWhileInstalling`] is that node.
+    // PROPOSED(D-127): a stream the node holds is answered while its install is made.
+    async fn held(
+        &self,
+        range: RangeId,
+        from: ServerId,
+        term: Term,
+        at: (Index, Term),
+        incarnation: u64,
+    ) {
+        if self.variants.contains(NodeVariant::SilentWhileInstalling) {
+            return;
+        }
+        self.answer(range, from, snapshot::waiting(term, at), incarnation)
+            .await;
+    }
+
     /// Answers a sender, stamped with this store's incarnation (D-042).
     async fn answer(&self, range: RangeId, to: ServerId, message: Message, incarnation: u64) {
         let message = match message {
@@ -2253,7 +2648,7 @@ impl<E: Environment> Task<E> {
 
     /// A minimum election timeout: how long a stream refused under the overlap rule
     /// waits before its range's core may stream again (SHARD.md §5, Q27).
-    // PROPOSED(D-110)
+    // D-110
     fn election_min(&self) -> Duration {
         Duration::from_nanos(self.config.tick_nanos * self.config.election_ticks.0)
     }
@@ -2266,7 +2661,7 @@ impl<E: Environment> Task<E> {
     /// "Predates" is read off the checkpoint itself: its descriptor, out of the version
     /// directory the refused stream read, is at a generation below the one the range's
     /// descriptor is at now ([`retake_after_overlap`]).
-    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    // D-110: the leader's wait, and the fresh take.
     async fn waited(&mut self, now: ananke_env::Instant) {
         let over: Vec<(RangeId, ServerId)> = self
             .overlapped
@@ -2289,7 +2684,7 @@ impl<E: Environment> Task<E> {
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
             let now = lock(&self.descriptors).get(&range).cloned();
             // The variant: the refused checkpoint is streamed again, whatever it is.
-            // PROPOSED(D-110): the fresh take's variant (#185's review, NB2).
+            // D-110: the fresh take's variant (#185's review, NB2).
             let retake = !self.variants.contains(NodeVariant::RetakeNeverAfterOverlap)
                 && retake_after_overlap(streamed.as_ref(), now.as_ref());
             self.env.trace(TraceEvent::RaftSnapshotRestream {
@@ -2956,7 +3351,7 @@ mod tests {
     /// stream, and on the wire is an `Overlaps` and not a start-over: the done-when of
     /// #177, where the refusal was a `Restart` that spent RAFT.md:210-212's bound, so
     /// that at the third refusal of a sound checkpoint the leader retook it.
-    // PROPOSED(D-110): the overlap rule's refusal is counted against no bound.
+    // D-110: the overlap rule's refusal is counted against no bound.
     #[test]
     fn an_overlap_refusal_ends_the_stream_and_leaves_the_restart_count_unchanged() {
         let correct = NodeVariants::correct();
@@ -3049,7 +3444,7 @@ mod tests {
         );
     }
 
-    // --- The overlap rule (SHARD.md §5, Q27; PROPOSED D-110, #180's review) ---
+    // --- The overlap rule (SHARD.md §5, Q27; D-110, #180's review) ---
 
     fn key(name: &str) -> Bytes {
         ananke_raft::apply::user_key(name.as_bytes())
@@ -3074,7 +3469,7 @@ mod tests {
     /// task's loop, read by span, and no run of the tree computed anything but "no", so
     /// `||` planted as `&&` — the bug a split's left half meets, its start kept and its
     /// end moved — passed everything. Each case here is one that reading gets wrong.
-    // PROPOSED(D-110): the fresh take, read by the checkpoint's generation.
+    // D-110: the fresh take, read by the checkpoint's generation.
     #[test]
     fn a_refused_checkpoint_is_retaken_exactly_when_its_generation_is_not_the_ranges() {
         let before = described(R2, "k0", "k2", 1);
@@ -3107,7 +3502,7 @@ mod tests {
     /// snapshot is installed only where its span overlaps no other initialised replica
     /// on the node, a snapshot naming no span is refused on both, and the variant
     /// installs whatever its span overlaps and nothing else.
-    // PROPOSED(D-110): one decision for both install paths, failing closed.
+    // D-110: one decision for both install paths, failing closed.
     #[test]
     fn the_overlap_rule_admits_an_install_only_where_its_span_overlaps_no_other_replica() {
         let correct = RangeVariants::correct();
@@ -3191,7 +3586,35 @@ mod tests {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
-        let mut sim = ananke_env::sim::Sim::new(ananke_env::sim::SimConfig::new(3));
+        on_a_node_of(ananke_env::sim::SimConfig::new(3), body)
+    }
+
+    /// [`on_a_node`] on a disk whose every operation takes a millisecond or two, so that a
+    /// switch takes tens of them and a task spawned beside it runs inside it.
+    // PROPOSED(D-133)
+    fn on_a_node_with_a_disk<T, F>(
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut config = ananke_env::sim::SimConfig::new(3);
+        config.fs.latency_min = Duration::from_millis(1);
+        config.fs.latency_max = Duration::from_millis(2);
+        on_a_node_of(config, body)
+    }
+
+    /// [`on_a_node`] under `config`.
+    fn on_a_node_of<T, F>(
+        config: ananke_env::sim::SimConfig,
+        body: impl FnOnce(ananke_env::sim::SimEnv) -> F + Send + 'static,
+    ) -> (T, Vec<ananke_env::sim::TraceRecord>)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut sim = ananke_env::sim::Sim::new(config);
         let node = sim.add_node();
         let env = sim.env(node);
         let out: Arc<std::sync::Mutex<Option<T>>> = Arc::default();
@@ -3275,6 +3698,8 @@ mod tests {
             store.clone(),
             false,
             RangeVariants::correct(),
+            Arc::default(),
+            Installing::default(),
         );
         (task, store, local, follower)
     }
@@ -3311,7 +3736,7 @@ mod tests {
 
     /// [`checkpoint_of`], over the descriptor's span too where `user` names keys to put
     /// in it: what a take of a range holding those keys leaves.
-    // PROPOSED(D-128)
+    // D-128
     async fn checkpoint_with<E: Environment>(
         env: &E,
         range: RangeId,
@@ -3365,13 +3790,201 @@ mod tests {
             .expect("the checkpoint");
     }
 
+    /// A resent chunk of `R2`'s stream from [`FOLLOWER`]'s side at (2, 30, 2): what a
+    /// sender puts on the wire while it waits on that stream's install.
+    // PROPOSED(D-127)
+    fn resent_last_chunk() -> Message {
+        Message::InstallSnapshot {
+            term: 2,
+            last_index: 30,
+            last_term: 2,
+            file: Bytes::from_static(b"CURRENT"),
+            offset: 0,
+            total: 16,
+            done: true,
+            data: Bytes::from(vec![0u8; 16]),
+        }
+    }
+
+    /// #120's first silence, through the task's chunk path: a chunk of a stream whose
+    /// install is pending — staged whole, its range held for the repair — is answered
+    /// `Waiting`, which clears its sender's resend count (`booked`). Before D-127 it was
+    /// answered nothing, and the sender, which cannot tell that from a lost chunk, gave
+    /// the stream up on `CHUNK_RESENDS` while the install it waited on was being made.
+    /// `SilentWhileInstalling` is that node: nothing reaches the follower under it.
+    // PROPOSED(D-127): a stream whose install is pending is answered `Waiting`.
+    #[test]
+    fn a_chunk_of_a_stream_whose_install_is_pending_is_answered_waiting() {
+        let heard = |variants: NodeVariants| {
+            on_a_node(move |env| async move {
+                let (mut task, _store, _local, follower) = task_on(&env, R2, &[]).await;
+                task.variants = variants;
+                let at = Identity {
+                    term: 2,
+                    last_index: 30,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                task.chunk(R2, FOLLOWER, resent_last_chunk()).await;
+                answered(&env, &follower).await
+            })
+            .0
+        };
+        assert_eq!(
+            heard(NodeVariants::correct()),
+            Some(SnapshotStatus::Waiting),
+            "a chunk of a stream whose install is pending is answered, `Waiting`"
+        );
+        assert_eq!(
+            heard(NodeVariants::of(&[NodeVariant::SilentWhileInstalling])),
+            None,
+            "under `SilentWhileInstalling` it is answered nothing, the node before D-127"
+        );
+    }
+
+    /// #120's second silence: the task answers nothing while it makes an install, so it
+    /// marks one as being made for the node's `net` task, from the top of `finish` until
+    /// it returns, and the `net` task answers a chunk that arrives meanwhile with
+    /// [`queued`] — `Waiting`, at the chunk's own identity, framed for its range. Planted
+    /// away, the mark in `finish` is false at the switch here, and the one in
+    /// `install_placeholder` is what `sim/install.rs`'s check of no stream given up
+    /// reads, since every install there is a placeholder's.
+    // PROPOSED(D-127): the node answers a chunk while its `snapshot` task is installing.
+    #[test]
+    fn an_install_is_marked_while_it_is_made_and_a_chunk_meanwhile_is_answered_waiting() {
+        let ((before, during, after), _) = on_a_node(|env| async move {
+            let parent = described(R2, "k0", "k2", 1);
+            let (mut task, _store, _local, _follower) =
+                task_on(&env, R2, std::slice::from_ref(&parent)).await;
+            let at = Identity {
+                term: 2,
+                last_index: 30,
+                last_term: 2,
+            };
+            let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true) else {
+                panic!("the stream completes");
+            };
+            checkpoint_of(&env, R2, 30, Some(&parent), &install.source).await;
+            task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+            let installing = task.installing.clone();
+            let before = installing.now();
+            let seen = Arc::new(AtomicBool::new(false));
+            *lock(&task.at_the_switch) = Some(Box::pin({
+                let installing = installing.clone();
+                let seen = seen.clone();
+                async move { seen.store(installing.now(), Ordering::SeqCst) }
+            }));
+            task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+            (before, seen.load(Ordering::SeqCst), installing.now())
+        });
+        assert!(!before, "nothing is marked before the install");
+        assert!(
+            during,
+            "an install is marked while it is made: the switch saw no mark"
+        );
+        assert!(!after, "and the mark goes with it");
+        let frame = queued(ServerId(1), R2, &resent_last_chunk()).expect("a chunk is answered");
+        let decoded = crate::frame::decode(&frame).expect("one frame");
+        let [tagged] = &decoded.messages[..] else {
+            panic!("one message in the frame");
+        };
+        assert_eq!((tagged.range, tagged.frame.from), (R2, ServerId(1)));
+        assert!(
+            matches!(
+                tagged.frame.message,
+                Message::InstallSnapshotResponse {
+                    status: SnapshotStatus::Waiting,
+                    last_index: 30,
+                    last_term: 2,
+                    ..
+                }
+            ),
+            "the `net` task's answer is `Waiting` at the chunk's identity, not {:?}",
+            tagged.frame.message
+        );
+        assert!(
+            queued(ServerId(1), R2, &snapshot::waiting(2, (30, 2))).is_none(),
+            "an answer is not a chunk, and is not answered"
+        );
+    }
+
+    /// The bound's reading (#120's third finding): a stream whose answer has reached the
+    /// node and waits in the task's queue is not unanswered. `due` neither resends nor
+    /// counts it and lets it fall due a chunk timeout on; the same stream with nothing
+    /// queued is resent and counted. Before D-127 the count ran from the last answer
+    /// *read*, and on `sim/install.rs` one of the 21 streams given up was given up with
+    /// its answer already queued behind the task's own work.
+    // PROPOSED(D-127): an answer in the queue is an answer.
+    #[test]
+    fn a_stream_whose_answer_is_queued_is_not_counted_as_unanswered() {
+        let ((queued_count, queued_deadline, bare_count), trace) = on_a_node(|env| async move {
+            let parent = described(R2, "k0", "k2", 1);
+            let (mut task, _store, _local, _follower) =
+                task_on(&env, R2, std::slice::from_ref(&parent)).await;
+            // A take's version, whole: its checkpoint and its own RAFT-FORMAT record,
+            // which `find_version` asks of every candidate (D-060, D-083).
+            let version = Path::new("/n1/snap-r2-30-1");
+            checkpoint_of(&env, R2, 30, Some(&parent), version).await;
+            ananke_raft::format::write_checkpoint_record(&env, version)
+                .await
+                .expect("the version's format record");
+            task.open(R2, FOLLOWER, 30, 2).await;
+            assert!(
+                task.sending.contains_key(&(R2, FOLLOWER)),
+                "the stream opens"
+            );
+            let now = env.clock().now();
+            task.sending
+                .get_mut(&(R2, FOLLOWER))
+                .expect("the stream")
+                .deadline = now;
+            task.snaps.push(SnapJob::Response {
+                range: R2,
+                from: FOLLOWER,
+                message: snapshot::ack(2, (30, 2), Bytes::new(), 0),
+            });
+            task.due().await;
+            let out = &task.sending[&(R2, FOLLOWER)];
+            let queued = (out.counted.resends, out.deadline > now);
+            let _ = task.snaps.remove_first(|_| true);
+            task.sending
+                .get_mut(&(R2, FOLLOWER))
+                .expect("the stream")
+                .deadline = now;
+            task.due().await;
+            (
+                queued.0,
+                queued.1,
+                task.sending[&(R2, FOLLOWER)].counted.resends,
+            )
+        });
+        assert_eq!(
+            queued_count, 0,
+            "a stream whose answer is queued is not counted"
+        );
+        assert!(queued_deadline, "and falls due again later, not at once");
+        assert_eq!(
+            bare_count, 1,
+            "the same stream with nothing queued is counted"
+        );
+        let resent = trace
+            .iter()
+            .filter(|record| matches!(record.event, TraceEvent::RaftSnapshotResumed { .. }))
+            .count();
+        assert_eq!(resent, 1, "and only that one is resent");
+    }
+
     /// A core's ask for a stream to a follower whose overlap refusal's wait is still
     /// running is dropped (#180's review, N1): the wait stands whoever asks, and its end
     /// lets the core ask again. Planted away (`&& false` on the drop), (i) stayed green
     /// with the same figures, because no core of the tree asks inside a wait. The
     /// control is the same ask outside a wait, which gets as far as finding no version
     /// of the index and giving the stream up for a take.
-    // PROPOSED(D-110): the leader's wait drops an ask inside it.
+    // D-110: the leader's wait drops an ask inside it.
     #[test]
     fn a_cores_ask_for_a_stream_inside_an_overlap_refusals_wait_is_dropped() {
         let ((outside, inside), _) = on_a_node(|env| async move {
@@ -3412,7 +4025,7 @@ mod tests {
     /// core is told to retake one from before the range's last split, to stream again
     /// one at its present generation, and to retake one that cannot be read — and each
     /// is traced as it is told.
-    // PROPOSED(D-110): the leader's wait, and the fresh take.
+    // D-110: the leader's wait, and the fresh take.
     #[test]
     fn a_waits_end_retakes_a_checkpoint_from_before_the_ranges_split_and_no_other() {
         let left = described(R2, "k0", "k1", 2);
@@ -3474,7 +4087,7 @@ mod tests {
     /// start-over, failing closed; and P's post-split snapshot, overlapping nothing,
     /// switches. Before the review a walk that never found the descriptor installed the
     /// first two with every test green.
-    // PROPOSED(D-110): the overlap rule on an install onto an initialised replica.
+    // D-110: the overlap rule on an install onto an initialised replica.
     #[test]
     fn an_install_onto_a_held_replica_is_refused_where_it_overlaps_another_or_names_no_span() {
         let before = described(R2, "k0", "k2", 1);
@@ -3561,13 +4174,13 @@ mod tests {
     }
 
     /// What the switch of an install replaces, read off the things that decide it
-    /// (PROPOSED D-128, D-132): a replica the node holds a descriptor of replaces that
+    /// (D-128, D-132): a replica the node holds a descriptor of replaces that
     /// descriptor's span, whatever the plan's copy says, and one with none the snapshot's
     /// span, however wide configuration's, unless a variant says to read the copy.
     /// `an_install_replaces_its_hosted_span_only_on_a_replica_the_node_holds_a_descriptor_of`
     /// until D-132, which made its name false.
-    // PROPOSED(D-128)
-    // PROPOSED(D-132)
+    // D-128
+    // D-132
     #[test]
     fn an_install_replaces_the_hosts_descriptors_span_and_the_snapshots_where_it_holds_none() {
         let prefix = KeyPrefix::group(R2.get());
@@ -3660,7 +4273,7 @@ mod tests {
     /// `[k0, k9)`, and R9's key is gone, with every descriptor right, and check 8's install
     /// clause reads that off the switch's spans. (`review-200-two-streams-test.rs`, which
     /// #215 names, is not on this machine; this is built from the issue's account of it.)
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn a_second_streams_copy_of_configurations_span_leaves_the_right_half_beside_it() {
         for (variants, second_end, right_kept) in [
@@ -3704,6 +4317,8 @@ mod tests {
                     panic!("the first stream switched");
                 };
                 lock(&task.descriptors).insert(R2, *descriptor);
+                // PROPOSED(D-133): and lets go of the switch's hold on R2.
+                task.switching.switched(R2);
                 task.finish(R2, ServerId(2), r2_repair(), env.decision())
                     .await;
                 let after_second = store.engine().get(&key("k1x")).await.expect("a read");
@@ -3769,7 +4384,7 @@ mod tests {
     /// A split applied through the log between a stream's last chunk and its switch, through
     /// the real [`ServerApplier::split`](crate::server::split_applied): the route seed 5620 of
     /// S11's sweep found, where node 3 applied range 3's split at 113 during the install of
-    /// range 3's snapshot at 113 and the switch removed range 20's keys (PROPOSED D-132). R2
+    /// range 3's snapshot at 113 and the switch removed range 20's keys (D-132). R2
     /// over `[k0, k9)` holds `k7x`; the split cuts at `k5` and makes R9.
     ///
     /// Four cases on the correct node, and all four under the variant. A snapshot past the
@@ -3780,7 +4395,7 @@ mod tests {
     /// add and is the only install whose span is wider than the replica's. Under
     /// `InstallReplacesCopiedSpan` each replaces the copy from its last chunk, `[k0, k9)`, and
     /// R9's key is gone with every descriptor right, and check 8's install clause names it.
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn a_split_applied_through_the_log_before_a_switch_leaves_the_right_halfs_keys() {
         #[derive(Clone, Copy, Debug)]
@@ -3880,7 +4495,12 @@ mod tests {
                         .await;
                         task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
                         let split = {
-                            let wired = (task.descriptors.clone(), task.snaps.clone());
+                            let wired = (
+                                task.descriptors.clone(),
+                                task.snaps.clone(),
+                                task.switching.clone(),
+                                variants,
+                            );
                             let (env, store) = (env.clone(), store.clone());
                             async move {
                                 // The entries the job carries up to the split, then the split.
@@ -3959,13 +4579,449 @@ mod tests {
         }
     }
 
+    /// Where a split's apply meets a switch of its range inside the switch (#225).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Meets {
+        /// The apply begins once the switch is numbered, at `Engine::install_spans`'s call,
+        /// and before the switch: seed 13283's.
+        AfterTheNumbering,
+        /// The apply is in flight, its batch being written, when the switch reaches the
+        /// reads it is made of.
+        InFlightAtTheSwitch,
+    }
+
+    /// A split's apply and a switch of its range, inside the switch: route 1 of #225, which
+    /// seed 13283 of the sharded sweep reached, node 2 applying range 44's split at 167 after
+    /// its install of range 44's snapshot at 167 was numbered and before the switch, which
+    /// replaced the pre-split span and range 3's keys with it and took the store back from 168
+    /// to 167 (PROPOSED D-133). R2 over `[k0, k9)` holds `k7x`; the split, at 9 through the real
+    /// [`ServerApplier::split`](crate::server::split_applied), cuts at `k5` and makes R9. On a disk
+    /// of a millisecond or two an operation, so the switch takes tens of them.
+    ///
+    /// On the correct node the two exclude each other. An apply that begins after the numbering
+    /// waits out the switch and the host's step of `Switched`, which restates the range's applied
+    /// index, then finds the store at or past its entry and leaves it to the install, which made the node's R2 the snapshot's left half and owns no right half here: so
+    /// `k7x`, which no replica on the node owns, goes, R9 is never made here, and the job's next
+    /// entry applies after the switch, the store not taken back (the second case is seed 13283's
+    /// shape, the snapshot at the split's own index). A switch that reaches its reads with the
+    /// apply in flight waits for it, then replaces the left half the table now holds, or, the
+    /// store being at the snapshot's index, answers installed and switches nothing; R9 keeps
+    /// `k7x`. Under `SplitAppliesInsideTheSwitch`, the order before this entry, every case lands
+    /// the split between the numbering and the switch, the switch replaces `[k0, k9)` with R9
+    /// made, and check 8's install clause names it; in seed 13283's shape the store is taken back
+    /// below the entry the job applied after the split where the switch's restatement may move
+    /// down, the tree before PROPOSED D-126 too (`SwitchForgetsLateApplies` beside the variant).
+    /// D-126's rule alone keeps the entry the job applied (the Stage C integration).
+    // PROPOSED(D-133)
+    // PROPOSED(D-126): the restatement moves only up, so the take-back needs its variant too.
+    #[test]
+    fn a_split_applied_inside_a_switch_of_its_range_waits_for_it_or_is_waited_for() {
+        #[derive(Clone, Copy, Debug)]
+        struct Case {
+            meets: Meets,
+            snapshot: Index,
+            /// Whether the job carries the entry after the split, as seed 13283's did.
+            next: bool,
+            /// On the correct node: the end of the span the switch replaced, if it switched,
+            /// whether the split took here, and the store's applied index after it all.
+            switched: Option<&'static str>,
+            took: bool,
+            ends_at: Index,
+        }
+        const SPLIT: Index = 9;
+        let cases = [
+            Case {
+                meets: Meets::AfterTheNumbering,
+                snapshot: 30,
+                next: false,
+                switched: Some("k9"),
+                took: false,
+                ends_at: 30,
+            },
+            Case {
+                meets: Meets::AfterTheNumbering,
+                snapshot: SPLIT,
+                next: true,
+                switched: Some("k9"),
+                took: false,
+                ends_at: SPLIT + 1,
+            },
+            Case {
+                meets: Meets::InFlightAtTheSwitch,
+                snapshot: 30,
+                next: false,
+                switched: Some("k5"),
+                took: true,
+                ends_at: 30,
+            },
+            Case {
+                meets: Meets::InFlightAtTheSwitch,
+                snapshot: SPLIT,
+                next: false,
+                switched: None,
+                took: true,
+                ends_at: SPLIT,
+            },
+        ];
+        for case in cases {
+            // `forgets`: D-126's `SwitchForgetsLateApplies` beside the variant, the tree before
+            // both entries, whose restatement takes the store back (the Stage C integration).
+            for (buggy, forgets) in [(false, false), (true, false), (true, true)] {
+                let variants = if buggy && forgets {
+                    NodeVariants::of(&[
+                        NodeVariant::SplitAppliesInsideTheSwitch,
+                        NodeVariant::SwitchForgetsLateApplies,
+                    ])
+                } else if buggy {
+                    NodeVariants::of(&[NodeVariant::SplitAppliesInsideTheSwitch])
+                } else {
+                    NodeVariants::correct()
+                };
+                let (
+                    (
+                        right_key,
+                        job,
+                        (held_in_flight, waits_for_switched, free),
+                        let_go,
+                        sent,
+                        applied,
+                    ),
+                    trace,
+                ) = on_a_node_with_a_disk(move |env| async move {
+                    let parent = described(R2, "k0", "k9", 1);
+                    let (mut task, store, local, follower) =
+                        task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                    task.variants = variants;
+                    let prefix = KeyPrefix::group(R2.get());
+                    let mut first = ananke_storage::WriteBatch::new();
+                    first.put(prefix.descriptor_key(), parent.encode());
+                    store.apply(1, first).await.expect("an apply");
+                    for index in 2..SPLIT {
+                        store
+                            .apply(index, ananke_storage::WriteBatch::new())
+                            .await
+                            .expect("an apply");
+                    }
+                    one_key(&store, "k7x").await;
+                    let at = Identity {
+                        term: 2,
+                        last_index: case.snapshot,
+                        last_term: 2,
+                    };
+                    let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                    else {
+                        panic!("the stream completes");
+                    };
+                    checkpoint_with(
+                        &env,
+                        R2,
+                        case.snapshot,
+                        Some(&described(R2, "k0", "k5", 2)),
+                        &["k0x"],
+                        &install.source,
+                    )
+                    .await;
+                    task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                    // What the job reports: whether the split took, and the store's
+                    // applied index once the job is done.
+                    let job: Arc<std::sync::Mutex<Option<(bool, Index)>>> = Arc::default();
+                    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let split = {
+                        let wired = (
+                            task.descriptors.clone(),
+                            task.snaps.clone(),
+                            task.switching.clone(),
+                            variants,
+                        );
+                        let (env, store, job, started) =
+                            (env.clone(), store.clone(), job.clone(), started.clone());
+                        async move {
+                            started.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let took = crate::server::split_applied(
+                                &env,
+                                &store,
+                                wired,
+                                (R2, R9),
+                                (SPLIT, b"k5"),
+                            )
+                            .await;
+                            // The job's next entry, skipped where the store is past it,
+                            // as the apply loop skips it.
+                            if case.next && store.applied() < SPLIT + 1 {
+                                store
+                                    .apply(SPLIT + 1, ananke_storage::WriteBatch::new())
+                                    .await
+                                    .expect("the entry after the split");
+                            }
+                            *lock(&job) = Some((took, store.applied()));
+                        }
+                    };
+                    let held_in_flight: Arc<std::sync::Mutex<Option<bool>>> = Arc::default();
+                    match case.meets {
+                        Meets::AfterTheNumbering => {
+                            *lock(&task.at_the_numbering) = Some(Box::pin(split));
+                        }
+                        Meets::InFlightAtTheSwitch => {
+                            let (env, switching, held_in_flight) =
+                                (env.clone(), task.switching.clone(), held_in_flight.clone());
+                            *lock(&task.at_the_switch) = Some(Box::pin(async move {
+                                env.spawn("landing", split);
+                                while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                                    env.clock().sleep(Duration::from_micros(10)).await;
+                                }
+                                // Inside the batch's write, a disk operation of a
+                                // millisecond or more.
+                                env.clock().sleep(Duration::from_micros(100)).await;
+                                *lock(&held_in_flight) = Some(switching.holds(R2));
+                            }));
+                        }
+                    }
+                    task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                    let answer = local.remove_first(|_| true);
+                    let let_go = matches!(
+                        answer,
+                        Some(crate::server::Local::Snapshot(SnapAnswer::Abandoned { .. }))
+                    );
+                    // A little later, and before the host steps `Switched`: whether the
+                    // job is still waiting.
+                    env.clock().sleep(Duration::from_millis(5)).await;
+                    let waits_for_switched = lock(&job).is_none();
+                    // What the host does at `Switched`, once it has restated the range.
+                    if matches!(
+                        answer,
+                        Some(crate::server::Local::Snapshot(SnapAnswer::Switched { .. }))
+                    ) {
+                        task.switching.switched(R2);
+                    }
+                    let sent = answered(&env, &follower).await;
+                    while lock(&job).is_none() {
+                        env.clock().sleep(Duration::from_millis(1)).await;
+                    }
+                    let job = lock(&job).take();
+                    let right_key = store.engine().get(&key("k7x")).await.expect("a read");
+                    let held_in_flight = lock(&held_in_flight).take();
+                    let free = !task.switching.holds(R2);
+                    (
+                        right_key,
+                        job,
+                        (held_in_flight, waits_for_switched, free),
+                        let_go,
+                        sent,
+                        store.applied(),
+                    )
+                });
+                let name = format!("{case:?}, buggy: {buggy}, forgets: {forgets}");
+                let (took, after_job) = job.expect("the job finished");
+                assert_eq!(sent, Some(SnapshotStatus::Installed), "{name}");
+                let at = |want: &dyn Fn(&TraceEvent) -> bool| {
+                    trace.iter().position(|record| want(&record.event))
+                };
+                let numbered = at(
+                    &|event| matches!(event, TraceEvent::TaskSpawned { name, .. } if *name == "span-install"),
+                );
+                let split = at(&|event| matches!(event, TraceEvent::RangeSplit { .. }));
+                let switched = at(&|event| matches!(event, TraceEvent::SpanInstalled { .. }));
+                let clause = install_clause(&trace, None);
+                if buggy {
+                    // The shape: the split lands between the numbering and the switch.
+                    assert!(
+                        numbered < split && split < switched && numbered.is_some(),
+                        "{name}: numbered at {numbered:?}, split at {split:?}, switched at \
+                         {switched:?}"
+                    );
+                    assert!(took, "{name}: the split takes inside the switch");
+                    assert_eq!(switches(&trace), vec![r2_replaced("k9")], "{name}");
+                    assert!(right_key.is_none(), "{name}: R9's key is gone");
+                    let why = clause.expect_err("check 8's install clause catches the switch");
+                    assert!(
+                        why.contains("one owner per key") && why.contains("its replica of range 9"),
+                        "{name}: {why}"
+                    );
+                    if case.next {
+                        // The switch's restatement takes the store back below the job's entry
+                        // only where it may move down, as before D-126; D-126's rule, in the
+                        // tree since the Stage C integration, keeps the entry the job applied.
+                        let kept = if forgets { case.snapshot } else { SPLIT + 1 };
+                        assert_eq!(
+                            (after_job, applied),
+                            (SPLIT + 1, kept),
+                            "{name}: the switch's restatement of the store past the job's entry"
+                        );
+                    }
+                } else {
+                    assert_eq!(took, case.took, "{name}: whether the split took here");
+                    match case.meets {
+                        // The apply waited out the switch, and the host's `Switched` after
+                        // it: it took nothing, and traced nothing, inside either.
+                        Meets::AfterTheNumbering => {
+                            assert!(waits_for_switched, "{name}: the job waits for `Switched`");
+                            assert_eq!(split, None, "{name}: the entry is the install's");
+                        }
+                        // The switch waited for the apply: its numbering, if it switched,
+                        // comes after the split, which held the range while in flight.
+                        Meets::InFlightAtTheSwitch => {
+                            assert_eq!(held_in_flight, Some(true), "{name}: the split held R2");
+                            assert!(
+                                split.is_some()
+                                    && numbered.is_none_or(|numbered| split < Some(numbered)),
+                                "{name}: split at {split:?}, numbered at {numbered:?}"
+                            );
+                        }
+                    }
+                    let expected = case
+                        .switched
+                        .map(r2_replaced)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        switches(&trace),
+                        expected,
+                        "{name}: what the switch replaced"
+                    );
+                    assert_eq!(
+                        right_key.is_some(),
+                        case.took,
+                        "{name}: R9's key stays where R9 is made here, and goes with the switch \
+                         where no replica here owns it"
+                    );
+                    assert_eq!(
+                        let_go,
+                        case.switched.is_none(),
+                        "{name}: the hold let go unswitched"
+                    );
+                    assert_eq!(applied, case.ends_at, "{name}: the store's applied index");
+                    if case.meets == Meets::AfterTheNumbering {
+                        assert_eq!(
+                            after_job, case.ends_at,
+                            "{name}: the job ends after the switch"
+                        );
+                    }
+                    assert_eq!(clause, Ok(()), "{name}: check 8's install clause");
+                }
+                assert!(free, "{name}: nothing holds R2 once the job is done");
+            }
+        }
+    }
+
+    /// Route 2 of #225, **which D-133 does not close, asserted open**: #215's related window.
+    /// `/n1` hosts R2 at configuration's `[k0, k9)` with no descriptor. Stream A, R2's pre-split
+    /// snapshot over `[k0, k9)`, switches down D-128's path, and `finish` leaves R2 out of the
+    /// host's table until the host steps `Switched(A)`. R9's placeholder's stream completes
+    /// first: its admission reads a table with no R2 in it, sees no overlap, and R9 is made over
+    /// `[k5, k9)` with `k7x`. Then the host steps `Switched(A)`, the table holds R2's wide
+    /// descriptor, and stream B, R2's post-split snapshot over `[k0, k5)`, is admitted, since its
+    /// span overlaps nothing, and replaces the wide descriptor's span: R9's key goes, and check 8's
+    /// install clause names it.
+    ///
+    /// No split is applied on this node, so the exclusion between a switch and a split's apply
+    /// has nothing to hold: the correct node and `SplitAppliesInsideTheSwitch` run this record for
+    /// record. Closing it needs the placeholder's admission to see R2 from the switch on, which is
+    /// a change to where the table is written or read and not D-133's. The day it is closed this
+    /// test fails, and becomes that fix's directed test.
+    // PROPOSED(D-133)
+    #[test]
+    fn a_placeholder_admitted_before_the_host_steps_switched_still_loses_its_key_to_the_next_install()
+     {
+        let run = |variants: NodeVariants| {
+            on_a_node(move |env| async move {
+                let wide = described(R2, "k0", "k9", 1);
+                let left = described(R2, "k0", "k5", 2);
+                let right = described(R9, "k5", "k9", 2);
+                let (mut task, store, local, _follower) = task_on(&env, R2, &[]).await;
+                task.variants = variants;
+                let stream = |index: Index| Identity {
+                    term: 2,
+                    last_index: index,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) =
+                    task.plan.on_chunk(R2, FOLLOWER, stream(30), 16, true)
+                else {
+                    panic!("stream A completes");
+                };
+                checkpoint_with(&env, R2, 30, Some(&wide), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let Some(crate::server::Local::Snapshot(SnapAnswer::Switched {
+                    descriptor: Some(switched_a),
+                    ..
+                })) = local.remove_first(|_| true)
+                else {
+                    panic!("stream A switched");
+                };
+                let r2_in_the_table = lock(&task.descriptors).contains_key(&R2);
+                // R9's placeholder's stream completes before the host steps `Switched(A)`.
+                let source = PathBuf::from("/n1/staging-r9-s3");
+                checkpoint_with(&env, R9, 40, Some(&right), &["k7x"], &source).await;
+                let placeholder = Install {
+                    range: R9,
+                    from: FOLLOWER,
+                    at: stream(40),
+                    source,
+                    spans: vec![KeyPrefix::group(R9.get()).span()],
+                    repair_in_switch: true,
+                    reopens_engine: false,
+                    adopted: false,
+                };
+                task.install_placeholder(R9, FOLLOWER, placeholder).await;
+                let made = lock(&task.stores).contains_key(&R9);
+                let after_r9 = store.engine().get(&key("k7x")).await.expect("a read");
+                // What the host does at `Switched(A)`, then stream B.
+                lock(&task.descriptors).insert(R2, *switched_a);
+                task.switching.switched(R2);
+                let Landing::Complete(install) =
+                    task.plan.on_chunk(R2, ServerId(2), stream(50), 16, true)
+                else {
+                    panic!("stream B completes");
+                };
+                checkpoint_with(&env, R2, 50, Some(&left), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, ServerId(2))).or_default().pending = Some(install);
+                task.finish(R2, ServerId(2), r2_repair(), env.decision())
+                    .await;
+                let after_b = store.engine().get(&key("k7x")).await.expect("a read");
+                (r2_in_the_table, made, after_r9.is_some(), after_b.is_some())
+            })
+        };
+        let (seen, trace) = run(NodeVariants::correct());
+        assert_eq!(
+            seen,
+            (false, true, true, false),
+            "R2 out of the table at A's switch, R9 made with its key, and the key gone after B"
+        );
+        let raft9 = KeyPrefix::group(R9.get()).span();
+        assert_eq!(
+            switches(&trace),
+            vec![
+                r2_replaced("k9"),
+                vec![(raft9.start, raft9.end), (key("k5"), key("k9"))],
+                r2_replaced("k9"),
+            ],
+            "A's switch, R9's creation, and B's switch over the wide descriptor"
+        );
+        let why = install_clause(&trace, None).expect_err("check 8's install clause fires");
+        assert!(
+            why.contains("one owner per key")
+                && why.contains("an install of range 2 on node")
+                && why.contains("its replica of range 9"),
+            "B's switch, and not R9's creation: {why}"
+        );
+        let (under, variant) = run(NodeVariants::of(&[
+            NodeVariant::SplitAppliesInsideTheSwitch,
+        ]));
+        assert_eq!(under, seen, "the exclusion changes nothing on this route");
+        assert_eq!(
+            variant, trace,
+            "the correct node and the variant run one run"
+        );
+    }
+
     /// An install onto a replica the host holds a descriptor of replaces that descriptor's
     /// whole span, at the call and not only in [`switched_spans`] (#215): P over `[k0, k2)`
     /// takes its post-split snapshot over `[k0, k1)`, never having applied the split, and
     /// the key beyond the snapshot's span goes with the rest. A plant at the call site that
     /// replaced the snapshot's span alone passed every test of the tree, and left that key in
     /// the engine with no replica on the node owning it.
-    // PROPOSED(D-132)
+    // D-132
     #[test]
     fn an_install_onto_a_replica_with_a_descriptor_replaces_that_descriptors_whole_span() {
         let ((past_snapshot, in_snapshot), trace) = on_a_node(|env| async move {
@@ -4001,7 +5057,7 @@ mod tests {
         assert!(in_snapshot.is_some(), "the snapshot's key is installed");
     }
 
-    /// An install onto a replica with no descriptor, through the task (PROPOSED D-128):
+    /// An install onto a replica with no descriptor, through the task (D-128):
     /// node `/n1` hosts R2 at configuration's `[k0, k9)` with no descriptor of it, as a
     /// re-seed leaves a user range, and holds R9 over `[k1, k2)`, as R9's placeholder's
     /// install left it, with a key. R2's post-split snapshot names `[k0, k1)`, which
@@ -4013,7 +5069,7 @@ mod tests {
     /// `Switched`. Under the variant the switch replaces what the plan hosts and R9's key
     /// is gone, with every descriptor as it was; check 8's install clause reads the
     /// switch's spans off the same trace.
-    // PROPOSED(D-128)
+    // D-128
     #[test]
     fn an_install_onto_a_replica_with_no_descriptor_replaces_the_snapshots_span_alone() {
         struct Case {
@@ -4173,7 +5229,7 @@ mod tests {
     /// `into_placeholder: true` to `admission`, which is what refuses the first: planted as
     /// `false` the refusal went, every test green, and with it the guard against the double
     /// creation D-110 §4 records for seed 219 under the variant.
-    // PROPOSED(D-110): the placeholder's path asks the decision as itself.
+    // D-110: the placeholder's path asks the decision as itself.
     #[test]
     fn a_placeholders_install_of_a_range_made_here_meanwhile_is_refused() {
         let right = described(R9, "k1", "k2", 2);
@@ -4222,6 +5278,221 @@ mod tests {
                     (sent, created, made),
                     (Some(SnapshotStatus::Installed), true, true),
                     "the same install where the range is not held creates it"
+                );
+            }
+        }
+    }
+
+    /// A job the replaced core queued before the hold that applies past the snapshot while
+    /// the switch is in flight is kept by the `snapshot` task's own restatement, as the
+    /// host's at `Switched` keeps it (#113's review, F1). R2's store and its `apply` task
+    /// stand at 28 and the stream's snapshot is at 30, so both re-checks pass and the install
+    /// switches. The job lands after the engine has numbered the switch (`after_the_switch`)
+    /// and applies 29 to 32 as the `apply` task does, the store's batch and then the task's
+    /// state. Its batches are numbered above the switch's and survive it, so the store's
+    /// applied-index key reads 32 on both nodes.
+    ///
+    /// The correct node leaves the store's cached index and the task at 32, the key's own
+    /// value. Under `SwitchForgetsLateApplies`, the tree before this, both go back to 30,
+    /// below the key: the restatement at `Switched` then reads 30 and keeps nothing, and the
+    /// new replica's first `Apply` hands 31 and 32 out a second time. No sweep reaches the
+    /// late job at its tiers; seed 13283 of the sharded sweep, past the nightly's range, did
+    /// on D-126's own tree, failing on #225's window on the correct node too, and on the Stage
+    /// C integration's tree reaches it on neither schedule, so it is not pinned (PROPOSED
+    /// D-126 sections 6 and 7). So this is the pair of the half that lives here.
+    // PROPOSED(D-126)
+    #[test]
+    fn a_late_job_that_applies_past_the_snapshot_while_the_switch_is_in_flight_is_kept() {
+        for buggy in [false, true] {
+            let variants = if buggy {
+                NodeVariants::of(&[NodeVariant::SwitchForgetsLateApplies])
+            } else {
+                NodeVariants::correct()
+            };
+            let ((cached, task_at, on_disk), trace) = on_a_node(move |env| async move {
+                let parent = described(R2, "k0", "k9", 1);
+                let (mut task, store, _local, _follower) =
+                    task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                task.variants = variants;
+                let mut first = ananke_storage::WriteBatch::new();
+                first.put(KeyPrefix::group(R2.get()).descriptor_key(), parent.encode());
+                store.apply(1, first).await.expect("an apply");
+                for index in 2..=28 {
+                    store
+                        .apply(index, ananke_storage::WriteBatch::new())
+                        .await
+                        .expect("an apply");
+                }
+                let held = |index| crate::server::Applied {
+                    index,
+                    term: 2,
+                    config: Configuration::of(&[ServerId(1), ServerId(2), FOLLOWER]),
+                };
+                lock(&task.applied).insert(R2, held(28));
+                let at = Identity {
+                    term: 2,
+                    last_index: 30,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                checkpoint_with(&env, R2, 30, Some(&parent), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                let late = {
+                    let (store, applied) = (store.clone(), task.applied.clone());
+                    async move {
+                        for index in 29..=32 {
+                            store
+                                .apply(index, ananke_storage::WriteBatch::new())
+                                .await
+                                .expect("the late job's apply");
+                            lock(&applied).insert(R2, held(index));
+                        }
+                    }
+                };
+                *lock(&task.after_the_switch) = Some(Box::pin(late));
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let task_at = lock(&task.applied).get(&R2).map(|state| state.index);
+                let on_disk = store
+                    .applied_at(&store.engine().snapshot())
+                    .await
+                    .expect("a read");
+                (store.applied(), task_at, on_disk)
+            });
+            assert_eq!(
+                switches(&trace),
+                vec![r2_replaced("k9")],
+                "buggy: {buggy}: the install switched"
+            );
+            assert_eq!(
+                on_disk, 32,
+                "buggy: {buggy}: the late job's applies were written above the switch"
+            );
+            if buggy {
+                assert_eq!(
+                    (cached, task_at),
+                    (30, Some(30)),
+                    "the variant takes the store and the task back to the snapshot, below \
+                     the store's own key"
+                );
+            } else {
+                assert_eq!(
+                    (cached, task_at),
+                    (32, Some(32)),
+                    "the correct node keeps what the late job applied past the snapshot"
+                );
+            }
+        }
+    }
+
+    /// The test above keeps an index past the snapshot because it was applied after the
+    /// switch's numbering, and that rests on D-132's second re-check: a store at or past the
+    /// snapshot there is answered installed, so a store that reaches the switch stood below
+    /// it (#113's second review, N1). R2's store and its `apply` task stand at 5 and the
+    /// stream's snapshot is at 6. A job lands at the switch (`at_the_switch`), after the
+    /// stream's last await and before the numbering, and applies 6 to 9 as the `apply` task
+    /// does, entry 8 writing `k0y`.
+    ///
+    /// The correct node finds the store at 9 at the re-check and switches nothing: the
+    /// store, the task and the applied-index key stand at 9, and `k0y` is there.
+    /// `InstallReplacesCopiedSpan` skips the re-check and switches over the job's batches,
+    /// which were numbered below the switch, so the applied-index key reads 6 and `k0y` is
+    /// gone. Its restatement takes the store and the task back to 6, as the tree before
+    /// D-132 did, so the new replica's first `Apply` hands 7 to 9 out again and entry 8
+    /// writes `k0y` back. Kept at 9 over a key at 6, the store would take 10 next and entry
+    /// 8's write would be lost for good: a second bug beside the variant's own, which the
+    /// tree before D-132 did not have.
+    // PROPOSED(D-126)
+    #[test]
+    fn a_switch_numbered_over_a_store_past_the_snapshot_keeps_nothing_past_it() {
+        for buggy in [false, true] {
+            let variants = if buggy {
+                NodeVariants::of(&[NodeVariant::InstallReplacesCopiedSpan])
+            } else {
+                NodeVariants::correct()
+            };
+            let ((cached, task_at, on_disk, k0y), trace) = on_a_node(move |env| async move {
+                let parent = described(R2, "k0", "k9", 1);
+                let (mut task, store, _local, _follower) =
+                    task_on(&env, R2, std::slice::from_ref(&parent)).await;
+                task.variants = variants;
+                let mut first = ananke_storage::WriteBatch::new();
+                first.put(KeyPrefix::group(R2.get()).descriptor_key(), parent.encode());
+                store.apply(1, first).await.expect("an apply");
+                for index in 2..=5 {
+                    store
+                        .apply(index, ananke_storage::WriteBatch::new())
+                        .await
+                        .expect("an apply");
+                }
+                let held = |index| crate::server::Applied {
+                    index,
+                    term: 2,
+                    config: Configuration::of(&[ServerId(1), ServerId(2), FOLLOWER]),
+                };
+                lock(&task.applied).insert(R2, held(5));
+                let at = Identity {
+                    term: 2,
+                    last_index: 6,
+                    last_term: 2,
+                };
+                let Landing::Complete(install) = task.plan.on_chunk(R2, FOLLOWER, at, 16, true)
+                else {
+                    panic!("the stream completes");
+                };
+                checkpoint_with(&env, R2, 6, Some(&parent), &["k0x"], &install.source).await;
+                task.receiving.entry((R2, FOLLOWER)).or_default().pending = Some(install);
+                let job = {
+                    let (store, applied) = (store.clone(), task.applied.clone());
+                    async move {
+                        for index in 6..=9 {
+                            let mut batch = ananke_storage::WriteBatch::new();
+                            if index == 8 {
+                                batch.put(key("k0y"), Bytes::from_static(b"entry 8"));
+                            }
+                            store.apply(index, batch).await.expect("the job's apply");
+                            lock(&applied).insert(R2, held(index));
+                        }
+                    }
+                };
+                *lock(&task.at_the_switch) = Some(Box::pin(job));
+                task.finish(R2, FOLLOWER, r2_repair(), env.decision()).await;
+                let task_at = lock(&task.applied).get(&R2).map(|state| state.index);
+                let on_disk = store
+                    .applied_at(&store.engine().snapshot())
+                    .await
+                    .expect("a read");
+                let k0y = store.engine().get(&key("k0y")).await.expect("a read");
+                (store.applied(), task_at, on_disk, k0y.is_some())
+            });
+            if buggy {
+                assert_eq!(
+                    switches(&trace),
+                    vec![r2_replaced("k9")],
+                    "the variant switches over a store past the snapshot"
+                );
+                assert_eq!(
+                    (on_disk, k0y),
+                    (6, false),
+                    "the switch overwrote what the job applied below its numbering"
+                );
+                assert_eq!(
+                    (cached, task_at),
+                    (6, Some(6)),
+                    "the variant's restatement takes the store and the task back to the \
+                     snapshot, to the key the switch wrote, so the entries are handed out again"
+                );
+            } else {
+                assert!(
+                    switches(&trace).is_empty(),
+                    "the correct node answers a store past the snapshot installed"
+                );
+                assert_eq!(
+                    (cached, task_at, on_disk, k0y),
+                    (9, Some(9), 9, true),
+                    "the correct node keeps what the job applied"
                 );
             }
         }

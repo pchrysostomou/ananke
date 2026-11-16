@@ -73,7 +73,7 @@ fn same_inside_the_driver(name: &str, trace: impl Fn(u64) -> String + Sync + Sen
 /// every Phase 3 scenario's pinned seed means the same whichever way its sweep ran.
 /// `sim/reseed.rs` and `sim/install.rs` keep no moirae header in their reports, so theirs
 /// is the records themselves, which is the moirae export's whole input but for the header.
-// PROPOSED(D-113): the node scenarios join the driver's proof.
+// D-113: the node scenarios join the driver's proof.
 #[test]
 fn a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace() {
     let (cores, node, range) = (
