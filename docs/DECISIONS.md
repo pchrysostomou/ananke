@@ -29041,4 +29041,70 @@ Every `shard` row and the two `node` rows that run the sharded sweep were weighe
 
 ---
 
-_Next entry: D-144. Add one before implementing anything not covered above._
+## PROPOSED D-144 — The history's closure under directed tests: a resend's proposal closes the operation its `ClientSend` names, only an apply to `applied` closes an operation, and one whose every proposal applied as nothing is counted apart from one never proposed (S13)
+
+**The number.** Off d3d6bab, the tip of #259 (the Stage C integration), whose footer reads D-144. S13's close-out reserves D-144 to D-148 for its first five PRs in order, and this is the first: the directed tests of "`invoked` pairing" and "closing only on `applied`" that #162's S13 lists. The footer names D-145; the PRs beside this one append their own entries, and the footer is settled as they merge. The code sites carry `// PROPOSED(D-144)`.
+
+**What it answers.** SHARD.md §9 ("History") gives the history two rules for routing, which §11's env item 9 and Stage C's Builds line repeat. An operation's proposals are gathered by `invoked`: each `ClientSend` names the `seq` of its operation's `ClientInvoke`, and a `RaftProposed` under a resend's `seq` joins the proposals of the operation that `seq`'s `ClientSend` names. And only an apply whose effect is `applied` closes an operation: a `Cas` whose compare failed is still `applied`, an operation whose every proposal applied to another effect leaves the history, and one with a proposal never applied stays pending. D-071 item 4 built neither ("Each belongs to the stage that can make it false"). D-097's item 7 built both in `sim/lin.rs` (cd3de12) with no test of them: the file had 19 tests before cd3de12 and 19 after, and the only two that call `History::from_trace`, D-071's two-range pair, feed it no `ClientSend` and one apply, to `applied`. A closure that read no `invoked`, or closed an operation at any apply, passed every test in the file.
+
+### 1. What is built (`sim/lin.rs` alone)
+
+- **A counter of its own for an operation that applied as nothing.** `History::applied_as_nothing` counts the abandoned operations whose every proposal applied to an effect other than `applied`, which leave the history. D-097 counted them in `never_proposed`, whose doc reads "no leader proposed", so the counters could not say why an operation left. `never_proposed` now counts what its doc says. Nothing outside `sim/lin.rs` reads either counter, and every other construction of `History` takes `..History::default()`.
+- **`two_range_trace` takes the apply's effect**, which was `applied` alone. D-071's pair passes `applied`, and asserts what it asserted.
+- **`resent_trace`**, one abandoned write sent twice. Range 2 proposes it at (5, 2) and applies it at 20 as `out_of_span`. The client sends it again to range 3 under `seq` 1, whose `ClientSend` names the `invoked` the test gives, and range 3 proposes it at (7, 1) and applies it as `applied` at the time the test gives on one replica and 5 ms later on another, or never. Between the resend and its proposal a third client sends its own operation 1 under the same `seq` 1, a send the trace holds alone. The writer never returns. A second client reads the key over the window the test gives and sees the value it gives.
+- **Six tests**, in `mod tests` after D-071's pair. Each asserts how the history closed its abandoned operations, as (closed by an apply, never proposed, applied as nothing, pending), and what `lin::check` says.
+  1. `a_resends_proposal_closes_the_operation_its_send_names`: `invoked` 0, the resend applied at 40 and at 45, a read over [100, 110] that saw the write. The write is closed at 40 by its resend's first apply, (1, 0, 0, 0), and the history passes.
+  2. `a_resend_whose_send_names_another_operation_closes_nothing_of_this_one`, the first test's pair: the same trace with `invoked` 1. The write's one proposal applied as nothing, so it leaves, (0, 0, 1, 0), and the read saw a value nobody wrote: the history fails. The two traces differ in that one field.
+  3. `an_operation_whose_resend_never_applied_stays_pending`: the resend never applies. The write stays pending, (0, 0, 0, 1), and the read that saw it passes.
+  4. `an_operations_proposal_is_closed_only_by_an_apply_to_effect_applied`: D-071's trace with the write's own range's apply traced as each of `out_of_span`, `frozen`, `took`, `aborted`, `refused` and `none`. Each leaves the write out, (0, 0, 1, 0), and the read that saw nothing passes. D-071's `an_operations_proposal_is_closed_by_its_own_ranges_apply` is the same trace with `applied`, which closes the write and fails.
+  5. `an_operation_returns_at_its_first_apply_to_effect_applied_not_its_first_apply`: the first test's trace with a read over [30, 35] that saw nothing, and a third proposal: the client sends `seq` 1 again to range 3's next leader, which proposes it at (8, 2) and applies it as `applied` at 50. The write returns at 40, the earliest apply to `applied` of any of its proposals on any replica ("the earliest such apply", SHARD.md §9): not at 20, its first apply, nor at 45, its resend's entry on the second replica, nor at 50, its third proposal's. The read passes.
+  6. `a_compare_and_set_whose_compare_failed_still_closes_its_operation`: an abandoned `Cas` of the key from `x` to `y` under `seq` 1, whose client traces no `ClientSend`, as the sharded sweep's bursts trace none (D-131), its one proposal applied as `applied` at 50, where nothing wrote `x`. It is closed at 50 with no result, (1, 0, 0, 0), so the model chooses the boolean (SHARD.md §9): a later read of nothing passes, and a read of `y` fails.
+
+### 2. Each test fails under a plant
+
+Each plant was applied alone to the tree as built, the file's 25 tests run in release (`cargo test --release -p ananke-sim --lib lin::`), and the plant reverted, the revert confirmed by an empty `git diff`. P1 to P3 are the ones S13's plan named. P2' and P4 to P7 were added so that every test fails under at least one plant, the second and the sixth among them. P8 to P11 were added in review, for four parts of the rules no plant before them reached: an entry's earliest apply across its replicas, an operation's earliest across its entries, a send's operation named by its client and its `seq` together, and a proposal no `ClientSend` names kept under its own `seq`. Under each of P1, P2 and P8 to P11 the 19 tests the file had before this entry all pass.
+
+| plant | fails | what it reports |
+|---|---|---|
+| P1. A proposal joins its own `seq`'s operation, `invoked` unread (`let invoked = *seq;`) | 1, 3, 5 | the write's one gathered proposal applied as nothing, so it leaves: 1 holds one operation where it owes two, 3 and 5 count (0, 0, 1, 0) |
+| P2. Every apply closes, whatever its effect | 1 to 5 | the write's first apply closes it, whatever its effect: 1 and 5 return it at 20, the `out_of_span` apply's time, not 40; 2, 3 and 4 count (1, 0, 0, 0), 4 at `out_of_span`, the first effect its loop asks |
+| P2'. An apply to `none` closes, as one to `applied` does | 4, at `none`, the last effect its loop asks | (1, 0, 0, 0) |
+| P3. An operation leaves once any one of its proposals applied as nothing (`.all(` to `.any(`) | 3 | (0, 0, 1, 0) where it stays pending |
+| P4. A proposal joins its client's open operation, whatever its `ClientSend` names | 2 | the resend closes the write at 40: (1, 0, 0, 0) |
+| P5. A closed `Cas` is given the result `Swapped(true)`, reading `applied` as "it wrote" | 6 | a result `Swapped(true)` where none is owed |
+| P6. A closed `Cas` is left pending | 6 | (0, 0, 0, 1) |
+| P7. The counter split undone: an operation applied as nothing counted as never proposed | 2, 4 | (0, 1, 0, 0) |
+| P8. An entry's last apply counts, not its first (`applied_at.insert(entry, record.at)` for `.entry(entry).or_insert(record.at)`) | 1, 5 | the write returns at 45, its resend's entry's apply on the second replica, not 40 |
+| P9. An operation returns at the latest of its entries' applies (`.min()` to `.max()`) | 5 | the write returns at 50, its third proposal's apply, not 40 |
+| P10. A send's operation is keyed by its `seq` alone, its client unread (`invoked_by` keyed by `(0, seq)`) | 1, 3, 5 | the third client's send under `seq` 1 is read as the resend's, and the resend joins an operation 1 that is not the write's: 1 holds one operation where it owes two, 3 counts (0, 0, 1, 0), and 5 returns the write at 50, the third proposal's apply, which the second send under `seq` 1 gathers back under the write |
+| P11. A proposal no `ClientSend` names joins its client's operation 0, not its own `seq`'s (`.unwrap_or(*seq)` to `.unwrap_or(0)`) | 6 | the `Cas` counts as never proposed: (0, 1, 0, 0) |
+
+The sixth test's read of `y` is its pair's other half, as D-071's second test is its first's: no plant here makes that read pass without first failing the read of nothing. What refuses it is the model, `apply`, which D-080's tests hold.
+
+One part of "the earliest such apply" is not told apart. A plant that takes an operation's first applied entry in proposal order, not its earliest (`.min()` to `.next()`), passes all 25 tests. Test 5's two applied entries are in one range: of two entries of one range that both apply, the one proposed first has the lower index, and every replica applies a range's entries in index order, so in one range the first proposed is also the first applied. Telling the two rules apart needs an operation with entries applied as `applied` in two ranges, the later proposed applied first, and no test here builds one.
+
+### 3. What the sweeps reach, and do not assert
+
+The node sweep's client (`sim/raft.rs`) traces `ClientSend` on every send and resends under a fresh `seq` after a `RangeMismatch`, and every node and sharded run asks `lin::check` of its history, so both rules run on the sweeps. None of them asserts what the history did:
+- `a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node` (`sim/tests/node.rs`) asserts, at every tier, that the apply check refused a trusted write on some seed. It counts `RangeMismatchSent` at apply, not a resend paired or a proposal closed.
+- `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` asserts a write refused at apply after a split (`SplitCoverage::refused_at_apply`) from the thousand only.
+- `every_seed_passes_on_the_correct_sharded_sweep` asserts, at every tier, that a split's apply check refused a write of D-131's burst. The burst's client traces no `ClientSend` and returns only on an outcome, so a write whose every proposal is refused that way leaves the history by the effect rule, and nothing reads that it did.
+
+A break of either rule shows on a sweep only as a false linearizability violation, on a seed with an abandoned operation of that shape and a later read that contradicts it. That rate has not been measured.
+
+### 4. Named, and not held here
+
+**The server's half of "closing only on `applied`".** The history cannot tell a `Cas` whose compare failed from one that swapped. It relies on the server tracing every keyed command its apply check did not refuse as `applied`, with its key. Two applies make that mapping, each in a `(key, effect)` match before its `RaftApply`: `server.rs`'s, on the node and the sharded sweeps (D-097), and the one-group node's in `crates/ananke-raft/src/node.rs`, whose comment says a `Cas` whose compare failed is still `applied`, on the raft sweeps (D-069). Each of those sweeps' histories goes through `History::from_trace`. No test holds either mapping. D-069's payload oracle in `sim/raft.rs` asks a key of an `applied` apply and none of a `none` apply, so a failed-compare `Cas` traced as `none` with no key would pass it, and the history would then leave that operation out where §9 closes it with the boolean the model must match. Both are held by reading only (question 2 below).
+
+### 5. What moves
+
+Nothing: no schedule, no trace, no pinned hash, no bound. The tests are in ananke-sim's lib, which the gate, CI and the nightly's `rest` job run at every tier; they run no sweep, so they need no row in `scripts/nightly-shards.txt` (D-064). On this tree, in release, the file's 25 tests pass in under 10 ms.
+
+### For the owner (PROPOSED)
+
+1. **The counter split.** `History::applied_as_nothing` beside `never_proposed`, rather than `never_proposed`'s doc reworded to cover both. Recommended: the split, as built. It lets a test say why an operation left, and no code outside `sim/lin.rs` reads the counters.
+2. **The server's half** (§4). Recommended: an issue, labelled phase:3, for a unit test of each of the two applies, in ananke-shard's server tests and in ananke-raft's node tests, that applies a `Cas` whose compare fails and asserts that its `RaftApply` names its key with effect `applied`, each planted by tracing a failed compare as `none`. It is S13's only if the owner reads "closing only on `applied`" as including the servers' trace; this entry reads it as the history's rule, which §9 states.
+
+---
+
+_Next entry: D-145. Add one before implementing anything not covered above._

@@ -95,6 +95,10 @@ pub struct History {
     pub closed_by_apply: usize,
     /// Abandoned operations no leader proposed, left out.
     pub never_proposed: usize,
+    /// Abandoned operations whose every proposal applied to an effect other than
+    /// `applied`, left out.
+    // PROPOSED(D-144): counted apart from `never_proposed`.
+    pub applied_as_nothing: usize,
 }
 
 impl History {
@@ -184,6 +188,7 @@ impl History {
         }
         let mut closed_by_apply = 0;
         let mut never_proposed = 0;
+        let mut left_as_nothing = 0;
         let mut kept = Vec::with_capacity(ops.len());
         for mut op in ops {
             if op.ret.is_none() {
@@ -200,7 +205,9 @@ impl History {
                             // Every proposal applied to an effect other than
                             // `applied`: the operation did not take effect and leaves
                             // the history (SHARD.md §9).
-                            never_proposed += 1;
+                            // PROPOSED(D-144): counted as applied as nothing, not as
+                            // never proposed.
+                            left_as_nothing += 1;
                             continue;
                         }
                     }
@@ -212,6 +219,8 @@ impl History {
             ops: kept,
             closed_by_apply,
             never_proposed,
+            // A count of operations; the set of that name above holds entries.
+            applied_as_nothing: left_as_nothing,
         }
     }
 
@@ -942,6 +951,16 @@ mod tests {
         );
     }
 
+    /// A record of the trace at `ms`, decided then.
+    fn record(ms: u64, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(ms),
+            decided: at(ms),
+            node: Some(NodeId::new(1)),
+            event,
+        }
+    }
+
     /// A trace of two ranges, with a write proposed in one of them and never
     /// applied there, and the other range's entry at the same (index, term)
     /// applied: the record the closure keyed by (index, term) alone would close
@@ -949,14 +968,9 @@ mod tests {
     ///
     /// Every event of every sweep in this tree carries one range, so the two
     /// keyings say the same thing on every seed; this is the history that tells
-    /// them apart. `applied_in` is the range whose apply is traced.
-    fn two_range_trace(applied_in: u64) -> Vec<TraceRecord> {
-        let record = |ms, event| TraceRecord {
-            at: at(ms),
-            decided: at(ms),
-            node: Some(NodeId::new(1)),
-            event,
-        };
+    /// them apart. `applied_in` is the range whose apply is traced, and `effect`
+    /// the effect it is traced with.
+    fn two_range_trace(applied_in: u64, effect: ApplyEffect) -> Vec<TraceRecord> {
         vec![
             record(
                 0,
@@ -989,7 +1003,7 @@ mod tests {
                     entry_term: 2,
                     hash: 0xaa,
                     key: Some(b("k")),
-                    effect: ApplyEffect::Applied,
+                    effect,
                 },
             ),
             record(
@@ -1018,7 +1032,7 @@ mod tests {
     /// violation of nothing.
     #[test]
     fn an_operations_proposal_is_closed_only_by_its_own_ranges_apply() {
-        let history = History::from_trace(&two_range_trace(3));
+        let history = History::from_trace(&two_range_trace(3, ApplyEffect::Applied));
         assert_eq!((history.closed_by_apply, history.pending()), (0, 1));
         check(&history).unwrap();
     }
@@ -1027,9 +1041,355 @@ mod tests {
     /// took effect before the read, which saw nothing, and that is the violation.
     #[test]
     fn an_operations_proposal_is_closed_by_its_own_ranges_apply() {
-        let history = History::from_trace(&two_range_trace(2));
+        let history = History::from_trace(&two_range_trace(2, ApplyEffect::Applied));
         assert_eq!((history.closed_by_apply, history.pending()), (1, 0));
         assert!(check(&history).is_err(), "{history:?}");
+    }
+
+    // The tests below pin the closure's two rules from routing (SHARD.md §3, §9;
+    // D-097): an operation's proposals are gathered by the `invoked` its sends name,
+    // and only an apply whose effect is `applied` closes it. D-071 put both off to the
+    // stage that could make them false, and D-097 built them with no test that fed
+    // `from_trace` a `ClientSend` or an effect other than `applied`. Each fails under
+    // at least one way of getting the closure wrong, and D-144's table names which.
+    // PROPOSED(D-144)
+
+    /// A trace of one abandoned write sent twice. Its first send goes to range 2,
+    /// which proposes it at (5, 2) and applies it at 20 as `out_of_span`: the key is
+    /// no longer range 2's. The client sends it again to range 3 under the fresh
+    /// `seq` 1, whose `ClientSend` names `invoked` as its operation, and range 3
+    /// proposes that at (7, 1) and applies it as `applied` at `resend_applied` on one
+    /// replica and five milliseconds later on another, or never. Between the resend
+    /// and its proposal a third client sends its own operation 1 under the same `seq`
+    /// 1, a send the trace holds alone: a `seq` names an operation of its own
+    /// client's. The writer never returns. A second client reads the key over `read`
+    /// and sees `seen`.
+    fn resent_trace(
+        invoked: u64,
+        resend_applied: Option<u64>,
+        read: (u64, u64),
+        seen: Option<&str>,
+    ) -> Vec<TraceRecord> {
+        let mut trace = vec![
+            record(
+                0,
+                TraceEvent::ClientInvoke {
+                    client: 1,
+                    seq: 0,
+                    op: ClientOp::Put {
+                        key: b("k"),
+                        value: b("a"),
+                    },
+                },
+            ),
+            record(
+                1,
+                TraceEvent::ClientSend {
+                    client: 1,
+                    seq: 0,
+                    range: 2,
+                    generation: 0,
+                    to: 1,
+                    invoked: 0,
+                },
+            ),
+            record(
+                10,
+                TraceEvent::RaftProposed {
+                    server: 1,
+                    range: 2,
+                    client: 1,
+                    seq: 0,
+                    index: 5,
+                    term: 2,
+                },
+            ),
+            record(
+                20,
+                TraceEvent::RaftApply {
+                    server: 1,
+                    range: 2,
+                    index: 5,
+                    entry_term: 2,
+                    hash: 0xaa,
+                    key: Some(b("k")),
+                    effect: ApplyEffect::OutOfSpan,
+                },
+            ),
+            record(
+                22,
+                TraceEvent::ClientSend {
+                    client: 1,
+                    seq: 1,
+                    range: 3,
+                    generation: 1,
+                    to: 2,
+                    invoked,
+                },
+            ),
+            record(
+                25,
+                TraceEvent::ClientSend {
+                    client: 3,
+                    seq: 1,
+                    range: 3,
+                    generation: 1,
+                    to: 2,
+                    invoked: 1,
+                },
+            ),
+            record(
+                30,
+                TraceEvent::RaftProposed {
+                    server: 2,
+                    range: 3,
+                    client: 1,
+                    seq: 1,
+                    index: 7,
+                    term: 1,
+                },
+            ),
+            record(
+                read.0,
+                TraceEvent::ClientInvoke {
+                    client: 2,
+                    seq: 0,
+                    op: ClientOp::Get { key: b("k") },
+                },
+            ),
+            record(
+                read.1,
+                TraceEvent::ClientReturn {
+                    client: 2,
+                    seq: 0,
+                    result: ClientResult::Value(seen.map(b)),
+                },
+            ),
+        ];
+        if let Some(ms) = resend_applied {
+            for (server, ms) in [(2, ms), (3, ms + 5)] {
+                trace.push(record(
+                    ms,
+                    TraceEvent::RaftApply {
+                        server,
+                        range: 3,
+                        index: 7,
+                        entry_term: 1,
+                        hash: 0xbb,
+                        key: Some(b("k")),
+                        effect: ApplyEffect::Applied,
+                    },
+                ));
+            }
+        }
+        trace.sort_by_key(|record| record.at);
+        trace
+    }
+
+    /// How a history closed its abandoned operations, and how many it left pending:
+    /// (closed by an apply, never proposed, applied as nothing, pending).
+    fn fates(history: &History) -> (usize, usize, usize, usize) {
+        (
+            history.closed_by_apply,
+            history.never_proposed,
+            history.applied_as_nothing,
+            history.pending(),
+        )
+    }
+
+    /// A resend's proposal joins the operation its `ClientSend` names: the write's
+    /// first proposal applied as nothing and its resend's applied at 40, and at 45 on
+    /// a second replica, so the write returns at 40, and the read after it that saw
+    /// it is linearizable.
+    #[test]
+    fn a_resends_proposal_closes_the_operation_its_send_names() {
+        let history = History::from_trace(&resent_trace(0, Some(40), (100, 110), Some("a")));
+        assert_eq!(history.ops.len(), 2, "{history:?}");
+        assert_eq!(fates(&history), (1, 0, 0, 0), "{history:?}");
+        assert_eq!(history.ops[0].ret, Some(at(40)), "{history:?}");
+        check(&history).unwrap();
+    }
+
+    /// The pair: the same trace with the resend's `ClientSend` naming another
+    /// operation. The write's only proposal applied as nothing, so it leaves the
+    /// history, and the read saw a value nobody wrote. The two traces differ in that
+    /// one `invoked` alone.
+    #[test]
+    fn a_resend_whose_send_names_another_operation_closes_nothing_of_this_one() {
+        let history = History::from_trace(&resent_trace(1, Some(40), (100, 110), Some("a")));
+        assert_eq!(fates(&history), (0, 0, 1, 0), "{history:?}");
+        assert_eq!(history.ops.len(), 1, "{history:?}");
+        assert!(check(&history).is_err(), "{history:?}");
+    }
+
+    /// One proposal applied as nothing and the other never applied: the write may
+    /// still take effect, so it stays pending, and a read that saw it is
+    /// linearizable. Gathered under its own `seq` alone, or left out where any one
+    /// proposal applied as nothing, it would leave the history and the read would be
+    /// a violation.
+    #[test]
+    fn an_operation_whose_resend_never_applied_stays_pending() {
+        let history = History::from_trace(&resent_trace(0, None, (100, 110), Some("a")));
+        assert_eq!(fates(&history), (0, 0, 0, 1), "{history:?}");
+        check(&history).unwrap();
+    }
+
+    /// Every effect but `applied` closes nothing: the write's one proposal applied in
+    /// its own range with each other effect, so the write did not take effect and
+    /// leaves the history, and the later read that saw nothing is linearizable.
+    /// `an_operations_proposal_is_closed_by_its_own_ranges_apply` is the same trace
+    /// with `applied`, which closes it.
+    #[test]
+    fn an_operations_proposal_is_closed_only_by_an_apply_to_effect_applied() {
+        // Every effect of `ApplyEffect` (trace.rs) but `applied`. The enum is
+        // non-exhaustive, so no match here can say so: an effect added there is added
+        // here.
+        for effect in [
+            ApplyEffect::OutOfSpan,
+            ApplyEffect::Frozen,
+            ApplyEffect::Took,
+            ApplyEffect::Aborted,
+            ApplyEffect::Refused,
+            ApplyEffect::None,
+        ] {
+            let history = History::from_trace(&two_range_trace(2, effect));
+            assert_eq!(fates(&history), (0, 0, 1, 0), "{effect:?}: {history:?}");
+            assert_eq!(history.ops.len(), 1, "{effect:?}: {history:?}");
+            check(&history).unwrap_or_else(|violation| panic!("{effect:?}: {violation}"));
+        }
+    }
+
+    /// The write returns at the earliest apply to `applied` of any of its proposals
+    /// on any replica, at 40 (SHARD.md §9): not at its first apply, the `out_of_span`
+    /// one at 20, and not at a later apply to `applied`, its resend's entry on a
+    /// second replica at 45 or a third proposal at 50. The client sent the resend's
+    /// `seq` again to range 3's next leader, which proposed it a second time at
+    /// (8, 2), and both entries applied. A read over [30, 35] that saw nothing is
+    /// linearizable, the write taking effect after it.
+    #[test]
+    fn an_operation_returns_at_its_first_apply_to_effect_applied_not_its_first_apply() {
+        let mut trace = resent_trace(0, Some(40), (30, 35), None);
+        trace.extend([
+            record(
+                36,
+                TraceEvent::ClientSend {
+                    client: 1,
+                    seq: 1,
+                    range: 3,
+                    generation: 1,
+                    to: 3,
+                    invoked: 0,
+                },
+            ),
+            record(
+                38,
+                TraceEvent::RaftProposed {
+                    server: 3,
+                    range: 3,
+                    client: 1,
+                    seq: 1,
+                    index: 8,
+                    term: 2,
+                },
+            ),
+            record(
+                50,
+                TraceEvent::RaftApply {
+                    server: 3,
+                    range: 3,
+                    index: 8,
+                    entry_term: 2,
+                    hash: 0xbb,
+                    key: Some(b("k")),
+                    effect: ApplyEffect::Applied,
+                },
+            ),
+        ]);
+        trace.sort_by_key(|record| record.at);
+        let history = History::from_trace(&trace);
+        assert_eq!(fates(&history), (1, 0, 0, 0), "{history:?}");
+        assert_eq!(history.ops[0].ret, Some(at(40)), "{history:?}");
+        check(&history).unwrap();
+    }
+
+    /// `applied` is any client command executed within its span, whatever it wrote
+    /// (SHARD.md §9): an abandoned compare-and-set applied there closes its operation
+    /// at the apply with no result, even where its compare failed, and the model
+    /// chooses the boolean. Nothing wrote `"x"`, so it did not swap: a later read that
+    /// saw nothing is linearizable, and one that saw `"y"` is not. Its client traces
+    /// no `ClientSend` and sends it under its `seq` 1, as the sharded sweep's bursts
+    /// send theirs (D-131): a proposal no `ClientSend` names is its own `seq`'s
+    /// operation's.
+    #[test]
+    fn a_compare_and_set_whose_compare_failed_still_closes_its_operation() {
+        let trace = |seen: Option<&str>| {
+            vec![
+                record(
+                    0,
+                    TraceEvent::ClientInvoke {
+                        client: 1,
+                        seq: 1,
+                        op: ClientOp::Cas {
+                            key: b("k"),
+                            expect: Some(b("x")),
+                            value: b("y"),
+                        },
+                    },
+                ),
+                record(
+                    10,
+                    TraceEvent::RaftProposed {
+                        server: 1,
+                        range: 2,
+                        client: 1,
+                        seq: 1,
+                        index: 5,
+                        term: 2,
+                    },
+                ),
+                record(
+                    50,
+                    TraceEvent::RaftApply {
+                        server: 1,
+                        range: 2,
+                        index: 5,
+                        entry_term: 2,
+                        hash: 0xaa,
+                        key: Some(b("k")),
+                        effect: ApplyEffect::Applied,
+                    },
+                ),
+                record(
+                    100,
+                    TraceEvent::ClientInvoke {
+                        client: 2,
+                        seq: 0,
+                        op: ClientOp::Get { key: b("k") },
+                    },
+                ),
+                record(
+                    110,
+                    TraceEvent::ClientReturn {
+                        client: 2,
+                        seq: 0,
+                        result: ClientResult::Value(seen.map(b)),
+                    },
+                ),
+            ]
+        };
+        let history = History::from_trace(&trace(None));
+        assert_eq!(fates(&history), (1, 0, 0, 0), "{history:?}");
+        assert_eq!(
+            (history.ops[0].ret, history.ops[0].result.clone()),
+            (Some(at(50)), None),
+            "{history:?}"
+        );
+        check(&history).unwrap();
+        let swapped = History::from_trace(&trace(Some("y")));
+        assert!(
+            check(&swapped).is_err(),
+            "a compare-and-set whose compare failed was placed as a swap: {swapped:?}"
+        );
     }
 
     #[test]
