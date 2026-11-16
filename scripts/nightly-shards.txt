@@ -841,6 +841,16 @@
 # other row moved by under 10 % (`every_seed_passes_on_the_correct_sharded_sweep` 392.9 -> 410.8, +4.6 %). Seed 1314's
 # pin is re-pinned on seed 448 and renamed, keeping shard 4: 0.2 (0.15 + 0.00 three times, rounded up), shard 4 at
 # 2452.1 -> 2452.0.
+# #162's S13 (SHARD.md §11, env 7: the directed runs Stage C added join the determinism test) re-weighed one `parallel`
+# row in place, `a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace`, which now compares eleven more
+# runs, each on seed 42 alone and on seeds 40 to 43 inside the driver, the same at every tier. Weighed on its tree from
+# the built release binary (`parallel-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
+# three runs, the median rounded up to a tenth, on an Apple M2 of 8 cores on AC power beside other slices' builds (load
+# averages 5 to 6): 22.8 (21.84 + 0.96, 21.49 + 0.81, 23.36 + 0.96). Each run was beside one of the test without the
+# line its review added, the sharded sweep on `shard::Schedule::shaped`, which measured 21.8 (21.73, 21.57, 26.48) there
+# and 28.4 at load averages 31 to 61. The test as it stood measured 11.8 (11.80, 11.90, 10.31) against its row's 10.8,
+# at load averages 15 to 20 just after. It keeps its shard, shard 5 at 2461.0 -> 2473.0, still the heaviest. No other
+# row moved. Shard 5's header is recomputed.
 # shard 1: 2430.6 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -967,7 +977,7 @@
 4	shard	0.6	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
 4	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
 4	node	33.5	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves
-# shard 5: 2461.0 cpu s
+# shard 5: 2473.0 cpu s
 5	shard	31.5	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.6	seed_2272_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
 5	shard	0.1	seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
@@ -981,7 +991,7 @@
 5	shard	0.6	a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep
 5	shard	4.6	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_sharded_sweep
 5	shard	4.7	a_placeholder_that_grants_votes_is_caught_by_check_20_on_the_sharded_sweep
-5	parallel	10.8	a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace
+5	parallel	22.8	a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace
 5	shard	15.9	a_server_without_pre_vote_is_caught_by_the_isolations_on_the_sharded_sweep
 5	shard	16.1	a_snapshot_that_overlaps_a_replica_is_caught_by_check_8_on_the_sharded_sweep
 5	shard	16.1	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_sharded_sweep
