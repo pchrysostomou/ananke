@@ -26415,7 +26415,7 @@ reason:
 | seed 368 (a grant whose answer has not landed) | absence: no plain schedule of the ten thousand carries it |
 | seed 8934 (a placeholder's answer overtaken) | absence: the fold without resets passes every plain schedule of the ten thousand |
 | seed 707 (the log view after a re-seed) | absence |
-| seed 992 (an asker whose answer is lost) | seed 1314 |
+| seed 992 (an asker whose answer is lost) | seed 1314; re-pinned by D-143 on seed 448, on the sweep's own schedule |
 | seed 5620 (an install a split overtook) | absence; the variant's catch is `install.rs`'s unit tests' |
 | seed 16725 (a write that heard nothing) | seed 73, the lowest |
 | seed 18925 (an asker's tries spent on bounces) | absence: no restart arm on it now |
@@ -26440,6 +26440,10 @@ and the absences on seeds 707, 5620 and 18925 are asserted on that schedule and 
 schedules were re-audited the same way at the integration; what each became is in its own entry.
 At the integration's finish, seeds 1314 and 73 also assert their situations absent from the sweep's
 schedule, by D-135's rule (`absent_from_the_sweep`; D-135 §5's note).
+
+*Re-pinned by D-143.* Seed 1314's asker, under D-143's asker, asks anew `SPLIT_RETRY` after its
+answer is lost and ends before the last heal, an asker D-092's check no longer asks of. The pin is
+seed 448's now, which carries the whole situation on the sweep's own schedule (D-143 §5).
 
 ### Found on the way: two plain-schedule seeds
 
@@ -27580,6 +27584,17 @@ harness, shown from the trace, and each is fixed there; no bound moved.
   keeps refusing still stops and is still reported. Seed 18925's pin
   (`seed_18925_an_asker_whose_tries_went_on_bounces_...`) asserts the twelve asks before the first
   refusal, a retry after it, and the answer within D-092's bound; removing the refill fails it.
+- *Amended by D-143 after #259.* The count this bullet restarts now holds only before the first
+  `NoRangeId`. From that refusal the asker asks until its window closes: D-092's bound past the
+  later of the last fault's heal, read on the admins' clock, and the refusal, and one wait more,
+  where this entry gave it `ASKS` again. Once refused it waits `SPLIT_RETRY` for an answer, not
+  `SPLIT_WAIT`, before it asks anew (seed 992's change above), and it reads no answer queued
+  before an ask as that ask's answer. Seed 781 under `ReadCheckAtReceiptOnly` failed #259's nightly
+  on the count: its asker spent 5 of its 12 retries inside the fault and stopped unanswered 1.15 s
+  past the heal, after the id it waited for had landed. The bound is unchanged. Seed 18925's pin
+  keeps its predicate, read as D-143 says, and its mechanism, a first `NoRangeId` on the count's
+  last ask still followed by a retry, is held by a directed test of the asker (D-143 §4); seed
+  992's lost answer, on seed 1314 since D-127, is re-pinned on seed 448.
 
 **D-064's rows.** Weighed from the built release binaries at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
 user + sys, three runs, the median, on an Apple M2 of 8 cores under load averages of 14 to 54.
@@ -28083,7 +28098,8 @@ the arm's split's answer lost, with its asker asking anew and refused `KeyOutsid
 sweep's schedule seed 1314's arm's split is still refused `NoRangeId` on its node's new run, so the
 broad predicate is true there and cannot serve as its absence. The 992 pin runs the variant on the
 sweep's schedule (`absent_from_the_sweep_of`). The guard asserts each predicate true on its shaped
-run.
+run. *Re-pinned by D-143:* seed 1314's pin is seed 448's, on the sweep's own schedule, so three pins
+assert an absence through `absent_from_the_sweep` now (D-143 §5).
 
 `absent_from_both` has no such guard. No run on the integrated tree reaches any of its four
 situations (707, 16725, 18925, 1032), so there is no run to assert a predicate true on first. What
@@ -28116,6 +28132,14 @@ widened here. It is left to the owner, pending an issue. *The owner ruled on 202
 during this integration (D-142):* in #220's exception alone, and until #220 is fixed, a replica
 quarantined under D-130 counts as a voter that cannot vote. Node 3's range 51 is one D-130's rule
 quarantined, so seed 1137 passes there, and is pinned on the sweep's schedule on that mechanism.
+
+*Re-derived by D-143*, whose asker asks until its window closes from its first `NoRangeId`. 707 and
+5620 assert no ask count, and their absences hold on both schedules. 992 under `RefusedAfterRefill`
+holds unchanged. 992's lost answer, seed 1314's, is re-pinned on seed 448 (D-143 §5). 18925's
+predicate is unchanged, twelve asks before the arm's asker's first `NoRangeId` and one after, but
+the twelve are now the asker's whole count before any refusal and the ask after comes from the
+window, not from a second twelve; its absence holds on both schedules, and a directed test of the
+asker holds its mechanism (D-143 §4, §5).
 
 The node sweep's pins (seeds 48 and 66 under check 16's comparison) run `raft::run_on_the_node` and
 did not move.
@@ -28892,4 +28916,129 @@ Nothing else moves. `able`, `stuck` and `others` are read as before, and `others
 
 ---
 
-_Next entry: D-143. Add one before implementing anything not covered above._
+## D-143 — The D-092 asker asks until its window closes: it reads no answer queued before an ask as that ask's answer, from its first `NoRangeId` it asks until D-092's bound past the later of the heal and that refusal and one wait more, and once refused it waits `SPLIT_RETRY` for an answer before it asks anew; amends D-131 after #259's nightly
+
+**Decided** — the owner's, of 2026-11-16 (given in chat the night of 2026-11-15), after #259's nightly. The choices the ruling leaves open are this entry's, each marked PROPOSED below, and their code sites `// PROPOSED(D-143)`.
+
+**The number.** D-143, after D-142 in number order. The footer moves to D-144. Every code site carries `// D-143`. D-131 is merged, so it is amended by this entry and a note in D-131 marked "amended by D-143 after #259"; D-092's code sites, the check's two (`Retried::took_no_effect`, `Report::retries_take_effect`) and its pair's test, carry a `// D-143` line beside theirs.
+
+**The ruling, verbatim**, the option chosen: "Διόρθωση πρώτα (Recommended)", "fix first". Its text, in English: the owner approves a new design of the harness's split asker (`sim/shard.rs`'s `split_admin`, D-092's asker), amending D-131.
+1. It never reads an answer queued before the current ask as that ask's answer. It drains the socket before each ask, and processes a done (or other non-`NoRangeId`) answer it finds queued rather than dropping it. Retries share one number, so the number cannot tell them apart.
+2. After the first `NoRangeId` it keeps asking until a deadline, instead of the count `ASKS = BOOTSTRAP * 4 = 12`. The deadline is the later of the last fault's heal, read on the admins' clock, and its first `NoRangeId`, plus `election_max() * LIVENESS_TIMEOUTS`, plus one wait. The heal is known from the schedule before the run.
+3. After the first refusal it waits for an answer for about `SPLIT_RETRY`, not `SPLIT_WAIT` (600 ms), and then asks anew (`ASK_ANEW`), so that one lost answer cannot carry an asker over the bound.
+
+The check (`retries_take_effect`, `Retried::took_no_effect`), the 2 s bound and the variant test's "every failure at serving" assertion are unchanged. The merge waits for the fix. Filed separately and not part of this entry: #260, `meta_sender`'s double advance of `root_turn`.
+
+### 1. What failed, and why
+
+#259's ten-thousand-seed nightly, shard 4, failed `a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep` on seed 781 under `ReadCheckAtReceiptOnly`, on the sweep's own schedule: "seed 781: NoRangeId: the split of range 35 refused at Instant(6.633607232s) stopped asking at Instant(8.629701779s), 1.152701779s past the last heal at Instant(7.477s), with no answer". The test asserts that every failure is at serving, and this one was D-092's check.
+
+The diagnosis, verified independently of the agent that first made it:
+- The variant moved only timing. It touches the read's serving alone, and no read of the run touched range 35's split; with the variant made inert the run is byte-identical to the correct run, all 105 753 records, and passes.
+- On the timing it drew, restarted slow node 2 held no id block, and its refill landed 1.03 s after the last heal, past an injected drop, the crash of range 0's leader and a `NotLeader` round.
+- The asker of the restart arm's split of range 35 spent 5 of the 12 retries D-131 gave it inside the fault. Network duplicates of two of its asks left answers queued on its socket, and from then each ask read an earlier ask's answer at once; that backlog hid an injected drop of one ask, which would otherwise have cost it a `SPLIT_WAIT`. It stopped 1.15 s past the heal with no answer, 91 ms after the block it waited for had landed, inside D-092's 2 s.
+
+So the report was of the asker, not the system: a defect of the harness, the kind D-131 found on seed 18925 ("a report of the asker's count and not of the system"). The bound is unchanged. Seed 781 is not pinned on the stale-answer mechanism: single-seed counterfactuals took a different path at each change, and the verifier's own stand-in for the fix sent it to check 9 at serving.
+
+### 2. What changed (`sim/shard.rs`)
+
+- **`split_admin` takes `heal`**, the last fault's heal read on the admins' clock. `run_watched` reads it before the run from the schedule's timeline, the latest `Step::End` (the warmup's end where no fault is drawn), puts it on the admins' clock with the run's clock model (`RunHeader::node_time`), and passes it in at the asker's four call sites: `act`, `split_from_restarted`, `block_meta_and_split` and `split_the_left_half_through_the_third`. An assertion at the run's end ties it to `Report::last_fault_healed`, the heal D-092's check reads, on every run no check stopped.
+- **(1)** Before each ask it takes what its socket already holds (`queued`: the socket's `recv` polled with a no-op waker until it has nothing, so it never waits and draws nothing). None of it is the answer to the ask about to go. A queued `NoRangeId` is dropped; any other answer is taken as one read after an ask is.
+- **(2)** Before its first `NoRangeId` the asker asks `ASKS` times, round the bootstrap nodes four times, waiting `SPLIT_WAIT` for each answer, as before. Its first `NoRangeId` opens D-092's window, and from then it asks while its clock reads before `window_closes(heal, refused)`: the later of `heal` and that refusal, plus `election_max() * LIVENESS_TIMEOUTS`, plus one `RETRY_WAIT`. D-131's second `ASKS` is gone.
+- **(3)** Once refused, it waits `RETRY_WAIT` for each answer, which is `SPLIT_RETRY`, 150 ms. After a silent wait it tries the next node under a number the leader has not seen (`ASK_ANEW`), as D-131 has it.
+- `Report::heal_on_the_admins_clock` and `Report::askers_short_of_their_window`, the askers refused `NoRangeId` that stopped with no answer before their window closed, which no run has (§4).
+
+So "with no answer" now means the system did not make the retry take effect within D-092's bound: an asker stops unanswered only once its window has closed, past the bound by the check's own reading (§3, P4).
+
+### 3. What the ruling leaves open, proposed here
+
+Each follows the existing code's meaning where it has one.
+
+- **P1. A queued `NoRangeId` is dropped outright.** It is not counted in the driver's figures (`refused`, `no_range_id`, D-092's measurement), and it does not open the window. The ruling processes the other answers and so drops this one; what dropping means for the figures it does not say. It answers an ask the asker has moved past, the ask about to go is its retry, and counting it would count a network duplicate twice. The cost: where a late `NoRangeId` is the asker's first, its window opens at the next refusal it does read, a little later. The correct sweep counts 64 at the thousand, against 68 on #259's tip.
+- **P2. Any other queued answer is taken as one read after an ask is**, by the same arms: done ends the asker and counts as done; a refusal other than `NoRangeId` ends it on that refusal and counts; `NotLeader` moves its target to the leader it names, or to the next node; `RangeMismatch` to the next node. The first queued answer that ends it ends it; the rest are left unread. The ruling names "a done (or other non-`NoRangeId`) answer"; how each is processed is the existing arms'.
+- **P3. The queue is read once more before the asker stops**, not only before each ask, so an answer that came during its last `SPLIT_RETRY` sleep is read. "Never reads an answer queued before the current ask as that ask's answer" leaves an answer queued at the stop unread; reading it is the existing meaning of an answer the asker has. It can only move an asker past its window from "with no answer" to "answered, over the bound", both violations.
+- **P4. "About `SPLIT_RETRY`" is `SPLIT_RETRY` itself, 150 ms (`RETRY_WAIT`), and "one wait" in the deadline is that `RETRY_WAIT`.** The verifier's stand-in used 200 ms. The wait is longer than the admins' clock's offset from global time, at most 50 ms of skew and 500 ppm of drift on this sweep, so an asker that stops unanswered at the window's close is past the bound by D-092's check too, which reads the heal on the global clock (#245).
+- **P5. Once refused, a silent wait still moves the asker to the next node**, besides asking anew, as the existing code did after any silent wait.
+- **P6. The window gates asks.** No ask is sent at or after its close. The last ask's answer is awaited up to `RETRY_WAIT` past it, and a `NoRangeId` read just before it carries the stop up to `SPLIT_RETRY` past it.
+- **P7. Inside the window a bounce is asked again at once**, as before it: a `NotLeader` or `RangeMismatch` answer moves the target on and the asker asks again with no wait, and those asks are bounded by the window's time, not by a count. Under D-131 the second count capped them at twelve; the ruling replaces the count and says nothing of the bounces, and this is the existing code's arms. So through a leaderless stretch an asker once refused asks once a round trip until its window closes: a directed probe at D-143's review, every node answering `NotLeader` naming none after a first `NoRangeId` at 2 ms, 1 ms a hop, asked 1 001 times before it stopped at 2.153 s with no answer. On the correct sweep's seeds 0 to 999, on this tree and on #259's tip, no asker asked more than twelve times (seed 959), as measured at the same review.
+
+### 4. The tests
+
+Six directed tests in `sim/shard.rs` run one asker against three scripted servers, with no drops and no duplicates, and each was seen to fail with its plant:
+- `the_asker_refused_asks_until_its_window_closes_and_not_by_a_count`: servers that refuse every split `NoRangeId`, the heal at 3 s and at 0. The asker asks until `window_closes`, never at or after it, stops with no answer at most a `SPLIT_RETRY` and a `RETRY_WAIT` past it, and asks more than D-131's thirteen times. Planted back to D-131's count, it fails.
+- `the_asker_reads_no_queued_answer_as_the_answer_to_its_next_ask`: the first ask's `NoRangeId` arrives twice and the second ask is answered done 50 ms after it arrives. Two asks, one `NoRangeId` counted, ended on the second ask's own answer. With the queue not read (the old asker), it fails.
+- `the_asker_takes_a_done_it_finds_queued`: a done arrives during the asker's `SPLIT_RETRY` sleep, and every later ask is met with silence. It ends on that done with one ask. With the queue not read it fails, and with every queued answer dropped, as the verifier's stand-in did, it fails.
+- `the_asker_refused_waits_a_short_while_for_an_answer_and_then_asks_anew`: the silent ask's next goes `SPLIT_RETRY` later to the next node under `ASK_ANEW`. With `SPLIT_WAIT` for the wait it fails, and with `ASK_ANEW` planted out it fails.
+- `the_asker_never_refused_stops_after_its_count`: `NotLeader` naming none from every node, twelve asks, no window, no `Retried`. With the count planted out it fails.
+- `the_asker_refused_on_the_last_ask_of_its_count_still_retries`, seed 18925's mechanism (D-131): `NotLeader` naming none to the count's first eleven asks, `NoRangeId` to its twelfth and done to every ask after. Thirteen asks, the last `SPLIT_RETRY` after the refusal, one `Retried`, ended on the done. With the refusal on the count's last ask ending the asker (`Some(_) if tries == 0 => break` before the window's arm, seed 18925's bug in this asker's form), it fails: twelve asks. Added at D-143's review, which found nothing else holding it: with that plant the other directed tests and `sim/tests/shard.rs` passed at the gate's twenty, and the correct sweep passed at a thousand, where no correct asker is refused on its count's last ask; only `RefillNotResent`'s window assertion caught it at the premerge's tier, on one asker of one seed in its hundred.
+
+The wiring of the heal at the call sites is held by the sweeps. `every_seed_passes_on_the_correct_sharded_sweep` asserts, at every tier, that no asker refused `NoRangeId` stopped with no answer before its window closed, and prints how many stopped with no answer. `a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered` asserts the same of the variant's askers, which are never answered, and that some went unanswered. With the call sites given the warmup's end for the heal (a plant), the variant's test fails at the gate's twenty: 91 of its 92 unanswered askers stopped short of their window.
+
+### 5. Pins
+
+The change moves the runs that have an asker refused `NoRangeId` or an answer queued on an asker's socket. At the gate's twenty, the whole workspace in release (`ANANKE_SEEDS=20 cargo test --release --workspace --all-features --all-targets --no-fail-fast`), every test passed but seed 1314's pin. At a thousand, `sim/tests/shard.rs` passed 45 of its 46, seed 1314's pin the one, and `sim/tests/node.rs` (72) and `sim/tests/reseed.rs` (19) passed whole. Seed 1314's is the one pin re-pinned; the others hold as they stood. On the tree as committed the gate's twenty pass across the workspace, seed 448's pin and the directed tests among them, with rustfmt, clippy, the direct-I/O check, `cargo doc`, the doctests and `scripts/check-nightly-shards.sh`.
+
+**Seed 1314, re-pinned by D-143 on seed 448.** Its asker, asking anew after `SPLIT_RETRY` where it waited 600 ms, ended on `KeyOutsideSpan` at 7.775 s on the admins' clock, before the last heal, and D-092's check no longer asks of it; the pin asserted that it does. A search of seeds 0 to 9 999 on both schedules for the whole situation (the restart arm's split refused `NoRangeId` on its node's new run, its retry applied at its proposal, its done dropped on the way to the asker, the asker asking anew and refused `KeyOutsideSpan`, the asker asked of and answered within the bound, the split applied by the answer) found it on the sweep's own schedule on seeds 448, 1989, 3544, 8085 and 9769, and on the shaped schedule on 1989 and 2421. The pin runs seed 448 on the sweep's schedule, so it needs no absence on another; `seed_448_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound` asserts the mechanism as 1314's did and, of D-143, each silent wait well short of `SPLIT_WAIT` and each ask after a silence under a new number, read off the trace. It fails with `SPLIT_WAIT` for the wait and with `ASK_ANEW` planted out. D-127's table of re-pins and D-135 §5 carry the note.
+
+**D-135's pins, re-derived for the new asker.**
+- **707** (log view) and **5620** (install) assert no ask count. Their absences hold on both schedules.
+- **992** under `RefusedAfterRefill`, on the shaped schedule, asserts one asker asked of and refused `NotLive`, with the split never applied, and its absence from the sweep's schedule. Both hold unchanged.
+- **992's lost answer**, on 1314 since D-127, is 448's above.
+- **18925.** Its predicate counts the arm's asker's asks: twelve, `BOOTSTRAP * 4`, before its first `NoRangeId` and at least one after. Under D-131 the twelve were the whole budget, which the first refusal gave again. Under D-143 they are the asker's whole count before any refusal, the refusal coming on its last ask, and the ask after it comes from the window. The predicate is unchanged. What it now asserts is that no asker of the restart arm's split, on either schedule of seed 18925, spent its whole count before its first refusal and then retried, and that the day one does the pin is upgraded to its mechanism. Its tie to the arm's asker holds as before: only the asker's own first `NoRangeId` gives it a thirteenth ask. The mechanism itself, a first refusal on the count's last ask still opening the window and a retry after it, is held by `the_asker_refused_on_the_last_ask_of_its_count_still_retries` (§4), and the count before the first refusal and the window after it by the other directed tests, none of which a schedule moves.
+
+### 6. Measured
+
+On this tree and on #259's tip (b635f4e, the tree before it), in release, on an Apple M2 of 8 cores, one sweep at a time.
+
+**The correct system.** No correct run fails anywhere measured.
+- `every_seed_passes_on_the_correct_sharded_sweep` at ANANKE_SEEDS=10000, the sweep's own schedule: **0 of 10 000 seeds failed**, 519 s of wall, 3 921.9 s user and 81.7 s sys. Meta convergence was asked of 27 663 descriptors, none unnamed, worst 834 ms; #220's exception excused 64, 20 of them by D-142's reading alone, as before.
+- The shaped schedule (`Schedule::shaped`), seeds 0 to 9 999, by a probe that asks each run the sweep's verdict, `check()` and D-141's clause: **0 failed**.
+- The correct node sweep, `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`, at 1000: passes, 112 s of wall. It does not run this asker; its own is `sim/raft.rs`'s.
+
+**D-092's askers on the correct sweeps, seeds 0 to 9 999**, this tree against #259's tip:
+
+| | refused `NoRangeId` | asked of by the check | the slowest of those | refused and unanswered | of those, asked of |
+|---|---|---|---|---|---|
+| sweep's schedule, D-143 | 591 | 67 | 637 ms | 2 | 0 |
+| sweep's schedule, #259's tip | 592 | 72 | 1.572 s | 9 | 0 |
+| shaped schedule, D-143 | 658 | 70 | 833 ms | 2 | 0 |
+| shaped schedule, #259's tip | 662 | 77 | 978 ms | 6 | 0 |
+
+- Every asker asked of was answered, and its split had applied by its answer: on the sweep's schedule 62 done and 5 `KeyOutsideSpan`.
+- The four askers left unanswered are seed 1409's of range 2 and seed 9217's of range 19 on the sweep's schedule, and two of seed 8324's of range 27 on the shaped one. Each stopped at its window's close, 2.1 s to 2.3 s past the heal, and none is asked of. Each seed is uniform, but no range of it, range 0 among them, has a majority up where the run ends (the majority rule, replicas on refused nodes impaired), so the check asks nothing of it.
+- On #259's tip the nine unanswered askers of the sweep's schedule included three still asking at the heal and stopped unanswered after it, on seeds the check exempts as not uniform: 1223 (+0.98 s), 3050 (+1.38 s) and 9011 (+0.65 s), the shape of seed 781. On this tree none of the three is left unanswered.
+- Fewer askers are asked of: once refused, an asker waits `SPLIT_RETRY` where it waited 600 ms, and reads no stale answer, so more are answered before the heal, as on seed 1314.
+
+**The variants whose catch involves the asker**, at their tiers, D-143 against #259's tip:
+
+| Variant (test) | the gate's 20 | the premerge's tier | the nightly's tier |
+|---|---|---|---|
+| `ReadCheckAtReceiptOnly` (share) | 10 of 20, all at serving; 10 | 66 of 100, all at serving; 66 | **599 of 1 000, all at serving; 600, 599 at serving and seed 781 by D-092's check** |
+| `RefillNotResent` (share) | 10 of 20; 3 | 46 of 100; 16 | 451 of 1 000; 173 |
+| `RefusedAfterRefill` (over the thousand) | fired 1, none asked of; the same | fired 45, asked of 7, caught 7; 44, 8, 8 | — |
+| `MetaOverwritesByArrival`, each run to its end | — | check 16 357, the bound 27, the arm's reorder 298 with check 16 on each and the bound on 19; the same | — |
+| `IdBlockResumed` (share) | — | 52 of 100, check 18 by the run on 17, an id taken twice on 35; the same | — |
+| Check 9 under `ReadCheckAtReceiptOnly`, fold by fold, `node.rs` | — | 66 of 100; 66 | — |
+| Check 16 under `MetaOverwritesByArrival`, sharded, fold by fold, `node.rs` | — | 33 of 100; 33 | — |
+
+- `RefillNotResent`'s askers are never answered; under D-143 each asks until its window closes, and every one of the 4 024 the variant left unanswered over the nightly's thousand did, as the test now asserts at every tier.
+- The rest of the shard binary's variants at the premerge's thousand print what they printed on #259's tip, to within a seed: `ClientIgnoresMismatch`'s write bound 23 of 500 uniform seeds against 21, `TrustStaleDescriptor`'s linearizability 65 against 64, and the others the same.
+- The correct sweep at the thousand: the driver asked 5 177 splits on both trees, done 4 645 against 4 644, refused `NoRangeId` 64 times against 68 (P1), unanswered 96 on both.
+
+**Seed 781 under `ReadCheckAtReceiptOnly`, on the sweep's schedule: now passes.** The restart arm's asker of range 35 on restarted node 2 is refused `NoRangeId` ten times from 6.634 s on the admins' clock, its window open, until node 2's block lands; its split applies at 8.410 s, and the asker is answered done at 8.414 s, 937 ms past the heal. No read the variant serves is caught on this run. The correct run of seed 781 passes as well.
+
+### 7. D-064's rows
+
+Every `shard` row and the two `node` rows that run the sharded sweep were weighed on this tree and on #259's tip, one run each from the built release binaries at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys. One row moved by more than 10 %: `RefillNotResent`'s, 25.7 -> 32.5, its askers asking until their window closes. Re-weighed, three runs, the median rounded up to a tenth: 31.5 (30.94 + 0.79, 30.74 + 0.69, 30.79 + 0.68). It keeps shard 5, at 2449.9 -> 2461.0, now the heaviest. Seed 1314's row is seed 448's, renamed in shard 4: 0.2 (0.15 + 0.00, three times), shard 4 at 2452.1 -> 2452.0. The rows under a second moved by at most 0.02 s, twice the timer's resolution, and none crosses its rounded tenth. Every other row moved by under 10 %, the correct sharded sweep's by 4.6 % (392.9 -> 410.8). The directed tests are in the crate's lib, in the `rest` job. `scripts/check-nightly-shards.sh` passes.
+
+### 8. What it costs, and what it does not change
+
+- An asker refused `NoRangeId` and never answered now asks until D-092's bound past the heal, one ask every `SPLIT_RETRY` and a round trip while it is refused, and one a round trip while it is bounced (P7), through the rest of a fault and past it; one ask anew to a leader that holds ids proposes the split again, and that id goes unused if the first applies. The driver's drain waits for it. `RefillNotResent`'s test costs 26 % more for it.
+- A retry that is proposed and slow to commit, but not lost, is handled: the asker ends on its done. But each ask anew that reaches the leader meanwhile carries a new number, which a leader holding ids proposes again with a fresh one, about one each `RETRY_WAIT` and round trip of the delay, where under `SPLIT_WAIT` a done up to 600 ms late arrived before any ask anew. With `ID_BLOCK` at eight (`REFILL_AT` two), a commit about a second slow can spend most of a block. A directed probe at D-143's review, its retry's done 400 ms late, saw two asks anew reach the leader, at 305 ms and 457 ms, each a proposal and an id in the real server, where `SPLIT_WAIT` would have made none. None happened over the correct sweep's first thousand seeds: no asker's split was proposed under more than one number, on this tree or on #259's tip.
+- P1 reaches only what is queued when the asker asks. A late answer still in flight then is read as the next ask's answer, and so it is across an ask anew too: there the number could tell them apart, but `reply_to` takes any number the asker has asked under, and refusing a superseded one would go past the ruling. So a late `NoRangeId` to the earlier number that lands in the wait after an ask anew is read as the new ask's refusal, counted, and filed in `no_range_id` under the node just asked, which never refused. It costs one `SPLIT_RETRY` and that misattributed row. It cannot make a false report or lose an answer: the new ask's own answer is read after it, by the next drain or as the next ask's answer (a directed probe at D-143's review, where it landed during the `SPLIT_RETRY` sleep and the drain took it).
+- An asker refused and still unanswered at the heal now keeps asking past it, so the check asks of it wherever it asks of its seed and range; D-131's count let some stop before the heal. Askers answered sooner are asked of less often: 67 askers over the sweep's 10 000 seeds against 72.
+- Unchanged: the check, the 2 s bound, `took_no_effect`, the variant test's "every failure at serving", the node sweep's asker in `sim/raft.rs`, and the system.
+
+---
+
+_Next entry: D-144. Add one before implementing anything not covered above._

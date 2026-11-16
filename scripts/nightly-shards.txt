@@ -829,6 +829,18 @@
 # at the Stage C integration, beside D-141's row, it goes into the integrated table's lightest, shard 3 at 2428.6 ->
 # 2428.8. `every_seed_passes_on_the_correct_sharded_sweep` reads one more fold per seed to print what the ruling
 # excused, and keeps its row; its re-weigh stays owed with the others'.
+# D-143 (the owner's ruling of 2026-11-16 on D-092's asker, after #259's nightly) changed the sharded sweep's asker,
+# which moves the runs with an asker refused `NoRangeId` or an answer queued. Every `shard` row and the two `node` rows
+# that run the sharded sweep were weighed on D-143's tree and on #259's tip, b635f4e, one run each from the built
+# release binaries at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores with nothing
+# else running. One row moved by more than 10 %, `RefillNotResent`'s,
+# `a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered`: 25.7 -> 32.5, its askers now asking
+# until their window closes. Re-weighed, three runs, the median rounded up to a tenth: 31.5 (30.94 + 0.79, 30.74 +
+# 0.69, 30.79 + 0.68), keeping its shard, shard 5 at 2449.9 -> 2461.0, now the heaviest. The
+# rows under a second moved by at most 0.02 s, twice the timer's resolution, and none crosses its rounded tenth; every
+# other row moved by under 10 % (`every_seed_passes_on_the_correct_sharded_sweep` 392.9 -> 410.8, +4.6 %). Seed 1314's
+# pin is re-pinned on seed 448 and renamed, keeping shard 4: 0.2 (0.15 + 0.00 three times, rounded up), shard 4 at
+# 2452.1 -> 2452.0.
 # shard 1: 2430.6 cpu s
 1	shard	311.8	every_seed_passes_on_the_correct_sharded_sweep
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -909,7 +921,7 @@
 3	split	318.8	a_leader_that_never_retakes_after_an_overlap_refusal_leaves_x_without_its_right_half
 3	shard	243.6	a_node_that_refuses_splits_once_its_refill_lands_leaves_the_retry_without_effect
 3	shard	0.2	seed_1137_a_right_half_whose_third_voter_is_quarantined_is_excused_from_the_meta_bound
-# shard 4: 2452.1 cpu s
+# shard 4: 2452.0 cpu s
 4	shard	14.9	clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_the_heal
 4	shard	146.2	a_meta_range_that_stores_updates_as_they_arrive_is_caught_on_the_sharded_sweep
 4	echo	0.1	same_seed_gives_byte_identical_trace
@@ -948,15 +960,15 @@
 4	shard	17.4	a_server_that_ignores_the_span_at_apply_trips_check_10_on_the_sharded_sweep
 4	shard	13.8	a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep
 4	node	12.8	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_read_check_at_receipt_only
-4	shard	0.3	seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
+4	shard	0.2	seed_448_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound
 4	shard	0.4	seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_the_log_view
 4	shard	1.0	seed_5620_an_install_a_split_overtook_switches_nothing_and_leaves_the_right_half_its_keys
 4	shard	0.3	seed_73_a_write_that_heard_nothing_is_asked_once_and_nothing_reads_a_value_applied_twice
 4	shard	0.6	seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id
 4	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
 4	node	33.5	the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_restart_drops_right_halves
-# shard 5: 2449.9 cpu s
-5	shard	20.4	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
+# shard 5: 2461.0 cpu s
+5	shard	31.5	a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered
 5	shard	0.6	seed_2272_a_right_half_with_no_possible_majority_is_excused_from_the_meta_bound
 5	shard	0.1	seed_2272_the_meta_bound_trips_again_on_any_condition_of_the_exception_broken
 5	shard	0.1	seed_368_a_grant_whose_answer_has_not_landed_still_refuses_a_split

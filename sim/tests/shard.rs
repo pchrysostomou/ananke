@@ -26,6 +26,7 @@ use ananke_env::sim::TraceRecord;
 use ananke_env::{Instant, NodeId, RangeCause, RecoveredAs, TraceEvent};
 use ananke_raft::apply::SplitRefusal;
 use ananke_raft::core::{Variant, Variants};
+use ananke_shard::client::RangedRequest;
 use ananke_shard::invariants::{self, Fold};
 use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
@@ -70,6 +71,11 @@ struct Seen {
     /// split had applied by then, and whether its key was outside its range by then
     /// (PROPOSED D-137).
     retries_answered: Vec<(&'static str, bool, bool)>,
+    /// The askers refused `NoRangeId` that stopped with no answer, asked of or not (D-143).
+    retries_unanswered: usize,
+    /// Those of them that stopped before their window closed, in words: none, an asker refused
+    /// asking until its window closes (D-143).
+    retries_short: Vec<String>,
     /// Check 8's right-half clause under reading R tripped (PROPOSED D-141).
     right_half: bool,
     /// The restatements past a split the clause excused, by a voter that had not applied it
@@ -311,6 +317,17 @@ fn seen_of(seed: u64) -> Seen {
             .iter()
             .map(|retried| retried.took(report.last_fault_healed))
             .collect(),
+        retries_unanswered: report
+            .driver
+            .retried
+            .iter()
+            .filter(|retried| !retried.answered)
+            .count(),
+        retries_short: report
+            .askers_short_of_their_window()
+            .iter()
+            .map(|retried| format!("seed {seed}: {retried:?}"))
+            .collect(),
         retries_answered: report
             .retries_asked()
             .iter()
@@ -549,10 +566,18 @@ fn every_seed_passes_on_the_correct_sharded_sweep() {
         "shard: D-092's asker: {} askers refused `NoRangeId`, {} of them still asking at the last \
          fault's heal on a uniform seed with their ranges live; the slowest of those took {:?}; \
          their answers, with whether the split had applied by then and whether its key was outside \
-         its range by then (PROPOSED D-137): {answered:?}",
+         its range by then (PROPOSED D-137): {answered:?}; {} of the askers refused stopped with \
+         no answer, each at its window's close (D-143)",
         seen.iter().map(|s| s.driver.retried.len()).sum::<usize>(),
         retries.len(),
         retries.iter().max(),
+        seen.iter().map(|s| s.retries_unanswered).sum::<usize>(),
+    );
+    // D-143: an asker refused asks until its window closes, unless an answer ends it first.
+    let short: Vec<&String> = seen.iter().flat_map(|s| &s.retries_short).collect();
+    assert!(
+        short.is_empty(),
+        "askers refused `NoRangeId` stopped with no answer before their window closed: {short:?}"
     );
     // PROPOSED(D-141): check 8's right-half clause under the owner's reading R of D-107,
     // asserted by every seed's verdict above; printed with what reading R excused —
@@ -851,6 +876,11 @@ struct Under {
     /// The holds an install let go with no replica restored (PROPOSED D-134), measured only when
     /// [`under`] is asked to.
     released: Option<Released>,
+    /// The askers refused `NoRangeId` that stopped with no answer (D-143).
+    unanswered: usize,
+    /// Those of them that stopped before their window closed: none, an asker refused asking until
+    /// its window closes (D-143).
+    short_of_window: usize,
 }
 
 /// `high_rate_share` of `sim/tests/node.rs`: a tenth of the tier, at least the gate's twenty.
@@ -892,6 +922,13 @@ fn under(
             splits: report.splits(),
             from_an_earlier_run: shard::splits_from_a_block_of_an_earlier_run_of(report.records()),
             released: released.then(|| released_of(&report)),
+            unanswered: report
+                .driver
+                .retried
+                .iter()
+                .filter(|retried| !retried.answered)
+                .count(),
+            short_of_window: report.askers_short_of_their_window().len(),
         }
     });
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
@@ -1043,11 +1080,18 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_by_check_9_on_the_sharded_s
 }
 
 /// §10's `ReadCheckAtReceiptOnly`, the pair's buggy half (the correct half is the sweep above,
-/// which reaches this window and refuses every such read at serving: D-131): 57 of 100
-/// seeds and 13 of the gate's 20 by check 9, the variant's named catch, at a `RaftRead` served for a right-half key at
+/// which reaches this window and refuses every such read at serving: D-131): 66 of 100
+/// seeds and 10 of the gate's 20 by check 9, the variant's named catch, at a `RaftRead` served for a right-half key at
 /// or past the split it let in. Every failure is that catch, and none trips first on anything else,
 /// so the words are asserted of every one.
+///
+/// #259's nightly failed it on seed 781 of its thousand, by D-092's check: the variant had moved
+/// the run's timing only, and the harness's asker stopped on its count with no answer, inside the
+/// bound (D-143). On D-143's tree, whose asker asks until its window closes: the same 10 of the
+/// gate's 20 and 66 of the premerge's 100 as on #259's tip, and 599 of the nightly's 1 000, every
+/// one at serving; seed 781 passes.
 // D-131
+// D-143: the nightly's seed 781 was the asker's, not the variant's.
 #[test]
 fn a_read_checked_only_at_receipt_is_caught_by_check_9_on_the_sharded_sweep() {
     let found = range_variant(
@@ -1624,9 +1668,14 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_sharded_sweep() {
 /// node is refused `NoRangeId`, and an asker's retries after the heal end with no answer: 32 of
 /// 100 seeds, by this check and no other. Re-measured once the retry has to take effect (PROPOSED
 /// D-137): 32 of 100 and 8 of the gate's 20, every one with no answer and none by a retry answered
-/// with no effect, since this variant's askers are never answered at all.
+/// with no effect, since this variant's askers are never answered at all. D-143's asker asks until
+/// its window closes, where D-131's count let it stop before or soon after the heal: 10 of the
+/// gate's 20, 46 of the premerge's 100 and 451 of the nightly's 1 000, against 3, 16 and 173 on
+/// #259's tip, every one with no answer. Each asker the variant leaves unanswered asked until its
+/// window closed, asserted at every tier, which holds D-143's heal at the asker's call sites.
 // D-092: answer A; the asker retries.
 // D-113: §8's pair for the check read from the heal.
+// D-143: the asker asks until its window closes.
 #[test]
 fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered() {
     let found = range_variant("RefillNotResent", share(), RangeVariant::RefillNotResent);
@@ -1640,6 +1689,21 @@ fn a_node_that_does_not_resend_its_refill_leaves_the_askers_retries_unanswered()
     assert!(
         said(&found, "with no answer") > 0,
         "no asker's retries after the heal went unanswered"
+    );
+    // D-143: each asker the variant leaves with no answer asked until its window closed.
+    let unanswered: usize = found.iter().map(|u| u.unanswered).sum();
+    let short: usize = found.iter().map(|u| u.short_of_window).sum();
+    println!(
+        "shard: RefillNotResent: {unanswered} askers refused `NoRangeId` stopped with no answer, \
+         {short} of them before their window closed (D-143)"
+    );
+    assert!(
+        unanswered > 0,
+        "no asker refused `NoRangeId` went unanswered"
+    );
+    assert_eq!(
+        short, 0,
+        "askers refused `NoRangeId` stopped with no answer before their window closed"
     );
 }
 
@@ -1666,7 +1730,7 @@ fn as_first_written(retried: &shard::Retried) -> shard::SplitFate {
 /// passes. 7 of 1 000 and 43 of 1 000 are under D-061's 5 %, so both are asserted over the thousand
 /// and printed below it, where it sweeps `share()`, the same twenty at the gate and in CI (1 fires,
 /// none asked), as D-113 §8 placed `NoRangeId`'s own count. Seed 992's pin asserts the catch at
-/// every tier.
+/// every tier. On D-143's tree, over the thousand: 45, 7 and 7 (44, 8 and 8 on #259's tip).
 // PROPOSED(D-137): the retry takes effect, not only gets an answer.
 #[test]
 fn a_node_that_refuses_splits_once_its_refill_lands_leaves_the_retry_without_effect() {
@@ -1825,6 +1889,12 @@ fn clients_cut_off_past_the_bound_after_the_heal_are_caught_by_the_reading_from_
 // and 13283 compare the correct run with their variant's. Corrected at the integration's finish:
 // this said that no pin was left whose situation the sweep's schedule alone lost and that
 // `absent_from_the_sweep` went; four were, and it is back.
+//
+// D-143: the asker's change moved the schedules of the runs with an asker refused `NoRangeId` or an
+// answer queued. Of these pins only 1314's failed at the gate's twenty and the premerge's thousand:
+// its asker, asking anew after `SPLIT_RETRY`, was answered before the last heal and was no longer
+// one D-092's check asks of. It is re-pinned on seed 448, on the sweep's own schedule, found by a
+// search of seeds 0 to 9 999 on both. Every other pin here holds on D-143's tree as it stood.
 
 /// A shape-drawn pin's run on the schedule it was found on, [`shard::Schedule::shaped`]: the
 /// sweep's before `Fault::MetaReorder` moved it.
@@ -1922,9 +1992,10 @@ fn restart_arms_split_refused_no_range_id(report: &shard::Report) -> bool {
 
 /// Whether the restart arm's split, retried on its restarted node, took effect at that proposal, its
 /// answer was dropped on the way to the asker, and the asker asked anew and was refused
-/// `KeyOutsideSpan`: the situation seed 1314 carries (seed 992's until PROPOSED D-127). On the
-/// sweep's schedule seed 1314's arm's split is still refused `NoRangeId` on its node's new run
-/// ([`restart_arms_split_refused_no_range_id`]), so that predicate cannot name the absence there.
+/// `KeyOutsideSpan`: the situation seed 448 carries on the sweep's schedule since D-143 (seed 992's
+/// until PROPOSED D-127, and seed 1314's on the shaped schedule until D-143). Seed 1314's absence
+/// from the sweep's schedule named this and not the broad
+/// [`restart_arms_split_refused_no_range_id`], which held there too.
 // PROPOSED(D-135): the Stage C integration, D-127 beside D-135.
 fn restart_arms_answer_lost_and_asked_anew(report: &shard::Report) -> bool {
     let records = report.records();
@@ -1996,7 +2067,17 @@ fn asks_around(report: &shard::Report, seq: u64, refused: Instant) -> (usize, us
 /// landing between the arm's twelfth and thirteenth. That reads as the situation reached where it
 /// is not: on the sweep's schedule a false alarm, never an absence that passes, and on the shaped
 /// run the pin asserts the one retried split and its counts itself (#240's second review).
+///
+/// Since D-143 the twelve, `BOOTSTRAP * 4`, are the asker's whole count before its first
+/// `NoRangeId` and no longer a budget its retries share: that refusal opens a window the asker
+/// asks in until it closes, D-092's bound past the later of the heal and the refusal, where D-131
+/// gave it twelve asks again. So the predicate reads the same asks, and what it names is an asker
+/// whose count went on bounces and whose first `NoRangeId` came on its last ask, still retrying
+/// after it, by the window now and by the count's restart before; only its own first `NoRangeId`
+/// still gives it a thirteenth.
 // PROPOSED(D-135)
+// D-143: the twelve are the count before the first refusal; the retries ask until the window
+// closes.
 fn restart_arms_asker_spent_its_asks_before_its_first_no_range_id(report: &shard::Report) -> bool {
     let asks = usize::try_from(shard::BOOTSTRAP * 4).expect("small");
     report.restart_arms.iter().any(|arm| {
@@ -3679,29 +3760,38 @@ fn seed_707_a_reseed_below_a_compacted_tail_leaves_nothing_of_the_lost_store_in_
 /// wait, is refused `KeyOutsideSpan` at once since the split has landed, and stops within it.
 ///
 /// **Pinned on seed 992 until PROPOSED D-127**, whose answers to the chunks a node holds moved its
-/// schedule off the shape. Seed 1314 carries it on D-127's tree: the restart arm's split refused `NoRangeId` on node 3's new run, its retry applied, the
-/// answer dropped on the way to the asker, the asker asking anew and refused `KeyOutsideSpan`,
-/// within D-092's bound. D-127 searched the shaped schedules, so at the Stage C integration (D-127
-/// beside D-135) the pin runs `shard::Schedule::shaped`, the schedule it was found on, and asserts
-/// its situation absent from the sweep's ([`absent_from_the_sweep`]). There `Fault::MetaReorder`
-/// moved it: the restart arm crashes node 1, not node 3, and its split of range 19 is refused
-/// `NoRangeId` twice on node 1's new run, then proposed, applied and answered done, the answer
-/// arriving. The broad predicate, [`restart_arms_split_refused_no_range_id`], holds there too, so
-/// the absence names the answer lost and the asker asking anew
-/// ([`restart_arms_answer_lost_and_asked_anew`]).
+/// schedule off the shape, and on seed 1314 from then, on `shard::Schedule::shaped`, with its
+/// situation asserted absent from the sweep's schedule (PROPOSED D-135).
+///
+/// **Re-pinned by D-143** on seed 448, on the sweep's own schedule. D-143's asker waits
+/// `SPLIT_RETRY` for an answer once refused, where it waited `SPLIT_WAIT`'s 600 ms, so on seed 1314
+/// it asked anew 450 ms sooner and ended on `KeyOutsideSpan` before the last fault's heal, an asker
+/// D-092's check no longer asks of. A search of seeds 0 to 9 999 on both schedules for the
+/// situation with the asker asked of found it on the sweep's schedule first on seed 448: node 2,
+/// crashed and restarted by the restart arm, is asked to split range 19 at `k12` after the last
+/// heal and refuses it `NoRangeId` on its new run; the retry is proposed and applied at 166 and
+/// its done is dropped on the way to the asker; the asker waits `SPLIT_RETRY`, asks node 3 anew
+/// (that ask is dropped too), waits again, asks node 1 anew, is sent to node 2 and is refused
+/// `KeyOutsideSpan`, 470 ms past the heal. Asserted: that mechanism, the split taking effect by the
+/// answer, the answer within D-092's bound, each silent wait well short of `SPLIT_WAIT`, and each
+/// ask after a silence under a number the leader has not seen. The numbers are read off the trace:
+/// on this seed a resend under the old number is answered too, node 2 no longer holding it as a
+/// copy of an entry in its log, so the answer alone would not show the asking anew (with
+/// `ASK_ANEW` planted out the pin fails there, and with `SPLIT_WAIT` for the wait it fails at the
+/// silent wait).
 // PROPOSED(D-131)
 // PROPOSED(D-127): re-pinned from seed 992, whose schedule D-127 moved.
-// PROPOSED(D-135): on the shaped schedule it was found on; the situation absent from the sweep's.
+// D-143: re-pinned from seed 1314, on the sweep's own schedule.
 #[test]
-fn seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound() {
-    let seed = 1314;
-    let report = shaped_of(seed, NodeVariants::correct());
-    absent_from_the_sweep(
-        &report,
-        "the restart arm's split's answer lost and its asker asking anew",
-        restart_arms_answer_lost_and_asked_anew,
-    );
+fn seed_448_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_bound() {
+    let seed = 448;
+    let report = shard::run(seed);
     report.check().unwrap();
+    assert!(
+        restart_arms_answer_lost_and_asked_anew(&report),
+        "seed {seed} no longer has the restart arm's split's answer lost and its asker asking anew: \
+         pin it on its mechanism"
+    );
     assert!(
         restart_arms_split_refused_no_range_id(&report),
         "seed {seed}: the restart arm's split is no longer refused `NoRangeId` on its node's new run"
@@ -3723,9 +3813,10 @@ fn seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_
         empties[0].restarted.is_some(),
         "its node restarted before it"
     );
-    assert!(
-        retried.answered && retried.asking_at(report.last_fault_healed),
-        "the asker is asked of, and got an answer: {retried:?}"
+    assert_eq!(
+        report.retries_asked(),
+        vec![retried.clone()],
+        "the asker is asked of: still asking at the last heal, on a uniform seed with its ranges live"
     );
     let records = report.records();
     let index_of_the_proposal = records
@@ -3775,6 +3866,35 @@ fn seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_
         retried.took(report.last_fault_healed) <= bound,
         "answered within D-092's bound: {retried:?}"
     );
+    // D-143: once refused, a silent wait is about `SPLIT_RETRY`, after which the asker asks anew,
+    // where it waited `SPLIT_WAIT`'s 600 ms. Every ask the asker sent: the refused one, the
+    // proposed retry, and the asks after it, each anew after a silence until the last.
+    let asks: Vec<(Instant, u64)> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::MessageSent { from, payload, .. } if *from == admin => {
+                let ask = RangedRequest::decode(payload.clone()).expect("a split's ask");
+                Some((record.at, ask.request.seq))
+            }
+            _ => None,
+        })
+        .collect();
+    let anew = 1 << 16;
+    assert_eq!(
+        asks.iter().map(|(_, number)| *number).collect::<Vec<_>>(),
+        vec![seq, seq, seq + anew, seq + 2 * anew, seq + 2 * anew],
+        "the refused ask, the proposed retry, two asks anew after a silence, each under a number \
+         the leader has not seen, and the one `NotLeader` sent on: {asks:?}"
+    );
+    for silent in [
+        asks[2].0.duration_since(asks[1].0),
+        asks[3].0.duration_since(asks[2].0),
+    ] {
+        assert!(
+            silent < Duration::from_millis(200),
+            "a silent wait of {silent:?}, where once refused the asker waits about `SPLIT_RETRY`"
+        );
+    }
 }
 
 /// Seed 992 under `RefusedAfterRefill`, the instrument's pair at every tier (PROPOSED D-137, issue
@@ -3786,7 +3906,8 @@ fn seed_1314_an_asker_whose_answer_is_lost_asks_anew_and_is_answered_within_the_
 /// same asker's retry is proposed and applied, and the split had applied when it was answered.
 /// Until the Stage C integration it was the pin above on the same seed; PROPOSED D-127 moved that
 /// pin's lost answer to seed 1314, where the variant's asker is never asked of, and this seed
-/// keeps the variant's catch.
+/// keeps the variant's catch. D-143 moved the lost answer again, to seed 448 on the sweep's
+/// schedule, and this pin holds on its tree unchanged.
 ///
 /// Both halves run the schedule the pin was found on, `shard::Schedule::shaped`: on the sweep's,
 /// `Fault::MetaReorder` moved the restart arm's split off its `NoRangeId` (PROPOSED D-135; the Stage
@@ -4316,9 +4437,22 @@ fn seed_16725_a_hold_let_go_with_no_switch_is_held_to_its_release_by_the_timer_c
 /// does again this says so; the asker's count starting again at its first `NoRangeId` is D-131's
 /// and no schedule moves it. At the Stage C integration (D-127 beside D-135) the absence is
 /// asserted on both schedules, the shaped one D-127 audited and the sweep's.
+///
+/// **Re-read by D-143**, which ends the count at the first `NoRangeId`: from it the asker asks
+/// until its window closes, D-092's bound past the later of the heal and that refusal, so the
+/// "twelve asks again" this pin was built on is gone and an asker whose twelve went on bounces
+/// retries after its first refusal by the window. The premise "spent its `BOOTSTRAP * 4` asks"
+/// now means the asker's whole count before any refusal, which D-143 keeps, the refusal coming
+/// on its last ask; the predicate still asks for twelve asks before it and one after. The absence
+/// holds on both schedules on D-143's tree. The directed tests in `sim/shard.rs`, which no
+/// schedule moves, hold the mechanism:
+/// `the_asker_refused_on_the_last_ask_of_its_count_still_retries` an asker whose first
+/// `NoRangeId` came on its count's last ask retrying after it, and the others the count before
+/// the first refusal and the window after it.
 // D-131
 // PROPOSED(D-127): the schedule moved off the shape; the absence, with its reason.
 // PROPOSED(D-135): on both schedules.
+// D-143: the count before the first refusal kept; the retries ask until the window closes.
 #[test]
 fn seed_18925_an_asker_whose_tries_went_on_bounces_still_retries_after_its_first_no_range_id() {
     absent_from_both(

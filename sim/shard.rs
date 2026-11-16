@@ -84,6 +84,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
@@ -172,9 +173,16 @@ const STALE_ADMIN: u64 = 200;
 /// What a split's asker adds to its request's number when it asks anew, past every admin
 /// number (PROPOSED D-131).
 const ASK_ANEW: u64 = 1 << 16;
-/// How many times a split's asker asks before it stops: round the bootstrap nodes four times.
-/// Its first `NoRangeId` starts the count again (D-131).
+/// How many times a split's asker asks before its first `NoRangeId`: round the bootstrap nodes
+/// four times (D-131). From that refusal on it asks until its window closes, not by a count
+/// ([`window_closes`]; D-143, amending D-131 after #259).
 const ASKS: u64 = BOOTSTRAP * 4;
+/// How long a split's asker waits for each answer once a `NoRangeId` has opened its window, before
+/// it tries the next node and asks anew: [`SPLIT_RETRY`], where it waits [`SPLIT_WAIT`] before the
+/// window opens, so that one lost answer costs it one short wait and cannot carry it over D-092's
+/// bound. Also the one wait [`window_closes`] adds for the last ask's answer (D-143).
+// PROPOSED(D-143): the ruling's "about `SPLIT_RETRY`" read as `SPLIT_RETRY` itself.
+const RETRY_WAIT: Duration = SPLIT_RETRY;
 /// The meta convergence bound (SHARD.md §8), in maximum election timeouts; measured on the
 /// correct system before it is asserted (Q39; D-113 §6).
 pub const META_CONVERGENCE_TIMEOUTS: u32 = 10;
@@ -960,6 +968,7 @@ impl Retried {
     // D-092: answer A; the asker retries.
     // D-113: read from the heal, §8.
     // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    // D-143: the asker asks until its window closes, so "no answer" is past the bound.
     #[must_use]
     pub fn took_no_effect(
         &self,
@@ -1023,10 +1032,71 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// When a split's asker stops asking, once its first `NoRangeId`, at `refused`, has opened its
+/// window: D-092's bound, `election_max() * LIVENESS_TIMEOUTS`, past the last fault's heal,
+/// `heal`, or past `refused` if that came later, and one wait more for the last ask's answer, the
+/// asker's `RETRY_WAIT` once refused, `SPLIT_RETRY`. Both times are read on the admins' clock,
+/// where the asker reads its own; the heal is known from the schedule before the run. The wait is
+/// also longer than the admins' clock's offset from the global heal D-092's check reads (#245),
+/// so an asker that stops here with no answer has asked past the bound by the check's own reading
+/// (D-143).
+#[must_use]
+pub fn window_closes(heal: Instant, refused: Instant) -> Instant {
+    heal.max(refused) + election_max() * LIVENESS_TIMEOUTS + RETRY_WAIT
+}
+
+/// How an answer ended a split's asker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answered {
+    /// Done: proposed, and applied on the leader that answered.
+    Done,
+    /// Refused for a reason the asker does not retry.
+    Refused(SplitRefusal),
+}
+
+/// The reply in `bytes`, where it answers split `n`'s asker: under its number, or one it asked
+/// anew under.
+fn reply_to(n: u64, bytes: Bytes) -> Option<Reply> {
+    let answer = RangedResponse::decode(bytes).ok()?;
+    (answer.response.seq % ASK_ANEW == n).then_some(answer.response.reply)
+}
+
+/// What an answer other than `NoRangeId` does to a split's asker, counted in the driver's
+/// figures: done or a refusal ends it; `NotLeader` and `RangeMismatch` move its target on.
+fn answered(reply: Reply, target: &mut u64, stats: &Driver) -> Option<Answered> {
+    match reply {
+        Reply::Outcome(Outcome::Refused(reason)) => {
+            *lock(stats).refused.entry(reason.name()).or_default() += 1;
+            Some(Answered::Refused(reason))
+        }
+        Reply::Outcome(_) => {
+            lock(stats).splits_done += 1;
+            Some(Answered::Done)
+        }
+        Reply::NotLeader { leader } => {
+            *target = leader.map_or(*target % BOOTSTRAP + 1, |leader| leader.0);
+            None
+        }
+        Reply::RangeMismatch { .. } => {
+            *target = *target % BOOTSTRAP + 1;
+            None
+        }
+    }
+}
+
+/// The datagrams already on `sock`, taken without waiting for one (D-143).
+fn queued(sock: &impl Socket) -> Vec<Bytes> {
+    let mut held = Vec::new();
+    let mut cx = Context::from_waker(Waker::noop());
+    while let Poll::Ready(Ok((_, bytes))) = pin!(sock.recv()).poll(&mut cx) {
+        held.push(bytes);
+    }
+    held
+}
+
 /// The split's admin: asks `range`'s leader, `target` first, to split at `key`, follows
-/// `NotLeader` round the bootstrap nodes twice, retries after `NoRangeId`
-/// (D-092's A), and records every answer. Under a burst it asks `delay` after the action fired
-/// (D-131).
+/// `NotLeader` round the bootstrap nodes, retries after `NoRangeId` (D-092's A), and records
+/// every answer it reads. Under a burst it asks `delay` after the action fired (D-131).
 ///
 /// A leader answers a split's copy with silence once its entry is in the log, and answers the
 /// entry once, at its apply (SHARD.md §5): an asker that heard `NoRangeId`, then asked again,
@@ -1036,12 +1106,26 @@ fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// where it has already landed. Seed 992 found it: the split took effect 130 ms after its
 /// first refusal and its asker was answered 3.2 s later (PROPOSED D-131).
 ///
-/// The asks before the first `NoRangeId` and the retries after it are counted apart. D-092's
-/// check is about the retries, and it reports an asker still asking at the last heal that ends
-/// with no answer. An asker whose tries went on `NotLeader` bounces and whose first `NoRangeId`
-/// came on its last one has made no retry, and the check would be reading the bounces. So the
-/// first `NoRangeId` gives the asker [`ASKS`] again, and only the first, so an asker every
-/// node keeps refusing still stops and is still reported. Seed 18925 found it (D-131).
+/// The asks before the first `NoRangeId` and the retries after it are told apart. Before it, the
+/// asker asks [`ASKS`] times, round the bootstrap nodes four times, waiting [`SPLIT_WAIT`] for
+/// each answer. Its first `NoRangeId` opens D-092's window, and from then it asks until the window
+/// closes ([`window_closes`], from `heal`, the last fault's heal on its own clock), waiting
+/// [`RETRY_WAIT`] for each answer. D-092's check reports an asker still asking at the last heal
+/// that ends with no answer, and the window makes that a report of the system: an asker stops
+/// with no answer only past the bound the check holds it to. Until D-143 the retries were
+/// counted too, [`ASKS`] again from the first refusal (D-131, seed 18925, whose asks went on
+/// `NotLeader` bounces and whose first `NoRangeId` came on its last). Seed 781 found that count
+/// short in #259's nightly: its asker spent 5 of its 12 retries inside the fault and stopped
+/// 1.15 s past the heal with no answer, 91 ms after the id it waited for had landed.
+///
+/// It never reads an answer queued before an ask as that ask's answer: before each ask, and
+/// before it stops, it takes what its socket already holds ([`queued`]). Retries share one
+/// number, so the number cannot tell a network duplicate or a late answer of an earlier ask from
+/// the answer to the next one, and read as that answer a stale `NoRangeId` can hide a lost ask.
+/// A queued `NoRangeId` is dropped, the ask about to go being its retry; any other answer is
+/// taken as one read after an ask is (D-143).
+// D-092: answer A; the asker retries.
+// D-143: the asker asks until its window closes.
 #[allow(clippy::too_many_arguments)]
 async fn split_admin<E: Environment>(
     env: E,
@@ -1052,6 +1136,7 @@ async fn split_admin<E: Environment>(
     key: Bytes,
     stats: Driver,
     delay: Duration,
+    heal: Instant,
 ) {
     let Ok(sock) = env.net().bind(admin_addr(n)).await else {
         lock(&stats).outstanding -= 1;
@@ -1061,13 +1146,36 @@ async fn split_admin<E: Environment>(
         env.clock().sleep(delay).await;
     }
     let mut tries = ASKS;
-    let mut done = false;
-    // PROPOSED(D-137): the refusal the asker stopped on, if it stopped on one.
-    let mut refusal: Option<SplitRefusal> = None;
+    // How an answer ended the asker, where one did.
+    // PROPOSED(D-137): the refusal the asker stopped on, if it stopped on one, is kept here.
+    let mut ended_on: Option<Answered> = None;
     let mut first_refused: Option<Instant> = None;
     let mut seq = n;
-    while tries > 0 && !done {
-        tries -= 1;
+    loop {
+        // D-143: what the socket already holds answers an earlier ask, never the next one.
+        // PROPOSED(D-143): a queued `NoRangeId` dropped and not counted, any other answer taken
+        // as after an ask, and the queue read before the asker stops as well as before each ask.
+        for bytes in queued(&sock) {
+            match reply_to(n, bytes) {
+                None | Some(Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId))) => {}
+                Some(reply) => ended_on = answered(reply, &mut target, &stats),
+            }
+            if ended_on.is_some() {
+                break;
+            }
+        }
+        if ended_on.is_some() {
+            break;
+        }
+        match first_refused {
+            None if tries == 0 => break,
+            None => tries -= 1,
+            // D-143: the retries ask until the window closes; see above.
+            // PROPOSED(D-143): the window gates asks only; the last answer may be awaited past
+            // it (P6).
+            Some(refused) if env.clock().now() >= window_closes(heal, refused) => break,
+            Some(_) => {}
+        }
         let request = RangedRequest {
             range: RangeId(range),
             generation,
@@ -1087,12 +1195,18 @@ async fn split_admin<E: Environment>(
         {
             break;
         }
+        let wait = if first_refused.is_some() {
+            RETRY_WAIT
+        } else {
+            SPLIT_WAIT
+        };
         let answer = {
             let recv = pin!(sock.recv());
-            let timer = pin!(env.clock().sleep(SPLIT_WAIT));
+            let timer = pin!(env.clock().sleep(wait));
             race(&env, recv, timer).await
         };
         let Either::Left(Ok((_, bytes))) = answer else {
+            // PROPOSED(D-143): once refused, a silent wait still moves the asker to the next node.
             target = target % BOOTSTRAP + 1;
             // PROPOSED(D-131): the copy of a split the log holds is answered once; see above.
             if first_refused.is_some() {
@@ -1100,49 +1214,32 @@ async fn split_admin<E: Environment>(
             }
             continue;
         };
-        let Ok(answer) = RangedResponse::decode(bytes) else {
+        let Some(reply) = reply_to(n, bytes) else {
             continue;
         };
-        if answer.response.seq % ASK_ANEW != n {
-            continue;
-        }
-        match answer.response.reply {
-            Reply::Outcome(Outcome::Refused(reason)) => {
+        match reply {
+            Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId)) => {
                 let now = env.clock().now();
                 {
                     let mut stats = lock(&stats);
-                    *stats.refused.entry(reason.name()).or_default() += 1;
-                    if reason == SplitRefusal::NoRangeId {
-                        stats.no_range_id.push((target, now));
-                    }
+                    *stats
+                        .refused
+                        .entry(SplitRefusal::NoRangeId.name())
+                        .or_default() += 1;
+                    stats.no_range_id.push((target, now));
                 }
-                if reason == SplitRefusal::NoRangeId {
-                    // D-131: the retries get the budget whole; see above.
-                    if first_refused.is_none() {
-                        tries = ASKS;
-                    }
-                    first_refused.get_or_insert(now);
-                    env.clock().sleep(SPLIT_RETRY).await;
-                    continue;
-                }
-                refusal = Some(reason);
-                done = true;
+                // D-143: the first opens the window the retries ask in; see above.
+                first_refused.get_or_insert(now);
+                env.clock().sleep(SPLIT_RETRY).await;
             }
-            Reply::Outcome(_) => {
-                lock(&stats).splits_done += 1;
-                done = true;
-            }
-            Reply::NotLeader { leader } => {
-                target = leader.map_or(target % BOOTSTRAP + 1, |leader| leader.0);
-            }
-            Reply::RangeMismatch { .. } => {
-                target = target % BOOTSTRAP + 1;
-            }
+            // PROPOSED(D-143): inside the window a bounce is asked again at once, as before it, its
+            // asks bounded by the window's time and not by a count (P7).
+            reply => ended_on = answered(reply, &mut target, &stats),
         }
     }
     let ended = env.clock().now();
     let mut stats = lock(&stats);
-    if !done {
+    if ended_on.is_none() {
         stats.splits_unanswered += 1;
     }
     if let Some(refused) = first_refused {
@@ -1151,8 +1248,11 @@ async fn split_admin<E: Environment>(
             key,
             refused,
             ended,
-            answered: done,
-            refusal,
+            answered: ended_on.is_some(),
+            refusal: match ended_on {
+                Some(Answered::Refused(reason)) => Some(reason),
+                Some(Answered::Done) | None => None,
+            },
         });
     }
     stats.outstanding -= 1;
@@ -1759,6 +1859,18 @@ fn run_watched(
         }
     }
     steps.sort_by_key(|(at, order, _)| (*at, *order));
+    // D-143: where a split's asker's window opens, the last fault's heal, known from the schedule
+    // before the run and read on the admins' clock, where the asker reads its own times.
+    let heals = steps
+        .iter()
+        .filter(|(_, _, step)| matches!(step, Step::End(_)))
+        .map(|(at, _, _)| *at)
+        .max()
+        .unwrap_or(begin);
+    let heal = sim
+        .run_header()
+        .node_time(admin, heals)
+        .expect("the admins' node is one of the run's");
 
     let all: Vec<NodeId> = nodes
         .iter()
@@ -1851,6 +1963,7 @@ fn run_watched(
                             pick,
                             &watch.spans,
                             &driver,
+                            heal,
                         );
                         open = None;
                     }
@@ -1883,7 +1996,15 @@ fn run_watched(
                 if watch.checks.stopped.is_some() {
                     break;
                 }
-                aimed[j] = act(&sim, admin, j, &schedule.actions[j], &watch.spans, &driver);
+                aimed[j] = act(
+                    &sim,
+                    admin,
+                    j,
+                    &schedule.actions[j],
+                    &watch.spans,
+                    &driver,
+                    heal,
+                );
             }
             // D-131: the shapes' later steps, each resolved against the trace as
             // it stands when it fires, each doing nothing where its split did not land.
@@ -1944,6 +2065,7 @@ fn run_watched(
                         schedule.picks[i],
                         &watch.spans,
                         &driver,
+                        heal,
                     );
                 }
             }
@@ -1972,6 +2094,7 @@ fn run_watched(
                         schedule.picks[i],
                         &watch.spans,
                         &driver,
+                        heal,
                     );
                 }
             }
@@ -1984,6 +2107,11 @@ fn run_watched(
         advance(&mut sim, SLICE, &mut watch);
     }
     let last_fault_healed = last_heal;
+    // D-143: the asker's window opened at the heal D-092's check reads from.
+    assert!(
+        watch.checks.stopped.is_some() || last_fault_healed == heals,
+        "the last fault healed at {last_fault_healed:?}, where the schedule said {heals:?}"
+    );
     last_heal = last_heal.max(sim.now());
     // The instrument for the bound read from the heal (D-113 §5): the same window,
     // its first stretch with no client reaching any node. `last_heal` is not moved, as the
@@ -2179,8 +2307,10 @@ fn hand_restarted_a_range(
 }
 
 /// [`Fault::SplitFromRestarted`]'s last step (D-131): asks the restarted node to split
-/// the range it was handed.
+/// the range it was handed. `heal` is the last fault's on the admins' clock, where the asker's
+/// window opens (D-143).
 // D-131
+#[allow(clippy::too_many_arguments)]
 fn split_from_restarted(
     sim: &Sim,
     admin: NodeId,
@@ -2189,6 +2319,7 @@ fn split_from_restarted(
     pick: u64,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) {
     let Some(range) = arm.range else {
         return;
@@ -2221,6 +2352,7 @@ fn split_from_restarted(
             key(at),
             driver.clone(),
             Duration::ZERO,
+            heal,
         ),
     );
 }
@@ -2240,8 +2372,10 @@ fn twice_split_keys(span: &Span) -> Vec<u64> {
 /// [`Fault::MetaReorder`]'s first step (SHARD.md §10; PROPOSED D-135): picks a user range that
 /// can split twice and is led on a node other than the meta range's leader's, blocks that node's
 /// link to meta's leader's node one way, and asks the range's leader to split it. No range
-/// qualifies, and the arm does nothing.
+/// qualifies, and the arm does nothing. `heal` is the last fault's on the admins' clock, where the
+/// asker's window opens (D-143).
 // PROPOSED(D-135)
+#[allow(clippy::too_many_arguments)]
 fn block_meta_and_split(
     sim: &mut Sim,
     nodes: &[NodeId],
@@ -2250,6 +2384,7 @@ fn block_meta_and_split(
     pick: u64,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) -> Option<MetaArm> {
     let to = raft::leader_of_range(sim, META_RANGE);
     let candidates: Vec<(u64, &Span, u64, Vec<u64>)> = spans
@@ -2300,6 +2435,7 @@ fn block_meta_and_split(
             key(first_cut),
             driver.clone(),
             Duration::ZERO,
+            heal,
         ),
     );
     Some(MetaArm {
@@ -2368,8 +2504,10 @@ fn hand_the_left_half_to_the_third(
 }
 
 /// [`Fault::MetaReorder`]'s last step (PROPOSED D-135): asks the third node to split the left
-/// half again, where the lead was handed on and nothing has split the left half since.
+/// half again, where the lead was handed on and nothing has split the left half since. `heal` is
+/// the last fault's on the admins' clock, where the asker's window opens (D-143).
 // PROPOSED(D-135)
+#[allow(clippy::too_many_arguments)]
 fn split_the_left_half_through_the_third(
     sim: &Sim,
     admin: NodeId,
@@ -2378,6 +2516,7 @@ fn split_the_left_half_through_the_third(
     pick: u64,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) {
     if !arm.transferred {
         return;
@@ -2410,6 +2549,7 @@ fn split_the_left_half_through_the_third(
             key(at),
             driver.clone(),
             Duration::ZERO,
+            heal,
         ),
     );
 }
@@ -2435,7 +2575,8 @@ fn burst_ops(n: u64, right: &[u64], count: u64, pick: u64, writes: bool) -> Vec<
 }
 
 /// Fires the driver's action `j`, resolved against `spans` as they stand. What a split aimed at,
-/// for the shape's later steps (D-131).
+/// for the shape's later steps (D-131). `heal` is the last fault's on the admins' clock, where a
+/// split's asker's window opens (D-143).
 fn act(
     sim: &Sim,
     admin: NodeId,
@@ -2443,6 +2584,7 @@ fn act(
     action: &Action,
     spans: &Spans,
     driver: &Driver,
+    heal: Instant,
 ) -> Option<Aimed> {
     let n = u64::try_from(j).expect("small") + 1;
     let env = sim.env(admin);
@@ -2488,6 +2630,7 @@ fn act(
                     key(at),
                     driver.clone(),
                     delay,
+                    heal,
                 ),
             );
             if let Some((writes, count, every, _)) = burst {
@@ -3538,6 +3681,35 @@ impl Report {
         Ok(())
     }
 
+    /// The last fault's heal read on the admins' clock: where a split's asker's window opens
+    /// (D-143), the asker reading its own times on that clock.
+    // D-143
+    #[must_use]
+    pub fn heal_on_the_admins_clock(&self) -> Instant {
+        self.checked
+            .run
+            .node_time(self.admin, self.last_fault_healed)
+            .expect("the admins' node is one of the run's")
+    }
+
+    /// The askers refused `NoRangeId` that stopped with no answer before their window closed
+    /// ([`window_closes`]): none on any run, an asker refused asking until its window closes
+    /// unless an answer ends it first (D-143). A run a check stopped has its heal read where it
+    /// stopped, at or before the one the askers were given, so it can only find fewer.
+    // D-143
+    #[must_use]
+    pub fn askers_short_of_their_window(&self) -> Vec<Retried> {
+        let heal = self.heal_on_the_admins_clock();
+        self.driver
+            .retried
+            .iter()
+            .filter(|retried| {
+                !retried.answered && retried.ended < window_closes(heal, retried.refused)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The askers [`Report::retries_take_effect`] asks of: on a uniformly scheduled seed whose
     /// ranges 0 and the asked range have a majority, each still asking when the last fault
     /// healed.
@@ -3624,6 +3796,7 @@ impl Report {
     // D-092: answer A; the asker retries.
     // D-113: read from the heal, §8.
     // PROPOSED(D-137): the retry takes effect, not only gets an answer.
+    // D-143: the asker asks until its window closes, so "no answer" is past the bound.
     pub fn retries_take_effect(&self) -> Result<(), String> {
         let seed = self.seed;
         let bound = election_max() * LIVENESS_TIMEOUTS;
@@ -5378,5 +5551,251 @@ mod tests {
             512,
             "every shaped seed draws the reorder arm"
         );
+    }
+
+    /// What a scripted server answers the `k`th ask the asker sends, counted across the three
+    /// servers from 0, under number `seq`: each reply sent after a wait in milliseconds, the waits
+    /// one after another from the ask's arrival.
+    type Script = dyn Fn(usize, u64) -> Vec<(u64, Reply)> + Send + Sync;
+
+    /// The number the scripted asker asks under.
+    const ASKER: u64 = 7;
+
+    /// One split's asker against three scripted servers on a network with neither drops nor
+    /// duplicates, its window opened from a heal at `heal` ms (D-143): every ask the servers
+    /// received, as (when, which server, under what number), and the driver's record.
+    fn asker_against(heal: u64, script: Arc<Script>) -> (Vec<(Instant, u64, u64)>, DriverStats) {
+        let mut sim = Sim::new(SimConfig::new(7));
+        let asks: Arc<Mutex<Vec<(Instant, u64, u64)>>> = Arc::default();
+        for id in 1..=BOOTSTRAP {
+            let node = sim.add_node();
+            let env = sim.env(node);
+            let inner = env.clone();
+            let (asks, script) = (asks.clone(), script.clone());
+            env.spawn("scripted-server", async move {
+                let sock = inner.net().bind(server_addr(id)).await.expect("bound");
+                while let Ok((from, bytes)) = sock.recv().await {
+                    let asked = RangedRequest::decode(bytes).expect("a ranged request");
+                    let (client, seq) = (asked.request.client, asked.request.seq);
+                    let k = {
+                        let mut asks = lock(&asks);
+                        asks.push((inner.clock().now(), id, seq));
+                        asks.len() - 1
+                    };
+                    for (after, reply) in script(k, seq) {
+                        inner.clock().sleep(Duration::from_millis(after)).await;
+                        let answer = RangedResponse {
+                            range: asked.range,
+                            response: ananke_raft::client::Response { client, seq, reply },
+                        };
+                        let _ = sock.send(from, answer.encode()).await;
+                    }
+                }
+            });
+        }
+        let admin = sim.add_node();
+        let driver: Driver = Arc::default();
+        lock(&driver).outstanding += 1;
+        let env = sim.env(admin);
+        let inner = env.clone();
+        env.spawn(
+            "split-admin",
+            split_admin(
+                inner,
+                ASKER,
+                1,
+                20,
+                FIRST_GENERATION,
+                key(5),
+                driver.clone(),
+                Duration::ZERO,
+                at(heal),
+            ),
+        );
+        sim.run_until(at(10_000));
+        let stats = lock(&driver).clone();
+        assert_eq!(stats.outstanding, 0, "the asker stopped");
+        let asks = lock(&asks).clone();
+        (asks, stats)
+    }
+
+    fn no_range_id() -> Reply {
+        Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId))
+    }
+
+    fn split_done() -> Reply {
+        Reply::Outcome(Outcome::Done)
+    }
+
+    /// D-143's (2): from its first `NoRangeId` the asker asks until its window closes, D-092's
+    /// bound past the heal or past that refusal, whichever is later, and one `RETRY_WAIT` more;
+    /// not the thirteen asks D-131's count gave it. Against servers that refuse every split
+    /// `NoRangeId` it stops with no answer at the window's close and asks nothing at or after it.
+    // D-143
+    #[test]
+    fn the_asker_refused_asks_until_its_window_closes_and_not_by_a_count() {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        assert_eq!(
+            window_closes(at(3_000), at(2)),
+            at(3_000) + bound + RETRY_WAIT
+        );
+        assert_eq!(window_closes(at(0), at(2)), at(2) + bound + RETRY_WAIT);
+        for heal in [3_000, 0] {
+            let (asks, stats) = asker_against(heal, Arc::new(|_, _| vec![(0, no_range_id())]));
+            assert_eq!(stats.retried.len(), 1, "{stats:?}");
+            let retried = &stats.retried[0];
+            assert!(!retried.answered, "{retried:?}");
+            let closes = window_closes(at(heal), retried.refused);
+            assert!(
+                asks.iter().all(|(when, _, _)| *when < closes),
+                "an ask at or after the window closed at {closes:?}: {asks:?}"
+            );
+            assert!(
+                retried.ended >= closes && retried.ended < closes + SPLIT_RETRY + RETRY_WAIT,
+                "heal at {heal} ms: stopped at {:?}, the window closing at {closes:?}",
+                retried.ended
+            );
+            let count = usize::try_from(ASKS).expect("small") + 1;
+            assert!(
+                asks.len() > count,
+                "heal at {heal} ms: {} asks, no more than D-131's count",
+                asks.len()
+            );
+            assert_eq!(stats.splits_unanswered, 1);
+        }
+    }
+
+    /// D-143's (1): an answer already queued when the asker asks is not that ask's answer. Here
+    /// the first ask's `NoRangeId` arrives twice, as a network duplicate would bring it, and the
+    /// second ask is answered done 50 ms after it arrives. The copy is dropped, not read as the
+    /// second ask's refusal; counted once; and the asker asks twice and ends on the done.
+    // D-143
+    #[test]
+    fn the_asker_reads_no_queued_answer_as_the_answer_to_its_next_ask() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id()), (0, no_range_id())],
+                _ => vec![(50, split_done())],
+            }),
+        );
+        assert_eq!(asks.len(), 2, "{asks:?}");
+        assert_eq!(stats.refused.get("no-range-id"), Some(&1), "{stats:?}");
+        assert_eq!(stats.no_range_id.len(), 1, "{stats:?}");
+        assert_eq!(stats.splits_done, 1);
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            retried.ended >= asks[1].0 + Duration::from_millis(50),
+            "ended on the second ask's own answer: {retried:?}, {asks:?}"
+        );
+    }
+
+    /// D-143's (1), the other half: a done found queued is taken, not dropped. The first ask is
+    /// refused `NoRangeId` and then answered done 100 ms later, inside the asker's
+    /// `SPLIT_RETRY`, as where a copy of the split had been proposed; every later ask is met with
+    /// silence. The asker ends on that done before it asks again.
+    // D-143
+    #[test]
+    fn the_asker_takes_a_done_it_finds_queued() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id()), (100, split_done())],
+                _ => Vec::new(),
+            }),
+        );
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(stats.splits_done, 1, "{stats:?}");
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            retried.ended < retried.refused + SPLIT_RETRY + Duration::from_millis(5),
+            "ended on the queued done, before asking again: {retried:?}"
+        );
+    }
+
+    /// D-143's (3): once refused, the asker waits `RETRY_WAIT` for an answer, not `SPLIT_WAIT`,
+    /// then tries the next node under a number the leader has not seen. Here the second ask is met
+    /// with silence and the next node answers done.
+    // D-143
+    #[test]
+    fn the_asker_refused_waits_a_short_while_for_an_answer_and_then_asks_anew() {
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(|k, _| match k {
+                0 => vec![(0, no_range_id())],
+                1 => Vec::new(),
+                _ => vec![(0, split_done())],
+            }),
+        );
+        assert_eq!(asks.len(), 3, "{asks:?}");
+        assert_eq!(
+            (asks[1].1, asks[1].2, asks[2].1, asks[2].2),
+            (1, ASKER, 2, ASKER + ASK_ANEW),
+            "the silent ask's next goes to the next node under a new number: {asks:?}"
+        );
+        let silent = asks[2].0.duration_since(asks[1].0);
+        assert!(
+            silent >= SPLIT_RETRY && silent < SPLIT_RETRY + Duration::from_millis(5),
+            "waited {silent:?} on the silent ask, where about `SPLIT_RETRY` is the wait"
+        );
+        assert!(stats.retried[0].answered, "{stats:?}");
+    }
+
+    /// Seed 18925's mechanism, D-131's fix, which D-143 keeps: an asker whose count went on
+    /// bounces and whose first `NoRangeId` came on the count's last ask still opens its window and
+    /// retries after it. Here every node answers `NotLeader` naming none to the count's first
+    /// `ASKS - 1` asks, `NoRangeId` to its last and done to every ask after it: the asker asks
+    /// `ASKS + 1` times, the last a retry `SPLIT_RETRY` after the refusal, and ends on its done.
+    /// With the refusal on the count's last ask ending the asker, seed 18925's bug, it fails.
+    // D-131
+    // D-143
+    #[test]
+    fn the_asker_refused_on_the_last_ask_of_its_count_still_retries() {
+        let count = usize::try_from(ASKS).expect("small");
+        let (asks, stats) = asker_against(
+            0,
+            Arc::new(move |k, _| {
+                if k + 1 < count {
+                    vec![(0, Reply::NotLeader { leader: None })]
+                } else if k + 1 == count {
+                    vec![(0, no_range_id())]
+                } else {
+                    vec![(0, split_done())]
+                }
+            }),
+        );
+        assert_eq!(asks.len(), count + 1, "{asks:?}");
+        assert_eq!(stats.no_range_id.len(), 1, "{stats:?}");
+        assert_eq!(stats.retried.len(), 1, "{stats:?}");
+        let retried = &stats.retried[0];
+        assert!(retried.answered && retried.refusal.is_none(), "{retried:?}");
+        assert!(
+            asks[count - 1].0 <= retried.refused && asks[count].0 >= retried.refused + SPLIT_RETRY,
+            "the refusal came on the count's last ask and the retry after it: {retried:?}, {asks:?}"
+        );
+        assert_eq!(stats.splits_done, 1, "{stats:?}");
+        assert_eq!(stats.splits_unanswered, 0, "{stats:?}");
+    }
+
+    /// Before its first `NoRangeId` the asker still asks `ASKS` times and stops (D-131): an asker
+    /// every node answers `NotLeader` naming none is no retry, opens no window and is not
+    /// recorded as one.
+    // D-131
+    // D-143
+    #[test]
+    fn the_asker_never_refused_stops_after_its_count() {
+        let (asks, stats) = asker_against(
+            3_000,
+            Arc::new(|_, _| vec![(0, Reply::NotLeader { leader: None })]),
+        );
+        assert_eq!(
+            asks.len(),
+            usize::try_from(ASKS).expect("small"),
+            "{asks:?}"
+        );
+        assert!(stats.retried.is_empty(), "{stats:?}");
+        assert_eq!(stats.splits_unanswered, 1);
     }
 }

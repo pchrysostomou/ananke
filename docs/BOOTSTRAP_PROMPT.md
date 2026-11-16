@@ -101,6 +101,20 @@ ananke/
 
 _Update this section at the end of every session._
 
+- D-143 (2026-11-16), one scratch commit on `integ-final` off #259's pushed tip b635f4e: the owner's ruling
+  after #259's 10k nightly failed seed 781 under `ReadCheckAtReceiptOnly` by D-092's check, a defect of
+  the harness's asker and not of the system. `sim/shard.rs`'s `split_admin` reads no answer queued before
+  an ask as that ask's answer, asks from its first `NoRangeId` until D-092's bound past the later of the
+  last fault's heal (on the admins' clock) and that refusal and one wait, and once refused waits
+  `SPLIT_RETRY` for an answer before it asks anew; amends D-131, whose entry carries the note. Seven
+  choices the ruling leaves open are PROPOSED in D-143 §3. Six directed tests of the asker, and the correct
+  sweep and `RefillNotResent`'s test assert that no unanswered asker stopped before its window closed. Seed
+  1314's pin is re-pinned on seed 448, on the sweep's own schedule; 18925's is re-read, its mechanism held
+  by a directed test its review found missing. Measured: the
+  correct sharded sweep 0 of 10 000 on both schedules; `ReadCheckAtReceiptOnly` 599 of 1 000, every one
+  at serving, and seed 781 passes; `RefillNotResent` 451 of 1 000 (173 before); `RefusedAfterRefill` 7
+  (8). `RefillNotResent`'s row re-weighed into shard 5, 2461.0. #260 (`meta_sender`) is not part of it.
+  Not pushed; the merge waited on this fix.
 - Stage C integration, the rulings commit (2026-11-15): **D-139** records the owner's rulings of 2026-11-14 (D-093 and D-092 answered A, D-107 read as R, D-092 to D-132 approved as built but for the open questions), and approved headings and 1 241 comment lines in 49 files drop PROPOSED, the entries then in flight and the open questions keeping it; D-108, which the ruling names bare among the open questions, keeps PROPOSED whole until the owner says whether only Stage D's question 1 is meant; **D-142** (the ruling of 2026-11-15, seed 1137) follows D-141, its row in shard 3. Not pushed.
 - Stage C integration (2026-11-15), branch `integ-stage-c-2026-11-15` off `main` at 3030e34: one tree
   holding #242, #253, #246, #247, #237, #238, #240, #254, #244, #239, #249, #251, #243 and #252,
