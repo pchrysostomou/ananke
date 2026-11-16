@@ -29041,4 +29041,58 @@ Every `shard` row and the two `node` rows that run the sharded sweep were weighe
 
 ---
 
-_Next entry: D-144. Add one before implementing anything not covered above._
+## PROPOSED D-145 — Q23 at proposal: a split asked of a leader with a change under way is refused `ConfigurationChanging` at once and takes no id, held by a directed test of the host's own step; §5's "committed" at proposal put to the owner (S13)
+
+**The number.** Off d3d6bab, #259's tip, whose footer reads D-144. S13's close-out reserves D-144 to D-148 for its first five PRs, in order, and this is the second, **D-145**; D-144 is not in this tree. The footer names D-146, the number after this entry; where another of S13's entries merges first, the merge resolves it. The test carries `// PROPOSED(D-145)`, and the comment over the split's proposal a `// PROPOSED(D-145)` line naming the question of §4.
+
+**What it answers.** S13's directed test "Q23 at proposal" (#162). Q23 refuses a split "at proposal while a change is catching up" (SHARD.md:3164-3170, and Stage C's list at 2524-2525), and §5 has the leader check, for liveness only, "the configuration in force plain and committed, and no change in flight, catch-up included" (SHARD.md:619-627). D-100 item 2 built the check: the Split arm of `ServerHost::local_input` refuses `ConfigurationChanging` while `Raft::changing()` holds, a change being under way while servers catch up as learners or while the joint configuration is in force (`core.rs:1209-1216`). Nothing held it. On d3d6bab `ConfigurationChanging` is named only at its definitions in `apply.rs` and at the proposal's and the apply's code sites, and `changing()` is called by the Split arm alone, never by a test. No run reaches it either: `sim/install.rs` and `sim/membership.rs` send `Command::Change` and no split, and `sim/raft.rs`, `sim/reseed.rs`, `sim/shard.rs` and `sim/split.rs` send `Command::Split` and no change.
+
+### 1. The test
+
+`a_split_asked_while_a_change_is_under_way_is_refused_at_proposal_and_takes_no_id` (`crates/ananke-shard/src/server.rs`, `mod tests`; the crate's lib, the `rest` job). It drives the host's own `local_input`, the call the node's `raft` task makes for a client's request before it steps the core (`node.rs:622-628`), with a `ServerHost` that holds one replica, range 2 over `[k0, kz)`, `Live`, and a block of ten ids, 10 to 19, adopted for its run. Each case asks `Split { key: k5, right: 0 }` and reads the input `local_input` returned, the answer it queued and the ids left in the block.
+
+- **(a) No change under way.** A leader of one, elected by `Input::Campaign`. The split takes id 10 and is handed to the core as `Input::Propose` of the encoded `Split { key: k5, right: 10 }`, with nothing answered and 9 ids left.
+- **(b) A learner catching up.** The same leader steps `Input::Change([1, 2])`. The change is accepted and server 2 catches up as a learner: the configuration in force is still the initial `{1}`, at index 0, with no joint entry appended. The split is refused: `local_input` returns nothing, `Refused(ConfigurationChanging)` is answered for client 1's request 2, and 9 ids are left.
+- **(c) The joint configuration in force.** A leader of `{1, 2}`, elected by its `Campaign` and server 2's pre-vote and vote delivered by hand, steps `Input::Change([1])`. A change that only removes appends the joint entry at once (`core.rs:2336-2342`), and with server 2 silent the entry stays uncommitted. The split is refused the same way, with 9 ids left.
+
+Two choices make each assertion hold its mechanism. Each case reads the host's answer before it asks `changing()`, so a core that stops counting a state as a change fails on the answer the host gives, not on the test's own precondition; (b)'s precondition reads the configuration in force and its index, not `changing()`. And the block holds ids throughout, so "takes no id" reads 9 left where a split that went through would leave 8; an empty block would have answered `NoRangeId` to (a) and left 0 whatever happened.
+
+### 2. Plants
+
+Each was applied alone on this tree, the test run in release and seen to fail, and the plant reverted; after each revert `git diff` showed nothing unstaged. A failing case prints the input the host handed the core with the split's command encoded, so the table names the command and the byte that carries `right`.
+
+| Plant | Fails |
+|---|---|
+| The Split arm's `else if core.changing()` branch deleted (`server.rs`) | (b): the host hands the core `Input::Propose` of the encoded `Split { key: k5, right: 11 }`, printed `Propose(b"\t\x02\0\0\0k5\x0b\0\0\0\0\0\0\0")`, answers nothing and leaves 8 ids, where the refusal with 9 left was asserted. With (b)'s assertion inverted to reach (c), (c) fails the same way, with `right` 12 (`\x0c`) and 7 left. |
+| `Raft::changing` as `self.membership.new_voters.is_some()` alone (`core.rs:1215`) | (b), as above: `right` 11 (`\x0b`), 8 left. |
+| `Raft::changing` as `self.change.is_some()` alone | (c): `right` 11 (`\x0b`), 8 left; (b) passes. |
+
+### 3. The comment over the proposal
+
+The comment over the Split arm said that what the leader "cannot see here — the configuration plain, no change in flight — every replica re-checks at the apply (Q23)". The arm checks a change under way itself, through `core.changing()` a few lines below the comment, as D-100 item 2 says. The comment now lists that check among the leader's checks, says what a change under way is, and says why the apply checks again: the proposal's checks are for liveness only, and every replica re-checks at the apply, against state every replica shares, the key inside P's span, P `Live` and the latest configuration entry at or below `s` plain (D-100 item 3). The comment beside the check itself was right and is unchanged, as is the code.
+
+### 4. For the owner (PROPOSED): "plain and committed" at proposal
+
+§5 has the leader check the configuration in force "plain and committed" (SHARD.md:624-625). `Raft::changing()` reads a change under way, catch-up included, and the joint configuration; it does not read whether the plain configuration in force is committed. Once the joint entry commits, `after_commit` appends `C_new` (`core.rs:2478-2497`); `change` is already `None`, since `append_joint` cleared it, and `C_new` is plain. Until `C_new` commits, `changing()` is false and a split is accepted. `on_change` refuses a change in the same state (`membership_index > commit`, `core.rs:2333`). Q23's own text and Stage C's list name only the catch-up, so the code asks more than Q23 (it refuses under the joint configuration too) and less than §5 (it does not ask "committed").
+
+A probe at this entry's writing, not committed, saw it on the host: a leader of `{1, 2, 3}` stepped `Change([1, 2])`, which only removes, and then server 2's acknowledgement of the joint entry, by hand. The joint entry committed at 2 and `C_new`, `{1, 2}`, was appended at 3 with the commit index at 2; `changing()` was false; the host proposed the split and took id 10; and a `Change([1])` stepped in the same state was rejected.
+
+It is safe. The split's entry `s` lands above `C_new` in the leader's log, so the latest configuration entry at or below `s`, which the apply reads, is `C_new`, plain, and the apply takes the split. `s` commits only after `C_new` does, and a leader whose log lacks `C_new` lacks `s` too, so at any replica's apply of `s` R's voters are a committed configuration's. Q23's reason, "every descriptor stays a plain committed voter set", holds either way. What is open is the text against the code.
+
+- **(a)** Refuse until the configuration in force is committed: `Raft::changing()` adds `|| self.membership_index > self.commit`, and its doc says so. A core test pins `changing()` at each state of a change, and this test gains a case (d), a leader whose `C_new` is appended and uncommitted, refused `ConfigurationChanging`.
+- **(b)** The owner amends §5 to drop "and committed" at the proposal, and an entry records why.
+
+**Recommended: (a).** It makes the proposal what §5 says and what `on_change` already does in the same state. It costs a split asked in the round trip `C_new` takes to commit, refused as one asked while the joint entry is uncommitted is refused today. No scenario both changes a range and splits it, so it is expected to move no schedule; the gate confirms it. It is not built here: the documents leave the choice open, and it changes core code every range runs.
+
+### 5. What moves
+
+Nothing. The test is a unit test of the crate's lib and runs no schedule, so it needs no nightly row; the comment changes no code. No trace, schedule, pinned hash, bound or nightly row moves, and no assertion is widened.
+
+### 6. What it leaves
+
+- Q23 at apply and the non-voter's path, S13's next lines, are D-146's.
+- The change guard, a leader accepting no `Change` before it has applied its own term's first entry, is Stage D's (SHARD.md:2673-2675) and is not built.
+
+---
+
+_Next entry: D-146. Add one before implementing anything not covered above._
