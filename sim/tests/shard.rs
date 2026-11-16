@@ -5,7 +5,7 @@
 //!
 //! What it asserts, at every tier: the correct system passes every seed under every
 //! check `sim/shard.rs`'s `Report::check` makes — checks 1 to 4 keyed by range, the range
-//! layer's folds (7, 8, 9, 10, 16, 17, 18, 20), linearizability of every key across every
+//! layer's folds (7, 8, 9, 10, 16, 17, 18, 19, 20), linearizability of every key across every
 //! split, pre-vote's property, on uniform seeds the timer check, the write bound per key
 //! and per range the run ended with and the meta convergence bound — and, beside them, check
 //! 8's right half's clause under the owner's reading R of D-107 (PROPOSED D-141); that nodes 4
