@@ -73,7 +73,17 @@ fn same_inside_the_driver(name: &str, trace: impl Fn(u64) -> String + Sync + Sen
 /// every Phase 3 scenario's pinned seed means the same whichever way its sweep ran.
 /// `sim/reseed.rs` and `sim/install.rs` keep no moirae header in their reports, so theirs
 /// is the records themselves, which is the moirae export's whole input but for the header.
+///
+/// A scenario's directed runs join it beside its sweep, each on the correct system. Each
+/// builds a shape of its own and its tests sweep it or pin seeds of it, so it is a scenario
+/// of its own here (SHARD.md §11, env 7). The sharded sweep joins on each of the three
+/// schedules `shard::Schedule` builds, since its pins run all three: the one its sweep draws
+/// (`shard::run`); `shard::Schedule::shaped`, the sweep's before `Fault::MetaReorder`, which
+/// the pins found there run (`shaped_of` in `sim/tests/shard.rs`); and
+/// `shard::Schedule::plain`, which the pins found on the schedule with no shape run (`pinned`
+/// and `pinned_of` there).
 // D-113: the node scenarios join the driver's proof.
+// SHARD.md §11, env 7: the directed runs Stage C added join it (#162's S13).
 #[test]
 fn a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace() {
     let (cores, node, range) = (
@@ -96,12 +106,54 @@ fn a_seed_of_a_node_scenario_inside_the_driver_gives_the_sequential_trace() {
     same_inside_the_driver("the install scenario", |seed| {
         format!("{:?}", install::run(seed, cores, node).records)
     });
+    same_inside_the_driver("the install scenario's joiner re-seeded", |seed| {
+        format!("{:?}", install::run_joiner_reseed(seed).records)
+    });
     same_inside_the_driver("the re-seed scenario", |seed| {
         format!("{:?}", reseed::run(seed, cores, node).records)
+    });
+    same_inside_the_driver("the re-seed scenario restarted again", |seed| {
+        format!(
+            "{:?}",
+            reseed::run_restarted_again(seed, cores, node).records
+        )
+    });
+    same_inside_the_driver("the re-seed after a split", |seed| {
+        format!("{:?}", reseed::run_after_split(seed).records)
+    });
+    same_inside_the_driver("the split after a re-seed", |seed| {
+        format!("{:?}", reseed::run_split_after_reseed(seed, node).records)
+    });
+    same_inside_the_driver("the split of a replayed range", |seed| {
+        format!(
+            "{:?}",
+            reseed::run_split_of_a_replayed_range(seed, node).records
+        )
+    });
+    same_inside_the_driver("the unconfirmable reads, stalled", |seed| {
+        format!(
+            "{:?}",
+            reseed::run_unconfirmable_reads_stalled(seed).records
+        )
+    });
+    same_inside_the_driver("the unconfirmable reads", |seed| {
+        format!("{:?}", reseed::run_unconfirmable_reads(seed, cores).records)
     });
     same_inside_the_driver("split's vote shape", |seed| split::run(seed, range).jsonl());
     same_inside_the_driver("split's overlap shape", |seed| {
         split::run_overlap(seed, range).jsonl()
     });
+    same_inside_the_driver("split's overlap shape with R split again", |seed| {
+        split::run_overlap_resplit(seed, node).jsonl()
+    });
+    same_inside_the_driver("split's follower cut from the start", |seed| {
+        split::run_cut_from_the_start(seed).jsonl()
+    });
     same_inside_the_driver("the sharded sweep", |seed| shard::run(seed).jsonl());
+    same_inside_the_driver("the sharded sweep on the shaped schedule", |seed| {
+        shard::run_with(seed, shard::Schedule::shaped(seed), cores, node, range).jsonl()
+    });
+    same_inside_the_driver("the sharded sweep on the plain schedule", |seed| {
+        shard::run_with(seed, shard::Schedule::plain(seed), cores, node, range).jsonl()
+    });
 }
