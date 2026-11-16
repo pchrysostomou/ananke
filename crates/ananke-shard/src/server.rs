@@ -1607,14 +1607,19 @@ impl<E: Environment> Host for ServerHost<E> {
                 })
             }
             // A split's proposal (SHARD.md §5; D-100): the leader's checks,
-            // for liveness only — a user range, the key strictly inside the span of
-            // the descriptor this node holds, that descriptor `Live` — and the right
-            // half's id taken from the node's block. With no id left the split is
-            // refused `NoRangeId`, as Stage C's question 1 proposes (D-092,
+            // for liveness only — a user range, no change under way, the key strictly
+            // inside the span of the descriptor this node holds, that descriptor `Live` —
+            // and the right half's id taken from the node's block. With no id left the
+            // split is refused `NoRangeId`, as Stage C's question 1 proposes (D-092,
             // A), and the asker retries; the block's refill is already outstanding.
-            // What the leader cannot see here — the configuration plain, no change in
-            // flight — every replica re-checks at the apply (Q23). A copy of a split
-            // whose entry is in the log is answered when that entry applies, once.
+            // A change is under way while servers catch up as learners or while the joint
+            // configuration is in force (`Raft::changing`; Q23). Because these checks are
+            // for liveness only, every replica re-checks at the apply that the key is
+            // inside P's span, that P is `Live` and that the latest configuration entry at
+            // or below `s` is plain (D-100 items 2 and 3). A copy of a split whose entry is
+            // in the log is answered when that entry applies, once.
+            // PROPOSED(D-145): §5's "plain and committed" is not asked here: a split is
+            // accepted while `C_new` is appended and uncommitted.
             Command::Split { key, .. } => {
                 if let Some(&(index, term)) = state.proposed.get(&(request.client, request.seq))
                     && core.term_at(index) == Some(term)
@@ -5509,6 +5514,221 @@ mod tests {
         // `answer_read` takes it when the answer comes.
         assert!(replica.reads.remove(&id).is_some());
         assert!(replica.reads.is_empty());
+    }
+
+    /// Q23 at proposal (SHARD.md §5; D-100 item 2): a leader with a change under way refuses
+    /// a split `ConfigurationChanging`. The refusal is answered at once, nothing is handed to
+    /// the core, and no id is taken from the node's block. A change is under way while the
+    /// servers being added catch up as learners, before any joint entry, and while the joint
+    /// configuration is in force (`Raft::changing`). The test drives the host's own
+    /// `local_input` with a core in each state, beside a leader with no change under way,
+    /// whose split takes an id and is proposed. No schedule reaches this refusal: no scenario
+    /// of the tree both changes a range's configuration and splits it.
+    ///
+    /// The block holds ids throughout, so "no id taken" reads the ids left, not an empty
+    /// block's zero. Each answer is read before `changing()` is asked, so a core that stops
+    /// counting either state as a change fails here on the host's answer.
+    // PROPOSED(D-145)
+    #[test]
+    fn a_split_asked_while_a_change_is_under_way_is_refused_at_proposal_and_takes_no_id() {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        const R2: RangeId = RangeId(2);
+        /// What `local_input` did with a split: the input it handed the core, the answer it
+        /// queued, and the ids left in the node's block after.
+        type Asked = (Option<Input>, Option<RangedResponse>, u64);
+
+        let mut sim = Sim::new(SimConfig::new(7));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let bound = Arc::new(Mutex::new(None));
+        env.clone().spawn("bind", {
+            let (env, bound) = (env.clone(), bound.clone());
+            async move {
+                let sock = env
+                    .net()
+                    .bind(SocketAddr::from(([10, 0, 0, 1], 7000)))
+                    .await
+                    .expect("a bind");
+                *lock(&bound) = Some(sock);
+            }
+        });
+        sim.run_for(Duration::from_millis(1));
+        let sock = lock(&bound).take().expect("the socket is bound");
+        let mut ids = IdBlocks::new(1);
+        assert!(ids.adopt(
+            &LeaseRecord {
+                run: 1,
+                first: 10,
+                last: 19,
+            },
+            false
+        ));
+        let descriptor = RangeDescriptor {
+            range: R2,
+            start: user_key(b"k0"),
+            end: user_key(b"kz"),
+            generation: FIRST_GENERATION,
+            voters: vec![ServerId(1), ServerId(2)],
+            state: RangeState::Live,
+        };
+        let host = ServerHost {
+            env: env.clone(),
+            id: ServerId(1),
+            sock: Arc::new(sock),
+            addrs: BTreeMap::new(),
+            stores: Arc::default(),
+            replicas: Arc::new(Mutex::new(
+                [(R2, Arc::new(Mutex::new(Replica::new())))].into(),
+            )),
+            jobs: Queue::new(),
+            answers: Queue::new(),
+            snaps: Queue::new(),
+            ranges: Vec::new(),
+            initial: vec![ServerId(1), ServerId(2)],
+            raft: RaftConfig::default(),
+            variants: Variants::default(),
+            node: NodeVariants::correct(),
+            range_variants: RangeVariants::correct(),
+            gaps: Mutex::new(Gaps::default()),
+            descriptors: Arc::new(Mutex::new([(R2, descriptor)].into())),
+            led: Mutex::new(BTreeMap::new()),
+            meta: Queue::new(),
+            ids: Arc::new(Mutex::new(ids)),
+            refill_at: 0,
+            applied: Arc::default(),
+            placeholders: Arc::default(),
+            on_a_reseed: false,
+            switching: Arc::default(),
+        };
+        let ask = |core: &Raft, seq: u64| -> Asked {
+            let input = host.local_input(
+                Local::Request {
+                    range: R2,
+                    from: client_addr(),
+                    request: Request {
+                        client: 1,
+                        seq,
+                        command: Command::Split {
+                            key: Bytes::from_static(b"k5"),
+                            right: 0,
+                        },
+                    },
+                },
+                core,
+            );
+            let answer = host.answers.remove_first(|_| true).map(|(to, bytes)| {
+                assert_eq!(to, client_addr(), "the answer goes to the asker");
+                RangedResponse::decode(bytes).expect("the answer decodes")
+            });
+            assert!(host.answers.is_empty(), "one answer at most");
+            (input, answer, lock(&host.ids).left())
+        };
+        let refused = |seq: u64| RangedResponse {
+            range: R2,
+            response: Response {
+                client: 1,
+                seq,
+                reply: Reply::Outcome(Outcome::Refused(SplitRefusal::ConfigurationChanging)),
+            },
+        };
+        let rejected = |outputs: &[Output]| {
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::Rejected { .. }))
+        };
+        let config = RaftConfig {
+            range: R2.get(),
+            ..RaftConfig::default()
+        };
+
+        // (a) A leader of one with no change under way: the split takes the block's first
+        // id and is proposed, and nothing is answered yet.
+        let mut core = Raft::new(
+            ServerId(1),
+            Configuration::of(&[ServerId(1)]),
+            config.clone(),
+            7,
+        );
+        core.step(Input::Campaign);
+        assert_eq!(core.role(), Role::Leader, "a voter of one elects itself");
+        assert!(!core.changing());
+        let proposed = Command::Split {
+            key: Bytes::from_static(b"k5"),
+            right: 10,
+        };
+        assert_eq!(
+            ask(&core, 1),
+            (Some(Input::Propose(proposed.encode())), None, 9),
+            "with no change under way the split takes an id and is proposed"
+        );
+
+        // (b) The same leader adds server 2, which catches up as a learner: the change is
+        // accepted, and the configuration in force is still the initial plain one, with no
+        // joint entry appended.
+        let outputs = core.step(Input::Change(vec![ServerId(1), ServerId(2)]));
+        assert!(!rejected(&outputs), "the change is accepted");
+        assert_eq!(
+            (core.membership(), core.membership_index()),
+            (&Configuration::of(&[ServerId(1)]), 0),
+            "server 2 catches up before any joint entry"
+        );
+        assert_eq!(
+            ask(&core, 2),
+            (None, Some(refused(2)), 9),
+            "a split asked while a learner catches up is refused at once, and takes no id"
+        );
+        assert!(core.changing());
+
+        // (c) A leader of two, elected by server 2's pre-vote and vote, removes server 2. A
+        // change that only removes appends the joint entry at once (`Raft::on_change`), and
+        // it stays uncommitted while server 2 is silent.
+        let mut core = Raft::new(
+            ServerId(1),
+            Configuration::of(&[ServerId(1), ServerId(2)]),
+            config,
+            7,
+        );
+        core.step(Input::Campaign);
+        core.step(Input::Message {
+            from: ServerId(2),
+            message: Message::PreVoteResponse {
+                term: 1,
+                granted: true,
+            },
+            now: 0,
+        });
+        core.step(Input::Message {
+            from: ServerId(2),
+            message: Message::RequestVoteResponse {
+                term: 1,
+                granted: true,
+            },
+            now: 0,
+        });
+        assert_eq!(
+            core.role(),
+            Role::Leader,
+            "server 2's pre-vote and vote elect 1"
+        );
+        let outputs = core.step(Input::Change(vec![ServerId(1)]));
+        assert!(!rejected(&outputs), "the change is accepted");
+        assert_eq!(
+            core.membership().new_voters,
+            Some(vec![ServerId(1)]),
+            "the joint configuration is in force"
+        );
+        assert!(
+            core.commit() < core.membership_index(),
+            "the joint entry is uncommitted"
+        );
+        assert_eq!(
+            ask(&core, 3),
+            (None, Some(refused(3)), 9),
+            "a split asked while the joint configuration is in force is refused at once, and \
+             takes no id"
+        );
+        assert!(core.changing());
     }
 
     /// What [`split_with_no_descriptor`] found once the split's apply was done: its effect
