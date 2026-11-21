@@ -2,7 +2,7 @@
 
 # ananke
 
-**A distributed SQL database in Rust, built so that every failure it can have is reproducible.**
+**A distributed database in Rust, built so that every failure it can have is reproducible.**
 
 [![CI](https://github.com/pchrysostomou/ananke/actions/workflows/ci.yml/badge.svg)](https://github.com/pchrysostomou/ananke/actions/workflows/ci.yml)
 [![Nightly: 10 000 seeds](https://github.com/pchrysostomou/ananke/actions/workflows/nightly.yml/badge.svg)](https://github.com/pchrysostomou/ananke/actions/workflows/nightly.yml)
